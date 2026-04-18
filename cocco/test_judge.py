@@ -129,3 +129,11 @@ async def test_language_java():
         exe = await python.compile(script_path, tmp)
         res = await python.run(exe, stdin_path)
     assert res.stdout.strip() == "hello moon"
+    assert cj.EqualityEvaluator("hello moon").evaluate(res.stdout)[0] == 1
+
+
+def test_evaluator():
+    evaluator = cj.DiffEvaluator("one\ntwo\nthree\nfour")
+    ev = evaluator.evaluate("one\nfour\nthree\nfour")
+    print(ev[1])
+    assert ev[0] == 0.75
