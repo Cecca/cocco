@@ -67,7 +67,7 @@ async def isolate_run(
 ) -> RunOutcome:
     async with _IDS_POOL.acquire() as box_id:
         isolate_init = await asyncio.create_subprocess_exec(
-            "isolate", "--box-id", str(box_id), "--init",
+            "isolate", "--cg", "--box-id", str(box_id), "--init",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -96,10 +96,11 @@ async def isolate_run(
         with open(stdin) as fp:
             isolate_run = await asyncio.create_subprocess_exec(
                 "isolate",
+                "--cg",
                 "--box-id",
                 str(box_id),
                 f"--time={time_limit}",
-                f"--mem={mem_limit_kb}",
+                f"--cg-mem={mem_limit_kb}",
                 "--dir=/nix/store",  # this allows running the programs
                 f"--meta={meta_file}",
                 f"--stdout={stdout_file.name}",
@@ -134,7 +135,7 @@ async def isolate_run(
         )
 
         isolate_cleanup = await asyncio.create_subprocess_exec(
-            "isolate", "--box-id", str(box_id), "--cleanup",
+            "isolate", "--cg", "--box-id", str(box_id), "--cleanup",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )

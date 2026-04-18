@@ -61,7 +61,7 @@ async def test_language_java():
             import java.util.Scanner;
             public class Test {
                 public static void main(String [] args) {
-                    Scanner s = new Scanner(System.in);
+                    Scanner scanner = new Scanner(System.in);
                     System.out.println("hello " + scanner.next());
                 }
             }
