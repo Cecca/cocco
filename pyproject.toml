@@ -9,6 +9,7 @@ dependencies = [
     "icecream>=2.2.0",
     "jinja2>=3.1.6",
     "sqlmodel>=0.0.38",
+    "toml>=0.10.2",
 ]
 
 [tool.fastapi]

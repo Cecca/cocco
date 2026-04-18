@@ -1,9 +1,10 @@
 import asyncio
+import tomllib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from os.path import isfile
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 import shutil
 import os
 from icecream import ic
@@ -29,7 +30,7 @@ class BoxPool:
 _IDS_POOL = BoxPool()
 
 
-async def resolve_runtime(runtime_name: str, bin_name) -> Path:
+async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
     p = await asyncio.create_subprocess_shell(
         " ".join(["nix", "build", f".#{runtime_name}", "--no-link", "--print-out-paths"]),
         stdout=asyncio.subprocess.PIPE,
@@ -42,6 +43,10 @@ async def resolve_runtime(runtime_name: str, bin_name) -> Path:
     binary = Path(f"{nix_store_path}/bin/{bin_name}")
     assert binary.is_file()
     return binary
+
+
+
+
 
 
 @dataclass
@@ -142,6 +147,93 @@ async def isolate_run(
 
 
 
+
+
+@dataclass
+class Language:
+    """A language runtime loaded from `languages.toml`.
+
+    Three cases, driven by `compile_args` and `run_binary`:
+    - Interpreted (python): `compile_args` is None. `binary` is the interpreter;
+      `run` invokes it with the source as the first argument.
+    - Compiled native (cpp): `compile_args` is set. `binary` is the compiler;
+      `run` executes the compiled output directly.
+    - Compiled + VM (java): `compile_args` and `run_binary` are both set.
+      `binary` is the compiler, `run_binary` is the VM used at execution time
+      with args from `run_args`.
+
+    Compile-time placeholders: `{source}`, `{output}`, `{workdir}`.
+    Run-time placeholders: `{executable}`, `{workdir}`, `{name}`.
+    """
+
+    name: str
+    extensions: List[str]
+    runtime: str
+    binary: str
+    compile_args: List[str] | None = None
+    output_ext: str = ""
+    run_binary: str | None = None
+    run_args: List[str] | None = None
+
+    @property
+    def is_interpreted(self) -> bool:
+        return self.compile_args is None
+
+    async def compile(self, source: Path, workdir: Path) -> Path:
+        if self.is_interpreted:
+            return source
+        compiler = await resolve_runtime(self.runtime, self.binary)
+        output = workdir / (source.stem + self.output_ext)
+        fmt_args = [
+            a.format(source=str(source), output=str(output), workdir=str(workdir))
+            for a in self.compile_args
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            str(compiler), *fmt_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        assert proc.returncode == 0, f"compilation failed:\n{stderr.decode()}"
+        return output
+
+    async def run(
+        self,
+        executable: Path,
+        stdin: Path,
+        args: List[str] | None = None,
+        time_limit: float = 2.0,
+        mem_limit_kb: int = 262144,
+    ) -> RunOutcome:
+        args = args or []
+        if self.is_interpreted:
+            interpreter = await resolve_runtime(self.runtime, self.binary)
+            return await isolate_run(
+                interpreter, stdin, [str(executable), *args],
+                time_limit=time_limit, mem_limit_kb=mem_limit_kb,
+            )
+        if self.run_binary is not None:
+            vm = await resolve_runtime(self.runtime, self.run_binary)
+            fmt = dict(
+                executable=str(executable),
+                workdir=str(executable.parent),
+                name=executable.stem,
+            )
+            prefix = [a.format(**fmt) for a in (self.run_args or [])]
+            return await isolate_run(
+                vm, stdin, [*prefix, *args],
+                time_limit=time_limit, mem_limit_kb=mem_limit_kb,
+            )
+        return await isolate_run(
+            executable, stdin, args,
+            time_limit=time_limit, mem_limit_kb=mem_limit_kb,
+        )
+
+
+def load_languages(path: Path) -> Dict[str, Language]:
+    with open(path, "rb") as fp:
+        data = tomllib.load(fp)
+    return {name: Language(name=name, **cfg) for name, cfg in data.items()}
 
 
 if __name__ == "__main__":

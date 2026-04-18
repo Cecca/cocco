@@ -1,0 +1,25 @@
+[python]
+extensions = ["py"]
+runtime = "python3"
+binary = "python"
+
+[cpp]
+extensions = ["cpp", "cc", "cxx"]
+runtime = "gcc"
+binary = "g++"
+compile_args = ["-O2", "-std=c++17", "-o", "{output}", "{source}"]
+
+[c]
+extensions = ["c"]
+runtime = "gcc"
+binary = "gcc"
+compile_args = ["-O2", "-std=c17", "-o", "{output}", "{source}"]
+
+[java]
+extensions = ["java"]
+runtime = "jdk"
+binary = "javac"
+compile_args = ["-d", "{workdir}", "{source}"]
+output_ext = ".class"
+run_binary = "java"
+run_args = ["-cp", "{workdir}", "{name}"]
