@@ -1,12 +1,13 @@
 import asyncio
+import os
+import shutil
 import tomllib
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from os.path import isfile
 from pathlib import Path
 from typing import Dict, List
-import shutil
-import os
+
 from icecream import ic
 
 
@@ -43,9 +44,6 @@ async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
     binary = Path(f"{nix_store_path}/bin/{bin_name}")
     assert binary.is_file()
     return binary
-
-
-
 
 
 
@@ -169,24 +167,25 @@ class Language:
     name: str
     extensions: List[str]
     runtime: str
-    binary: str
-    compile_args: List[str] | None = None
+    compiler: str | None = None
+    compiler_args: List[str] = field(default_factory=list)
     output_ext: str = ""
-    run_binary: str | None = None
-    run_args: List[str] | None = None
+    interpreter: str | None = None
+    interpreter_args: List[str] = field(default_factory=list)
 
     @property
     def is_interpreted(self) -> bool:
-        return self.compile_args is None
+        return self.interpreter is not None
 
     async def compile(self, source: Path, workdir: Path) -> Path:
         if self.is_interpreted:
             return source
-        compiler = await resolve_runtime(self.runtime, self.binary)
+        assert self.compiler is not None
+        compiler = await resolve_runtime(self.runtime, self.compiler)
         output = workdir / (source.stem + self.output_ext)
         fmt_args = [
             a.format(source=str(source), output=str(output), workdir=str(workdir))
-            for a in self.compile_args
+            for a in self.compiler_args
         ]
         proc = await asyncio.create_subprocess_exec(
             str(compiler), *fmt_args,
@@ -207,21 +206,16 @@ class Language:
     ) -> RunOutcome:
         args = args or []
         if self.is_interpreted:
-            interpreter = await resolve_runtime(self.runtime, self.binary)
-            return await isolate_run(
-                interpreter, stdin, [str(executable), *args],
-                time_limit=time_limit, mem_limit_kb=mem_limit_kb,
-            )
-        if self.run_binary is not None:
-            vm = await resolve_runtime(self.runtime, self.run_binary)
+            assert self.interpreter is not None
+            interpreter = await resolve_runtime(self.runtime, self.interpreter)
             fmt = dict(
                 executable=str(executable),
                 workdir=str(executable.parent),
                 name=executable.stem,
             )
-            prefix = [a.format(**fmt) for a in (self.run_args or [])]
+            prefix_args = [a.format(**fmt) for a in (self.interpreter_args)]
             return await isolate_run(
-                vm, stdin, [*prefix, *args],
+                interpreter, stdin, [*prefix_args, *args],
                 time_limit=time_limit, mem_limit_kb=mem_limit_kb,
             )
         return await isolate_run(
