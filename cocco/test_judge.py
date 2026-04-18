@@ -1,5 +1,4 @@
 import textwrap
-import asyncio
 import tempfile
 from pathlib import Path
 from icecream import ic
@@ -51,6 +50,63 @@ async def test_language_python():
 
 
 @pytest.mark.integration
+async def test_language_c():
+    c = cj.load_languages(Path("languages.toml"))["c"]
+    with tempfile.TemporaryDirectory(delete=False) as tmp:
+        tmp = Path(tmp)
+        script_path = tmp / "hello.c"
+        with open(script_path, "w") as fp:
+            fp.write(textwrap.dedent("""\
+            #include <stdio.h>
+
+            int main(void) {
+                char word[256];
+                if (scanf("%255s", word) != 1) {
+                    return 1;
+                }
+                printf("hello %s\\n", word);
+                return 0;
+            }
+            """))
+        stdin_path = tmp / "stdin.txt"
+        with open(stdin_path, "w") as fp:
+            fp.write("moon")
+
+        exe = await c.compile(script_path, tmp)
+        res = await c.run(exe, stdin_path)
+    assert res.stdout.strip() == "hello moon"
+
+
+@pytest.mark.integration
+async def test_language_cpp():
+    cpp = cj.load_languages(Path("languages.toml"))["cpp"]
+    with tempfile.TemporaryDirectory(delete=False) as tmp:
+        tmp = Path(tmp)
+        script_path = tmp / "hello.cpp"
+        with open(script_path, "w") as fp:
+            fp.write(textwrap.dedent("""\
+            #include <iostream>
+            #include <string>
+
+            int main() {
+                std::string word;
+                if (!(std::cin >> word)) {
+                    return 1;
+                }
+                std::cout << "hello " << word << std::endl;
+                return 0;
+            }
+            """))
+        stdin_path = tmp / "stdin.txt"
+        with open(stdin_path, "w") as fp:
+            fp.write("moon")
+
+        exe = await cpp.compile(script_path, tmp)
+        res = await cpp.run(exe, stdin_path)
+    assert res.stdout.strip() == "hello moon"
+
+
+@pytest.mark.integration
 async def test_language_java():
     python = cj.load_languages(Path("languages.toml"))["java"]
     with tempfile.TemporaryDirectory(delete=False) as tmp:
@@ -72,5 +128,4 @@ async def test_language_java():
 
         exe = await python.compile(script_path, tmp)
         res = await python.run(exe, stdin_path)
-        print(res.stdout)
     assert res.stdout.strip() == "hello moon"

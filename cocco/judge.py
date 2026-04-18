@@ -4,7 +4,6 @@ import shutil
 import tomllib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from os.path import isfile
 from pathlib import Path
 from typing import Dict, List
 
@@ -38,12 +37,13 @@ async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await p.communicate()
-    print(stderr)
     assert p.returncode == 0
-    nix_store_path: str = stdout.strip().decode()
-    binary = Path(f"{nix_store_path}/bin/{bin_name}")
-    assert binary.is_file()
-    return binary
+    nix_store_paths: List[str] = stdout.strip().decode().splitlines()
+    for path in nix_store_paths:
+        binary = Path(f"{path}/bin/{bin_name}")
+        if binary.is_file():
+            return binary
+    raise ValueError(f"could not find binary {bin_name} in {nix_store_paths}")
 
 
 
@@ -63,7 +63,9 @@ async def isolate_run(
     stdin: Path,
     args: List[str],
     time_limit: float = 2.0,
-    mem_limit_kb: int = 262144,
+    mem_limit_kb: int = 512 * 1024,
+    processes: int = 1,
+    additional_files: List[Path] = []
 ) -> RunOutcome:
     async with _IDS_POOL.acquire() as box_id:
         isolate_init = await asyncio.create_subprocess_exec(
@@ -90,6 +92,12 @@ async def isolate_run(
             else:
                 filtered_args.append(arg)
 
+        for f in additional_files:
+            if os.path.isfile(f):
+                shutil.copy(f, box_path / f.name)
+            elif os.path.isdir(f):
+                shutil.copytree(f, box_path / f.name)
+
         stdout_file = box_path / "_stdout"
         stderr_file = box_path / "_stderr"
         meta_file = f"/tmp/meta-{box_id}.txt"
@@ -101,7 +109,8 @@ async def isolate_run(
                 str(box_id),
                 f"--time={time_limit}",
                 f"--cg-mem={mem_limit_kb}",
-                "--dir=/nix/store",  # this allows running the programs
+                f"--processes={processes}",
+                "--dir=/nix/store",  # this allows running the compilers/interpreters
                 f"--meta={meta_file}",
                 f"--stdout={stdout_file.name}",
                 f"--stderr={stderr_file.name}",
@@ -173,15 +182,15 @@ class Language:
     output_ext: str = ""
     interpreter: str | None = None
     interpreter_args: List[str] = field(default_factory=list)
+    additional_processes: int = 0
 
     @property
     def is_interpreted(self) -> bool:
         return self.interpreter is not None
 
     async def compile(self, source: Path, workdir: Path) -> Path:
-        if self.is_interpreted:
+        if self.compiler is None:
             return source
-        assert self.compiler is not None
         compiler = await resolve_runtime(self.runtime, self.compiler)
         output = workdir / (source.stem + self.output_ext)
         fmt_args = [
@@ -204,6 +213,7 @@ class Language:
         args: List[str] | None = None,
         time_limit: float = 2.0,
         mem_limit_kb: int = 262144,
+        processes:int = 1
     ) -> RunOutcome:
         args = args or []
         if self.is_interpreted:
@@ -218,10 +228,16 @@ class Language:
             return await isolate_run(
                 interpreter, stdin, [*prefix_args, *args],
                 time_limit=time_limit, mem_limit_kb=mem_limit_kb,
+                processes=processes+self.additional_processes,
+                additional_files=[executable]
             )
         return await isolate_run(
-            executable, stdin, args,
+            # For compiled executables, we strip the absolute path, which is instead needed
+            # for the interpreters above
+            Path(executable.name), stdin, args,
             time_limit=time_limit, mem_limit_kb=mem_limit_kb,
+            processes=processes+self.additional_processes,
+            additional_files=[executable]
         )
 
 
@@ -233,7 +249,7 @@ def load_languages(path: Path) -> Dict[str, Language]:
 
 if __name__ == "__main__":
     async def main():
-        exe = await resolve_runtime("python3", "python")
+        exe = await resolve_runtime("gcc", "gcc")
         print(exe)
 
     asyncio.run(main())

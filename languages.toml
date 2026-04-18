@@ -4,23 +4,24 @@ runtime = "python3"
 interpreter = "python"
 interpreter_args = ["{executable}"]
 
-# [cpp]
-# extensions = ["cpp", "cc", "cxx"]
-# runtime = "gcc"
-# binary = "g++"
-# compile_args = ["-O2", "-std=c++17", "-o", "{output}", "{source}"]
+[cpp]
+extensions = ["cpp", "cc", "cxx"]
+runtime = "gcc"
+compiler = "g++"
+compiler_args = ["-O2", "-std=c++17", "-o", "{output}", "{source}"]
 
-# [c]
-# extensions = ["c"]
-# runtime = "gcc"
-# binary = "gcc"
-# compile_args = ["-O2", "-std=c17", "-o", "{output}", "{source}"]
+[c]
+extensions = ["c"]
+runtime = "gcc"
+compiler = "gcc"
+compiler_args = ["-O2", "-std=c17", "-o", "{output}", "{source}"]
 
 [java]
 extensions = ["java"]
 runtime = "jdk"
 compiler = "javac"
-compiler_args = ["-d", "{workdir}", "{source}"]
+compiler_args = ["{source}"]
 output_ext = ".class"
 interpreter = "java"
-interpreter_args = ["-cp", "{workdir}", "{name}"]
+interpreter_args = ["{name}"]
+additional_processes = 20 # processes needed for the JVM
