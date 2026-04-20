@@ -62,6 +62,8 @@ class TestOutcome(SQLModel, table=True):
     outcome: OutcomeEnum
     elapsed_s: float | None
     peak_memory_bytes: int | None
+    score: float | None
+    message: str | None
 
 
 class QueuedSubmission(SQLModel, table=True):
