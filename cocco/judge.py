@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List
 
+from sqlmodel import Session, select
+
 
 class BoxPool:
     """A pool of ids to be used with isolate boxes"""
@@ -425,36 +427,28 @@ class RMSEEvaluator(Evaluator):
         return rmse, "\n".join(message_lines)
 
 
-# class Evaluator(object):
-#     expected_output: List[str]
-#     strip_whitespace: bool
+async def run_from_queue(session: Session, evaluator: type[Evaluator]):
+    """Does the following:
 
-#     def __init__(self, expected_output: str, strip_whitespace: bool = True):
-#         self.expected_output = expected_output.splitlines()
-#         self.strip_whitespace = strip_whitespace
-#         if self.strip_whitespace:
-#             self.expected_output = [line.strip() for line in expected_output]
+    - Pulls a job from the DB queue
+    - Marks it as "in progress"
+    - Compiles the code
+    - Runs it in isolation on all test cases
+    - Evaluates the outcomes using the given evaluator
+    - Writes the results back to the database
 
-#     def evaluate(self, actual_output: str) -> tuple[float, str]:
-#         """Return the fraction of matched lines (optinally stripping whitespaces),
-#         along with a diff.
-#         """
-#         from difflib import context_diff
+    If there is no job in the queue, then this function simply returns.
+    """
+    from cocco.model import QueuedSubmission, QueuedSubmissionStatus
 
-#         total_lines = len(self.expected_output)
-#         matching = 0
-#         actual_lines: List[str] = actual_output.splitlines()
-#         ic(self.expected_output)
-#         ic(actual_lines)
-#         if self.strip_whitespace:
-#             actual_lines = [line.strip() for line in actual_lines]
-#         for expected, actual in zip(self.expected_output, actual_lines):
-#             if expected == actual:
-#                 matching += 1
+    job: QueuedSubmission | None = session.exec(
+        select(QueuedSubmission)
+        .order_by("enqueued")
+        .where(QueuedSubmission.status == QueuedSubmissionStatus.waiting)
+    ).first()
+    if job is None:
+        return # maybe signal to the caller, that can then wait for some time
 
-#         diff = "\n".join(context_diff(self.expected_output, actual_lines))
-
-#         return (matching / total_lines), diff
 
 
 if __name__ == "__main__":

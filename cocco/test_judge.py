@@ -1,9 +1,9 @@
-import textwrap
 import tempfile
+import textwrap
 from pathlib import Path
-from icecream import ic
 
 import pytest
+from icecream import ic
 
 import cocco.judge as cj
 
@@ -137,3 +137,57 @@ def test_evaluator():
     ev = evaluator.evaluate("one\nfour\nthree\nfour")
     print(ev[1])
     assert ev[0] == 0.75
+
+
+async def test_run_from_queue():
+    from sqlmodel import Session, SQLModel, create_engine, select
+    import cocco.model as cm
+
+    engine = create_engine("sqlite:///:memory:", echo=True)
+    SQLModel.metadata.create_all(engine)
+    session = Session(engine)
+
+    res = await cj.run_from_queue(session, cj.EqualityEvaluator)
+    assert res is None
+
+    user = cm.User(
+        email="student@example.com",
+        role=cm.UserRole.student,
+        nickname="happy-otter",
+    )
+    challenge = cm.Challenge(
+        title="Hello",
+        description="Print hello <name>",
+        max_memory_bytes=64 * 1024 * 1024,
+        max_time_s=1.0,
+    )
+    session.add(user)
+    session.add(challenge)
+    session.commit()
+    session.refresh(user)
+    session.refresh(challenge)
+
+    testcase = cm.TestCase(
+        challenge_id=challenge.id,
+        execution_order=0,
+        input_path="stdin.txt",
+        expected_output_path="expected.txt",
+    )
+    submission = cm.Submission(
+        user_id=user.id,
+        challenge_id=challenge.id,
+        language="python",
+        source='print("hello", input())',
+    )
+    session.add(testcase)
+    session.add(submission)
+    session.commit()
+    session.refresh(submission)
+
+    cm.enqueue_submission(submission, session)
+    session.commit()
+
+    queued = session.exec(select(cm.QueuedSubmission)).all()
+    assert len(queued) == 1
+    assert queued[0].submission_id == submission.id
+    assert queued[0].status == cm.QueuedSubmissionStatus.waiting

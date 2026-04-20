@@ -66,9 +66,15 @@ class TestOutcome(SQLModel, table=True):
     message: str | None
 
 
+class QueuedSubmissionStatus(Enum):
+    waiting = "waiting"
+    running = "running"
+
+
 class QueuedSubmission(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     enqueued: datetime
+    status: QueuedSubmissionStatus = QueuedSubmissionStatus.waiting
     submission_id: int | None = Field(default=None, foreign_key="submission.id")
 
 
