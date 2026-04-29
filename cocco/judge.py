@@ -1,13 +1,24 @@
 import asyncio
 import os
 import shutil
+import tempfile
 import tomllib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence 
 
-from sqlmodel import Session, select
+from icecream import ic
+from sqlmodel import Session, create_engine, select
+
+from cocco.model import Challenge, OutcomeEnum, Submission, SubmissionStatus, TestCase, TestOutcome
+from cocco.storage import Storage
+
+
+# this is the length we truncate the output at, when saving
+# it to the database. This prevents attacks that flood the
+# database with data
+MAX_OUTPUT_LENGTH = 80000
 
 
 class BoxPool:
@@ -48,7 +59,7 @@ async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
     raise ValueError(f"could not find binary {bin_name} in {nix_store_paths}")
 
 
-@dataclass
+@dataclass(frozen=True)
 class RunOutcome(object):
     retcode: int
     stdout: str
@@ -57,6 +68,14 @@ class RunOutcome(object):
     max_rss_kb: int
     status: str
     message: str | None
+
+
+@dataclass(frozen=True)
+class CompileOutcome(object):
+    success: bool
+    executable: Path | None
+    stdout: str | None = None
+    stderr: str | None = None
 
 
 async def isolate_run(
@@ -194,9 +213,9 @@ class Language:
     def is_interpreted(self) -> bool:
         return self.interpreter is not None
 
-    async def compile(self, source: Path, workdir: Path) -> Path:
+    async def compile(self, source: Path, workdir: Path) -> CompileOutcome:
         if self.compiler is None:
-            return source
+            return CompileOutcome(executable=source, success=True)
         compiler = await resolve_runtime(self.runtime, self.compiler)
         output = workdir / (source.stem + self.output_ext)
         fmt_args = [
@@ -209,9 +228,21 @@ class Language:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
-        assert proc.returncode == 0, f"compilation failed:\n{stderr.decode()}"
-        return output
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            return CompileOutcome(
+                executable=output,
+                success=True,
+                stdout=stdout.decode(),
+                stderr=stderr.decode(),
+            )
+        else:
+            return CompileOutcome(
+                executable=None,
+                success=False,
+                stdout=stdout.decode(),
+                stderr=stderr.decode(),
+            )
 
     async def run(
         self,
@@ -261,46 +292,40 @@ def load_languages(path: Path) -> Dict[str, Language]:
 
 
 class Evaluator(object):
-    def evaluate(self, actual_output: str) -> tuple[float, str]:
+    def evaluate(self, expected_output: str, actual_output: str) -> tuple[float, str]:
         raise NotImplementedError("Not implemented")
 
 
 class EqualityEvaluator(Evaluator):
-    expected_output: str
     strip_whitespace: bool
 
-    def __init__(self, expected_output: str, strip_whitespace: bool = True):
-        if strip_whitespace:
-            self.expected_output = expected_output.strip()
-        else:
-            self.expected_output = expected_output
+    def __init__(self, strip_whitespace: bool = True):
         self.strip_whitespace = strip_whitespace
 
-    def evaluate(self, actual_output: str) -> tuple[float, str]:
+    def evaluate(self, expected_output: str, actual_output: str) -> tuple[float, str]:
+        expected_output = (
+            expected_output.strip() if self.strip_whitespace else expected_output
+        )
         actual_output = (
             actual_output.strip() if self.strip_whitespace else actual_output
         )
-        if actual_output == self.expected_output:
+        if actual_output == expected_output:
             return (1, "")
         else:
             return (0, "Output is not the expected one:\n{expected_output}")
 
 
 class DiffEvaluator(Evaluator):
-    expected_lines: List[str]
-
-    def __init__(self, expected_output: str):
-        self.expected_lines = expected_output.splitlines(keepends=True)
-
-    def evaluate(self, actual_output: str) -> tuple[float, str]:
+    def evaluate(self, expected_output: str, actual_output: str) -> tuple[float, str]:
         """Return the ratio of the diff lines as the score, and
         the actual diff as the message"""
         from difflib import Differ
 
+        expected_lines = expected_output.splitlines(keepends=True)
         actual_lines = actual_output.splitlines(keepends=True)
-        diff = list(Differ().compare(self.expected_lines, actual_lines))
+        diff = list(Differ().compare(expected_lines, actual_lines))
         matching = sum(1 for line in diff if line.startswith("  "))
-        total = len(self.expected_lines)
+        total = len(expected_lines)
         score = matching / total if total > 0 else 1.0
         return score, "".join(diff)
 
@@ -308,20 +333,15 @@ class DiffEvaluator(Evaluator):
 class AccuracyEvaluator(Evaluator):
     """Interprets the text as a sequence of labels and compares the accuracy of
     a classificator."""
-
-    ground_truth: List[str]
-
-    def __init__(self, expected_output: str):
-        self.ground_truth = expected_output.splitlines()
-
-    def evaluate(self, actual_output: str) -> tuple[float, str]:
+    def evaluate(self, expected_output: str, actual_output: str) -> tuple[float, str]:
+        ground_truth = expected_output.splitlines()
         actual_labels = actual_output.splitlines()
-        total = len(self.ground_truth)
+        total = len(ground_truth)
         if total == 0:
             return 1.0, ""
         matching = sum(
             1
-            for expected, actual in zip(self.ground_truth, actual_labels)
+            for expected, actual in zip(ground_truth, actual_labels)
             if expected == actual
         )
         score = matching / total
@@ -343,22 +363,18 @@ class F1Evaluator(Evaluator):
     and the final macro-F1.
     """
 
-    ground_truth: List[str]
-
-    def __init__(self, expected_output: str):
-        self.ground_truth = expected_output.splitlines()
-
-    def evaluate(self, actual_output: str) -> tuple[float, str]:
+    def evaluate(self, expected_output: str, actual_output: str) -> tuple[float, str]:
+        ground_truth = expected_output.splitlines()
         actual_labels = actual_output.splitlines()
-        if len(self.ground_truth) == 0:
+        if len(ground_truth) == 0:
             return 1.0, ""
 
-        labels = set(self.ground_truth) | set(actual_labels)
+        labels = set(ground_truth) | set(actual_labels)
         per_class = []
         lines = []
         for label in sorted(labels):
             tp = fp = fn = 0
-            for expected, actual in zip(self.ground_truth, actual_labels):
+            for expected, actual in zip(ground_truth, actual_labels):
                 if actual == label and expected == label:
                     tp += 1
                 elif actual == label and expected != label:
@@ -391,12 +407,8 @@ class RMSEEvaluator(Evaluator):
     as floats.
     """
 
-    ground_truth: List[float]
-
-    def __init__(self, expected_output: str):
-        self.ground_truth = [float(line) for line in expected_output.splitlines()]
-
-    def evaluate(self, actual_output: str) -> tuple[float, str]:
+    def evaluate(self, expected_output: str, actual_output: str) -> tuple[float, str]:
+        ground_truth = [float(line) for line in expected_output.splitlines()]
         actual_values: List[float] = []
         parse_errors: List[str] = []
         for i, line in enumerate(actual_output.splitlines()):
@@ -405,20 +417,20 @@ class RMSEEvaluator(Evaluator):
             except ValueError:
                 parse_errors.append(f"line {i + 1}: {line!r}")
 
-        n = min(len(self.ground_truth), len(actual_values))
+        n = min(len(ground_truth), len(actual_values))
         if n == 0:
             return float("inf"), "No comparable float pairs"
 
         squared_errors = [
             (expected - actual) ** 2
-            for expected, actual in zip(self.ground_truth[:n], actual_values[:n])
+            for expected, actual in zip(ground_truth[:n], actual_values[:n])
         ]
         rmse = (sum(squared_errors) / n) ** 0.5
 
         message_lines = [f"RMSE: {rmse:.6f}", f"Samples: {n}"]
-        if len(self.ground_truth) != len(actual_values):
+        if len(ground_truth) != len(actual_values):
             message_lines.append(
-                f"Length mismatch: expected {len(self.ground_truth)}, "
+                f"Length mismatch: expected {len(ground_truth)}, "
                 f"got {len(actual_values)}"
             )
         if parse_errors:
@@ -427,34 +439,126 @@ class RMSEEvaluator(Evaluator):
         return rmse, "\n".join(message_lines)
 
 
-async def run_from_queue(session: Session, evaluator: type[Evaluator]):
-    """Does the following:
+async def run_submission(
+    storage: Storage,
+    evaluator: Evaluator,
+    submission: Submission,
+    challenge: Challenge,
+    tests: Sequence[TestCase]
+) -> List[TestOutcome]:
+    assert submission.challenge_id == challenge.id
+    assert all(t.challenge_id == challenge.id for t in tests)
+    runtime: Language = load_languages(Path("languages.toml"))[submission.language]
 
-    - Pulls a job from the DB queue
-    - Marks it as "in progress"
-    - Compiles the code
-    - Runs it in isolation on all test cases
-    - Evaluates the outcomes using the given evaluator
-    - Writes the results back to the database
+    outcomes = []
+    with tempfile.TemporaryDirectory() as temp:
+        temp = Path(temp)
+        source_fname = temp / ("source" + runtime.extensions[0])
+        with open(source_fname, "w") as fp:
+            fp.write(submission.source)
 
-    If there is no job in the queue, then this function simply returns.
-    """
-    from cocco.model import QueuedSubmission, QueuedSubmissionStatus
+        # First we compile
+        compile_result = await runtime.compile(source_fname, temp)
+        if compile_result.success:
+            assert compile_result.executable is not None
+            for test_case in tests:
+                exec_res = await runtime.run(
+                    compile_result.executable,
+                    storage.resolve(test_case.input_path),
+                    [],
+                    time_limit=challenge.max_time_s,
+                    mem_limit_kb=challenge.max_memory_bytes // 1024,
+                    processes=challenge.max_threads,
+                )
+                # TODO: handle timed out runs
+                # TODO: handle out of memory runs
+                if exec_res.status != "OK":
+                    score = 0.0
+                    eval_msg = ""
+                    outcome = OutcomeEnum.failure
+                else:                        
+                    (score, eval_msg) = evaluator.evaluate(
+                        storage.read(test_case.expected_output_path), exec_res.stdout
+                    )
+                    outcome = OutcomeEnum.success
+                test_outcome = TestOutcome(
+                    submission_id=submission.id,
+                    testcase_id=test_case.id,
+                    outcome=outcome,
+                    score=score,
+                    elapsed_s=exec_res.elapsed_time_s,
+                    peak_memory_bytes=exec_res.max_rss_kb * 1024,
+                    message=eval_msg,
+                    # outputs are truncated to prevent flooding attacks
+                    stdout=exec_res.stdout[:MAX_OUTPUT_LENGTH],
+                    stderr=exec_res.stderr[:MAX_OUTPUT_LENGTH],
+                )
+                outcomes.append(test_outcome)
 
-    job: QueuedSubmission | None = session.exec(
-        select(QueuedSubmission)
+        else:
+            for test_case in tests:
+                test_outcome = TestOutcome(
+                    submission_id=submission.id,
+                    testcase_id=test_case.id,
+                    outcome=OutcomeEnum.compile_failure,
+                    score=0.0,
+                    message=f"stdout:\n{compile_result.stdout}\n\nstderr:\n{compile_result.stderr}",
+                )
+                outcomes.append(test_outcome)
+                
+
+    return outcomes
+
+
+async def run_from_queue(session: Session, storage: Storage, evaluator: Evaluator) -> bool:
+    submission: Submission | None = session.exec(
+        select(Submission)
         .order_by("enqueued")
-        .where(QueuedSubmission.status == QueuedSubmissionStatus.waiting)
+        .where(Submission.status == SubmissionStatus.queued)
     ).first()
-    if job is None:
-        return # maybe signal to the caller, that can then wait for some time
+    if submission is None:
+        return False
 
+    # mark the submission as running
+    submission.status = SubmissionStatus.running
+    session.add(submission)
+    session.commit()
+
+    # TODO: make the path to languages.toml configurable
+    challenge = session.exec(
+        select(Challenge).where(Challenge.id == submission.challenge_id)
+    ).first()
+    if challenge is None:
+        # This should never happen. Report the error robustly
+        raise ValueError("missing challenge")
+    tests = session.exec(
+        select(TestCase).where(TestCase.challenge_id == challenge.id)
+    ).fetchall()
+
+    outcomes = await run_submission(storage, evaluator, submission, challenge, tests)
+    session.add_all(outcomes)
+    submission.status = SubmissionStatus.done
+    session.add(submission)
+    session.commit()
+
+    return True
+
+
+async def run_loop(
+    session: Session, storage: Storage, evaluator: Evaluator, wait_time=1
+):
+    while True:
+        has_run = run_from_queue(session, storage, evaluator)
+        if not has_run:
+            await asyncio.sleep(wait_time)
 
 
 if __name__ == "__main__":
-
     async def main():
-        exe = await resolve_runtime("gcc", "gcc")
-        print(exe)
+        storage = Storage(Path("/tmp/cocco-storage"))
+        engine = create_engine("sqlite:///dev.db")
+        evaluator = EqualityEvaluator()
+        with Session(engine) as session:
+            await run_loop(session, storage, evaluator)
 
     asyncio.run(main())

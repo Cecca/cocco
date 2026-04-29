@@ -41,11 +41,19 @@ class TestCase(SQLModel, table=True):
     expected_output_path: str
 
 
+class SubmissionStatus(Enum):
+    queued = "queued"
+    running = "running"
+    done = "done"
+
+
 class Submission(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     user_id: int | None = Field(default=None, foreign_key="user.id")
     challenge_id: int | None = Field(default=None, foreign_key="challenge.id")
-    language: str   # TODO: maybe here we should support an explicit set of allowed languages
+    status: SubmissionStatus = Field(default=SubmissionStatus.queued)
+    enqueued: datetime = Field(default_factory=datetime.now)
+    language: str
     source: str     # for now we support only single-file submissions
 
 
@@ -60,27 +68,11 @@ class TestOutcome(SQLModel, table=True):
     submission_id: int | None = Field(default=None, foreign_key="submission.id")
     testcase_id: int | None = Field(default=None, foreign_key="testcase.id")
     outcome: OutcomeEnum
-    elapsed_s: float | None
-    peak_memory_bytes: int | None
-    score: float | None
-    message: str | None
+    elapsed_s: float | None = None
+    peak_memory_bytes: int | None = None
+    score: float | None = None
+    message: str | None = None
+    stdout: str | None = None
+    stderr: str | None = None
 
-
-class QueuedSubmissionStatus(Enum):
-    waiting = "waiting"
-    running = "running"
-
-
-class QueuedSubmission(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
-    enqueued: datetime
-    status: QueuedSubmissionStatus = QueuedSubmissionStatus.waiting
-    submission_id: int | None = Field(default=None, foreign_key="submission.id")
-
-
-def enqueue_submission(submission: Submission, session: Session):
-    q = QueuedSubmission(enqueued=datetime.now(), submission_id=submission.id)
-    session.add(q)
-    
-    
 
