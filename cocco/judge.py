@@ -1,4 +1,6 @@
+import argparse
 import asyncio
+import logging
 import os
 import shutil
 import tempfile
@@ -6,13 +8,15 @@ import tomllib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Sequence 
+from typing import Dict, List, Sequence
 
-from icecream import ic
-from sqlmodel import Session, create_engine, select
+from sqlmodel import SQLModel, Session, create_engine, select
 
 from cocco.model import Challenge, OutcomeEnum, Submission, SubmissionStatus, TestCase, TestOutcome
 from cocco.storage import Storage
+
+
+logger = logging.getLogger(__name__)
 
 
 # this is the length we truncate the output at, when saving
@@ -42,6 +46,7 @@ _IDS_POOL = BoxPool()
 
 
 async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
+    logger.debug("resolving runtime %s for binary %s", runtime_name, bin_name)
     p = await asyncio.create_subprocess_shell(
         " ".join(
             ["nix", "build", f".#{runtime_name}", "--no-link", "--print-out-paths"]
@@ -50,11 +55,19 @@ async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await p.communicate()
+    if p.returncode != 0:
+        logger.error(
+            "nix build of %s failed (rc=%s): %s",
+            runtime_name,
+            p.returncode,
+            stderr.decode().strip(),
+        )
     assert p.returncode == 0
     nix_store_paths: List[str] = stdout.strip().decode().splitlines()
     for path in nix_store_paths:
         binary = Path(f"{path}/bin/{bin_name}")
         if binary.is_file():
+            logger.debug("resolved %s -> %s", bin_name, binary)
             return binary
     raise ValueError(f"could not find binary {bin_name} in {nix_store_paths}")
 
@@ -88,6 +101,14 @@ async def isolate_run(
     additional_files: List[Path] = [],
 ) -> RunOutcome:
     async with _IDS_POOL.acquire() as box_id:
+        logger.debug(
+            "isolate run on box %s: exe=%s args=%s time=%.2fs mem=%dKB",
+            box_id,
+            exe,
+            args,
+            time_limit,
+            mem_limit_kb,
+        )
         isolate_init = await asyncio.create_subprocess_exec(
             "isolate",
             "--cg",
@@ -166,6 +187,14 @@ async def isolate_run(
             status=meta.get("status", "OK"),
             message=meta.get("message", None),
         )
+        logger.debug(
+            "isolate run on box %s done: status=%s rc=%s time=%.3fs rss=%dKB",
+            box_id,
+            ret.status,
+            ret.retcode,
+            ret.elapsed_time_s,
+            ret.max_rss_kb,
+        )
 
         isolate_cleanup = await asyncio.create_subprocess_exec(
             "isolate",
@@ -215,6 +244,7 @@ class Language:
 
     async def compile(self, source: Path, workdir: Path) -> CompileOutcome:
         if self.compiler is None:
+            logger.debug("language %s is interpreted, skipping compilation", self.name)
             return CompileOutcome(executable=source, success=True)
         compiler = await resolve_runtime(self.runtime, self.compiler)
         output = workdir / (source.stem + self.output_ext)
@@ -222,6 +252,7 @@ class Language:
             a.format(source=str(source), output=str(output), workdir=str(workdir))
             for a in self.compiler_args
         ]
+        logger.info("compiling %s with %s", source, self.name)
         proc = await asyncio.create_subprocess_exec(
             str(compiler),
             *fmt_args,
@@ -230,6 +261,7 @@ class Language:
         )
         stdout, stderr = await proc.communicate()
         if proc.returncode == 0:
+            logger.debug("compilation of %s succeeded -> %s", source, output)
             return CompileOutcome(
                 executable=output,
                 success=True,
@@ -237,6 +269,9 @@ class Language:
                 stderr=stderr.decode(),
             )
         else:
+            logger.info(
+                "compilation of %s failed (rc=%s)", source, proc.returncode
+            )
             return CompileOutcome(
                 executable=None,
                 success=False,
@@ -288,7 +323,9 @@ class Language:
 def load_languages(path: Path) -> Dict[str, Language]:
     with open(path, "rb") as fp:
         data = tomllib.load(fp)
-    return {name: Language(name=name, **cfg) for name, cfg in data.items()}
+    languages = {name: Language(name=name, **cfg) for name, cfg in data.items()}
+    logger.debug("loaded %d languages from %s: %s", len(languages), path, list(languages))
+    return languages
 
 
 class Evaluator(object):
@@ -448,6 +485,13 @@ async def run_submission(
 ) -> List[TestOutcome]:
     assert submission.challenge_id == challenge.id
     assert all(t.challenge_id == challenge.id for t in tests)
+    logger.info(
+        "running submission %s (challenge=%s, language=%s, tests=%d)",
+        submission.id,
+        challenge.id,
+        submission.language,
+        len(tests),
+    )
     runtime: Language = load_languages(Path("languages.toml"))[submission.language]
 
     outcomes = []
@@ -473,14 +517,27 @@ async def run_submission(
                 # TODO: handle timed out runs
                 # TODO: handle out of memory runs
                 if exec_res.status != "OK":
+                    logger.info(
+                        "submission %s test %s failed: status=%s message=%s",
+                        submission.id,
+                        test_case.id,
+                        exec_res.status,
+                        exec_res.message,
+                    )
                     score = 0.0
                     eval_msg = ""
                     outcome = OutcomeEnum.failure
-                else:                        
+                else:
                     (score, eval_msg) = evaluator.evaluate(
                         storage.read(test_case.expected_output_path), exec_res.stdout
                     )
                     outcome = OutcomeEnum.success
+                    logger.debug(
+                        "submission %s test %s scored %.3f",
+                        submission.id,
+                        test_case.id,
+                        score,
+                    )
                 test_outcome = TestOutcome(
                     submission_id=submission.id,
                     testcase_id=test_case.id,
@@ -496,6 +553,11 @@ async def run_submission(
                 outcomes.append(test_outcome)
 
         else:
+            logger.info(
+                "submission %s failed to compile, marking all %d tests as compile_failure",
+                submission.id,
+                len(tests),
+            )
             for test_case in tests:
                 test_outcome = TestOutcome(
                     submission_id=submission.id,
@@ -505,7 +567,7 @@ async def run_submission(
                     message=f"stdout:\n{compile_result.stdout}\n\nstderr:\n{compile_result.stderr}",
                 )
                 outcomes.append(test_outcome)
-                
+
 
     return outcomes
 
@@ -519,6 +581,7 @@ async def run_from_queue(session: Session, storage: Storage, evaluator: Evaluato
     if submission is None:
         return False
 
+    logger.info("picked up submission %s from queue", submission.id)
     # mark the submission as running
     submission.status = SubmissionStatus.running
     session.add(submission)
@@ -530,6 +593,11 @@ async def run_from_queue(session: Session, storage: Storage, evaluator: Evaluato
     ).first()
     if challenge is None:
         # This should never happen. Report the error robustly
+        logger.error(
+            "submission %s references missing challenge %s",
+            submission.id,
+            submission.challenge_id,
+        )
         raise ValueError("missing challenge")
     tests = session.exec(
         select(TestCase).where(TestCase.challenge_id == challenge.id)
@@ -540,23 +608,58 @@ async def run_from_queue(session: Session, storage: Storage, evaluator: Evaluato
     submission.status = SubmissionStatus.done
     session.add(submission)
     session.commit()
+    logger.info(
+        "submission %s done, recorded %d test outcomes",
+        submission.id,
+        len(outcomes),
+    )
 
     return True
 
 
 async def run_loop(
-    session: Session, storage: Storage, evaluator: Evaluator, wait_time=1
+    session: Session, storage: Storage, evaluator: Evaluator, wait_time=5
 ):
+    logger.info("judge run loop started (poll interval %ss)", wait_time)
     while True:
-        has_run = run_from_queue(session, storage, evaluator)
+        has_run = await run_from_queue(session, storage, evaluator)
         if not has_run:
+            logger.debug("judge waiting for %f seconds", wait_time)
             await asyncio.sleep(wait_time)
 
 
 if __name__ == "__main__":
     async def main():
-        storage = Storage(Path("/tmp/cocco-storage"))
-        engine = create_engine("sqlite:///dev.db")
+        parser = argparse.ArgumentParser(
+            description="Run the cocco judge loop, picking up queued submissions."
+        )
+        parser.add_argument(
+            "--database",
+            default="sqlite:///dev.db",
+            help="SQLAlchemy database URL (default: sqlite:///dev.db)",
+        )
+        parser.add_argument(
+            "--storage",
+            type=Path,
+            default=Path("/tmp/cocco-storage"),
+            help="Path to the storage root for test inputs/outputs (default: /tmp/cocco-storage)",
+        )
+        parser.add_argument(
+            "--log-level",
+            default="INFO",
+            choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+            help="Logging verbosity (default: INFO)",
+        )
+        args = parser.parse_args()
+
+        logging.basicConfig(
+            level=getattr(logging, args.log_level),
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+
+        storage = Storage(args.storage)
+        engine = create_engine(args.database)
+        SQLModel.metadata.create_all(engine)
         evaluator = EqualityEvaluator()
         with Session(engine) as session:
             await run_loop(session, storage, evaluator)
