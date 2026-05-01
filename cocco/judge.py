@@ -350,8 +350,10 @@ def load_languages(path: Path) -> Dict[str, Language]:
 
 
 class Evaluator(object):
+
     def evaluate(self, expected_output: str, actual_output: str) -> tuple[float, str]:
         raise NotImplementedError("Not implemented")
+
 
 
 class EqualityEvaluator(Evaluator):
@@ -495,6 +497,20 @@ class RMSEEvaluator(Evaluator):
             message_lines.append("Unparsable lines:")
             message_lines.extend(parse_errors)
         return rmse, "\n".join(message_lines)
+
+
+EVALUATOR_REGISTRY = {
+    "EqualityEvaluator": EqualityEvaluator,
+    "DiffEvaluator": DiffEvaluator,
+    "AccuracyEvaluator": AccuracyEvaluator,
+    "F1Evaluator": F1Evaluator,
+    "RMSEEvaluator": RMSEEvaluator,
+}
+
+
+def decode_evaluator(d: dict) -> Evaluator:
+    cls = EVALUATOR_REGISTRY[d.pop("type")]
+    return cls(**d)
 
 
 async def run_submission(
