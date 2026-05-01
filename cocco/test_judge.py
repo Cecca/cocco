@@ -198,7 +198,7 @@ async def test_run_submission():
         source='import sys; sys.exit(127)',
     )
     res = await cj.run_submission(storage, cj.EqualityEvaluator(), submission, challenge, tests)
-    assert res[0].outcome == cm.OutcomeEnum.failure
+    assert res[0].outcome == cm.OutcomeEnum.runtime_error
     assert res[0].score == 0
 
     # submission that does not compile

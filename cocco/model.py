@@ -59,8 +59,11 @@ class Submission(SQLModel, table=True):
 
 class OutcomeEnum(Enum):
     success = "success"
-    failure = "failure"
     compile_failure = "compile_failure"
+    timeout = "timeout"
+    out_of_memory = "out_of_memory"
+    runtime_error = "runtime_error"
+    judge_internal_error = "judge_internal_error"
 
 
 class TestOutcome(SQLModel, table=True):

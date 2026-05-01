@@ -81,6 +81,19 @@ class RunOutcome(object):
     max_rss_kb: int
     status: str
     message: str | None
+    oom: bool = False
+
+
+def _classify_isolate_failure(res: RunOutcome) -> OutcomeEnum:
+    # Caller guarantees res.status != "OK". OOM arrives as status=SG with
+    # cg-oom-killed=1, so check oom before the SG branch.
+    if res.status == "TO":
+        return OutcomeEnum.timeout
+    if res.oom:
+        return OutcomeEnum.out_of_memory
+    if res.status in ("SG", "RE"):
+        return OutcomeEnum.runtime_error
+    return OutcomeEnum.judge_internal_error
 
 
 @dataclass(frozen=True)
@@ -186,6 +199,7 @@ async def isolate_run(
             max_rss_kb=int(meta["max-rss"]),
             status=meta.get("status", "OK"),
             message=meta.get("message", None),
+            oom=meta.get("cg-oom-killed", "0").strip() == "1",
         )
         logger.debug(
             "isolate run on box %s done: status=%s rc=%s time=%.3fs rss=%dKB",
@@ -514,8 +528,6 @@ async def run_submission(
                     mem_limit_kb=challenge.max_memory_bytes // 1024,
                     processes=challenge.max_threads,
                 )
-                # TODO: handle timed out runs
-                # TODO: handle out of memory runs
                 if exec_res.status != "OK":
                     logger.info(
                         "submission %s test %s failed: status=%s message=%s",
@@ -525,8 +537,8 @@ async def run_submission(
                         exec_res.message,
                     )
                     score = 0.0
-                    eval_msg = ""
-                    outcome = OutcomeEnum.failure
+                    eval_msg = exec_res.message or exec_res.status
+                    outcome = _classify_isolate_failure(exec_res)
                 else:
                     (score, eval_msg) = evaluator.evaluate(
                         storage.read(test_case.expected_output_path), exec_res.stdout
