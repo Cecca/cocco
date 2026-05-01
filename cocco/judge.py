@@ -132,9 +132,10 @@ async def isolate_run(
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await isolate_init.communicate()
-        assert isolate_init.returncode == 0, (
-            f"call to isolate failed with output: {stderr.decode()}"
-        )
+        if isolate_init.returncode != 0:
+            raise RuntimeError(
+                f"isolate --init failed (rc={isolate_init.returncode}): {stderr.decode()}"
+            )
         box_path = Path(stdout.decode().strip()) / "box"
 
         filtered_args = []
@@ -183,10 +184,12 @@ async def isolate_run(
             stdout, stderr = await isolate_run.communicate()
 
         retcode = isolate_run.returncode
-        with open(stdout_file) as fp:
-            stdout = fp.read()
-        with open(stderr_file) as fp:
-            stderr = fp.read()
+        # Submitted programs may emit non-UTF-8 bytes; decode permissively
+        # rather than raising UnicodeDecodeError.
+        with open(stdout_file, "rb") as fp:
+            stdout = fp.read().decode("utf-8", errors="replace")
+        with open(stderr_file, "rb") as fp:
+            stderr = fp.read().decode("utf-8", errors="replace")
 
         with open(meta_file) as fp:
             meta = dict(line.strip().split(":", maxsplit=1) for line in fp.readlines())
@@ -220,7 +223,11 @@ async def isolate_run(
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await isolate_cleanup.communicate()
-        assert isolate_cleanup.returncode == 0, f"cleanup failed:\n{stdout}\n{stderr}"
+        if isolate_cleanup.returncode != 0:
+            raise RuntimeError(
+                f"isolate --cleanup failed (rc={isolate_cleanup.returncode}):\n"
+                f"{stdout.decode()}\n{stderr.decode()}"
+            )
 
         return ret
 
@@ -520,48 +527,63 @@ async def run_submission(
         if compile_result.success:
             assert compile_result.executable is not None
             for test_case in tests:
-                exec_res = await runtime.run(
-                    compile_result.executable,
-                    storage.resolve(test_case.input_path),
-                    [],
-                    time_limit=challenge.max_time_s,
-                    mem_limit_kb=challenge.max_memory_bytes // 1024,
-                    processes=challenge.max_threads,
-                )
-                if exec_res.status != "OK":
-                    logger.info(
-                        "submission %s test %s failed: status=%s message=%s",
+                try:
+                    exec_res = await runtime.run(
+                        compile_result.executable,
+                        storage.resolve(test_case.input_path),
+                        [],
+                        time_limit=challenge.max_time_s,
+                        mem_limit_kb=challenge.max_memory_bytes // 1024,
+                        processes=challenge.max_threads,
+                    )
+                    if exec_res.status != "OK":
+                        logger.info(
+                            "submission %s test %s failed: status=%s message=%s",
+                            submission.id,
+                            test_case.id,
+                            exec_res.status,
+                            exec_res.message,
+                        )
+                        score = 0.0
+                        eval_msg = exec_res.message or exec_res.status
+                        outcome = _classify_isolate_failure(exec_res)
+                    else:
+                        (score, eval_msg) = evaluator.evaluate(
+                            storage.read(test_case.expected_output_path),
+                            exec_res.stdout,
+                        )
+                        outcome = OutcomeEnum.success
+                        logger.debug(
+                            "submission %s test %s scored %.3f",
+                            submission.id,
+                            test_case.id,
+                            score,
+                        )
+                    test_outcome = TestOutcome(
+                        submission_id=submission.id,
+                        testcase_id=test_case.id,
+                        outcome=outcome,
+                        score=score,
+                        elapsed_s=exec_res.elapsed_time_s,
+                        peak_memory_bytes=exec_res.max_rss_kb * 1024,
+                        message=eval_msg,
+                        # outputs are truncated to prevent flooding attacks
+                        stdout=exec_res.stdout[:MAX_OUTPUT_LENGTH],
+                        stderr=exec_res.stderr[:MAX_OUTPUT_LENGTH],
+                    )
+                except Exception as e:
+                    logger.exception(
+                        "submission %s test %s: judge internal error",
                         submission.id,
                         test_case.id,
-                        exec_res.status,
-                        exec_res.message,
                     )
-                    score = 0.0
-                    eval_msg = exec_res.message or exec_res.status
-                    outcome = _classify_isolate_failure(exec_res)
-                else:
-                    (score, eval_msg) = evaluator.evaluate(
-                        storage.read(test_case.expected_output_path), exec_res.stdout
+                    test_outcome = TestOutcome(
+                        submission_id=submission.id,
+                        testcase_id=test_case.id,
+                        outcome=OutcomeEnum.judge_internal_error,
+                        score=0.0,
+                        message=f"Judge internal error: {e!r}",
                     )
-                    outcome = OutcomeEnum.success
-                    logger.debug(
-                        "submission %s test %s scored %.3f",
-                        submission.id,
-                        test_case.id,
-                        score,
-                    )
-                test_outcome = TestOutcome(
-                    submission_id=submission.id,
-                    testcase_id=test_case.id,
-                    outcome=outcome,
-                    score=score,
-                    elapsed_s=exec_res.elapsed_time_s,
-                    peak_memory_bytes=exec_res.max_rss_kb * 1024,
-                    message=eval_msg,
-                    # outputs are truncated to prevent flooding attacks
-                    stdout=exec_res.stdout[:MAX_OUTPUT_LENGTH],
-                    stderr=exec_res.stderr[:MAX_OUTPUT_LENGTH],
-                )
                 outcomes.append(test_outcome)
 
         else:
@@ -599,23 +621,44 @@ async def run_from_queue(session: Session, storage: Storage, evaluator: Evaluato
     session.add(submission)
     session.commit()
 
-    # TODO: make the path to languages.toml configurable
-    challenge = session.exec(
-        select(Challenge).where(Challenge.id == submission.challenge_id)
-    ).first()
-    if challenge is None:
-        # This should never happen. Report the error robustly
-        logger.error(
-            "submission %s references missing challenge %s",
+    outcomes: List[TestOutcome] = []
+    try:
+        # TODO: make the path to languages.toml configurable
+        challenge = session.exec(
+            select(Challenge).where(Challenge.id == submission.challenge_id)
+        ).first()
+        if challenge is None:
+            logger.error(
+                "submission %s references missing challenge %s",
+                submission.id,
+                submission.challenge_id,
+            )
+            raise ValueError(f"missing challenge {submission.challenge_id}")
+        tests = session.exec(
+            select(TestCase).where(TestCase.challenge_id == challenge.id)
+        ).fetchall()
+        outcomes = await run_submission(storage, evaluator, submission, challenge, tests)
+    except Exception as e:
+        logger.exception(
+            "submission %s failed during execution; marking as judge_internal_error",
             submission.id,
-            submission.challenge_id,
         )
-        raise ValueError("missing challenge")
-    tests = session.exec(
-        select(TestCase).where(TestCase.challenge_id == challenge.id)
-    ).fetchall()
+        session.rollback()
+        recovery_tests = session.exec(
+            select(TestCase).where(TestCase.challenge_id == submission.challenge_id)
+        ).fetchall()
+        message = f"Judge internal error: {e!r}"
+        outcomes = [
+            TestOutcome(
+                submission_id=submission.id,
+                testcase_id=t.id,
+                outcome=OutcomeEnum.judge_internal_error,
+                score=0.0,
+                message=message,
+            )
+            for t in recovery_tests
+        ]
 
-    outcomes = await run_submission(storage, evaluator, submission, challenge, tests)
     session.add_all(outcomes)
     submission.status = SubmissionStatus.done
     session.add(submission)
