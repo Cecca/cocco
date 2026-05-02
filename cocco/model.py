@@ -1,6 +1,8 @@
 from datetime import datetime
 from enum import Enum
-from sqlmodel import Field, SQLModel, Session, insert
+from sqlmodel import JSON, Field, SQLModel, Session, TypeDecorator, insert
+
+from cocco.evaluator import Evaluator, evaluator_adapter
 
 
 class UserRole(str, Enum):
@@ -21,6 +23,17 @@ class Course(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     title: str
     description: str
+
+
+class EvaluatorType(TypeDecorator):
+      impl = JSON                                                                                        
+      cache_ok = True
+
+      def process_bind_param(self, value: Evaluator | None, dialect):
+          return None if value is None else value.model_dump()
+                                                                                                         
+      def process_result_value(self, value, dialect):
+          return None if value is None else evaluator_adapter.validate_python(value)   
 
 
 class Challenge(SQLModel, table=True):

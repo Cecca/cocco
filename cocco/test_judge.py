@@ -7,6 +7,7 @@ from icecream import ic
 
 import cocco.judge as cj
 from cocco.storage import Storage
+from cocco.evaluator import DiffEvaluator, EqualityEvaluator
 
 
 @pytest.mark.integration
@@ -134,11 +135,11 @@ async def test_language_java():
         assert exe.success and exe.executable is not None
         res = await python.run(exe.executable, stdin_path)
     assert res.stdout.strip() == "hello moon"
-    assert cj.EqualityEvaluator().evaluate("hello moon", res.stdout)[0] == 1
+    assert EqualityEvaluator().evaluate("hello moon", res.stdout)[0] == 1
 
 
 def test_evaluator():
-    evaluator = cj.DiffEvaluator()
+    evaluator = DiffEvaluator()
     ev = evaluator.evaluate("one\ntwo\nthree\nfour", "one\nfour\nthree\nfour")
     print(ev[1])
     assert ev[0] == 0.75
@@ -177,7 +178,7 @@ async def test_run_submission():
         language="python",
         source='print("hello", input())',
     )
-    res = await cj.run_submission(storage, cj.EqualityEvaluator(), submission, challenge, tests)
+    res = await cj.run_submission(storage, EqualityEvaluator(), submission, challenge, tests)
     assert res[0].outcome == cm.OutcomeEnum.success
     assert res[0].score == 1
 
@@ -187,7 +188,7 @@ async def test_run_submission():
         language="python",
         source='print("wrong!", input())',
     )
-    res = await cj.run_submission(storage, cj.EqualityEvaluator(), submission, challenge, tests)
+    res = await cj.run_submission(storage, EqualityEvaluator(), submission, challenge, tests)
     assert res[0].outcome == cm.OutcomeEnum.success
     assert res[0].score == 0
 
@@ -197,7 +198,7 @@ async def test_run_submission():
         language="python",
         source='import sys; sys.exit(127)',
     )
-    res = await cj.run_submission(storage, cj.EqualityEvaluator(), submission, challenge, tests)
+    res = await cj.run_submission(storage, EqualityEvaluator(), submission, challenge, tests)
     assert res[0].outcome == cm.OutcomeEnum.runtime_error
     assert res[0].score == 0
 
@@ -212,67 +213,7 @@ async def test_run_submission():
             }
         """,
     )
-    res = await cj.run_submission(storage, cj.EqualityEvaluator(), submission, challenge, tests)
+    res = await cj.run_submission(storage, EqualityEvaluator(), submission, challenge, tests)
     assert res[0].outcome == cm.OutcomeEnum.compile_failure
     assert res[0].score == 0
 
-
-# async def test_run_from_queue():
-#     from sqlmodel import Session, SQLModel, create_engine, select
-#     import cocco.model as cm
-
-#     storage = Storage(Path("/tmp/cocco-storage"))
-#     engine = create_engine("sqlite:///:memory:", echo=False)
-#     SQLModel.metadata.create_all(engine)
-#     session = Session(engine)
-
-#     res = await cj.run_from_queue(session, storage, cj.EqualityEvaluator())
-#     assert res is None
-
-#     user = cm.User(
-#         email="student@example.com",
-#         role=cm.UserRole.student,
-#         nickname="happy-otter",
-#     )
-#     challenge = cm.Challenge(
-#         title="Hello",
-#         description="Print hello <name>",
-#         max_memory_bytes=64 * 1024 * 1024,
-#         max_time_s=1.0,
-#     )
-#     session.add(user)
-#     session.add(challenge)
-#     session.commit()
-#     session.refresh(user)
-#     session.refresh(challenge)
-
-#     stdin_path = Path("test-run-from-queue/stdin.txt")
-#     expected_path = Path("test-run-from-queue/expected.txt")
-#     storage.write(stdin_path, "moon")
-#     storage.write(expected_path, "hello moon")
-#     assert storage.resolve(stdin_path).is_file()
-#     assert storage.resolve(expected_path).is_file()
-#     testcase = cm.TestCase(
-#         challenge_id=challenge.id,
-#         execution_order=0,
-#         input_path=str(stdin_path),
-#         expected_output_path=str(expected_path),
-#     )
-#     submission = cm.Submission(
-#         user_id=user.id,
-#         challenge_id=challenge.id,
-#         language="python",
-#         source='print("hello", input())',
-#     )
-#     session.add(testcase)
-#     session.add(submission)
-#     session.commit()
-#     session.refresh(submission)
-#     session.commit()
-
-#     queued = session.exec(select(cm.Submission)).all()
-#     assert len(queued) == 1
-#     assert queued[0].status == cm.SubmissionStatus.queued
-
-#     res = await cj.run_from_queue(session, storage, cj.EqualityEvaluator())
-#     assert res is None
