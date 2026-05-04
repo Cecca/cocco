@@ -1,25 +1,11 @@
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import (
-    JSON,
-    Column,
-    DateTime,
-    Enum as SAEnum,
-    Float,
-    ForeignKey,
-    Integer,
-    MetaData,
-    String,
-    Table,
-)
+from sqlalchemy import JSON, ForeignKey
 from sqlalchemy.types import TypeDecorator
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from cocco.evaluator import Evaluator, evaluator_adapter
-
-
-metadata = MetaData()
 
 
 class UserRole(str, Enum):
@@ -54,80 +40,65 @@ class EvaluatorType(TypeDecorator):
         return None if value is None else evaluator_adapter.validate_python(value)
 
 
-users = Table(
-    "user",
-    metadata,
-    Column("id", Integer, primary_key=True),
-    Column("email", String, nullable=False),
-    Column("role", SAEnum(UserRole), nullable=False),
-    Column("nickname", String, nullable=False),
-)
+class Base(DeclarativeBase):
+    pass
 
 
-courses = Table(
-    "course",
-    metadata,
-    Column("id", Integer, primary_key=True),
-    Column("title", String, nullable=False),
-    Column("description", String, nullable=False),
-)
+class User(Base):
+    __tablename__ = "user"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(nullable=False)
+    role: Mapped[UserRole] = mapped_column(nullable=False)
+    nickname: Mapped[str] = mapped_column(nullable=False)
 
 
-challenges = Table(
-    "challenge",
-    metadata,
-    Column("id", Integer, primary_key=True),
-    Column("title", String, nullable=False),
-    Column("description", String, nullable=False),
-    Column("course_id", Integer, ForeignKey("course.id"), nullable=True),
-    Column("max_memory_bytes", Integer, nullable=False),
-    Column("max_time_s", Float, nullable=False),
-    Column("max_threads", Integer, nullable=False, default=1),
-)
+class Course(Base):
+    __tablename__ = "course"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(nullable=False)
+    description: Mapped[str] = mapped_column(nullable=False)
 
 
-test_cases = Table(
-    "testcase",
-    metadata,
-    Column("id", Integer, primary_key=True),
-    Column("challenge_id", Integer, ForeignKey("challenge.id"), nullable=True),
-    Column("execution_order", Integer, nullable=False),
-    Column("input_path", String, nullable=False),
-    Column("expected_output_path", String, nullable=False),
-)
+class Challenge(Base):
+    __tablename__ = "challenge"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(nullable=False)
+    description: Mapped[str] = mapped_column(nullable=False)
+    course_id: Mapped[int | None] = mapped_column(ForeignKey("course.id"), nullable=True)
+    max_memory_bytes: Mapped[int] = mapped_column(nullable=False)
+    max_time_s: Mapped[float] = mapped_column(nullable=False)
+    max_threads: Mapped[int] = mapped_column(nullable=False, default=1)
 
 
-submissions = Table(
-    "submission",
-    metadata,
-    Column("id", Integer, primary_key=True),
-    Column("user_id", Integer, ForeignKey("user.id"), nullable=True),
-    Column("challenge_id", Integer, ForeignKey("challenge.id"), nullable=True),
-    Column(
-        "status",
-        SAEnum(SubmissionStatus),
-        nullable=False,
-        default=SubmissionStatus.queued,
-    ),
-    Column("enqueued", DateTime, nullable=False, default=datetime.now),
-    Column("language", String, nullable=False),
-    Column("source", String, nullable=False),
-)
+class TestCase(Base):
+    __tablename__ = "testcase"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    challenge_id: Mapped[int | None] = mapped_column(ForeignKey("challenge.id"), nullable=True)
+    execution_order: Mapped[int] = mapped_column(nullable=False)
+    input_path: Mapped[str] = mapped_column(nullable=False)
+    expected_output_path: Mapped[str] = mapped_column(nullable=False)
 
 
-test_outcomes = Table(
-    "testoutcome",
-    metadata,
-    Column("id", Integer, primary_key=True),
-    Column("submission_id", Integer, ForeignKey("submission.id"), nullable=True),
-    Column("testcase_id", Integer, ForeignKey("testcase.id"), nullable=True),
-    Column("outcome", SAEnum(OutcomeEnum), nullable=False),
-    Column("elapsed_s", Float, nullable=True),
-    Column("peak_memory_bytes", Integer, nullable=True),
-    Column("score", Float, nullable=True),
-    Column("message", String, nullable=True),
-    Column("stdout", String, nullable=True),
-    Column("stderr", String, nullable=True),
-)
+class Submission(Base):
+    __tablename__ = "submission"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("user.id"), nullable=True)
+    challenge_id: Mapped[int] = mapped_column(ForeignKey("challenge.id"))
+    status: Mapped[SubmissionStatus] = mapped_column(nullable=False, default=SubmissionStatus.queued)
+    enqueued: Mapped[datetime] = mapped_column(nullable=False, default=datetime.now)
+    language: Mapped[str] = mapped_column(nullable=False)
+    source: Mapped[str] = mapped_column(nullable=False)
 
 
+class TestOutcome(Base):
+    __tablename__ = "testoutcome"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    submission_id: Mapped[int | None] = mapped_column(ForeignKey("submission.id"), nullable=True)
+    testcase_id: Mapped[int | None] = mapped_column(ForeignKey("testcase.id"), nullable=True)
+    outcome: Mapped[OutcomeEnum] = mapped_column(nullable=False)
+    elapsed_s: Mapped[float | None] = mapped_column(nullable=True)
+    peak_memory_bytes: Mapped[int | None] = mapped_column(nullable=True)
+    score: Mapped[float | None] = mapped_column(nullable=True)
+    message: Mapped[str | None] = mapped_column(nullable=True)
+    stdout: Mapped[str | None] = mapped_column(nullable=True)
+    stderr: Mapped[str | None] = mapped_column(nullable=True)

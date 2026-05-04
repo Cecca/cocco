@@ -71,6 +71,8 @@ class SubmissionRunData(Base):
     The data needed to run the submission code
     """
     submission_id: int
+    language: str
+    source: str
     max_threads: int
     max_memory_bytes: int
     max_time_s: float

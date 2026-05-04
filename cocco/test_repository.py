@@ -3,27 +3,26 @@ from datetime import datetime, timedelta
 from sqlalchemy import create_engine, insert
 
 import cocco.model as cm
-from cocco.model import challenges, courses, metadata, submissions, users
+from cocco.model import Base, Challenge, Course, Submission, User
 from cocco.repository import get_queued_submission
 from cocco.schema import SubmissionRunData
 
 
 def _make_engine():
     engine = create_engine("sqlite:///:memory:")
-    metadata.create_all(engine)
+    Base.metadata.create_all(engine)
     return engine
 
 
 def _make_example_database():
     engine = _make_engine()
-    now = datetime.now()
 
     with engine.begin() as conn:
         user_ids = [
             conn.execute(
-                insert(users)
+                insert(User)
                 .values(email=email, role=role, nickname=nickname)
-                .returning(users.c.id)
+                .returning(User.id)
             ).scalar_one()
             for email, role, nickname in [
                 ("alice@example.com", cm.UserRole.teacher, "alice"),
@@ -33,14 +32,14 @@ def _make_example_database():
         ]
 
         course_id = conn.execute(
-            insert(courses)
+            insert(Course)
             .values(title="Algorithms 101", description="intro course")
-            .returning(courses.c.id)
+            .returning(Course.id)
         ).scalar_one()
 
         challenge_ids = [
             conn.execute(
-                insert(challenges)
+                insert(Challenge)
                 .values(
                     title=title,
                     description=description,
@@ -48,7 +47,7 @@ def _make_example_database():
                     max_memory_bytes=1 << 20,
                     max_time_s=1.0,
                 )
-                .returning(challenges.c.id)
+                .returning(Challenge.id)
             ).scalar_one()
             for title, description in [
                 ("Hello", "say hi"),
@@ -58,13 +57,12 @@ def _make_example_database():
 
         for i, user_id in enumerate(user_ids):
             conn.execute(
-                insert(submissions).values(
+                insert(Submission).values(
                     user_id=user_id,
                     challenge_id=challenge_ids[i % len(challenge_ids)],
                     language="python",
                     source="print('hi')",
                     status=cm.SubmissionStatus.queued,
-                    enqueued=now - timedelta(seconds=i),
                 )
             )
 
@@ -77,18 +75,18 @@ async def test_get_queued_submission_returns_oldest_queued():
 
     with engine.begin() as conn:
         challenge_id = conn.execute(
-            insert(challenges)
+            insert(Challenge)
             .values(
                 title="Hello",
                 description="say hi",
                 max_memory_bytes=1 << 20,
                 max_time_s=1.0,
             )
-            .returning(challenges.c.id)
+            .returning(Challenge.id)
         ).scalar_one()
 
         oldest_id = conn.execute(
-            insert(submissions)
+            insert(Submission)
             .values(
                 challenge_id=challenge_id,
                 language="python",
@@ -96,11 +94,11 @@ async def test_get_queued_submission_returns_oldest_queued():
                 status=cm.SubmissionStatus.queued,
                 enqueued=now - timedelta(seconds=10),
             )
-            .returning(submissions.c.id)
+            .returning(Submission.id)
         ).scalar_one()
 
         conn.execute(
-            insert(submissions).values(
+            insert(Submission).values(
                 challenge_id=challenge_id,
                 language="python",
                 source="print('b')",
@@ -109,7 +107,7 @@ async def test_get_queued_submission_returns_oldest_queued():
             )
         )
         conn.execute(
-            insert(submissions).values(
+            insert(Submission).values(
                 challenge_id=challenge_id,
                 language="python",
                 source="print('c')",
