@@ -146,11 +146,11 @@ def test_evaluator():
 
 
 async def test_run_submission():
-    import cocco.model as cm
+    import cocco.schema as cs
 
     storage = Storage(Path("/tmp/cocco-storage"))
 
-    challenge = cm.Challenge(
+    challenge = cs.Challenge(
         title="Hello",
         description="Print hello <name>",
         max_memory_bytes=64 * 1024 * 1024,
@@ -164,7 +164,7 @@ async def test_run_submission():
     assert storage.resolve(stdin_path).is_file()
     assert storage.resolve(expected_path).is_file()
     tests.append(
-        cm.TestCase(
+        cs.TestCase(
             challenge_id=challenge.id,
             execution_order=0,
             input_path=str(stdin_path),
@@ -173,37 +173,37 @@ async def test_run_submission():
     )
 
     # correct submission
-    submission = cm.Submission(
+    submission = cs.Submission(
         challenge_id=challenge.id,
         language="python",
         source='print("hello", input())',
     )
     res = await cj.run_submission(storage, EqualityEvaluator(), submission, challenge, tests)
-    assert res[0].outcome == cm.OutcomeEnum.success
+    assert res[0].outcome == cs.OutcomeEnum.success
     assert res[0].score == 1
 
     # failing submission, by its score
-    submission = cm.Submission(
+    submission = cs.Submission(
         challenge_id=challenge.id,
         language="python",
         source='print("wrong!", input())',
     )
     res = await cj.run_submission(storage, EqualityEvaluator(), submission, challenge, tests)
-    assert res[0].outcome == cm.OutcomeEnum.success
+    assert res[0].outcome == cs.OutcomeEnum.success
     assert res[0].score == 0
 
     # submission that crashes
-    submission = cm.Submission(
+    submission = cs.Submission(
         challenge_id=challenge.id,
         language="python",
         source='import sys; sys.exit(127)',
     )
     res = await cj.run_submission(storage, EqualityEvaluator(), submission, challenge, tests)
-    assert res[0].outcome == cm.OutcomeEnum.runtime_error
+    assert res[0].outcome == cs.OutcomeEnum.runtime_error
     assert res[0].score == 0
 
     # submission that does not compile
-    submission = cm.Submission(
+    submission = cs.Submission(
         challenge_id=challenge.id,
         language="c",
         source="""
@@ -214,6 +214,6 @@ async def test_run_submission():
         """,
     )
     res = await cj.run_submission(storage, EqualityEvaluator(), submission, challenge, tests)
-    assert res[0].outcome == cm.OutcomeEnum.compile_failure
+    assert res[0].outcome == cs.OutcomeEnum.compile_failure
     assert res[0].score == 0
 

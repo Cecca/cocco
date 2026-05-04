@@ -14,12 +14,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
 from cocco import repository as repo
-from cocco.model import (
+from cocco.schema import (
     Challenge,
-    OutcomeEnum,
     Submission,
     TestCase,
     TestOutcome,
+)
+from cocco.model import (
+    OutcomeEnum,
     metadata,
 )
 from cocco.storage import Storage

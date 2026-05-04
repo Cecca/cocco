@@ -4,14 +4,17 @@ Functions in this module return models from `cocco.models`,
 or their combinations
 """
 
-from sqlalchemy import Connection, insert, select, update
+from sqlalchemy import JSON, Connection, cast, func, insert, select, update
 
-from cocco.model import (
+from cocco.schema import (
     Challenge,
-    Submission,
-    SubmissionStatus,
+    SubmissionRunData,
     TestCase,
     TestOutcome,
+    Submission,
+)
+from cocco.model import (
+    SubmissionStatus,
     challenges,
     submissions,
     test_cases,
@@ -19,17 +22,38 @@ from cocco.model import (
 )
 
 
-async def get_queued_submission(conn: Connection) -> Submission | None:
+async def get_queued_submission(conn: Connection) -> SubmissionRunData | None:
     """Get a queued submission, along with all the data required to run it."""
-    query = (
+    # we should mark the submission as running here, using a single atomic
+    # operation, otherwise two workers might dequeue the same submission!
+
+    submission = conn.execute(
         select(submissions)
-        .order_by(submissions.c.enqueued)
         .where(submissions.c.status == SubmissionStatus.queued)
-    )
-    res = conn.execute(query).mappings().fetchone()
-    if res is None:
+        .order_by(submissions.c.enqueued)
+    ).first()
+    if submission is None:
         return None
-    return Submission.model_validate(res)
+
+    challenge = conn.execute(
+        select(challenges)
+        .where(challenges.c.id == submission.id)
+    ).first()
+    if challenge is None:
+        return None
+
+    tests = conn.execute(
+        select(test_cases)
+        .where(test_cases.c.challenge_id == challenge.id)
+    ).all()
+
+    return SubmissionRunData(
+        submission_id=submission.id,
+        max_threads=challenge.max_threads,
+        max_memory_bytes=challenge.max_memory_bytes,
+        max_time_s=challenge.max_time_s,
+        test_cases=[TestCase.model_validate(t) for t in tests],
+    )
 
 
 def get_challenge(conn: Connection, challenge_id: int) -> Challenge | None:

@@ -1,5 +1,6 @@
 """\
-This module contains Pydantic schemas for user input validation.
+This module contains Pydantic schemas for user input validation, or the output
+of complex database queries.
 """
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
@@ -64,3 +65,14 @@ class TestOutcome(Base):
     stderr: str | None = None
     outcome: OutcomeEnum
 
+
+class SubmissionRunData(Base):
+    """\
+    The data needed to run the submission code
+    """
+    submission_id: int
+    max_threads: int
+    max_memory_bytes: int
+    max_time_s: float
+    test_cases: list[TestCase]
+    
