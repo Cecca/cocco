@@ -48,7 +48,6 @@ class User(Base):
     __tablename__ = "user"
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(nullable=False)
-    role: Mapped[UserRole] = mapped_column(nullable=False)
     nickname: Mapped[str] = mapped_column(nullable=False)
 
 
@@ -57,6 +56,13 @@ class Course(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(nullable=False)
     description: Mapped[str] = mapped_column(nullable=False)
+
+
+class Enrollment(Base):
+    __tablename__ = "enrollment"
+    user_id: Mapped[int] = mapped_column(ForeignKey("user.id"), primary_key=True)
+    course_id: Mapped[int] = mapped_column(ForeignKey("course.id"), primary_key=True)
+    role: Mapped[UserRole] = mapped_column(nullable=False)
 
 
 class Challenge(Base):
@@ -82,7 +88,7 @@ class TestCase(Base):
 class Submission(Base):
     __tablename__ = "submission"
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int | None] = mapped_column(ForeignKey("user.id"), nullable=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("user.id"), nullable=False)
     challenge_id: Mapped[int] = mapped_column(ForeignKey("challenge.id"))
     status: Mapped[SubmissionStatus] = mapped_column(nullable=False, default=SubmissionStatus.queued)
     enqueued: Mapped[datetime] = mapped_column(nullable=False, default=datetime.now)

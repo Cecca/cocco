@@ -150,70 +150,61 @@ async def test_run_submission():
 
     storage = Storage(Path("/tmp/cocco-storage"))
 
-    challenge = cs.Challenge(
-        title="Hello",
-        description="Print hello <name>",
-        max_memory_bytes=64 * 1024 * 1024,
-        max_time_s=1.0,
-    )
-    tests = []
     stdin_path = Path("test-run-from-queue/stdin.txt")
     expected_path = Path("test-run-from-queue/expected.txt")
     storage.write(stdin_path, "moon")
     storage.write(expected_path, "hello moon")
     assert storage.resolve(stdin_path).is_file()
     assert storage.resolve(expected_path).is_file()
-    tests.append(
+
+    test_cases = [
         cs.TestCase(
-            challenge_id=challenge.id,
             execution_order=0,
             input_path=str(stdin_path),
             expected_output_path=str(expected_path),
         )
-    )
+    ]
+
+    def make_run_data(language: str, source: str) -> cs.SubmissionRunData:
+        return cs.SubmissionRunData(
+            submission_id=1,
+            language=language,
+            source=source,
+            max_threads=1,
+            max_memory_bytes=64 * 1024 * 1024,
+            max_time_s=1.0,
+            test_cases=test_cases,
+        )
 
     # correct submission
-    submission = cs.Submission(
-        challenge_id=challenge.id,
-        language="python",
-        source='print("hello", input())',
-    )
-    res = await cj.run_submission(storage, EqualityEvaluator(), submission, challenge, tests)
+    run_data = make_run_data("python", 'print("hello", input())')
+    res = await cj.run_submission(storage, EqualityEvaluator(), run_data)
     assert res[0].outcome == cs.OutcomeEnum.success
     assert res[0].score == 1
 
     # failing submission, by its score
-    submission = cs.Submission(
-        challenge_id=challenge.id,
-        language="python",
-        source='print("wrong!", input())',
-    )
-    res = await cj.run_submission(storage, EqualityEvaluator(), submission, challenge, tests)
+    run_data = make_run_data("python", 'print("wrong!", input())')
+    res = await cj.run_submission(storage, EqualityEvaluator(), run_data)
     assert res[0].outcome == cs.OutcomeEnum.success
     assert res[0].score == 0
 
     # submission that crashes
-    submission = cs.Submission(
-        challenge_id=challenge.id,
-        language="python",
-        source='import sys; sys.exit(127)',
-    )
-    res = await cj.run_submission(storage, EqualityEvaluator(), submission, challenge, tests)
+    run_data = make_run_data("python", 'import sys; sys.exit(127)')
+    res = await cj.run_submission(storage, EqualityEvaluator(), run_data)
     assert res[0].outcome == cs.OutcomeEnum.runtime_error
     assert res[0].score == 0
 
     # submission that does not compile
-    submission = cs.Submission(
-        challenge_id=challenge.id,
-        language="c",
-        source="""
+    run_data = make_run_data(
+        "c",
+        """
             int main() {
                 asdfasdfg; // <- this does not compile
                 return 0;
             }
         """,
     )
-    res = await cj.run_submission(storage, EqualityEvaluator(), submission, challenge, tests)
+    res = await cj.run_submission(storage, EqualityEvaluator(), run_data)
     assert res[0].outcome == cs.OutcomeEnum.compile_failure
     assert res[0].score == 0
 
