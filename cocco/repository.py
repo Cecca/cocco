@@ -4,16 +4,19 @@ Functions in this module return models from `cocco.models`,
 or their combinations
 """
 
-from sqlalchemy import Connection, func, insert, select, update
+from sqlalchemy import JSON, Connection, func, insert, select, update
+from sqlalchemy.sql import functions
+from sqlalchemy.ext.compiler import compiles
 
 from cocco import schema
-from cocco.schema import SubmissionRunData
+from cocco.schema import SubmissionRunData, UserFocusedChallengeInfo
 from cocco.model import (
     Challenge,
     Submission,
     SubmissionStatus,
     TestCase,
     TestOutcome,
+    User,
 )
 
 
@@ -73,3 +76,25 @@ def insert_test_outcomes(conn: Connection, outcomes: list[schema.TestOutcome]) -
         insert(TestOutcome),
         [o.model_dump(exclude={"id"}) for o in outcomes],
     )
+
+
+def get_user_focused_challenge_info(conn: Connection, user_id: int, challenge_id: int) -> UserFocusedChallengeInfo | None:
+    user_subq = (
+        select(func.json_object("id", User.id, "email", User.email, "nickname", User.nickname))
+        .where(User.id == user_id)
+        .limit(1)
+        .scalar_subquery()
+    )
+    # if user is None:
+    #     return None
+    # challenge = conn.execute(
+    #     select(
+    #         func.json_group_object("challenge", Challenge).where(
+    #             Challenge.id == challenge_id
+    #         )
+    #     )
+    # ).fetchone()
+    # if challenge is None:
+    #     return None
+
+    pass

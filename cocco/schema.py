@@ -15,7 +15,6 @@ class Base(BaseModel):
 class User(Base):
     id: int | None = None
     email: str
-    role: UserRole
     nickname: str
 
 
@@ -77,4 +76,24 @@ class SubmissionRunData(Base):
     max_memory_bytes: int
     max_time_s: float
     test_cases: list[TestCase]
+
+
+class SubmissionWithOutcomes(Base):
+    """Data on a particular submission by a user,
+    along with all the outcomes on the tests, if available"""
+
+    submission_id: int | None = None
+    status: SubmissionStatus = SubmissionStatus.queued
+    enqueued: datetime = Field(default_factory=datetime.now)
+    language: str
+    source: str
+    test_cases: list[tuple[TestCase, TestOutcome | None]]
+
+
+class UserFocusedChallengeInfo(Base):
+    """Information related to attempts made by a user on a given challenge."""
+
+    user: User
+    challenge: Challenge
+    submissions: list[SubmissionWithOutcomes]
     

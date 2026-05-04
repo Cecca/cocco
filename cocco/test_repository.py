@@ -29,12 +29,12 @@ def _make_example_database():
 
     with engine.begin() as conn:
         users = [
-            ("root@example.com", "root", cm.UserRole.admin),
-            ("alice@example.com", "alice", cm.UserRole.teacher),
-            ("bob@example.com", "bob", cm.UserRole.teacher),
-            ("carol@example.com", "carol", cm.UserRole.student),
-            ("dave@example.com", "dave", cm.UserRole.student),
-            ("erin@example.com", "erin", cm.UserRole.student),
+            ("root@example.com", "root"),
+            ("alice@example.com", "alice"),
+            ("bob@example.com", "bob"),
+            ("carol@example.com", "carol"),
+            ("dave@example.com", "dave"),
+            ("erin@example.com", "erin"),
         ]
         user_ids = {
             nickname: conn.execute(
@@ -42,7 +42,7 @@ def _make_example_database():
                 .values(email=email, nickname=nickname)
                 .returning(User.id)
             ).scalar_one()
-            for email, nickname, _ in users
+            for email, nickname in users
         }
 
         courses = [
