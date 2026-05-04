@@ -10,11 +10,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Sequence
 
-from sqlmodel import SQLModel, Session, create_engine, select
+from sqlalchemy import create_engine
+from sqlalchemy.engine import Engine
 
-from cocco.model import Challenge, OutcomeEnum, Submission, SubmissionStatus, TestCase, TestOutcome
+from cocco import repository as repo
+from cocco.model import (
+    Challenge,
+    OutcomeEnum,
+    Submission,
+    TestCase,
+    TestOutcome,
+    metadata,
+)
 from cocco.storage import Storage
-from cocco.evaluator import Evaluator
+from cocco.evaluator import EqualityEvaluator, Evaluator
 
 
 logger = logging.getLogger(__name__)
@@ -461,47 +470,41 @@ async def run_submission(
     return outcomes
 
 
-async def run_from_queue(session: Session, storage: Storage, evaluator: Evaluator) -> bool:
-    submission: Submission | None = session.exec(
-        select(Submission)
-        .order_by("enqueued")
-        .where(Submission.status == SubmissionStatus.queued)
-    ).first()
-    if submission is None:
-        return False
+async def run_from_queue(engine: Engine, storage: Storage, evaluator: Evaluator) -> bool:
+    with engine.begin() as conn:
+        submission: Submission | None = await repo.get_queued_submission(conn)
+        if submission is None:
+            return False
+        assert submission.id is not None
+        repo.mark_submission_running(conn, submission.id)
 
     logger.info("picked up submission %s from queue", submission.id)
-    # mark the submission as running
-    submission.status = SubmissionStatus.running
-    session.add(submission)
-    session.commit()
 
     outcomes: List[TestOutcome] = []
+    challenge: Challenge | None = None
+    tests: List[TestCase] = []
     try:
         # TODO: make the path to languages.toml configurable
-        challenge = session.exec(
-            select(Challenge).where(Challenge.id == submission.challenge_id)
-        ).first()
-        if challenge is None:
-            logger.error(
-                "submission %s references missing challenge %s",
-                submission.id,
-                submission.challenge_id,
-            )
-            raise ValueError(f"missing challenge {submission.challenge_id}")
-        tests = session.exec(
-            select(TestCase).where(TestCase.challenge_id == challenge.id)
-        ).fetchall()
+        with engine.connect() as conn:
+            assert submission.challenge_id is not None
+            challenge = repo.get_challenge(conn, submission.challenge_id)
+            if challenge is None:
+                logger.error(
+                    "submission %s references missing challenge %s",
+                    submission.id,
+                    submission.challenge_id,
+                )
+                raise ValueError(f"missing challenge {submission.challenge_id}")
+            tests = repo.get_tests_for_challenge(conn, submission.challenge_id)
         outcomes = await run_submission(storage, evaluator, submission, challenge, tests)
     except Exception as e:
         logger.exception(
             "submission %s failed during execution; marking as judge_internal_error",
             submission.id,
         )
-        session.rollback()
-        recovery_tests = session.exec(
-            select(TestCase).where(TestCase.challenge_id == submission.challenge_id)
-        ).fetchall()
+        with engine.connect() as conn:
+            assert submission.challenge_id is not None
+            recovery_tests = repo.get_tests_for_challenge(conn, submission.challenge_id)
         message = f"Judge internal error: {e!r}"
         outcomes = [
             TestOutcome(
@@ -514,10 +517,9 @@ async def run_from_queue(session: Session, storage: Storage, evaluator: Evaluato
             for t in recovery_tests
         ]
 
-    session.add_all(outcomes)
-    submission.status = SubmissionStatus.done
-    session.add(submission)
-    session.commit()
+    with engine.begin() as conn:
+        repo.insert_test_outcomes(conn, outcomes)
+        repo.mark_submission_done(conn, submission.id)
     logger.info(
         "submission %s done, recorded %d test outcomes",
         submission.id,
@@ -528,11 +530,11 @@ async def run_from_queue(session: Session, storage: Storage, evaluator: Evaluato
 
 
 async def run_loop(
-    session: Session, storage: Storage, evaluator: Evaluator, wait_time=5
+    engine: Engine, storage: Storage, evaluator: Evaluator, wait_time=5
 ):
     logger.info("judge run loop started (poll interval %ss)", wait_time)
     while True:
-        has_run = await run_from_queue(session, storage, evaluator)
+        has_run = await run_from_queue(engine, storage, evaluator)
         if not has_run:
             logger.debug("judge waiting for %f seconds", wait_time)
             await asyncio.sleep(wait_time)
@@ -569,9 +571,8 @@ if __name__ == "__main__":
 
         storage = Storage(args.storage)
         engine = create_engine(args.database)
-        SQLModel.metadata.create_all(engine)
+        metadata.create_all(engine)
         evaluator = EqualityEvaluator()
-        with Session(engine) as session:
-            await run_loop(session, storage, evaluator)
+        await run_loop(engine, storage, evaluator)
 
     asyncio.run(main())

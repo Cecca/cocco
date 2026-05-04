@@ -1,8 +1,25 @@
 from datetime import datetime
 from enum import Enum
-from sqlmodel import JSON, Field, SQLModel, Session, TypeDecorator, insert
+
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    Enum as SAEnum,
+    Float,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Table,
+)
+from sqlalchemy.types import TypeDecorator
 
 from cocco.evaluator import Evaluator, evaluator_adapter
+
+
+metadata = MetaData()
 
 
 class UserRole(str, Enum):
@@ -11,63 +28,10 @@ class UserRole(str, Enum):
     student = "student"
 
 
-class User(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
-    email: str
-    role: UserRole
-    nickname: str   # Automatically generated with cute adjectives and animals
-    
-
-class Course(SQLModel, table=True):
-    """A course is a collection of challenges"""
-    id: int | None = Field(default=None, primary_key=True)
-    title: str
-    description: str
-
-
-class EvaluatorType(TypeDecorator):
-      impl = JSON                                                                                        
-      cache_ok = True
-
-      def process_bind_param(self, value: Evaluator | None, dialect):
-          return None if value is None else value.model_dump()
-                                                                                                         
-      def process_result_value(self, value, dialect):
-          return None if value is None else evaluator_adapter.validate_python(value)   
-
-
-class Challenge(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
-    title: str
-    description: str
-    course_id: int | None = Field(default=None, foreign_key="course.id")
-    max_memory_bytes: int
-    max_time_s: float
-    max_threads: int = Field(default=1)
-
-
-class TestCase(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
-    challenge_id: int | None = Field(foreign_key="challenge.id")
-    execution_order: int
-    input_path: str
-    expected_output_path: str
-
-
 class SubmissionStatus(Enum):
     queued = "queued"
     running = "running"
     done = "done"
-
-
-class Submission(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
-    user_id: int | None = Field(default=None, foreign_key="user.id")
-    challenge_id: int | None = Field(default=None, foreign_key="challenge.id")
-    status: SubmissionStatus = Field(default=SubmissionStatus.queued)
-    enqueued: datetime = Field(default_factory=datetime.now)
-    language: str
-    source: str     # for now we support only single-file submissions
 
 
 class OutcomeEnum(Enum):
@@ -79,16 +43,91 @@ class OutcomeEnum(Enum):
     judge_internal_error = "judge_internal_error"
 
 
-class TestOutcome(SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
-    submission_id: int | None = Field(default=None, foreign_key="submission.id")
-    testcase_id: int | None = Field(default=None, foreign_key="testcase.id")
-    outcome: OutcomeEnum
-    elapsed_s: float | None = None
-    peak_memory_bytes: int | None = None
-    score: float | None = None
-    message: str | None = None
-    stdout: str | None = None
-    stderr: str | None = None
+class EvaluatorType(TypeDecorator):
+    impl = JSON
+    cache_ok = True
+
+    def process_bind_param(self, value: Evaluator | None, dialect):
+        return None if value is None else value.model_dump()
+
+    def process_result_value(self, value, dialect):
+        return None if value is None else evaluator_adapter.validate_python(value)
+
+
+users = Table(
+    "user",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("email", String, nullable=False),
+    Column("role", SAEnum(UserRole), nullable=False),
+    Column("nickname", String, nullable=False),
+)
+
+
+courses = Table(
+    "course",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("title", String, nullable=False),
+    Column("description", String, nullable=False),
+)
+
+
+challenges = Table(
+    "challenge",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("title", String, nullable=False),
+    Column("description", String, nullable=False),
+    Column("course_id", Integer, ForeignKey("course.id"), nullable=True),
+    Column("max_memory_bytes", Integer, nullable=False),
+    Column("max_time_s", Float, nullable=False),
+    Column("max_threads", Integer, nullable=False, default=1),
+)
+
+
+test_cases = Table(
+    "testcase",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("challenge_id", Integer, ForeignKey("challenge.id"), nullable=True),
+    Column("execution_order", Integer, nullable=False),
+    Column("input_path", String, nullable=False),
+    Column("expected_output_path", String, nullable=False),
+)
+
+
+submissions = Table(
+    "submission",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("user_id", Integer, ForeignKey("user.id"), nullable=True),
+    Column("challenge_id", Integer, ForeignKey("challenge.id"), nullable=True),
+    Column(
+        "status",
+        SAEnum(SubmissionStatus),
+        nullable=False,
+        default=SubmissionStatus.queued,
+    ),
+    Column("enqueued", DateTime, nullable=False, default=datetime.now),
+    Column("language", String, nullable=False),
+    Column("source", String, nullable=False),
+)
+
+
+test_outcomes = Table(
+    "testoutcome",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("submission_id", Integer, ForeignKey("submission.id"), nullable=True),
+    Column("testcase_id", Integer, ForeignKey("testcase.id"), nullable=True),
+    Column("outcome", SAEnum(OutcomeEnum), nullable=False),
+    Column("elapsed_s", Float, nullable=True),
+    Column("peak_memory_bytes", Integer, nullable=True),
+    Column("score", Float, nullable=True),
+    Column("message", String, nullable=True),
+    Column("stdout", String, nullable=True),
+    Column("stderr", String, nullable=True),
+)
 
 

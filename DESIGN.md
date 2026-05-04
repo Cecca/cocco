@@ -47,3 +47,11 @@ Test inputs can be several megabytes. They are stored on the **filesystem** (not
 | Firecracker microVMs | Strongest isolation, but operationally complex for a self-hosted setup |
 | Piston | Easy to bootstrap, but less control and less battle-tested for adversarial input |
 | Storing inputs in DB | Dropped: multi-MB blobs harm query performance, backup size, and I/O |
+
+
+# Database design
+
+Instead of relying on an ORM (like `SQLModel` of `SQLAlchemy` ORM's API)
+we rely on SQLAlchemy 2.0 Core API, that give more control over the queries.
+In fact, it is very rare that the database returns full rows of a single table: rather the common case is for the database to give rows with results from many tables.
+To get structured data out of the database (thus reducing the number of queries and offloading the work to the database, that is more efficient at handling it) we take inspiration from this blog post: https://www.scattered-thoughts.net/writing/sql-needed-structure/
