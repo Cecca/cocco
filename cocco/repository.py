@@ -4,7 +4,7 @@ Functions in this module return models from `cocco.models`,
 or their combinations
 """
 
-from sqlalchemy import Connection, insert, select, update
+from sqlalchemy import Connection, func, insert, select, update
 
 from cocco import schema
 from cocco.schema import SubmissionRunData
@@ -17,18 +17,25 @@ from cocco.model import (
 )
 
 
-async def get_queued_submission(conn: Connection) -> SubmissionRunData | None:
-    """Get a queued submission, along with all the data required to run it."""
-    # we should mark the submission as running here, using a single atomic
-    # operation, otherwise two workers might dequeue the same submission!
-
+async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
+    """Get a queued submission, along with all the data required to run it.
+    Atomically set it to 'running'."""
+    # Get the submission to run, if any, and atomically sets it to running
     submission = conn.execute(
-        select(Submission)
-        .where(Submission.status == SubmissionStatus.queued)
-        .order_by(Submission.enqueued)
+        update(Submission).where(
+            Submission.id
+            == (
+                select(Submission.id)
+                .where(Submission.status == SubmissionStatus.queued)
+                .order_by(Submission.enqueued)
+                .limit(1)
+            ).scalar_subquery()
+        ).values(status = SubmissionStatus.running)
+        .returning(Submission)
     ).first()
     if submission is None:
         return None
+    conn.commit()
 
     challenge = conn.execute(
         select(Challenge).where(Challenge.id == submission.challenge_id)
@@ -48,30 +55,6 @@ async def get_queued_submission(conn: Connection) -> SubmissionRunData | None:
         max_memory_bytes=challenge.max_memory_bytes,
         max_time_s=challenge.max_time_s,
         test_cases=[schema.TestCase.model_validate(t) for t in tests],
-    )
-
-
-def get_challenge(conn: Connection, challenge_id: int) -> schema.Challenge | None:
-    res = conn.execute(
-        select(Challenge).where(Challenge.id == challenge_id)
-    ).mappings().first()
-    if res is None:
-        return None
-    return schema.Challenge.model_validate(res)
-
-
-def get_tests_for_challenge(conn: Connection, challenge_id: int) -> list[schema.TestCase]:
-    rows = conn.execute(
-        select(TestCase).where(TestCase.challenge_id == challenge_id)
-    ).mappings().all()
-    return [schema.TestCase.model_validate(r) for r in rows]
-
-
-def mark_submission_running(conn: Connection, submission_id: int) -> None:
-    conn.execute(
-        update(Submission)
-        .where(Submission.id == submission_id)
-        .values(status=SubmissionStatus.running)
     )
 
 

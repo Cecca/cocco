@@ -17,6 +17,7 @@ from cocco import repository as repo
 from cocco.schema import (
     Challenge,
     Submission,
+    SubmissionRunData,
     TestCase,
     TestOutcome,
 )
@@ -366,46 +367,41 @@ def load_languages(path: Path) -> Dict[str, Language]:
 async def run_submission(
     storage: Storage,
     evaluator: Evaluator,
-    submission: Submission,
-    challenge: Challenge,
-    tests: Sequence[TestCase]
+    run_data: SubmissionRunData,
 ) -> List[TestOutcome]:
-    assert submission.challenge_id == challenge.id
-    assert all(t.challenge_id == challenge.id for t in tests)
     logger.info(
-        "running submission %s (challenge=%s, language=%s, tests=%d)",
-        submission.id,
-        challenge.id,
-        submission.language,
-        len(tests),
+        "running submission %s (language=%s, tests=%d)",
+        run_data.submission_id,
+        run_data.language,
+        len(run_data.test_cases),
     )
-    runtime: Language = load_languages(Path("languages.toml"))[submission.language]
+    runtime: Language = load_languages(Path("languages.toml"))[run_data.language]
 
     outcomes = []
     with tempfile.TemporaryDirectory() as temp:
         temp = Path(temp)
         source_fname = temp / ("source" + runtime.extensions[0])
         with open(source_fname, "w") as fp:
-            fp.write(submission.source)
+            fp.write(run_data.source)
 
         # First we compile
         compile_result = await runtime.compile(source_fname, temp)
         if compile_result.success:
             assert compile_result.executable is not None
-            for test_case in tests:
+            for test_case in run_data.test_cases:
                 try:
                     exec_res = await runtime.run(
                         compile_result.executable,
                         storage.resolve(test_case.input_path),
                         [],
-                        time_limit=challenge.max_time_s,
-                        mem_limit_kb=challenge.max_memory_bytes // 1024,
-                        processes=challenge.max_threads,
+                        time_limit=run_data.max_time_s,
+                        mem_limit_kb=run_data.max_memory_bytes // 1024,
+                        processes=run_data.max_threads,
                     )
                     if exec_res.status != "OK":
                         logger.info(
                             "submission %s test %s failed: status=%s message=%s",
-                            submission.id,
+                            run_data.submission_id,
                             test_case.id,
                             exec_res.status,
                             exec_res.message,
@@ -421,12 +417,12 @@ async def run_submission(
                         outcome = OutcomeEnum.success
                         logger.debug(
                             "submission %s test %s scored %.3f",
-                            submission.id,
+                            run_data.submission_id,
                             test_case.id,
                             score,
                         )
                     test_outcome = TestOutcome(
-                        submission_id=submission.id,
+                        submission_id=run_data.submission_id,
                         testcase_id=test_case.id,
                         outcome=outcome,
                         score=score,
@@ -440,11 +436,11 @@ async def run_submission(
                 except Exception as e:
                     logger.exception(
                         "submission %s test %s: judge internal error",
-                        submission.id,
+                        run_data.submission_id,
                         test_case.id,
                     )
                     test_outcome = TestOutcome(
-                        submission_id=submission.id,
+                        submission_id=run_data.submission_id,
                         testcase_id=test_case.id,
                         outcome=OutcomeEnum.judge_internal_error,
                         score=0.0,
@@ -455,12 +451,12 @@ async def run_submission(
         else:
             logger.info(
                 "submission %s failed to compile, marking all %d tests as compile_failure",
-                submission.id,
-                len(tests),
+                run_data.submission_id,
+                len(run_data.test_cases),
             )
-            for test_case in tests:
+            for test_case in run_data.test_cases:
                 test_outcome = TestOutcome(
-                    submission_id=submission.id,
+                    submission_id=run_data.submission_id,
                     testcase_id=test_case.id,
                     outcome=OutcomeEnum.compile_failure,
                     score=0.0,
@@ -474,57 +470,39 @@ async def run_submission(
 
 async def run_from_queue(engine: Engine, storage: Storage, evaluator: Evaluator) -> bool:
     with engine.begin() as conn:
-        submission: Submission | None = await repo.get_queued_submission(conn)
-        if submission is None:
+        run_data = await repo.pull_queued_submission(conn)
+        if run_data is None:
             return False
-        assert submission.id is not None
-        repo.mark_submission_running(conn, submission.id)
 
-    logger.info("picked up submission %s from queue", submission.id)
+    logger.info("picked up submission %s from queue", run_data.submission_id)
 
     outcomes: List[TestOutcome] = []
-    challenge: Challenge | None = None
-    tests: List[TestCase] = []
     try:
         # TODO: make the path to languages.toml configurable
-        with engine.connect() as conn:
-            assert submission.challenge_id is not None
-            challenge = repo.get_challenge(conn, submission.challenge_id)
-            if challenge is None:
-                logger.error(
-                    "submission %s references missing challenge %s",
-                    submission.id,
-                    submission.challenge_id,
-                )
-                raise ValueError(f"missing challenge {submission.challenge_id}")
-            tests = repo.get_tests_for_challenge(conn, submission.challenge_id)
-        outcomes = await run_submission(storage, evaluator, submission, challenge, tests)
+        outcomes = await run_submission(storage, evaluator, run_data)
     except Exception as e:
         logger.exception(
             "submission %s failed during execution; marking as judge_internal_error",
-            submission.id,
+            run_data.submission_id,
         )
-        with engine.connect() as conn:
-            assert submission.challenge_id is not None
-            recovery_tests = repo.get_tests_for_challenge(conn, submission.challenge_id)
         message = f"Judge internal error: {e!r}"
         outcomes = [
             TestOutcome(
-                submission_id=submission.id,
+                submission_id=run_data.submission_id,
                 testcase_id=t.id,
                 outcome=OutcomeEnum.judge_internal_error,
                 score=0.0,
                 message=message,
             )
-            for t in recovery_tests
+            for t in run_data.test_cases
         ]
 
     with engine.begin() as conn:
         repo.insert_test_outcomes(conn, outcomes)
-        repo.mark_submission_done(conn, submission.id)
+        repo.mark_submission_done(conn, run_data.submission_id)
     logger.info(
         "submission %s done, recorded %d test outcomes",
-        submission.id,
+        run_data.submission_id,
         len(outcomes),
     )
 

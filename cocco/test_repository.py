@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, insert
 
 import cocco.model as cm
 from cocco.model import Base, Challenge, Course, Submission, User
-from cocco.repository import get_queued_submission
+from cocco.repository import pull_queued_submission
 from cocco.schema import SubmissionRunData
 
 
@@ -117,7 +117,7 @@ async def test_get_queued_submission_returns_oldest_queued():
         )
 
     with engine.connect() as conn:
-        result: SubmissionRunData | None = await get_queued_submission(conn)
+        result: SubmissionRunData | None = await pull_queued_submission(conn)
 
     assert result is not None
     assert result.submission_id == oldest_id
