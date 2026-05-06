@@ -4,7 +4,7 @@ Functions in this module return models from `cocco.models`,
 or their combinations
 """
 
-from sqlalchemy import JSON, Connection, func, insert, select, update
+from sqlalchemy import JSON, Connection, func, insert, literal_column, select, text, update
 from sqlalchemy.sql import functions
 from sqlalchemy.ext.compiler import compiles
 
@@ -78,23 +78,36 @@ def insert_test_outcomes(conn: Connection, outcomes: list[schema.TestOutcome]) -
     )
 
 
-def get_user_focused_challenge_info(conn: Connection, user_id: int, challenge_id: int) -> UserFocusedChallengeInfo | None:
-    user_subq = (
-        select(func.json_object("id", User.id, "email", User.email, "nickname", User.nickname))
-        .where(User.id == user_id)
-        .limit(1)
-        .scalar_subquery()
-    )
-    # if user is None:
-    #     return None
-    # challenge = conn.execute(
-    #     select(
-    #         func.json_group_object("challenge", Challenge).where(
-    #             Challenge.id == challenge_id
-    #         )
-    #     )
-    # ).fetchone()
-    # if challenge is None:
-    #     return None
+def get_user_focused_challenge_info(conn: Connection, user_id: int, challenge_id: int):
 
-    pass
+    query = text("""
+    WITH
+    outcomes AS (
+        SELECT submission_id, json_agg(testoutcome) as outcome  
+        FROM testoutcome
+        GROUP BY submission_id
+    ),
+    submission AS (
+        SELECT submission.*, outcomes.outcome
+        FROM submission
+        JOIN outcomes ON submission.id = outcomes.submission_id
+        ORDER BY enqueued
+    ),
+    subs AS (
+        SELECT challenge_id, json_agg(submission) as subs
+        FROM submission
+        LEFT JOIN outcomes ON submission.id = outcomes.submission_id
+        WHERE challenge_id = :challenge_id
+          AND user_id = :user_id
+        GROUP BY challenge_id
+    ),
+    cs AS ( SELECT challenge.*, subs.subs
+        FROM challenge
+        -- JOIN tc ON tc.challenge_id = challenge.id
+        JOIN subs on subs.challenge_id = challenge.id)
+    SELECT row_to_json(cs) FROM cs;
+    """)
+
+    # print(query)
+    res = conn.execute(query, dict(user_id=user_id, challenge_id=challenge_id)).scalar()
+    return res

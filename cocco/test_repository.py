@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine, insert
+from icecream import ic
 
 import cocco.model as cm
 from cocco.model import (
@@ -13,18 +14,18 @@ from cocco.model import (
     TestOutcome,
     User,
 )
-from cocco.repository import pull_queued_submission
+from cocco.repository import get_user_focused_challenge_info, pull_queued_submission
 from cocco.schema import SubmissionRunData
 
 
-def _make_engine():
-    engine = create_engine("sqlite:///:memory:")
+def _make_engine(db_url="sqlite:///:memory:"):
+    engine = create_engine(db_url)
     Base.metadata.create_all(engine)
     return engine
 
 
-def _make_example_database():
-    engine = _make_engine()
+def _make_example_database(db_url="sqlite:///:memory:"):
+    engine = _make_engine(db_url)
     now = datetime.now()
 
     with engine.begin() as conn:
@@ -121,6 +122,8 @@ def _make_example_database():
         submissions = [
             ("carol", "Hello", "python", "print('hi')",
              cm.SubmissionStatus.done, now - timedelta(minutes=30)),
+            ("carol", "Hello", "c", "print('there')",
+             cm.SubmissionStatus.done, now - timedelta(minutes=35)),
             ("carol", "Sum", "python", "a,b=map(int,input().split());print(a+b)",
              cm.SubmissionStatus.done, now - timedelta(minutes=20)),
             ("carol", "BST insert", "cpp", "// not finished",
@@ -253,3 +256,13 @@ async def test_get_queued_submission_returns_none_when_empty():
     with engine.connect() as conn:
         result = await pull_queued_submission(conn)
     assert result is None
+
+
+def test_user_focused_challenge_info():
+    import os
+    url = f"postgresql+psycopg://{os.environ['PGUSER']}@/cocco-dev?host={os.environ['PGHOST']}"
+    engine = _make_example_database(url)
+    with engine.connect() as conn:
+        res = get_user_focused_challenge_info(conn, 4, 1)
+        ic(res)
+    
