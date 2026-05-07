@@ -5,7 +5,6 @@ from icecream import ic
 
 import cocco.model as cm
 from cocco.model import (
-    Base,
     Challenge,
     Course,
     Enrollment,
@@ -13,6 +12,7 @@ from cocco.model import (
     TestCase,
     TestOutcome,
     User,
+    metadata,
 )
 from cocco.repository import get_user_focused_challenge_info, pull_queued_submission
 from cocco.schema import SubmissionRunData
@@ -20,7 +20,7 @@ from cocco.schema import SubmissionRunData
 
 def _make_engine(db_url="sqlite:///:memory:"):
     engine = create_engine(db_url)
-    Base.metadata.create_all(engine)
+    metadata.create_all(engine)
     return engine
 
 
@@ -41,7 +41,7 @@ def _make_example_database(db_url="sqlite:///:memory:"):
             nickname: conn.execute(
                 insert(User)
                 .values(email=email, nickname=nickname)
-                .returning(User.id)
+                .returning(User.c.id)
             ).scalar_one()
             for email, nickname in users
         }
@@ -55,7 +55,7 @@ def _make_example_database(db_url="sqlite:///:memory:"):
             title: conn.execute(
                 insert(Course)
                 .values(title=title, description=description)
-                .returning(Course.id)
+                .returning(Course.c.id)
             ).scalar_one()
             for title, description in courses
         }
@@ -97,7 +97,7 @@ def _make_example_database(db_url="sqlite:///:memory:"):
                     max_time_s=time_s,
                     max_threads=threads,
                 )
-                .returning(Challenge.id)
+                .returning(Challenge.c.id)
             ).scalar_one()
             for title, description, course_title, mem, time_s, threads in challenges
         }
@@ -114,7 +114,7 @@ def _make_example_database(db_url="sqlite:///:memory:"):
                         input_path=f"{challenge_title}/in_{order}.txt",
                         expected_output_path=f"{challenge_title}/out_{order}.txt",
                     )
-                    .returning(TestCase.id)
+                    .returning(TestCase.c.id)
                 ).scalar_one()
                 ids.append(tc_id)
             testcase_ids[challenge_title] = ids
@@ -151,7 +151,7 @@ def _make_example_database(db_url="sqlite:///:memory:"):
                     status=status,
                     enqueued=enqueued,
                 )
-                .returning(Submission.id)
+                .returning(Submission.c.id)
             ).scalar_one()
             submission_ids.append((sub_id, challenge_title, status))
 
@@ -197,7 +197,7 @@ async def test_get_queued_submission_returns_oldest_queued():
                 email="me@example.com",
                 nickname = "the-admin"
             )
-            .returning(User.id)
+            .returning(User.c.id)
         ).scalar_one()
         challenge_id = conn.execute(
             insert(Challenge)
@@ -207,7 +207,7 @@ async def test_get_queued_submission_returns_oldest_queued():
                 max_memory_bytes=1 << 20,
                 max_time_s=1.0,
             )
-            .returning(Challenge.id)
+            .returning(Challenge.c.id)
         ).scalar_one()
 
         oldest_id = conn.execute(
@@ -220,7 +220,7 @@ async def test_get_queued_submission_returns_oldest_queued():
                 status=cm.SubmissionStatus.queued,
                 enqueued=now - timedelta(seconds=10),
             )
-            .returning(Submission.id)
+            .returning(Submission.c.id)
         ).scalar_one()
 
         conn.execute(

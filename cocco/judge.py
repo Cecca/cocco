@@ -22,7 +22,7 @@ from cocco.schema import (
     TestOutcome,
 )
 from cocco.model import (
-    Base,
+    metadata,
     OutcomeEnum,
 )
 from cocco.storage import Storage
@@ -551,7 +551,7 @@ if __name__ == "__main__":
 
         storage = Storage(args.storage)
         engine = create_engine(args.database)
-        Base.metadata.create_all(engine)
+        metadata.create_all(engine)
         evaluator = EqualityEvaluator()
         await run_loop(engine, storage, evaluator)
 

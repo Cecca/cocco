@@ -4,19 +4,16 @@ Functions in this module return models from `cocco.models`,
 or their combinations
 """
 
-from sqlalchemy import JSON, Connection, func, insert, literal_column, select, text, update
-from sqlalchemy.sql import functions
-from sqlalchemy.ext.compiler import compiles
+from sqlalchemy import Connection, insert, select, text, update
 
 from cocco import schema
-from cocco.schema import SubmissionRunData, UserFocusedChallengeInfo
+from cocco.schema import SubmissionRunData
 from cocco.model import (
     Challenge,
     Submission,
     SubmissionStatus,
     TestCase,
     TestOutcome,
-    User,
 )
 
 
@@ -26,28 +23,28 @@ async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
     # Get the submission to run, if any, and atomically sets it to running
     submission = conn.execute(
         update(Submission).where(
-            Submission.id
+            Submission.c.id
             == (
-                select(Submission.id)
-                .where(Submission.status == SubmissionStatus.queued)
-                .order_by(Submission.enqueued)
+                select(Submission.c.id)
+                .where(Submission.c.status == SubmissionStatus.queued)
+                .order_by(Submission.c.enqueued)
                 .limit(1)
             ).scalar_subquery()
         ).values(status = SubmissionStatus.running)
-        .returning(Submission)
+        .returning(*Submission.c)
     ).first()
     if submission is None:
         return None
     conn.commit()
 
     challenge = conn.execute(
-        select(Challenge).where(Challenge.id == submission.challenge_id)
+        select(Challenge).where(Challenge.c.id == submission.challenge_id)
     ).first()
     if challenge is None:
         return None
 
     tests = conn.execute(
-        select(TestCase).where(TestCase.challenge_id == challenge.id)
+        select(TestCase).where(TestCase.c.challenge_id == challenge.id)
     ).all()
 
     return SubmissionRunData(
@@ -64,7 +61,7 @@ async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
 def mark_submission_done(conn: Connection, submission_id: int) -> None:
     conn.execute(
         update(Submission)
-        .where(Submission.id == submission_id)
+        .where(Submission.c.id == submission_id)
         .values(status=SubmissionStatus.done)
     )
 
