@@ -1,0 +1,7 @@
+@import "tailwindcss";
+
+@source "../templates/**/*.jinja";
+@source "../cocco/**/*.py";
+
+@plugin "@tailwindcss/typography";
+@plugin "daisyui";

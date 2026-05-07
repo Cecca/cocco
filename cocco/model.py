@@ -9,6 +9,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    LargeBinary,
     MetaData,
     String,
     Table,
@@ -21,6 +22,7 @@ from cocco.evaluator import Evaluator, evaluator_adapter
 class UserRole(str, Enum):
     admin = "admin"
     teacher = "teacher"
+    collaborator = "collaborator"
     student = "student"
 
 
@@ -59,9 +61,13 @@ User = Table(
     Column("id", Integer, primary_key=True),
     Column("email", String, nullable=False),
     Column("nickname", String, nullable=False),
+    Column("image", LargeBinary, nullable=False),
+    Column("image_mime", String, nullable=False),
 )
 
 
+# TODO: add the year of the course
+# TODO: store a slug of the course
 Course = Table(
     "course",
     metadata,
@@ -80,6 +86,7 @@ Enrollment = Table(
 )
 
 
+# TODO: store a slug of the challenge
 Challenge = Table(
     "challenge",
     metadata,

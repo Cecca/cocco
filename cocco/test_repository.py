@@ -260,7 +260,7 @@ async def test_get_queued_submission_returns_none_when_empty():
 
 def test_user_focused_challenge_info():
     import os
-    url = f"postgresql+psycopg://{os.environ['PGUSER']}@/cocco-dev?host={os.environ['PGHOST']}"
+    url = f"postgresql+psycopg://{os.environ['PGUSER']}@/{os.environ['PGDATABASE']}?host={os.environ['PGHOST']}"
     engine = _make_example_database(url)
     with engine.connect() as conn:
         res = get_user_focused_challenge_info(conn, 4, 1)

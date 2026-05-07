@@ -51,16 +51,17 @@
           pkgs.python3
           pkgs.uv
           pkgs.postgresql
+          pkgs.nodejs_22
           pgStart
           pgStop
           pgCreateDb
         ];
         shellHook = ''
-          # export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib.outPath}/lib:${pkgs.pythonManylinuxPackages.manylinux2014Package}/lib:$LD_LIBRARY_PATH";
+          export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib.outPath}/lib:$LD_LIBRARY_PATH";
           export PGDATA="$PWD/.pg/data"
           export PGHOST="$PWD/.pg/sock"
           export PGUSER=postgres
-          export PGDATABASE=postgres
+          export PGDATABASE=cocco-dev
           test -d .venv || uv venv --python=${pkgs.python3.interpreter} .venv
           source .venv/bin/activate
 

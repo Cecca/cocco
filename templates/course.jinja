@@ -1,0 +1,29 @@
+{% extends "base.jinja" %}
+{% block title %}
+{{ title }}
+{% endblock %}
+
+{% block content %}
+
+<h1 class="text-3xl font-bold mb-6">{{ course.title }}</h1>
+
+<article class="prose max-w-none">{{ course.description | markdown }}</article>
+
+
+<ul class="list bg-base-100 rounded-box shadow-md">
+<li class="p-4 pb-2 text-xl opacity-90 tracking-wide">Challenges</li>
+
+{% for challenge in course.challenges %}
+<li class="list-row">
+  <a href="{{ url_for('get_challenge', course_id=course.id, challenge_id=challenge.id) }}">
+    <div>
+      {{ challenge.title }}
+    </div>
+  </a>
+</li>
+{% endfor %}
+</ul>
+
+{% endblock %}
+
+

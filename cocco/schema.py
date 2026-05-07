@@ -5,7 +5,7 @@ of complex database queries.
 from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
-from cocco.model import OutcomeEnum, SubmissionStatus, UserRole
+from cocco.model import OutcomeEnum, SubmissionStatus
 
 
 class Base(BaseModel):
@@ -13,7 +13,7 @@ class Base(BaseModel):
 
 
 class User(Base):
-    id: int | None = None
+    id: int | None
     email: str
     nickname: str
 

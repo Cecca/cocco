@@ -1,6 +1,8 @@
 .direnv
 *.db
 .pg/
+node_modules/
+static/styles.css
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

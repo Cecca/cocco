@@ -1,0 +1,22 @@
+<ul class="list bg-base-100 rounded-box shadow-md">
+  <li class="p-4 pb-2 text-lg opacity-90 tracking-wide">Submissions</li>
+  {% for submission in submissions %}
+  <li class="list-row">
+      <div>
+        <div class="text-base-500">
+          {{ submission.enqueued | datetime }}
+        </div>
+        <div class="text-primary">
+          {{ submission.language }}
+        </div>
+      </div>
+      <div>
+        {% for outcome in submission.outcome %}
+        {{ outcome.outcome }}
+        {% endfor %}
+      </div>
+    {# </a> #}
+  </li>
+  {% endfor %}
+</ul>
+

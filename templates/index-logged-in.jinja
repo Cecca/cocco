@@ -1,0 +1,41 @@
+{% extends "base.jinja" %}
+{% block title %}
+{{ title }}
+{% endblock %}
+
+{% block content %}
+<h1 class="text-3xl font-bold mb-6">Courses</h1>
+
+<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+  {% for course in courses.enrolled %}
+    <div class="card bg-base-100 shadow-sm">
+      <div class="card-body">
+        <h2 class="card-title">{{ course.title }}</h2>
+        <p>{{ course.description }}</p>
+        <div class="card-actions justify-end">
+          <a href="{{ url_for('get_course', course_id=course.id) }}">
+          <button class="btn btn-primary">Go!</button>
+          </a>
+        </div>
+      </div>
+    </div>
+  {% endfor %}
+</div>
+
+<div class="divider">other courses</div>
+
+<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+  {% for course in courses.non_enrolled %}
+    <div class="card bg-base-100 shadow-sm">
+      <div class="card-body">
+        <h2 class="card-title">{{ course.title }}</h2>
+        <p>{{ course.description }}</p>
+        <div class="card-actions justify-end">
+          <button class="btn btn-secondary">Enroll!</button>
+        </div>
+      </div>
+    </div>
+  {% endfor %}
+</div>
+{% endblock %}
+

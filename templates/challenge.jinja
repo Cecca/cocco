@@ -1,0 +1,44 @@
+{% extends "base.jinja" %}
+{% block title %}
+{# {{ title }} #}
+{% endblock %}
+
+{% block content %}
+
+<h1 class="text-3xl font-bold mb-6">{{ challenge.title }}</h1>
+
+<article class="prose max-w-none">{{ challenge.description | markdown }}</article>
+
+<div class="divider"></div>
+
+<div class="grid grid-cols-2">
+  <div>
+    <form id='form' hx-encoding='multipart/form-data' hx-post='/upload'>
+      <fieldset class="fieldset bg-base-200 border-base-400 rounded-box w-xs border p-4">
+        <legend class="fieldset-legend text-lg">New submission updload</legend>
+        <label class="label">Submission file</label>
+        <input type='file' name='file' class="file-input" />
+        <label class="label">Language</label>
+        <button class="btn btn-primary">
+          Upload
+        </button>
+        {# <progress id='progress' value='0' max='100'></progress> #}
+      </fieldset>
+    </form>
+    {# <script> #}
+        {# htmx.on('#form', 'htmx:xhr:progress', function(evt) { #}
+          {# htmx.find('#progress').setAttribute('value', evt.detail.loaded/evt.detail.total * 100) #}
+        {# }); #}
+    {# </script> #}
+  </div>
+  <div hx-get="{{ url_for('get_fragment_submissions', challenge_id=challenge.id) }}"
+       hx-trigger="load,every 2s">
+  </div>
+</div>
+
+
+
+{% endblock %}
+
+
+

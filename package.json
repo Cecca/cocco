@@ -1,0 +1,14 @@
+{
+  "name": "cocco-frontend",
+  "private": true,
+  "scripts": {
+    "build:css": "tailwindcss -i ./assets/styles.css -o ./static/styles.css --minify",
+    "watch:css": "tailwindcss -i ./assets/styles.css -o ./static/styles.css --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.0",
+    "@tailwindcss/typography": "^0.5.16",
+    "daisyui": "^5.0.0",
+    "tailwindcss": "^4.1.0"
+  }
+}
