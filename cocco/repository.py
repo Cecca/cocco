@@ -151,7 +151,7 @@ async def query_courses(conn: AsyncConnection, user_id: int):
     courses as (
         SELECT *
         FROM course c
-        LEFT JOIN (SELECT * FROM enrollment WHERE course_id = :user_id) e
+        LEFT JOIN (SELECT * FROM enrollment WHERE user_id = :user_id) e
         ON c.id = e.course_id
     ),
     enrolled_courses AS (
