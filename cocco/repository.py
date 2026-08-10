@@ -4,7 +4,7 @@ Functions in this module return models from `cocco.models`,
 or their combinations
 """
 
-from sqlalchemy import Connection, and_, insert, select, text, update
+from sqlalchemy import Connection, and_, delete, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from cocco import schema
@@ -163,9 +163,9 @@ async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_
     return res.scalar_one_or_none()
 
 
-async def query_challenge(conn: AsyncConnection, challenge_id: int):
-    """The challenge itself, its course, its position within the course and its
-    public sample test cases.
+async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int):
+    """The challenge itself, its course, its position within the course, the
+    viewer's role in that course and its public sample test cases.
 
     Submissions are deliberately not part of this document: the challenge page
     loads them through `query_user_submissions` and keeps them fresh by polling.
@@ -189,17 +189,20 @@ async def query_challenge(conn: AsyncConnection, challenge_id: int):
         SELECT challenge.*,
                course.title AS course_title,
                positions.position AS position,
+               enrollment.role AS viewer_role,
                coalesce(samples.samples, '[]'::json) AS samples
         FROM challenge
         LEFT JOIN course ON course.id = challenge.course_id
         LEFT JOIN positions ON positions.id = challenge.id
         LEFT JOIN samples ON samples.challenge_id = challenge.id
+        LEFT JOIN enrollment ON enrollment.course_id = challenge.course_id
+                            AND enrollment.user_id = :user_id
         WHERE challenge.id = :challenge_id
     )
     SELECT row_to_json(cs) FROM cs;
     """)
 
-    res = await conn.execute(query, dict(challenge_id=challenge_id))
+    res = await conn.execute(query, dict(challenge_id=challenge_id, user_id=user_id))
     return res.scalar_one_or_none()
 
 
@@ -267,6 +270,143 @@ async def query_sample_testcase(
     return (await conn.execute(stmt)).first()
 
 
+async def query_user_role(
+    conn: AsyncConnection, user_id: int, challenge_id: int
+) -> UserRole | None:
+    """The viewer's role in the course a challenge belongs to, or None if they
+    are not enrolled. This is the authorization check for the editor."""
+    stmt = (
+        select(Enrollment.c.role)
+        .select_from(
+            Challenge.join(
+                Enrollment, Enrollment.c.course_id == Challenge.c.course_id
+            )
+        )
+        .where(
+            and_(Challenge.c.id == challenge_id, Enrollment.c.user_id == user_id)
+        )
+    )
+    return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def query_challenge_testcases(conn: AsyncConnection, challenge_id: int):
+    """Every test case of a challenge, in execution order.
+
+    Unlike the `samples` array of `query_challenge`, this includes the hidden
+    ones - the editor lists them all.
+    """
+    stmt = (
+        select(TestCase)
+        .where(TestCase.c.challenge_id == challenge_id)
+        .order_by(TestCase.c.execution_order, TestCase.c.id)
+    )
+    return (await conn.execute(stmt)).all()
+
+
+async def query_testcase(conn: AsyncConnection, challenge_id: int, testcase_id: int):
+    """A single test case, scoped to its challenge so that an id from another
+    challenge cannot be manipulated through this challenge's routes."""
+    stmt = select(TestCase).where(
+        and_(TestCase.c.id == testcase_id, TestCase.c.challenge_id == challenge_id)
+    )
+    return (await conn.execute(stmt)).first()
+
+
+# The following mutations deliberately do not commit: the caller owns the
+# transaction, as with `insert_enrollment` and `insert_submission`.
+
+
+async def update_challenge(conn: AsyncConnection, challenge_id: int, **fields) -> None:
+    if not fields:
+        return
+    await conn.execute(
+        update(Challenge).where(Challenge.c.id == challenge_id).values(**fields)
+    )
+
+
+async def insert_testcase(
+    conn: AsyncConnection,
+    challenge_id: int,
+    input_path: str,
+    expected_output_path: str,
+    is_sample: bool = False,
+) -> int:
+    """Append a test case after the existing ones."""
+    next_order = (
+        await conn.execute(
+            select(func.coalesce(func.max(TestCase.c.execution_order) + 1, 0)).where(
+                TestCase.c.challenge_id == challenge_id
+            )
+        )
+    ).scalar_one()
+    stmt = (
+        insert(TestCase)
+        .values(
+            challenge_id=challenge_id,
+            execution_order=next_order,
+            input_path=input_path,
+            expected_output_path=expected_output_path,
+            is_sample=is_sample,
+        )
+        .returning(TestCase.c.id)
+    )
+    return (await conn.execute(stmt)).scalar_one()
+
+
+async def delete_testcase(conn: AsyncConnection, testcase_id: int) -> None:
+    """Delete a test case, detaching any outcome that scored against it.
+
+    `testoutcome.testcase_id` is a FK with no ON DELETE, so a test case a past
+    submission was graded on cannot simply be deleted. The outcomes are kept
+    with a null test case: their score and message are still the record of what
+    that submission did, and the submission history has to keep rendering.
+    """
+    await conn.execute(
+        update(TestOutcome)
+        .where(TestOutcome.c.testcase_id == testcase_id)
+        .values(testcase_id=None)
+    )
+    await conn.execute(delete(TestCase).where(TestCase.c.id == testcase_id))
+
+
+async def update_testcase(conn: AsyncConnection, testcase_id: int, **fields) -> None:
+    if not fields:
+        return
+    await conn.execute(
+        update(TestCase).where(TestCase.c.id == testcase_id).values(**fields)
+    )
+
+
+async def swap_testcase_order(conn: AsyncConnection, a_id: int, b_id: int) -> None:
+    """Exchange the execution_order of two test cases.
+
+    Done in three steps through a sentinel because `execution_order` may well
+    gain a unique constraint per challenge later, and a direct swap would then
+    collide mid-statement.
+    """
+    rows = (
+        await conn.execute(
+            select(TestCase.c.id, TestCase.c.execution_order).where(
+                TestCase.c.id.in_([a_id, b_id])
+            )
+        )
+    ).all()
+    orders = {row.id: row.execution_order for row in rows}
+    await conn.execute(
+        update(TestCase).where(TestCase.c.id == a_id).values(execution_order=-1)
+    )
+    await conn.execute(
+        update(TestCase)
+        .where(TestCase.c.id == b_id)
+        .values(execution_order=orders[a_id])
+    )
+    await conn.execute(
+        update(TestCase)
+        .where(TestCase.c.id == a_id)
+        .values(execution_order=orders[b_id])
+    )
+
+
 async def query_courses(conn: AsyncConnection, user_id: int):
     query = text("""
     WITH
@@ -276,11 +416,15 @@ async def query_courses(conn: AsyncConnection, user_id: int):
         LEFT JOIN (SELECT * FROM enrollment WHERE user_id = :user_id) e
         ON c.id = e.course_id
     ),
+    -- coalesce: json_agg over no rows is NULL, and a user enrolled in every
+    -- course (or none) would otherwise hand the template a null to iterate
     enrolled_courses AS (
-        SELECT json_agg(courses) AS enrolled FROM courses WHERE role IS NOT null
+        SELECT coalesce(json_agg(courses), '[]'::json) AS enrolled
+        FROM courses WHERE role IS NOT null
     ),
     non_enrolled_courses AS (
-        SELECT json_agg(courses) AS non_enrolled FROM courses WHERE role IS null
+        SELECT coalesce(json_agg(courses), '[]'::json) AS non_enrolled
+        FROM courses WHERE role IS null
     ),
     u AS (
         SELECT * from enrolled_courses, non_enrolled_courses

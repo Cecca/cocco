@@ -6,7 +6,7 @@ from sqlalchemy import insert, select
 from cocco.avatar import generate_identicon
 from cocco.evaluator import EqualityEvaluator
 from cocco.judge import load_languages
-from cocco.storage import Storage
+from cocco.storage import Storage, safe_filename
 from cocco.model import (
     Challenge,
     Course,
@@ -20,7 +20,7 @@ from cocco.model import (
     metadata,
 )
 from cocco import schema
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -28,14 +28,22 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 import os
 
 from cocco.repository import (
+    delete_testcase,
     insert_enrollment,
     insert_submission,
+    insert_testcase,
     query_challenge,
     query_challenge_leaderboard,
+    query_challenge_testcases,
     query_course_info,
     query_courses,
     query_sample_testcase,
+    query_testcase,
+    query_user_role,
     query_user_submissions,
+    swap_testcase_order,
+    update_challenge,
+    update_testcase,
 )
 
 
@@ -67,6 +75,16 @@ EXTENSION_TO_LANGUAGE = {
 }
 
 MAX_UPLOAD_BYTES = 1 << 20
+
+# Test case inputs are routinely far larger than a solution file, so they get
+# their own, much higher ceiling - and are streamed to disk, never buffered.
+MAX_TESTCASE_BYTES = 32 << 20
+
+# Course staff. `role` lives on `enrollment`, so these are per-course, not
+# site-wide. Everyone else - i.e. students and the unenrolled - is read-only.
+EDITOR_ROLES = {UserRole.teacher, UserRole.admin, UserRole.collaborator}
+# The same set as it comes back from `row_to_json`, i.e. plain strings
+EDITOR_ROLE_NAMES = {role.value for role in EDITOR_ROLES}
 
 
 def render_markdown(text: str | None) -> Markup:
@@ -171,8 +189,15 @@ async def _populate_dummy_data(conn: AsyncConnection):
                 .returning(Course.c.id)
             )
         ).scalar_one()
-        if course_title == "Algorithms 101":
-            await insert_enrollment(conn, user_id, course_id, UserRole.student)
+        # Teacher on one course, student on the other, so that both the staff
+        # and the read-only views of a challenge are reachable in development
+        # while `get_user` is still hardcoded.
+        await insert_enrollment(
+            conn,
+            user_id,
+            course_id,
+            UserRole.teacher if course_title == "Algorithms 101" else UserRole.student,
+        )
         for n in range(3):
             first = first_challenge_id is None
             challenge_id = (
@@ -324,6 +349,25 @@ async def get_user():
 CurrentUser = Annotated[schema.User, Depends(get_user)]
 
 
+async def require_challenge_editor(
+    challenge_id: int, db: DBDep, user: CurrentUser
+) -> UserRole:
+    """Authorize an edit of `challenge_id`, or raise 403.
+
+    Hiding the Edit button in the template is a UI affordance, not access
+    control: every route that mutates a challenge depends on this.
+    """
+    if user.id is None:
+        raise HTTPException(status_code=403)
+    role = await query_user_role(db, user_id=user.id, challenge_id=challenge_id)
+    if role is None or role not in EDITOR_ROLES:
+        raise HTTPException(status_code=403, detail="Not course staff")
+    return role
+
+
+ChallengeEditor = Annotated[UserRole, Depends(require_challenge_editor)]
+
+
 @app.on_event("startup")
 async def on_startup():
     # Resetting drops every table and reseeds the dummy data, so it must not
@@ -368,7 +412,7 @@ async def get_challenge(
 ):
     if user.id is None:
         raise HTTPException(status_code=404)
-    challenge = await query_challenge(db, challenge_id=challenge_id)
+    challenge = await query_challenge(db, user_id=user.id, challenge_id=challenge_id)
     if challenge is None:
         raise HTTPException(status_code=404)
     return templates.TemplateResponse(
@@ -379,6 +423,7 @@ async def get_challenge(
             "course_id": course_id,
             "challenge": challenge,
             "title": challenge["title"],
+            "can_edit": challenge["viewer_role"] in EDITOR_ROLE_NAMES,
         },
     )
 
@@ -502,6 +547,290 @@ async def get_sample_file(challenge_id: int, testcase_id: int, kind: str, db: DB
         media_type="text/plain",
         filename=f"sample{testcase.execution_order + 1}_{kind}.txt",
     )
+
+
+########################################################################
+# The challenge editor. Every route here depends on ChallengeEditor, which
+# 403s anyone who is not staff on the challenge's course.
+
+
+def _testcase_dir(challenge_id: int) -> str:
+    return f"challenge_{challenge_id}"
+
+
+async def _render_testcases(request: Request, db: DBDep, course_id: int, challenge_id: int,
+                            message: str | None = None, ok: bool = True):
+    """The test case list fragment. Every mutation returns this, so the table
+    always reflects what is actually in the database."""
+    testcases = await query_challenge_testcases(db, challenge_id)
+    return templates.TemplateResponse(
+        request=request,
+        name="f-testcases.jinja",
+        context={
+            "testcases": testcases,
+            "course_id": course_id,
+            "challenge_id": challenge_id,
+            "message": message,
+            "ok": ok,
+        },
+    )
+
+
+@app.get("/courses/{course_id}/{challenge_id}/edit")
+async def get_challenge_edit(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    role: ChallengeEditor,
+):
+    if user.id is None:
+        raise HTTPException(status_code=403)
+    challenge = await query_challenge(db, user_id=user.id, challenge_id=challenge_id)
+    if challenge is None:
+        raise HTTPException(status_code=404)
+    testcases = await query_challenge_testcases(db, challenge_id)
+    return templates.TemplateResponse(
+        request=request,
+        name="challenge-edit.jinja",
+        context={
+            "user": user,
+            "course_id": course_id,
+            "challenge_id": challenge_id,
+            "challenge": challenge,
+            "testcases": testcases,
+            "title": f"Editing {challenge['title']}",
+        },
+    )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/edit")
+async def post_challenge_edit(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+    description: Annotated[str, Form()],
+    max_time_s: Annotated[float, Form()],
+    max_memory_mb: Annotated[float, Form()],
+    max_threads: Annotated[int, Form()],
+):
+    """Save the problem statement and the sandbox limits."""
+
+    def alert(message: str, ok: bool = False):
+        return templates.TemplateResponse(
+            request=request,
+            name="f-edit-result.jinja",
+            context={"ok": ok, "message": message},
+        )
+
+    if max_time_s <= 0 or max_memory_mb <= 0 or max_threads < 1:
+        return alert("Limits must be positive.")
+
+    await update_challenge(
+        db,
+        challenge_id,
+        description=description,
+        max_time_s=max_time_s,
+        max_memory_bytes=int(max_memory_mb * 1024 * 1024),
+        max_threads=max_threads,
+    )
+    await db.commit()
+    return alert("Saved.", ok=True)
+
+
+@app.post("/f/markdown-preview")
+async def post_markdown_preview(
+    request: Request, description: Annotated[str, Form()] = ""
+):
+    """Render the editor's textarea through the same filter the challenge page
+    uses, so the preview cannot drift from the real thing."""
+    return templates.TemplateResponse(
+        request=request,
+        name="f-markdown-preview.jinja",
+        context={"description": description},
+    )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/testcases")
+async def post_testcase(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+    input_file: Annotated[UploadFile, File()],
+    expected_output_file: Annotated[UploadFile, File()],
+    is_sample: Annotated[bool, Form()] = False,
+):
+    """Create a test case from an uploaded input / expected output pair."""
+    try:
+        input_name = safe_filename(input_file.filename or "")
+        output_name = safe_filename(expected_output_file.filename or "")
+    except ValueError as e:
+        return await _render_testcases(
+            request, db, course_id, challenge_id, str(e), ok=False
+        )
+
+    if input_name == output_name:
+        return await _render_testcases(
+            request, db, course_id, challenge_id,
+            "The input and the expected output must be different files.", ok=False,
+        )
+
+    for upload in (input_file, expected_output_file):
+        if upload.size is not None and upload.size > MAX_TESTCASE_BYTES:
+            return await _render_testcases(
+                request, db, course_id, challenge_id,
+                f"{upload.filename} is larger than "
+                f"{MAX_TESTCASE_BYTES // (1024 * 1024)} MB.", ok=False,
+            )
+
+    directory = _testcase_dir(challenge_id)
+    input_path = f"{directory}/{input_name}"
+    output_path = f"{directory}/{output_name}"
+    if storage.exists(input_path) or storage.exists(output_path):
+        return await _render_testcases(
+            request, db, course_id, challenge_id,
+            "A file with that name already exists for this challenge.", ok=False,
+        )
+
+    # Streamed, not read: test inputs can be several megabytes (DESIGN.md)
+    storage.save_stream(input_path, input_file.file)
+    storage.save_stream(output_path, expected_output_file.file)
+
+    await insert_testcase(
+        db, challenge_id, input_path, output_path, is_sample=is_sample
+    )
+    await db.commit()
+    return await _render_testcases(
+        request, db, course_id, challenge_id, f"Added {input_name}.", ok=True
+    )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/testcases/{testcase_id}/delete")
+async def post_testcase_delete(
+    course_id: int,
+    challenge_id: int,
+    testcase_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+):
+    testcase = await query_testcase(db, challenge_id, testcase_id)
+    if testcase is None:
+        raise HTTPException(status_code=404)
+
+    await delete_testcase(db, testcase_id)
+    await db.commit()
+    # Only after the row is gone, so a failed commit cannot leave the database
+    # pointing at files that no longer exist.
+    storage.delete(testcase.input_path)
+    storage.delete(testcase.expected_output_path)
+    return await _render_testcases(
+        request, db, course_id, challenge_id, "Test case deleted.", ok=True
+    )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/testcases/{testcase_id}/rename")
+async def post_testcase_rename(
+    course_id: int,
+    challenge_id: int,
+    testcase_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+    kind: Annotated[str, Form()],
+    name: Annotated[str, Form()],
+):
+    """Rename one of a test case's two files, on disk and in the database."""
+    if kind not in ("input", "output"):
+        raise HTTPException(status_code=404)
+    testcase = await query_testcase(db, challenge_id, testcase_id)
+    if testcase is None:
+        raise HTTPException(status_code=404)
+
+    def fail(message: str):
+        return _render_testcases(request, db, course_id, challenge_id, message, ok=False)
+
+    try:
+        new_name = safe_filename(name)
+    except ValueError as e:
+        return await fail(str(e))
+
+    column = "input_path" if kind == "input" else "expected_output_path"
+    old_path = getattr(testcase, column)
+    new_path = f"{_testcase_dir(challenge_id)}/{new_name}"
+    if new_path == old_path:
+        return await _render_testcases(request, db, course_id, challenge_id)
+    if storage.exists(new_path):
+        return await fail(f"{new_name} already exists for this challenge.")
+
+    try:
+        storage.rename(old_path, new_path)
+    except (OSError, ValueError) as e:
+        return await fail(f"Could not rename: {e}")
+
+    await update_testcase(db, testcase_id, **{column: new_path})
+    await db.commit()
+    return await _render_testcases(
+        request, db, course_id, challenge_id, f"Renamed to {new_name}.", ok=True
+    )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/testcases/{testcase_id}/sample")
+async def post_testcase_sample(
+    course_id: int,
+    challenge_id: int,
+    testcase_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+    is_sample: Annotated[bool, Form()] = False,
+):
+    """Publish or hide a test case. A hidden one stops being downloadable."""
+    if await query_testcase(db, challenge_id, testcase_id) is None:
+        raise HTTPException(status_code=404)
+    await update_testcase(db, testcase_id, is_sample=is_sample)
+    await db.commit()
+    return await _render_testcases(
+        request, db, course_id, challenge_id,
+        "Now a public sample." if is_sample else "Now hidden.", ok=True,
+    )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/testcases/{testcase_id}/move")
+async def post_testcase_move(
+    course_id: int,
+    challenge_id: int,
+    testcase_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+    direction: Annotated[str, Form()],
+):
+    """Swap a test case with its neighbour. Buttons rather than drag-and-drop:
+    the repo has no JS build step, and this is two integers."""
+    if direction not in ("up", "down"):
+        raise HTTPException(status_code=404)
+
+    ordered = await query_challenge_testcases(db, challenge_id)
+    index = next(
+        (i for i, tc in enumerate(ordered) if tc.id == testcase_id), None
+    )
+    if index is None:
+        raise HTTPException(status_code=404)
+
+    neighbour = index - 1 if direction == "up" else index + 1
+    if not 0 <= neighbour < len(ordered):
+        # Already at the end; nothing to do rather than an error
+        return await _render_testcases(request, db, course_id, challenge_id)
+
+    await swap_testcase_order(db, testcase_id, ordered[neighbour].id)
+    await db.commit()
+    return await _render_testcases(request, db, course_id, challenge_id)
 
 
 @app.get("/users/{user_id}/avatar")

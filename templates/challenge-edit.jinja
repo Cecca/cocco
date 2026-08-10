@@ -1,0 +1,118 @@
+{% extends "base.jinja" %}
+{% block title %}Editing {{ challenge.title }}{% endblock %}
+
+{% block nav_extra %}
+<li><a class="text-base-content font-bold border-b-2 border-primary pb-0.5">Editing</a></li>
+{% endblock %}
+
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+
+  <div class="flex items-start justify-between gap-4 mb-6">
+    <div>
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+        <a href="{{ url_for('get_course', course_id=course_id) }}" class="hover:text-primary">
+          {{ challenge.course_title }}
+        </a>
+        · Challenge {{ "%02d" | format(challenge.position) }}
+      </p>
+      <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ challenge.title }}</h1>
+    </div>
+    <a href="{{ url_for('get_challenge', course_id=course_id, challenge_id=challenge.id) }}"
+       class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+      ← Back to challenge
+    </a>
+  </div>
+
+  <!-- ══ PROBLEM STATEMENT ═════════════════════════════════════════════ -->
+  <form hx-post="{{ url_for('post_challenge_edit', course_id=course_id, challenge_id=challenge.id) }}"
+        hx-target="#edit-result"
+        hx-swap="innerHTML">
+
+    <div class="card bg-base-100 border border-base-300 shadow-sm">
+      <div class="card-body p-7">
+        <div class="flex items-baseline justify-between">
+          <h2 class="font-bold text-lg">Problem statement</h2>
+          <span class="font-mono text-xs text-base-content/45">markdown</span>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 mt-3">
+          <div>
+            <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Source</label>
+            <!-- Preview re-renders server-side through the same filter the
+                 challenge page uses, so it cannot drift from the real thing. -->
+            <textarea name="description"
+                      id="description"
+                      rows="24"
+                      class="textarea font-mono text-sm w-full mt-1.5 leading-relaxed"
+                      hx-post="{{ url_for('post_markdown_preview') }}"
+                      hx-trigger="load, keyup changed delay:400ms"
+                      hx-target="#preview"
+                      hx-swap="innerHTML">{{ challenge.description }}</textarea>
+          </div>
+          <div>
+            <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Preview</label>
+            <div id="preview"
+                 class="rounded-xl border border-base-300 bg-base-200/40 p-5 mt-1.5 min-h-[10rem] overflow-x-auto">
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ SANDBOX LIMITS ══════════════════════════════════════════════ -->
+    <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+      <div class="card-body p-7">
+        <h2 class="font-bold text-lg">Sandbox limits</h2>
+        <p class="text-[13px] text-base-content/55 -mt-1">
+          Enforced by isolate on every run. Too tight and correct solutions get killed.
+        </p>
+
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-3">
+          <div>
+            <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Time (s)</label>
+            <input type="number" name="max_time_s" step="0.5" min="0.5" required
+                   value="{{ challenge.max_time_s }}"
+                   class="input font-mono w-full mt-1.5" />
+          </div>
+          <div>
+            <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Memory (MB)</label>
+            <input type="number" name="max_memory_mb" step="1" min="1" required
+                   value="{{ (challenge.max_memory_bytes / 1024 / 1024) | round | int }}"
+                   class="input font-mono w-full mt-1.5" />
+          </div>
+          <div>
+            <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Threads</label>
+            <input type="number" name="max_threads" step="1" min="1" required
+                   value="{{ challenge.max_threads }}"
+                   class="input font-mono w-full mt-1.5" />
+          </div>
+        </div>
+
+        <div class="flex items-center gap-4 mt-5">
+          <button type="submit" class="btn btn-primary shadow-md shadow-primary/30">
+            <span class="submit-label">Save changes</span>
+            <span class="htmx-indicator loading loading-spinner loading-sm"></span>
+          </button>
+          <div id="edit-result" class="empty:hidden flex-1"></div>
+        </div>
+      </div>
+    </div>
+  </form>
+
+  <!-- ══ TEST CASES ════════════════════════════════════════════════════ -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg">Test cases</h2>
+      <p class="text-[13px] text-base-content/55 -mt-1 mb-3">
+        Run in order. Public samples are downloadable from the challenge page; the rest stay hidden.
+      </p>
+
+      <!-- Every mutation returns this whole list, so it always matches the database -->
+      <div id="testcases">
+        {% include "f-testcases.jinja" %}
+      </div>
+    </div>
+  </div>
+</main>
+{% endblock %}

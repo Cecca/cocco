@@ -1,0 +1,119 @@
+{# The test case list. Every mutation returns this whole fragment, so what is
+   on screen always matches the database. Rendered both standalone (htmx) and
+   inlined by challenge-edit.jinja. #}
+
+{% if message %}
+<div role="alert" class="alert {{ 'alert-success' if ok else 'alert-error' }} text-sm mb-4">
+  <span>{{ message }}</span>
+</div>
+{% endif %}
+
+<div class="overflow-x-auto">
+  <table class="table">
+    <thead>
+      <tr class="text-xs uppercase tracking-wider text-base-content/45 font-mono">
+        <th class="w-12">#</th>
+        <th>Input</th>
+        <th>Expected output</th>
+        <th class="w-28">Public</th>
+        <th class="w-32 text-right">Order</th>
+        <th class="w-16"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for testcase in testcases %}
+      <tr>
+        <td class="font-mono font-semibold text-base-content/50">{{ loop.index }}</td>
+
+        {% for kind, path in [("input", testcase.input_path),
+                              ("output", testcase.expected_output_path)] %}
+        <td>
+          <form hx-post="{{ url_for('post_testcase_rename', course_id=course_id, challenge_id=challenge_id, testcase_id=testcase.id) }}"
+                hx-target="#testcases"
+                hx-swap="innerHTML"
+                class="flex items-center gap-1.5">
+            <input type="hidden" name="kind" value="{{ kind }}" />
+            <input type="text" name="name" value="{{ path.split('/') | last }}"
+                   class="input input-sm input-ghost font-mono text-sm w-full max-w-[14rem] px-2"
+                   aria-label="{{ kind }} file name" />
+            <button type="submit" class="btn btn-xs btn-ghost text-primary" title="Rename">✎</button>
+          </form>
+        </td>
+        {% endfor %}
+
+        <td>
+          {# Unchecked checkboxes are simply not submitted, so the route
+             defaults is_sample to false. #}
+          <input type="checkbox" name="is_sample" value="true"
+                 class="checkbox checkbox-sm checkbox-primary"
+                 {% if testcase.is_sample %}checked{% endif %}
+                 aria-label="Public sample"
+                 hx-post="{{ url_for('post_testcase_sample', course_id=course_id, challenge_id=challenge_id, testcase_id=testcase.id) }}"
+                 hx-trigger="change"
+                 hx-target="#testcases"
+                 hx-swap="innerHTML" />
+        </td>
+
+        <td class="text-right">
+          <div class="flex items-center justify-end gap-1">
+            {% for direction, glyph, disabled in [("up", "↑", loop.first), ("down", "↓", loop.last)] %}
+            <form hx-post="{{ url_for('post_testcase_move', course_id=course_id, challenge_id=challenge_id, testcase_id=testcase.id) }}"
+                  hx-target="#testcases"
+                  hx-swap="innerHTML">
+              <input type="hidden" name="direction" value="{{ direction }}" />
+              <button type="submit" class="btn btn-xs btn-ghost font-mono"
+                      title="Move {{ direction }}"
+                      {% if disabled %}disabled{% endif %}>{{ glyph }}</button>
+            </form>
+            {% endfor %}
+          </div>
+        </td>
+
+        <td class="text-right">
+          <form hx-post="{{ url_for('post_testcase_delete', course_id=course_id, challenge_id=challenge_id, testcase_id=testcase.id) }}"
+                hx-target="#testcases"
+                hx-swap="innerHTML"
+                hx-confirm="Delete this test case? Both files are removed and past submissions lose their link to it.">
+            <button type="submit" class="btn btn-xs btn-ghost text-error" title="Delete">✕</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="6" class="text-center text-sm text-base-content/45 py-6">
+          No test cases yet — a submission to this challenge would score nothing.
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- ── ADD A TEST CASE ──────────────────────────────────────────────── -->
+<form hx-post="{{ url_for('post_testcase', course_id=course_id, challenge_id=challenge_id) }}"
+      hx-encoding="multipart/form-data"
+      hx-target="#testcases"
+      hx-swap="innerHTML"
+      class="mt-5 rounded-xl border border-base-300 bg-base-200/40 p-4">
+  <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Add a test case</h3>
+  <div class="flex flex-wrap items-end gap-4">
+    <div>
+      <label class="text-xs text-base-content/55">Input file</label>
+      <input type="file" name="input_file" required
+             class="file-input file-input-sm w-56 mt-1" />
+    </div>
+    <div>
+      <label class="text-xs text-base-content/55">Expected output file</label>
+      <input type="file" name="expected_output_file" required
+             class="file-input file-input-sm w-56 mt-1" />
+    </div>
+    <label class="flex items-center gap-2 text-sm pb-2">
+      <input type="checkbox" name="is_sample" value="true" class="checkbox checkbox-sm checkbox-primary" />
+      Public sample
+    </label>
+    <button type="submit" class="btn btn-sm btn-primary">
+      <span class="submit-label">Add</span>
+      <span class="htmx-indicator loading loading-spinner loading-xs"></span>
+    </button>
+  </div>
+</form>

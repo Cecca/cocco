@@ -17,9 +17,12 @@ from cocco.model import (
     User,
     metadata,
 )
+from cocco.model import UserRole
 from cocco.repository import (
     pull_queued_submission,
     query_challenge,
+    query_challenge_testcases,
+    query_user_role,
     query_user_submissions,
 )
 from cocco.schema import SubmissionRunData
@@ -296,13 +299,20 @@ async def test_challenge_page_queries():
 
     engine = create_async_engine(url)
     async with engine.connect() as conn:
-        challenge = await query_challenge(conn, challenge_id=1)
+        # carol (user 4) is a student on Algorithms 101
+        challenge = await query_challenge(conn, user_id=4, challenge_id=1)
         assert challenge is not None
         assert challenge["title"] == "Hello"
         assert challenge["course_title"] == "Algorithms 101"
         assert challenge["position"] == 1
+        assert challenge["viewer_role"] == "student"
         # one of the three test cases per challenge is public
         assert [s["execution_order"] for s in challenge["samples"]] == [0]
+
+        # alice (user 2) teaches it, and is the one who gets the Edit button
+        as_teacher = await query_challenge(conn, user_id=2, challenge_id=1)
+        assert as_teacher is not None
+        assert as_teacher["viewer_role"] == "teacher"
 
         # carol (user 4) has two attempts on "Hello", newest first
         submissions = await query_user_submissions(conn, user_id=4, challenge_id=1)
@@ -312,11 +322,22 @@ async def test_challenge_page_queries():
         assert sum(1 for s in submissions if s["is_best"]) == 1
 
         # a challenge nobody has attempted still comes back, with no samples lost
-        untouched = await query_challenge(conn, challenge_id=5)
+        untouched = await query_challenge(conn, user_id=4, challenge_id=5)
         assert untouched is not None
         assert untouched["title"] == "Parallel sum"
+        # carol is not enrolled on Systems Programming
+        assert untouched["viewer_role"] is None
 
         # ...and its submission list is simply empty rather than None-ish
         assert await query_user_submissions(conn, user_id=4, challenge_id=5) is None
+
+        # The editor's authorization check, and the list it drives
+        assert await query_user_role(conn, user_id=2, challenge_id=1) == UserRole.teacher
+        assert await query_user_role(conn, user_id=4, challenge_id=1) == UserRole.student
+        assert await query_user_role(conn, user_id=4, challenge_id=5) is None
+
+        testcases = await query_challenge_testcases(conn, 1)
+        assert [tc.execution_order for tc in testcases] == [0, 1, 2]
+        assert [tc.is_sample for tc in testcases] == [True, False, False]
     await engine.dispose()
 

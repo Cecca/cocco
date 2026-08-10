@@ -12,12 +12,21 @@
     <!-- ── LEFT: problem + sample files ─────────────────────────────── -->
     <div class="card bg-base-100 border border-base-300 shadow-sm">
       <div class="card-body p-8">
-        <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
-          <a href="{{ url_for('get_course', course_id=course_id) }}" class="hover:text-primary">
-            {{ challenge.course_title }}
+        <div class="flex items-start justify-between gap-4">
+          <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+            <a href="{{ url_for('get_course', course_id=course_id) }}" class="hover:text-primary">
+              {{ challenge.course_title }}
+            </a>
+            · Challenge {{ "%02d" | format(challenge.position) }}
+          </p>
+          {# Course staff only. The real check is on the edit routes themselves. #}
+          {% if can_edit %}
+          <a href="{{ url_for('get_challenge_edit', course_id=course_id, challenge_id=challenge.id) }}"
+             class="btn btn-sm btn-ghost gap-1.5 font-semibold border border-base-300 -mt-1">
+            <span class="text-primary">✎</span> Edit
           </a>
-          · Challenge {{ "%02d" | format(challenge.position) }}
-        </p>
+          {% endif %}
+        </div>
         <h1 class="font-serif text-4xl font-semibold tracking-tight mt-1 mb-4">{{ challenge.title }}</h1>
 
         <!-- Limits enforced by the sandbox, straight from the challenge row -->

@@ -74,11 +74,22 @@ Uploads carry no language field: `post_submission` maps the file extension to a 
 
 Auth is still stubbed: `get_user` returns a hardcoded user.
 
+### Authorization
+
+`role` lives on `enrollment`, so permissions are **per course**, not site-wide. `EDITOR_ROLES`
+(teacher, admin, collaborator) is course staff; students and the unenrolled are read-only.
+
+The challenge editor's routes all depend on `require_challenge_editor`, which 403s a non-staff user.
+Hiding a control in a template is presentation, never access control — anything that mutates a
+challenge must go through that dependency.
+
 ## Conventions specific to this repo
 
 - **Async everywhere in `judge.py`.** Subprocess calls use `asyncio.create_subprocess_exec`; tests are `async def` and rely on `asyncio_mode = "auto"` in `pyproject.toml`, so no `@pytest.mark.asyncio` is needed.
 - **Box ids are a shared resource.** Always go through `_IDS_POOL.acquire()` rather than hardcoding a box id; the pool defaults to 32 concurrent boxes.
-- **Large inputs live on disk.** Test case inputs/outputs are passed by path, not read into memory, and isolate takes stdin directly from a file descriptor. Preserve this when adding features.
+- **Large inputs live on disk.** Test case inputs/outputs are passed by path, not read into memory, and isolate takes stdin directly from a file descriptor. Preserve this when adding features — uploaded test files go through `Storage.save_stream`, never `await upload.read()`.
+- **All file access goes through `Storage`.** `Storage.resolve` refuses any path that would land outside the storage root, and `safe_filename` reduces a user-supplied name to a bare, harmless one. Test case paths come from the database and ultimately from teacher input, so never join them onto a base directory by hand.
+- **Deleting a test case detaches its outcomes.** `testoutcome.testcase_id` is a FK with no `ON DELETE`, so `delete_testcase` nulls it first. Past submissions keep their scores and the history keeps rendering.
 - **Language runtimes are pinned by `flake.lock`.** Changing a compiler version means updating the flake, not the system.
 - **Scores are per test case, in `[0, 1]`.** A submission's headline score is the mean of its outcomes' scores, shown out of 100. This aggregation assumes higher-is-better, so it is wrong for a challenge using `RMSEEvaluator`.
 - **CSS is a build artifact.** Edit `assets/styles.css`, never `static/styles.css`. Tailwind only emits classes it can see, so it scans `templates/**/*.jinja` and `cocco/**/*.py` (`@source` directives); a class assembled dynamically at runtime will not be generated.
