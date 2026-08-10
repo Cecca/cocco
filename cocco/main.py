@@ -1,9 +1,12 @@
+from pathlib import Path
 from typing import Annotated
 import markdown as md
 from markupsafe import Markup
 from sqlalchemy import insert, select
 from cocco.avatar import generate_identicon
 from cocco.evaluator import EqualityEvaluator
+from cocco.judge import load_languages
+from cocco.storage import Storage
 from cocco.model import (
     Challenge,
     Course,
@@ -17,14 +20,23 @@ from cocco.model import (
     metadata,
 )
 from cocco import schema
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 import os
 
-from cocco.repository import query_course_info, query_courses, insert_enrollment, query_challenge, query_user_submissions
+from cocco.repository import (
+    insert_enrollment,
+    insert_submission,
+    query_challenge,
+    query_challenge_leaderboard,
+    query_course_info,
+    query_courses,
+    query_sample_testcase,
+    query_user_submissions,
+)
 
 
 # Root of the app
@@ -40,6 +52,22 @@ engine = create_async_engine(url)
 # The templates directory
 templates = Jinja2Templates(directory="templates")
 
+# Test case inputs and expected outputs live on the filesystem, not in the
+# database (see DESIGN.md). The judge must be pointed at the same root, either
+# through this variable or through its own --storage flag.
+storage = Storage(Path(os.environ.get("COCCO_STORAGE", "/tmp/cocco-storage")))
+
+# Uploads are mapped to a language by their extension, so the challenge page
+# needs no language picker. `languages.toml` is the same file the judge loads.
+LANGUAGES = load_languages(Path("languages.toml"))
+EXTENSION_TO_LANGUAGE = {
+    ext.lower(): name
+    for name, language in LANGUAGES.items()
+    for ext in language.extensions
+}
+
+MAX_UPLOAD_BYTES = 1 << 20
+
 
 def render_markdown(text: str | None) -> Markup:
     html = md.markdown(text or "", extensions=["fenced_code", "tables"])
@@ -52,8 +80,24 @@ def render_datetime(value):
         value = datetime.fromisoformat(value)
     return format_datetime(value, locale="en")
 
+def render_score(value) -> str:
+    """Per-test scores are in [0, 1]; the UI shows their mean out of 100."""
+    if value is None:
+        return "—"
+    return f"{round(float(value) * 100)}"
+
+def render_duration(value) -> str:
+    if value is None:
+        return "—"
+    value = float(value)
+    if value < 1:
+        return f"{value * 1000:.0f} ms"
+    return f"{value:.2f} s"
+
 templates.env.filters["markdown"] = render_markdown
 templates.env.filters["datetime"] = render_datetime
+templates.env.filters["score"] = render_score
+templates.env.filters["duration"] = render_duration
 
 
 async def create_db_and_tables(dummy=False):
@@ -324,16 +368,84 @@ async def get_challenge(
 ):
     if user.id is None:
         raise HTTPException(status_code=404)
-    challenge = await query_challenge(db, user_id=user.id, challenge_id=challenge_id)
+    challenge = await query_challenge(db, challenge_id=challenge_id)
+    if challenge is None:
+        raise HTTPException(status_code=404)
     return templates.TemplateResponse(
         request=request,
         name="challenge.jinja",
         context={
             "user": user,
             "course_id": course_id,
-            "challenge": challenge
+            "challenge": challenge,
+            "title": challenge["title"],
         },
     )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/submissions")
+async def post_submission(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    solution: Annotated[UploadFile, File()],
+):
+    """Enqueue an uploaded solution. The judge process picks it up from there.
+
+    Errors are reported as a 200 with an error alert rather than a 4xx: htmx
+    does not swap the response of an error status by default, and the fragment
+    is the whole point of the request.
+    """
+    if user.id is None:
+        raise HTTPException(status_code=404)
+
+    def alert(message: str, ok: bool = False):
+        return templates.TemplateResponse(
+            request=request,
+            name="f-submit-result.jinja",
+            context={"ok": ok, "message": message},
+        )
+
+    filename = os.path.basename(solution.filename or "")
+    if not filename:
+        return alert("No file was uploaded.")
+
+    contents = await solution.read()
+    if len(contents) > MAX_UPLOAD_BYTES:
+        return alert(
+            f"That file is {len(contents) / 1024:.0f} KB — the limit is 1 MB."
+        )
+
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    language = EXTENSION_TO_LANGUAGE.get(extension)
+    if language is None:
+        known = ", ".join(sorted("." + e for e in EXTENSION_TO_LANGUAGE))
+        return alert(f"Cannot tell the language of {filename!r}. Accepted: {known}.")
+
+    try:
+        source = contents.decode("utf-8")
+    except UnicodeDecodeError:
+        return alert(f"{filename} is not valid UTF-8 text.")
+
+    await insert_submission(
+        db,
+        user_id=user.id,
+        challenge_id=challenge_id,
+        language=language,
+        filename=filename,
+        source=source,
+    )
+    # get_db hands out a plain connection with no surrounding transaction
+    await db.commit()
+
+    return alert(
+        f"{filename} was queued as a {language} submission. "
+        "Results appear below as the judge works through it.",
+        ok=True,
+    )
+
 
 @app.get("/f/submissions/{challenge_id}")
 async def get_fragment_submissions(
@@ -346,8 +458,49 @@ async def get_fragment_submissions(
         request=request,
         name="f-submissions.jinja",
         context={
-            "submissions": submissions
+            "submissions": submissions or []
         },
+    )
+
+
+@app.get("/f/leaderboard/{challenge_id}")
+async def get_fragment_leaderboard(
+    challenge_id: int, request: Request, db: DBDep, user: CurrentUser
+):
+    entries = await query_challenge_leaderboard(db, challenge_id=challenge_id)
+    return templates.TemplateResponse(
+        request=request,
+        name="f-leaderboard.jinja",
+        context={
+            "entries": entries or [],
+            "user": user,
+        },
+    )
+
+
+@app.get("/challenges/{challenge_id}/samples/{testcase_id}/{kind}")
+async def get_sample_file(challenge_id: int, testcase_id: int, kind: str, db: DBDep):
+    """Serve the input or expected output of a *public* test case.
+
+    `query_sample_testcase` returns nothing for hidden test cases, so those
+    404 rather than leaking the judge's data.
+    """
+    if kind not in ("input", "output"):
+        raise HTTPException(status_code=404)
+    testcase = await query_sample_testcase(db, challenge_id, testcase_id)
+    if testcase is None:
+        raise HTTPException(status_code=404)
+
+    relative = (
+        testcase.input_path if kind == "input" else testcase.expected_output_path
+    )
+    path = storage.resolve(relative)
+    if not path.is_file():
+        raise HTTPException(status_code=404)
+    return FileResponse(
+        path,
+        media_type="text/plain",
+        filename=f"sample{testcase.execution_order + 1}_{kind}.txt",
     )
 
 

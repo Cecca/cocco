@@ -536,8 +536,11 @@ if __name__ == "__main__":
         parser.add_argument(
             "--storage",
             type=Path,
-            default=Path("/tmp/cocco-storage"),
-            help="Path to the storage root for test inputs/outputs (default: /tmp/cocco-storage)",
+            default=Path(os.environ.get("COCCO_STORAGE", "/tmp/cocco-storage")),
+            help=(
+                "Path to the storage root for test inputs/outputs. Must match the "
+                "web app's COCCO_STORAGE (default: $COCCO_STORAGE or /tmp/cocco-storage)"
+            ),
         )
         parser.add_argument(
             "--log-level",
