@@ -65,12 +65,24 @@
       <div class="card bg-base-100 border border-base-300 shadow-sm">
         <div class="card-body p-5">
           <div class="flex items-center justify-between">
-            <h2 class="font-bold text-[15px]">Fastest solutions</h2>
+            <h2 class="font-bold text-[15px]">
+              {% if challenge.ranking == 'total_score' %}Top total scores
+              {% elif challenge.ranking == 'average_score' %}Top average scores
+              {% else %}Fastest solutions{% endif %}
+            </h2>
             <span class="font-mono text-xs text-success flex items-center gap-1.5">
               <span class="h-1.5 w-1.5 rounded-full bg-success"></span>live
             </span>
           </div>
-          <p class="text-xs text-base-content/55 -mt-1 mb-2">Total running time of each student's fastest correct submission</p>
+          <p class="text-xs text-base-content/55 -mt-1 mb-2">
+            {% if challenge.ranking == 'total_score' %}
+            Points scored across all tests by each student's best submission
+            {% elif challenge.ranking == 'average_score' %}
+            Average per-test score of each student's best submission
+            {% else %}
+            Total running time of each student's fastest correct submission
+            {% endif %}
+          </p>
 
           <div id="leaderboard"
                hx-get="{{ url_for('get_fragment_leaderboard', challenge_id=challenge.id) }}"

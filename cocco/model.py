@@ -34,6 +34,20 @@ class SubmissionStatus(Enum):
     done = "done"
 
 
+class LeaderboardRanking(str, Enum):
+    """What "best" means on a challenge's leaderboard.
+
+    `running_time` is the speed board: only a submission that passed every test
+    qualifies, and the fastest one wins. The two score boards admit partially
+    correct submissions - that is the whole point of running a challenge on a
+    partial-credit evaluator - and rank them highest first.
+    """
+
+    running_time = "running_time"
+    total_score = "total_score"
+    average_score = "average_score"
+
+
 class OutcomeEnum(Enum):
     success = "success"
     compile_failure = "compile_failure"
@@ -100,6 +114,15 @@ Challenge = Table(
     Column("max_time_s", Float, nullable=False),
     Column("max_threads", Integer, nullable=False, default=1),
     Column("evaluator", EvaluatorType, nullable=False),
+    # Which leaderboard the challenge page shows. Course staff pick it in the
+    # editor; the judge is unaware of it.
+    Column(
+        "ranking",
+        SAEnum(LeaderboardRanking),
+        nullable=False,
+        default=LeaderboardRanking.running_time,
+        server_default=text("'running_time'"),
+    ),
 )
 
 

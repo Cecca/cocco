@@ -17,12 +17,14 @@ from cocco.model import (
     User,
     metadata,
 )
-from cocco.model import UserRole
+from cocco.model import LeaderboardRanking, UserRole
 from cocco.repository import (
     count_running_submissions,
     count_testcase_outcomes,
     pull_queued_submission,
     query_challenge,
+    query_challenge_leaderboard,
+    query_challenge_ranking,
     query_challenge_standings,
     query_challenge_testcases,
     query_sample_testcase,
@@ -454,6 +456,46 @@ async def test_challenge_page_queries():
         assert pending is not None
         assert sorted(s["nickname"] for s in pending) == ["dave", "erin"]
         assert all(s["n_pending"] == 1 and s["score"] is None for s in pending)
+
+        # ── the leaderboard ───────────────────────────────────────────────
+        # A challenge ranks by running time until someone changes it
+        assert (
+            await query_challenge_ranking(conn, 1) == LeaderboardRanking.running_time
+        )
+        assert await query_challenge_ranking(conn, 999) is None
+
+        # Nobody passed all three tests of "Hello", so the speed board is empty
+        # even though there are graded submissions to show...
+        assert (
+            await query_challenge_leaderboard(
+                conn, 1, LeaderboardRanking.running_time
+            )
+            is None
+        )
+
+        # ...and that is exactly what the score boards are for: carol and dave
+        # both peak at 2 of 3, and the tie goes to the faster one.
+        by_total = await query_challenge_leaderboard(
+            conn, 1, LeaderboardRanking.total_score
+        )
+        assert by_total is not None
+        assert [e["nickname"] for e in by_total] == ["carol", "dave"]
+        assert [e["rank"] for e in by_total] == [1, 2]
+        assert by_total[0]["total_score"] == pytest.approx(2.0)
+        # The denominator the points are shown out of
+        assert [e["n_tests"] for e in by_total] == [3, 3]
+        assert by_total[0]["elapsed_s"] < by_total[1]["elapsed_s"]
+
+        by_average = await query_challenge_leaderboard(
+            conn, 1, LeaderboardRanking.average_score
+        )
+        assert by_average is not None
+        assert [e["nickname"] for e in by_average] == ["carol", "dave"]
+        assert by_average[0]["average_score"] == pytest.approx(2 / 3)
+
+        # A user is represented once, by their best attempt: carol's other
+        # "Hello" submission scored 1 of 3 and is nowhere to be seen.
+        assert len([e for e in by_total if e["nickname"] == "carol"]) == 1
 
         # ── regrading ─────────────────────────────────────────────────────
         # Nothing is running on "Hello", but dave's "Buffer copy" is - that is

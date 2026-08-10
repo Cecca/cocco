@@ -60,6 +60,41 @@
       </div>
     </div>
 
+    <!-- ══ LEADERBOARD ═════════════════════════════════════════════════ -->
+    <!-- Inside the same form as the limits below: one Save covers both, and the
+         submit button lives at the end of that card. -->
+    <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+      <div class="card-body p-7">
+        <h2 class="font-bold text-lg">Leaderboard</h2>
+        <p class="text-[13px] text-base-content/55 -mt-1">
+          What the board on the challenge page ranks students by. Every student is
+          represented by their single best submission.
+        </p>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-3">
+          <div>
+            <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Rank by</label>
+            <select name="ranking" class="select w-full mt-1.5">
+              <option value="running_time" {{ 'selected' if challenge.ranking == 'running_time' }}>
+                Running time — fastest fully correct submission
+              </option>
+              <option value="total_score" {{ 'selected' if challenge.ranking == 'total_score' }}>
+                Total score — points summed over all tests
+              </option>
+              <option value="average_score" {{ 'selected' if challenge.ranking == 'average_score' }}>
+                Average score — mean score per test
+              </option>
+            </select>
+          </div>
+          <p class="text-[13px] text-base-content/55 sm:mt-6">
+            Ranking by time shows only students who passed every test; the two score
+            rankings include partially correct submissions. Both score rankings assume
+            higher is better, so neither suits a challenge scored with RMSE.
+          </p>
+        </div>
+      </div>
+    </div>
+
     <!-- ══ SANDBOX LIMITS ══════════════════════════════════════════════ -->
     <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
       <div class="card-body p-7">

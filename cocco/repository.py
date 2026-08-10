@@ -13,6 +13,7 @@ from cocco.model import (
     Challenge,
     Course,
     Enrollment,
+    LeaderboardRanking,
     Submission,
     SubmissionStatus,
     TestCase,
@@ -211,21 +212,67 @@ async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int
     return res.scalar_one_or_none()
 
 
-async def query_challenge_leaderboard(
-    conn: AsyncConnection, challenge_id: int, limit: int = 10
-):
-    """Ranking of the users who solved the challenge, fastest first.
+# What each ranking criterion means, as (qualifier, ordering) pairs of literal
+# SQL spliced into the leaderboard query below. They are written here and keyed
+# by the enum - no request data ever reaches the query as text.
+#
+# The speed board keeps its historical rule: only a submission that passed every
+# test is on it. The score boards take any submission that was actually graded,
+# because a partial-credit evaluator is exactly the case where nobody passes
+# everything, and they fall back on time to break a tie.
+_LEADERBOARD_CRITERIA: dict[LeaderboardRanking, tuple[str, str]] = {
+    LeaderboardRanking.running_time: (
+        "all_passed AND elapsed_s IS NOT NULL",
+        "elapsed_s ASC",
+    ),
+    LeaderboardRanking.total_score: (
+        "total_score IS NOT NULL",
+        "total_score DESC, elapsed_s ASC NULLS LAST",
+    ),
+    LeaderboardRanking.average_score: (
+        "average_score IS NOT NULL",
+        "average_score DESC, elapsed_s ASC NULLS LAST",
+    ),
+}
 
-    A submission qualifies only if it is done and every one of its tests
-    succeeded; its time is the sum of the per-test running times. Each user is
-    represented by their fastest qualifying submission.
+
+async def query_challenge_ranking(
+    conn: AsyncConnection, challenge_id: int
+) -> LeaderboardRanking | None:
+    """The challenge's leaderboard criterion, or None if there is no such
+    challenge. Its own query because the leaderboard fragment polls every few
+    seconds and has no use for the rest of `query_challenge`'s document."""
+    res = await conn.execute(
+        select(Challenge.c.ranking).where(Challenge.c.id == challenge_id)
+    )
+    return res.scalar_one_or_none()
+
+
+async def query_challenge_leaderboard(
+    conn: AsyncConnection,
+    challenge_id: int,
+    ranking: LeaderboardRanking = LeaderboardRanking.running_time,
+    limit: int = 10,
+):
+    """Ranking of the users who did best on the challenge, best first.
+
+    "Best" is whatever the challenge says: the total running time of a fully
+    correct submission, the sum of its per-test scores, or their mean - see
+    `_LEADERBOARD_CRITERIA`. Only submissions that are done and have outcomes
+    count, and each user is represented by their single best one. Every metric
+    comes back on every row, so a row carries the number the criterion ranked on
+    plus the `n_tests` the scores are out of.
     """
-    query = text("""
+    qualifier, order = _LEADERBOARD_CRITERIA[LeaderboardRanking(ranking)]
+    query = text(f"""
     WITH
     per_submission AS (
         SELECT submission.id,
                submission.user_id,
                sum(testoutcome.elapsed_s) AS elapsed_s,
+               sum(testoutcome.score) AS total_score,
+               avg(testoutcome.score) AS average_score,
+               count(testoutcome.id) AS n_tests,
                bool_and(testoutcome.outcome = 'success') AS all_passed
         FROM submission
         JOIN testoutcome ON testoutcome.submission_id = submission.id
@@ -234,20 +281,29 @@ async def query_challenge_leaderboard(
         GROUP BY submission.id, submission.user_id
     ),
     best AS (
-        SELECT DISTINCT ON (user_id) user_id, id AS submission_id, elapsed_s
+        SELECT DISTINCT ON (user_id)
+               user_id,
+               id AS submission_id,
+               elapsed_s,
+               total_score,
+               average_score,
+               n_tests
         FROM per_submission
-        WHERE all_passed AND elapsed_s IS NOT NULL
-        ORDER BY user_id, elapsed_s
+        WHERE {qualifier}
+        ORDER BY user_id, {order}, id
     ),
     board AS (
-        SELECT row_number() OVER (ORDER BY best.elapsed_s) AS rank,
+        SELECT row_number() OVER (ORDER BY {order}, submission_id) AS rank,
                best.user_id,
                best.submission_id,
                best.elapsed_s,
+               best.total_score,
+               best.average_score,
+               best.n_tests,
                "user".nickname
         FROM best
         JOIN "user" ON "user".id = best.user_id
-        ORDER BY best.elapsed_s
+        ORDER BY rank
         LIMIT :limit
     )
     SELECT json_agg(board ORDER BY board.rank) FROM board;

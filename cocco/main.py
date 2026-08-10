@@ -10,6 +10,7 @@ from cocco.storage import Storage, safe_filename
 from cocco.model import (
     Challenge,
     Course,
+    LeaderboardRanking,
     OutcomeEnum,
     Submission,
     SubmissionStatus,
@@ -46,6 +47,7 @@ from cocco.repository import (
     insert_testcase,
     query_challenge,
     query_challenge_leaderboard,
+    query_challenge_ranking,
     query_challenge_standings,
     query_challenge_testcases,
     query_course_info,
@@ -547,12 +549,18 @@ async def get_fragment_submissions(
 async def get_fragment_leaderboard(
     challenge_id: int, request: Request, db: DBDep, user: CurrentUser
 ):
-    entries = await query_challenge_leaderboard(db, challenge_id=challenge_id)
+    ranking = await query_challenge_ranking(db, challenge_id)
+    if ranking is None:
+        raise HTTPException(status_code=404)
+    entries = await query_challenge_leaderboard(
+        db, challenge_id=challenge_id, ranking=ranking
+    )
     return templates.TemplateResponse(
         request=request,
         name="f-leaderboard.jinja",
         context={
             "entries": entries or [],
+            "ranking": ranking.value,
             "user": user,
         },
     )
@@ -788,8 +796,9 @@ async def post_challenge_edit(
     max_time_s: Annotated[float, Form()],
     max_memory_mb: Annotated[float, Form()],
     max_threads: Annotated[int, Form()],
+    ranking: Annotated[str, Form()],
 ):
-    """Save the problem statement and the sandbox limits."""
+    """Save the problem statement, the sandbox limits and the leaderboard."""
 
     def alert(message: str, ok: bool = False):
         return templates.TemplateResponse(
@@ -801,6 +810,11 @@ async def post_challenge_edit(
     if max_time_s <= 0 or max_memory_mb <= 0 or max_threads < 1:
         return alert("Limits must be positive.")
 
+    try:
+        criterion = LeaderboardRanking(ranking)
+    except ValueError:
+        return alert("Unknown leaderboard ranking.")
+
     await update_challenge(
         db,
         challenge_id,
@@ -808,6 +822,7 @@ async def post_challenge_edit(
         max_time_s=max_time_s,
         max_memory_bytes=int(max_memory_mb * 1024 * 1024),
         max_threads=max_threads,
+        ranking=criterion,
     )
     await db.commit()
     return alert("Saved.", ok=True)
