@@ -4,9 +4,8 @@ Functions in this module return models from `cocco.models`,
 or their combinations
 """
 
-from sqlalchemy import Connection, insert, select, text, update
+from sqlalchemy import Connection, and_, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection
-from icecream import ic
 
 from cocco import schema
 from cocco.schema import SubmissionRunData
@@ -88,61 +87,184 @@ async def insert_enrollment(conn: AsyncConnection, user_id: int, course_id: int,
     await conn.execute(stmt)
 
 
+async def insert_submission(
+    conn: AsyncConnection,
+    user_id: int,
+    challenge_id: int,
+    language: str,
+    filename: str,
+    source: str,
+) -> int:
+    """Enqueue a new submission. Like `insert_enrollment`, this does not commit:
+    the caller owns the transaction."""
+    stmt = (
+        insert(Submission)
+        .values(
+            user_id=user_id,
+            challenge_id=challenge_id,
+            language=language,
+            filename=filename,
+            source=source,
+            status=SubmissionStatus.queued,
+        )
+        .returning(Submission.c.id)
+    )
+    return (await conn.execute(stmt)).scalar_one()
+
+
 async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_id: int):
+    """All the attempts of a user on a challenge, newest first.
+
+    Submissions are LEFT JOINed to their outcomes so that `queued` and `running`
+    ones - which have no outcomes yet - still show up: those are exactly the
+    rows the challenge page polls for.
+
+    The aggregate `score` is the mean of the per-test scores. Note that this is
+    only meaningful for higher-is-better evaluators; `RMSEEvaluator` returns a
+    score where lower is better, and this aggregation gets it backwards.
+    """
     query = text("""
     WITH
     outcomes AS (
-        SELECT submission_id, json_agg(testoutcome) as outcome  
+        SELECT submission_id,
+               json_agg(testoutcome ORDER BY testoutcome.id) AS outcome,
+               avg(coalesce(score, 0)) AS score,
+               sum(elapsed_s) AS elapsed_s,
+               count(*) FILTER (WHERE outcome = 'success') AS n_passed,
+               count(*) AS n_tests
         FROM testoutcome
         GROUP BY submission_id
     ),
-    submission AS (
-        SELECT submission.*, outcomes.outcome
+    attempts AS (
+        SELECT submission.*,
+               outcomes.outcome,
+               outcomes.score,
+               outcomes.elapsed_s,
+               outcomes.n_passed,
+               outcomes.n_tests,
+               row_number() OVER (ORDER BY submission.enqueued) AS attempt
         FROM submission
-        JOIN outcomes ON submission.id = outcomes.submission_id
-        ORDER BY enqueued
+        LEFT JOIN outcomes ON submission.id = outcomes.submission_id
+        WHERE submission.challenge_id = :challenge_id
+          AND submission.user_id = :user_id
+    ),
+    ranked AS (
+        SELECT attempts.*,
+               attempts.score IS NOT NULL
+               AND row_number() OVER (
+                   ORDER BY attempts.score DESC NULLS LAST, attempts.attempt DESC
+               ) = 1 AS is_best
+        FROM attempts
     )
-    SELECT json_agg(submission)
-    FROM submission
-    LEFT JOIN outcomes ON submission.id = outcomes.submission_id
-    WHERE challenge_id = :challenge_id
-      AND user_id = :user_id;
+    SELECT json_agg(ranked ORDER BY ranked.attempt DESC) FROM ranked;
     """)
 
     res = await conn.execute(query, dict(user_id=user_id, challenge_id=challenge_id))
     return res.scalar_one_or_none()
 
-async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int):
+
+async def query_challenge(conn: AsyncConnection, challenge_id: int):
+    """The challenge itself, its course, its position within the course and its
+    public sample test cases.
+
+    Submissions are deliberately not part of this document: the challenge page
+    loads them through `query_user_submissions` and keeps them fresh by polling.
+    """
     query = text("""
     WITH
-    outcomes AS (
-        SELECT submission_id, json_agg(testoutcome) as outcome  
-        FROM testoutcome
-        GROUP BY submission_id
-    ),
-    submission AS (
-        SELECT submission.*, outcomes.outcome
-        FROM submission
-        JOIN outcomes ON submission.id = outcomes.submission_id
-        ORDER BY enqueued
-    ),
-    subs AS (
-        SELECT challenge_id, json_agg(submission) as subs
-        FROM submission
-        LEFT JOIN outcomes ON submission.id = outcomes.submission_id
-        WHERE challenge_id = :challenge_id
-          AND user_id = :user_id
+    samples AS (
+        SELECT challenge_id,
+               json_agg(json_build_object('id', id, 'execution_order', execution_order)
+                        ORDER BY execution_order) AS samples
+        FROM testcase
+        WHERE is_sample
         GROUP BY challenge_id
     ),
-    cs AS ( SELECT challenge.*, subs.subs as submissions
+    positions AS (
+        SELECT id,
+               row_number() OVER (PARTITION BY course_id ORDER BY id) AS position
         FROM challenge
-        -- JOIN tc ON tc.challenge_id = challenge.id
-        JOIN subs on subs.challenge_id = challenge.id)
+    ),
+    cs AS (
+        SELECT challenge.*,
+               course.title AS course_title,
+               positions.position AS position,
+               coalesce(samples.samples, '[]'::json) AS samples
+        FROM challenge
+        LEFT JOIN course ON course.id = challenge.course_id
+        LEFT JOIN positions ON positions.id = challenge.id
+        LEFT JOIN samples ON samples.challenge_id = challenge.id
+        WHERE challenge.id = :challenge_id
+    )
     SELECT row_to_json(cs) FROM cs;
     """)
 
-    res = await conn.execute(query, dict(user_id=user_id, challenge_id=challenge_id))
-    return ic(res.scalar_one_or_none())
+    res = await conn.execute(query, dict(challenge_id=challenge_id))
+    return res.scalar_one_or_none()
+
+
+async def query_challenge_leaderboard(
+    conn: AsyncConnection, challenge_id: int, limit: int = 10
+):
+    """Ranking of the users who solved the challenge, fastest first.
+
+    A submission qualifies only if it is done and every one of its tests
+    succeeded; its time is the sum of the per-test running times. Each user is
+    represented by their fastest qualifying submission.
+    """
+    query = text("""
+    WITH
+    per_submission AS (
+        SELECT submission.id,
+               submission.user_id,
+               sum(testoutcome.elapsed_s) AS elapsed_s,
+               bool_and(testoutcome.outcome = 'success') AS all_passed
+        FROM submission
+        JOIN testoutcome ON testoutcome.submission_id = submission.id
+        WHERE submission.challenge_id = :challenge_id
+          AND submission.status = 'done'
+        GROUP BY submission.id, submission.user_id
+    ),
+    best AS (
+        SELECT DISTINCT ON (user_id) user_id, id AS submission_id, elapsed_s
+        FROM per_submission
+        WHERE all_passed AND elapsed_s IS NOT NULL
+        ORDER BY user_id, elapsed_s
+    ),
+    board AS (
+        SELECT row_number() OVER (ORDER BY best.elapsed_s) AS rank,
+               best.user_id,
+               best.submission_id,
+               best.elapsed_s,
+               "user".nickname
+        FROM best
+        JOIN "user" ON "user".id = best.user_id
+        ORDER BY best.elapsed_s
+        LIMIT :limit
+    )
+    SELECT json_agg(board ORDER BY board.rank) FROM board;
+    """)
+
+    res = await conn.execute(
+        query, dict(challenge_id=challenge_id, limit=limit)
+    )
+    return res.scalar_one_or_none()
+
+
+async def query_sample_testcase(
+    conn: AsyncConnection, challenge_id: int, testcase_id: int
+):
+    """The paths of a *public* test case, or None. Used to authorize downloads:
+    hidden test cases must never be served."""
+    stmt = select(TestCase.c.execution_order, TestCase.c.input_path,
+                  TestCase.c.expected_output_path).where(
+        and_(
+            TestCase.c.id == testcase_id,
+            TestCase.c.challenge_id == challenge_id,
+            TestCase.c.is_sample,
+        )
+    )
+    return (await conn.execute(stmt)).first()
 
 
 async def query_courses(conn: AsyncConnection, user_id: int):
