@@ -1,5 +1,7 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
+set dotenv-load
+
 log_dir := ".logs"
 
 # Storage root shared by the web app and the judge; they must agree on it.
