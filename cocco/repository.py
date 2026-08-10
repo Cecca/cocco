@@ -169,6 +169,115 @@ async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_
     return res.scalar_one_or_none()
 
 
+# The outcomes of one submission, joined to the test cases they were scored on.
+# Shared by the two queries below, which differ only in how much of the
+# submission itself they carry: `is_sample` is what tells the page whether the
+# free-text fields may be shown to a student (see `visible_outcomes` in main.py).
+_SUBMISSION_OUTCOMES_CTE = """
+    outcomes AS (
+        SELECT testoutcome.*,
+               testcase.execution_order,
+               testcase.is_sample,
+               testcase.is_active
+        FROM testoutcome
+        JOIN testcase ON testcase.id = testoutcome.testcase_id
+        WHERE testoutcome.submission_id = :submission_id
+    ),
+    -- Aggregated with no GROUP BY, so this is one row even when the submission
+    -- has no outcomes yet and can be CROSS JOINed unconditionally below.
+    agg AS (
+        SELECT coalesce(json_agg(outcomes ORDER BY execution_order, id),
+                        '[]'::json) AS outcomes,
+               avg(coalesce(score, 0)) AS score,
+               sum(elapsed_s) AS elapsed_s,
+               count(*) FILTER (WHERE outcome = 'success') AS n_passed,
+               count(*) AS n_tests
+        FROM outcomes
+    )
+"""
+
+
+async def query_submission(conn: AsyncConnection, submission_id: int):
+    """One submission in full: its source, who wrote it, where it belongs, and
+    every outcome it was scored on.
+
+    This is the only query that returns `source`, which is why the fragment that
+    polls the same page uses `query_submission_outcomes` instead.
+
+    `attempt` is the submission's position in its author's history on the
+    challenge, computed exactly as `query_user_submissions` does it, so the "#3"
+    on this page is the "#3" of the table the viewer clicked.
+    """
+    query = text(f"""
+    WITH
+    {_SUBMISSION_OUTCOMES_CTE},
+    attempts AS (
+        SELECT id,
+               row_number() OVER (ORDER BY enqueued) AS attempt
+        FROM submission
+        WHERE (user_id, challenge_id) = (
+            SELECT user_id, challenge_id FROM submission WHERE id = :submission_id
+        )
+    ),
+    s AS (
+        SELECT submission.*,
+               "user".nickname AS author_nickname,
+               "user".email AS author_email,
+               challenge.title AS challenge_title,
+               challenge.course_id AS course_id,
+               course.title AS course_title,
+               attempts.attempt,
+               agg.outcomes,
+               agg.score,
+               agg.elapsed_s,
+               agg.n_passed,
+               agg.n_tests
+        FROM submission
+        JOIN "user" ON "user".id = submission.user_id
+        JOIN challenge ON challenge.id = submission.challenge_id
+        LEFT JOIN course ON course.id = challenge.course_id
+        LEFT JOIN attempts ON attempts.id = submission.id
+        CROSS JOIN agg
+        WHERE submission.id = :submission_id
+    )
+    SELECT row_to_json(s) FROM s;
+    """)
+
+    res = await conn.execute(query, dict(submission_id=submission_id))
+    return res.scalar_one_or_none()
+
+
+async def query_submission_outcomes(conn: AsyncConnection, submission_id: int):
+    """What the submission page polls for: the status and the outcomes, and
+    deliberately *not* the source, which never changes and can be a megabyte.
+
+    `user_id` and `challenge_id` come along because the fragment route has to
+    authorize the viewer just like the page does.
+    """
+    query = text(f"""
+    WITH
+    {_SUBMISSION_OUTCOMES_CTE},
+    s AS (
+        SELECT submission.id,
+               submission.user_id,
+               submission.challenge_id,
+               submission.status,
+               agg.outcomes,
+               agg.score,
+               agg.elapsed_s,
+               agg.n_passed,
+               agg.n_tests
+        FROM submission
+        CROSS JOIN agg
+        WHERE submission.id = :submission_id
+    )
+    SELECT row_to_json(s) FROM s;
+    """)
+
+    res = await conn.execute(query, dict(submission_id=submission_id))
+    return res.scalar_one_or_none()
+
+
 async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int):
     """The challenge itself, its course, its position within the course, the
     viewer's role in that course and its public sample test cases.

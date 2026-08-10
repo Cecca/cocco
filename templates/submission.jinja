@@ -1,0 +1,88 @@
+{% extends "base.jinja" %}
+{% block title %}#{{ submission.attempt }} · {{ submission.challenge_title }}{% endblock %}
+
+{% block nav_extra %}
+<li><a class="text-base-content font-bold border-b-2 border-primary pb-0.5">This challenge</a></li>
+{% endblock %}
+
+{# One submission: what was handed in, and what the judge made of it. Reached
+   from the submission table on the student's own challenge page and on the
+   staff view of a single student - the same fragment, so the same link. The
+   route decides who may be here; `is_staff` only decides how much of the
+   judge's output the page prints. #}
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+
+  <div class="flex items-start justify-between gap-4 mb-6">
+    <div>
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+        <a href="{{ url_for('get_course', course_id=submission.course_id) }}" class="hover:text-primary">
+          {{ submission.course_title }}
+        </a>
+        ·
+        <a href="{{ url_for('get_challenge', course_id=submission.course_id, challenge_id=submission.challenge_id) }}"
+           class="hover:text-primary">{{ submission.challenge_title }}</a>
+        {% if not viewer_is_author %}
+        ·
+        <a href="{{ url_for('get_challenge_student', course_id=submission.course_id, challenge_id=submission.challenge_id, student_id=submission.user_id) }}"
+           class="hover:text-primary">{{ submission.author_nickname }}</a>
+        {% endif %}
+      </p>
+      <h1 class="font-serif text-3xl font-semibold tracking-tight leading-tight mt-1">
+        Attempt #{{ submission.attempt }}
+      </h1>
+      <div class="flex flex-wrap items-center gap-2.5 mt-2">
+        <span class="font-mono text-sm font-semibold">{{ submission.filename }}</span>
+        <span class="badge badge-ghost font-mono font-semibold">{{ submission.language }}</span>
+        <span class="text-sm text-base-content/55">{{ submission.enqueued | datetime }}</span>
+      </div>
+    </div>
+
+    <div class="flex flex-col items-end gap-2">
+      <a href="{{ back_url }}" class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+        {{ back_label }}
+      </a>
+      <div class="flex items-center gap-2">
+        {% if submission.status == "queued" %}
+        <span class="badge badge-ghost gap-1.5 font-mono font-semibold">queued</span>
+        {% elif submission.status == "running" %}
+        <span class="badge badge-ghost gap-1.5 font-mono font-semibold">
+          <span class="loading loading-spinner loading-xs"></span>running
+        </span>
+        {% elif submission.score is none %}
+        <span class="badge badge-ghost gap-1.5 font-mono font-semibold">no tests</span>
+        {% else %}
+        <span class="font-mono text-sm text-base-content/60">{{ submission.elapsed_s | duration }}</span>
+        {% with score = submission.score, n_passed = submission.n_passed, n_tests = submission.n_tests %}
+        {% include "_score-badge.jinja" %}
+        {% endwith %}
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ SOURCE ══════════════════════════════════════════════════════ -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm mb-6">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg">Source</h2>
+      <p class="text-[13px] text-base-content/55 -mt-1 mb-3">
+        Exactly the file that was handed in — this is what the judge compiled and ran.
+      </p>
+      <!-- Highlighted server-side by Pygments; the token colours live in
+           assets/styles.css under .cocco-code -->
+      <div class="max-h-[70vh] overflow-auto rounded-xl border border-base-300 bg-base-200/40">
+        {{ submission.source | highlight(submission.language) }}
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ COMPILER OUTPUT + TEST CASES ════════════════════════════════ -->
+  <!-- Polled only while there is something left to wait for: a submission that
+       is done will not change again. -->
+  <div id="submission-results"
+       hx-get="{{ url_for('get_fragment_submission_results', submission_id=submission.id) }}"
+       hx-trigger="load{% if submission.status != 'done' %}, every 2s{% endif %}"
+       hx-swap="innerHTML">
+  </div>
+</main>
+{% endblock %}

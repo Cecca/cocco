@@ -28,6 +28,8 @@ from cocco.repository import (
     query_challenge_standings,
     query_challenge_testcases,
     query_sample_testcase,
+    query_submission,
+    query_submission_outcomes,
     query_user_role,
     query_user_submissions,
     regrade_challenge,
@@ -351,16 +353,20 @@ async def test_get_queued_submission_returns_none_when_empty():
     assert result is None
 
 
+def _postgres_url():
+    import os
+
+    return (
+        f"postgresql+psycopg://{os.environ['PGUSER']}@/"
+        f"{os.environ['PGDATABASE']}?host={os.environ['PGHOST']}"
+    )
+
+
 # The json_agg / row_to_json queries backing the web pages are Postgres-only,
 # so this needs a live server (see PGUSER/PGDATABASE/PGHOST in the devShell).
 @pytest.mark.integration
 async def test_challenge_page_queries():
-    import os
-
-    url = (
-        f"postgresql+psycopg://{os.environ['PGUSER']}@/"
-        f"{os.environ['PGDATABASE']}?host={os.environ['PGHOST']}"
-    )
+    url = _postgres_url()
     sync_engine = create_engine(url)
     metadata.drop_all(sync_engine)
     _make_example_database(url)
@@ -528,5 +534,89 @@ async def test_challenge_page_queries():
                 select(Submission.c.status).where(Submission.c.challenge_id == 2)
             )
         ).scalars().all() == [cm.SubmissionStatus.done]
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_submission_page_queries():
+    """The two queries behind the single-submission page.
+
+    Submission ids follow the order of the fixture's `submissions` list, so 1
+    and 2 are carol's two attempts at "Hello" - the older one (2) being the one
+    the fixture's outcome cycle gives a compile failure.
+    """
+    url = _postgres_url()
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        newer = await query_submission(conn, 1)
+        assert newer is not None
+        # The whole document the page renders from: the file, who wrote it, and
+        # where it belongs
+        assert newer["source"] == "print('hi')"
+        assert newer["language"] == "python"
+        assert newer["filename"] == "solution.python"
+        assert newer["author_nickname"] == "carol"
+        assert newer["challenge_title"] == "Hello"
+        assert newer["course_title"] == "Algorithms 101"
+        # Carol's second attempt: the numbering matches query_user_submissions,
+        # which is what the table the viewer clicked showed them
+        assert newer["attempt"] == 2
+        history = await query_user_submissions(conn, user_id=4, challenge_id=1)
+        assert history is not None
+        assert [(s["id"], s["attempt"]) for s in history] == [(1, 2), (2, 1)]
+
+        # Two of "Hello"'s three test cases passed - the same aggregate the
+        # standings and the history compute
+        assert [newer["n_passed"], newer["n_tests"]] == [2, 3]
+        assert newer["score"] == pytest.approx(2 / 3)
+
+        # In execution order, carrying what the page needs to decide whether a
+        # student may see the free text of each one
+        outcomes = newer["outcomes"]
+        assert [o["execution_order"] for o in outcomes] == [0, 1, 2]
+        assert [o["is_sample"] for o in outcomes] == [True, False, True]
+        assert [o["is_active"] for o in outcomes] == [True, True, False]
+        assert [o["outcome"] for o in outcomes] == [
+            "success", "success", "runtime_error",
+        ]
+
+        # The older attempt is the one that failed to compile; its message is
+        # what the page prints above the table
+        older = await query_submission(conn, 2)
+        assert older is not None
+        assert older["attempt"] == 1
+        failures = [
+            o for o in older["outcomes"] if o["outcome"] == "compile_failure"
+        ]
+        assert len(failures) == 1
+        assert failures[0]["message"] == "fail"
+
+        # A submission nobody has judged yet still comes back, with an empty
+        # outcome array rather than a null the template would have to guard
+        queued = await query_submission(conn, 4)
+        assert queued is not None
+        assert queued["status"] == "queued"
+        assert queued["outcomes"] == []
+        assert queued["n_tests"] == 0
+        assert queued["score"] is None
+
+        assert await query_submission(conn, 999) is None
+
+        # The polled fragment sees the same outcomes, but never the source: it
+        # asks every two seconds and a source can be a megabyte
+        light = await query_submission_outcomes(conn, 1)
+        assert light is not None
+        assert "source" not in light
+        assert light["outcomes"] == outcomes
+        # ...and enough to authorize the viewer, exactly as the page does
+        assert [light["user_id"], light["challenge_id"]] == [
+            newer["user_id"], newer["challenge_id"]
+        ]
+
+        assert await query_submission_outcomes(conn, 999) is None
     await engine.dispose()
 

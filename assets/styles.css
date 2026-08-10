@@ -72,6 +72,118 @@ body {
   background: color-mix(in oklch, var(--color-primary) 6%, transparent);
 }
 
+/* Syntax highlighting for a submission's source.
+
+   Pygments emits its own short class names (.k for a keyword, .s2 for a double
+   quoted string, ...); these are the ones that actually occur in the languages
+   COCCO judges, written in the cocco palette rather than pasted from a
+   generated Pygments theme. A token with no rule here simply inherits the
+   body colour, which is a fine default. `cocco-code` is the cssclass passed to
+   HtmlFormatter in main.py, and `cocco-codetable` is the line-number table
+   Pygments wraps around it. */
+.cocco-codetable {
+  width: 100%;
+  border-collapse: collapse;
+}
+.cocco-codetable td {
+  vertical-align: top;
+  padding: 0;
+}
+/* Not selectable, so copying the source does not drag the numbers along.
+   Only horizontal padding: the vertical padding is the <pre>'s, and adding
+   the cell's on top of it would push the numbers below their lines. */
+.cocco-codetable .linenos {
+  user-select: none;
+  width: 1%;
+  padding: 0 0.85rem;
+  border-right: 1px solid var(--color-base-300);
+  text-align: right;
+  color: oklch(60% 0.01 80);
+}
+.cocco-codetable .linenos pre,
+.cocco-code pre {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  background: transparent;
+  overflow: visible;
+}
+.cocco-codetable .linenos pre {
+  padding: 0.75rem 0;
+}
+
+.cocco-code .c, /* comment */
+.cocco-code .c1,
+.cocco-code .cm,
+.cocco-code .ch,
+.cocco-code .cs {
+  color: oklch(58% 0.03 145);
+  font-style: italic;
+}
+.cocco-code .cp, /* C/C++ preprocessor */
+.cocco-code .cpf {
+  color: oklch(52% 0.09 320);
+}
+.cocco-code .k, /* keyword */
+.cocco-code .kc,
+.cocco-code .kd,
+.cocco-code .kn,
+.cocco-code .kp,
+.cocco-code .kr,
+.cocco-code .kt {
+  color: oklch(48% 0.14 285);
+  font-weight: 600;
+}
+.cocco-code .s, /* string */
+.cocco-code .s1,
+.cocco-code .s2,
+.cocco-code .sb,
+.cocco-code .sc,
+.cocco-code .sd,
+.cocco-code .se,
+.cocco-code .sh,
+.cocco-code .si,
+.cocco-code .sr,
+.cocco-code .ss,
+.cocco-code .sx {
+  color: oklch(48% 0.12 145);
+}
+.cocco-code .m, /* number */
+.cocco-code .mf,
+.cocco-code .mh,
+.cocco-code .mi,
+.cocco-code .mo,
+.cocco-code .il {
+  color: oklch(52% 0.13 40);
+}
+.cocco-code .nf, /* function / class / namespace name */
+.cocco-code .fm {
+  color: oklch(48% 0.12 245);
+  font-weight: 600;
+}
+.cocco-code .nc,
+.cocco-code .nn {
+  color: oklch(45% 0.1 245);
+  font-weight: 600;
+}
+.cocco-code .nb, /* builtin */
+.cocco-code .bp {
+  color: oklch(50% 0.1 200);
+}
+.cocco-code .nd { /* decorator */
+  color: oklch(55% 0.13 55);
+  font-weight: 600;
+}
+.cocco-code .o, /* operator */
+.cocco-code .ow {
+  color: oklch(45% 0.02 60);
+}
+.cocco-code .err { /* what the lexer could not make sense of */
+  color: var(--color-error);
+}
+
 /* htmx request-in-flight helpers */
 .htmx-indicator {
   opacity: 0;

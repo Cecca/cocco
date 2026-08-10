@@ -2,6 +2,10 @@ from pathlib import Path
 from typing import Annotated
 import markdown as md
 from markupsafe import Markup
+from pygments import highlight as pygments_highlight
+from pygments.formatters import HtmlFormatter
+from pygments.lexers import TextLexer, get_lexer_by_name
+from pygments.util import ClassNotFound
 from sqlalchemy import insert, select
 from cocco.avatar import generate_identicon
 from cocco.evaluator import EqualityEvaluator
@@ -53,6 +57,8 @@ from cocco.repository import (
     query_course_info,
     query_courses,
     query_sample_testcase,
+    query_submission,
+    query_submission_outcomes,
     query_testcase,
     query_user,
     query_user_role,
@@ -108,6 +114,23 @@ def render_markdown(text: str | None) -> Markup:
     html = md.markdown(text or "", extensions=["fenced_code", "tables"])
     return Markup(html)
 
+# Line numbers in their own table column so that selecting the code does not
+# select them too (see `.linenos` in assets/styles.css). `cocco-code` is the
+# class the token styles are scoped under.
+_SOURCE_FORMATTER = HtmlFormatter(cssclass="cocco-code", linenos="table", wrapcode=True)
+
+
+def render_source(source: str, language: str) -> Markup:
+    """A submission's source, highlighted. `language` is the name from
+    `languages.toml`, which for every language we support happens to be a
+    Pygments alias too; anything else falls back to unhighlighted text."""
+    try:
+        lexer = get_lexer_by_name(language)
+    except ClassNotFound:
+        lexer = TextLexer()
+    return Markup(pygments_highlight(source, lexer, _SOURCE_FORMATTER))
+
+
 def render_datetime(value):
     from babel.dates import format_datetime
     from datetime import datetime
@@ -130,6 +153,7 @@ def render_duration(value) -> str:
     return f"{value:.2f} s"
 
 templates.env.filters["markdown"] = render_markdown
+templates.env.filters["highlight"] = render_source
 templates.env.filters["datetime"] = render_datetime
 templates.env.filters["score"] = render_score
 templates.env.filters["duration"] = render_duration
@@ -290,6 +314,51 @@ async def _populate_dummy_data(conn: AsyncConnection):
 
     assert testcase_id is not None
 
+    # A plausible solution to the seeded challenge, so the submission page has
+    # something worth highlighting in development.
+    seeded_source = textwrap.dedent("""\
+        import heapq
+        import sys
+
+
+        def shortest_route(n, edges, src, dst):
+            \"\"\"Dijkstra over an undirected graph with non-negative weights.\"\"\"
+            graph = [[] for _ in range(n)]
+            for u, v, w in edges:
+                graph[u].append((v, w))
+                graph[v].append((u, w))
+
+            dist = [float("inf")] * n
+            dist[src] = 0
+            queue = [(0, src)]
+            while queue:
+                d, u = heapq.heappop(queue)
+                if u == dst:
+                    return d
+                if d > dist[u]:
+                    continue  # a stale entry, already improved on
+                for v, w in graph[u]:
+                    if d + w < dist[v]:
+                        dist[v] = d + w
+                        heapq.heappush(queue, (dist[v], v))
+            return -1
+
+
+        def main():
+            data = sys.stdin.read().split()
+            n, m = int(data[0]), int(data[1])
+            edges = [
+                (int(data[2 + 3 * i]), int(data[3 + 3 * i]), int(data[4 + 3 * i]))
+                for i in range(m)
+            ]
+            src, dst = int(data[2 + 3 * m]), int(data[3 + 3 * m])
+            print(shortest_route(n, edges, src, dst))
+
+
+        if __name__ == "__main__":
+            main()
+        """)
+
     async def _seed_submission(
         author_id: int,
         filename: str,
@@ -306,7 +375,7 @@ async def _populate_dummy_data(conn: AsyncConnection):
                     status=SubmissionStatus.done,
                     language="python",
                     filename=filename,
-                    source="# seeded submission\n",
+                    source=seeded_source,
                 )
                 .returning(Submission.c.id)
             )
@@ -387,6 +456,51 @@ async def require_challenge_editor(
 
 
 ChallengeEditor = Annotated[UserRole, Depends(require_challenge_editor)]
+
+
+async def authorize_submission(
+    db: AsyncConnection, user: schema.User, submission
+) -> bool:
+    """Let the viewer see a submission, or raise 403. Returns True for staff.
+
+    Not a dependency like `require_challenge_editor`, because it needs the
+    submission row first and because a student *is* allowed here: the rule is
+    that you may read your own work, and course staff may read anyone's.
+    """
+    if user.id is None:
+        raise HTTPException(status_code=403)
+    role = await query_user_role(
+        db, user_id=user.id, challenge_id=submission["challenge_id"]
+    )
+    is_staff = role in EDITOR_ROLES
+    if not is_staff and submission["user_id"] != user.id:
+        raise HTTPException(status_code=403, detail="Not your submission")
+    return is_staff
+
+
+# Fields of an outcome that are free text produced by the run rather than by the
+# judge's own bookkeeping. `stdout`/`stderr` are the submitted program's output,
+# and `message` can be the evaluator's diff - i.e. the expected output itself
+# (see DiffEvaluator). On a hidden test case all three would hand a student the
+# test data, so they are only shown for samples, or to course staff.
+_OUTCOME_FREE_TEXT = ("message", "stdout", "stderr")
+
+
+def visible_outcomes(outcomes, is_staff: bool):
+    """The outcomes as this viewer may see them.
+
+    The verdict, the score and the resource usage are always shown - a student
+    has to know which test failed. Only the free text is redacted, and only on
+    test cases that are not public samples.
+    """
+    if is_staff:
+        return outcomes
+    return [
+        outcome
+        if outcome["is_sample"]
+        else {**outcome, **{field: None for field in _OUTCOME_FREE_TEXT}}
+        for outcome in outcomes
+    ]
 
 
 @app.on_event("startup")
@@ -589,6 +703,79 @@ async def get_sample_file(challenge_id: int, testcase_id: int, kind: str, db: DB
         path,
         media_type="text/plain",
         filename=f"sample{testcase.execution_order + 1}_{kind}.txt",
+    )
+
+
+########################################################################
+# One submission. Reached from the submission table on both the student's own
+# challenge page and the staff view of a single student, which are the same
+# fragment. Not nested under the course: the submission id already determines
+# its challenge and course, so a course_id in the path would only be a segment
+# to get wrong.
+
+
+@app.get("/submissions/{submission_id}")
+async def get_submission(
+    submission_id: int, request: Request, db: DBDep, user: CurrentUser
+):
+    """A submission's source, its compiler output and its per-test outcomes."""
+    submission = await query_submission(db, submission_id)
+    if submission is None:
+        raise HTTPException(status_code=404)
+    is_staff = await authorize_submission(db, user, submission)
+    viewer_is_author = submission["user_id"] == user.id
+
+    course_id = submission["course_id"]
+    challenge_id = submission["challenge_id"]
+    if viewer_is_author:
+        back_url = request.url_for(
+            "get_challenge", course_id=course_id, challenge_id=challenge_id
+        )
+        back_label = f"← Back to {submission['challenge_title']}"
+    else:
+        back_url = request.url_for(
+            "get_challenge_student",
+            course_id=course_id,
+            challenge_id=challenge_id,
+            student_id=submission["user_id"],
+        )
+        back_label = f"← Back to {submission['author_nickname']}'s attempts"
+
+    return templates.TemplateResponse(
+        request=request,
+        name="submission.jinja",
+        context={
+            "user": user,
+            "submission": submission,
+            "outcomes": visible_outcomes(submission["outcomes"], is_staff),
+            "is_staff": is_staff,
+            "viewer_is_author": viewer_is_author,
+            "back_url": back_url,
+            "back_label": back_label,
+            "title": f"#{submission['attempt']} · {submission['challenge_title']}",
+        },
+    )
+
+
+@app.get("/f/submission/{submission_id}")
+async def get_fragment_submission_results(
+    submission_id: int, request: Request, db: DBDep, user: CurrentUser
+):
+    """The results half of the submission page, polled while it is still being
+    judged. Deliberately a different query from the page's: the source never
+    changes and there is no point shipping it every two seconds."""
+    submission = await query_submission_outcomes(db, submission_id)
+    if submission is None:
+        raise HTTPException(status_code=404)
+    is_staff = await authorize_submission(db, user, submission)
+    return templates.TemplateResponse(
+        request=request,
+        name="f-submission-results.jinja",
+        context={
+            "submission": submission,
+            "outcomes": visible_outcomes(submission["outcomes"], is_staff),
+            "is_staff": is_staff,
+        },
     )
 
 

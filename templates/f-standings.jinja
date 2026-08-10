@@ -28,26 +28,9 @@
     {% elif row.score is none %}
     <span class="badge badge-ghost gap-1.5 font-mono font-semibold">not graded yet</span>
     {% else %}
-    {# Spelled out rather than built from a variable: Tailwind only emits the
-       utilities it can literally see in these templates. #}
-    {% if row.score >= 0.9 %}
-    {% set badge = "badge-success" %}
-    {% set dot = "bg-success" %}
-    {% set tint = "background:color-mix(in oklch, var(--color-success) 16%, transparent);color:oklch(38% 0.1 150);" %}
-    {% elif row.score >= 0.5 %}
-    {% set badge = "badge-warning" %}
-    {% set dot = "bg-warning" %}
-    {% set tint = "background:color-mix(in oklch, var(--color-warning) 18%, transparent);color:oklch(45% 0.12 55);" %}
-    {% else %}
-    {% set badge = "badge-error" %}
-    {% set dot = "bg-error" %}
-    {% set tint = "background:color-mix(in oklch, var(--color-error) 14%, transparent);color:oklch(45% 0.15 28);" %}
-    {% endif %}
-    <span class="badge {{ badge }} gap-1.5 font-mono font-bold border-none"
-          style="{{ tint }}"
-          title="{{ row.n_passed }} of {{ row.n_tests }} tests passed">
-      <span class="h-1.5 w-1.5 rounded-full {{ dot }}"></span>{{ row.score | score }} / 100
-    </span>
+    {% with score = row.score, n_passed = row.n_passed, n_tests = row.n_tests %}
+    {% include "_score-badge.jinja" %}
+    {% endwith %}
     {% endif %}
   </td>
   <td class="text-right font-mono text-sm text-base-content/60">{{ row.elapsed_s | duration }}</td>

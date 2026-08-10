@@ -1,13 +1,21 @@
 {# Rows for #submission-history. Polled every 2s, so it has to render
-   submissions that are still queued or running and have no outcomes yet. #}
+   submissions that are still queued or running and have no outcomes yet.
+
+   Rendered both by the student's own challenge page and by the staff view of
+   one student, so the link out to a submission is written once here and works
+   from both. #}
 {% for submission in submissions %}
-<tr {% if submission.is_best %}style="background:color-mix(in oklch, var(--color-warning) 16%, transparent);"{% endif %}>
+{% set href = url_for('get_submission', submission_id=submission.id) %}
+{# The whole row is clickable for convenience; the filename is a real link so
+   the page is still reachable with a keyboard. #}
+<tr class="hover cursor-pointer" onclick="location.href='{{ href }}'"
+    {% if submission.is_best %}style="background:color-mix(in oklch, var(--color-warning) 16%, transparent);"{% endif %}>
   <td class="font-mono font-{{ 'bold text-primary' if submission.is_best else 'semibold text-base-content/50' }}">
     #{{ submission.attempt }}
   </td>
   <td>
     <div class="flex items-center gap-2.5">
-      <span class="font-mono font-semibold">{{ submission.filename }}</span>
+      <a href="{{ href }}" class="font-mono font-semibold hover:text-primary">{{ submission.filename }}</a>
       <span class="font-mono text-xs text-base-content/40">{{ submission.language }}</span>
       {% if submission.is_best %}
       <span class="badge badge-sm badge-warning border-none font-extrabold uppercase text-[10px] tracking-wide"
@@ -27,26 +35,9 @@
     {% elif submission.score is none %}
     <span class="badge badge-ghost gap-1.5 font-mono font-semibold">no tests</span>
     {% else %}
-    {# Class names are spelled out rather than built from a variable: Tailwind
-       only emits the utilities it can literally see in these templates. #}
-    {% if submission.score >= 0.9 %}
-    {% set badge = "badge-success" %}
-    {% set dot = "bg-success" %}
-    {% set tint = "background:color-mix(in oklch, var(--color-success) 16%, transparent);color:oklch(38% 0.1 150);" %}
-    {% elif submission.score >= 0.5 %}
-    {% set badge = "badge-warning" %}
-    {% set dot = "bg-warning" %}
-    {% set tint = "background:color-mix(in oklch, var(--color-warning) 18%, transparent);color:oklch(45% 0.12 55);" %}
-    {% else %}
-    {% set badge = "badge-error" %}
-    {% set dot = "bg-error" %}
-    {% set tint = "background:color-mix(in oklch, var(--color-error) 14%, transparent);color:oklch(45% 0.15 28);" %}
-    {% endif %}
-    <span class="badge {{ badge }} gap-1.5 font-mono font-bold border-none"
-          style="{{ tint }}"
-          title="{{ submission.n_passed }} of {{ submission.n_tests }} tests passed">
-      <span class="h-1.5 w-1.5 rounded-full {{ dot }}"></span>{{ submission.score | score }} / 100
-    </span>
+    {% with score = submission.score, n_passed = submission.n_passed, n_tests = submission.n_tests %}
+    {% include "_score-badge.jinja" %}
+    {% endwith %}
     {% endif %}
   </td>
 </tr>
