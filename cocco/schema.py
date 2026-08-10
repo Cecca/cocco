@@ -40,6 +40,7 @@ class TestCase(Base):
     execution_order: int
     input_path: str
     expected_output_path: str
+    is_sample: bool = False
 
 
 class Submission(Base):
@@ -49,6 +50,7 @@ class Submission(Base):
     status: SubmissionStatus = SubmissionStatus.queued
     enqueued: datetime = Field(default_factory=datetime.now)
     language: str
+    filename: str
     source: str
 
 

@@ -3,6 +3,7 @@ from enum import Enum
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     Column,
     DateTime,
     Enum as SAEnum,
@@ -109,6 +110,9 @@ TestCase = Table(
     Column("execution_order", Integer, nullable=False),
     Column("input_path", String, nullable=False),
     Column("expected_output_path", String, nullable=False),
+    # Sample test cases are public: their input and expected output can be
+    # downloaded from the challenge page. All the others are hidden.
+    Column("is_sample", Boolean, nullable=False, default=False),
 )
 
 
@@ -126,6 +130,8 @@ Submission = Table(
     ),
     Column("enqueued", DateTime, nullable=False, default=datetime.now),
     Column("language", String, nullable=False),
+    # The name of the file the student uploaded, shown in the submission history
+    Column("filename", String, nullable=False),
     Column("source", String, nullable=False),
 )
 
