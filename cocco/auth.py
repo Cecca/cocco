@@ -1,21 +1,20 @@
-"""Magic-link authentication: configuration, token helpers and the mailer.
+"""Google sign-in: configuration, the domain allowlist and the account behind
+a confirmed address.
 
-Everything here is testable without a database or a running app, except
+Nothing here talks to Google. The OAuth client and the routes live in
+`main.py`, where the request is; what is left is pure and unit-testable, except
 `get_or_create_user`, which is the one place the flow touches the schema.
 """
 
 import logging
 import os
 import secrets
-import smtplib
 import tomllib
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from email.message import EmailMessage
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
-from email_validator import EmailNotValidError, validate_email
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -25,35 +24,24 @@ from cocco.repository import insert_user, query_user_by_email
 
 logger = logging.getLogger(__name__)
 
-# A link that sits in a mailbox is a credential, so it does not sit there long.
-TOKEN_TTL = timedelta(minutes=15)
+# The institution, and the default allowlist. A domain admits its subdomains,
+# so this one entry already covers @studenti.unipd.it and @phd.unipd.it.
+DEFAULT_ALLOWED_DOMAINS = ("unipd.it",)
 
-# RFC 5321's ceiling. Checked before the address is normalized, hashed or
-# stored, so a megabyte in the form field costs nothing.
+GOOGLE_METADATA_URL = "https://accounts.google.com/.well-known/openid-configuration"
+
+# Where Google sends the browser back. A constant because it must match, byte
+# for byte, an "Authorized redirect URI" registered in the Google Cloud
+# console - it is not something a route can invent per request.
+GOOGLE_CALLBACK_PATH = "/auth/google/callback"
+
+# RFC 5321's ceiling. Checked before the address is looked at any further, so a
+# preposterous claim costs nothing.
 MAX_EMAIL_LENGTH = 254
-
-# The rate limit on requesting a link, per address and per client. Generous
-# enough that a student who mistypes twice is not locked out, small enough that
-# the login form is not a mail cannon.
-RATE_WINDOW = timedelta(hours=1)
-MAX_LINKS_PER_ADDRESS = 5
-MAX_LINKS_PER_CLIENT = 20
 
 
 ########################################################################
 # configuration
-
-
-@dataclass(frozen=True)
-class SmtpConfig:
-    host: str
-    from_address: str
-    port: int = 587
-    username: str | None = None
-    password: str | None = None
-    starttls: bool = True
-    from_name: str = "COCCO"
-    timeout: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -65,12 +53,35 @@ class SessionConfig:
 
 
 @dataclass(frozen=True)
+class GoogleConfig:
+    """The registered OAuth client. Both halves are required, so a
+    `GoogleConfig` that exists is one a flow can actually be started with."""
+
+    client_id: str
+    client_secret: str
+    # Google's `hd` hint, passed to the account chooser. Deliberately its own
+    # setting rather than something derived from `allowed_domains`: `hd` takes a
+    # single domain, and a Workspace's secondary domains are not always
+    # reachable through the parent's hint. Never the access check.
+    hd: str | None = None
+    server_metadata_url: str = GOOGLE_METADATA_URL
+
+
+@dataclass(frozen=True)
+class AuthConfig:
+    # Suffix-matched on a dot boundary: "unipd.it" admits unipd.it and every
+    # subdomain of it. See `is_allowed_email`.
+    allowed_domains: tuple[str, ...] = DEFAULT_ALLOWED_DOMAINS
+    # None means Google sign-in is unconfigured, which is not an error: the app
+    # boots and the login page says so. COCCO_DUMMY_AUTH=1 needs no credentials.
+    google: GoogleConfig | None = None
+
+
+@dataclass(frozen=True)
 class AppConfig:
     session: SessionConfig
-    # None means SMTP is unconfigured, which is not an error: the link is
-    # logged instead of mailed, so a fresh checkout can log in.
-    smtp: SmtpConfig | None
-    # Absolute base for the links that go into emails. None derives it from the
+    auth: AuthConfig
+    # Absolute base for the OAuth redirect URI. None derives it from the
     # incoming request, which is only right behind a proxy that sets
     # X-Forwarded-* and a uvicorn running with --proxy-headers.
     base_url: str | None = None
@@ -80,8 +91,8 @@ def load_config(path: Path) -> AppConfig:
     """Read `cocco.toml`, in the shape `load_languages` reads `languages.toml`.
 
     A missing file is not an error - a development checkout has none and must
-    still boot. Neither is an `[smtp]` table too incomplete to send with: both
-    fall back to logging the magic link.
+    still boot. Neither is an `[auth]` table with no credentials in it: the app
+    comes up and the login page says Google sign-in is unconfigured.
     """
     data: dict = {}
     if path.is_file():
@@ -92,7 +103,7 @@ def load_config(path: Path) -> AppConfig:
 
     return AppConfig(
         session=_load_session_config(data.get("session", {})),
-        smtp=_load_smtp_config(data.get("smtp", {})),
+        auth=_load_auth_config(data.get("auth", {})),
         base_url=data.get("site", {}).get("base_url"),
     )
 
@@ -117,25 +128,82 @@ def _load_session_config(section: dict) -> SessionConfig:
     )
 
 
-def _load_smtp_config(section: dict) -> SmtpConfig | None:
-    host = section.get("host")
-    from_address = section.get("from_address")
-    if not host or not from_address:
-        if section:
-            logger.warning(
-                "[smtp] needs both `host` and `from_address`; "
-                "magic links will be logged instead of mailed"
-            )
-        return None
-    return SmtpConfig(
-        host=host,
-        from_address=from_address,
-        port=int(section.get("port", SmtpConfig.port)),
-        username=section.get("username"),
-        password=section.get("password"),
-        starttls=bool(section.get("starttls", True)),
-        from_name=section.get("from_name", SmtpConfig.from_name),
-        timeout=float(section.get("timeout", SmtpConfig.timeout)),
+def _load_auth_config(section: dict) -> AuthConfig:
+    """The `[auth]` table, with the same precedence `_load_session_config`
+    uses: the environment wins over the file, and an absent setting is a
+    default rather than an error."""
+    raw_domains = section.get("allowed_domains")
+    domains = (
+        normalize_domains(raw_domains)
+        if raw_domains is not None
+        else DEFAULT_ALLOWED_DOMAINS
+    )
+
+    client_id = os.environ.get("COCCO_GOOGLE_CLIENT_ID") or section.get(
+        "google_client_id"
+    )
+    client_secret = os.environ.get("COCCO_GOOGLE_CLIENT_SECRET") or section.get(
+        "google_client_secret"
+    )
+
+    google = None
+    if client_id and client_secret:
+        google = GoogleConfig(
+            client_id=client_id,
+            client_secret=client_secret,
+            hd=section.get("google_hd"),
+            server_metadata_url=section.get(
+                "google_metadata_url", GOOGLE_METADATA_URL
+            ),
+        )
+    elif client_id or client_secret:
+        # Half a credential is a typo, not a decision: say so, then carry on
+        # unconfigured rather than refusing to boot.
+        logger.warning(
+            "[auth] needs both `google_client_id` and `google_client_secret` "
+            "(or COCCO_GOOGLE_CLIENT_ID / COCCO_GOOGLE_CLIENT_SECRET); "
+            "Google sign-in is disabled"
+        )
+    return AuthConfig(allowed_domains=domains, google=google)
+
+
+########################################################################
+# who may sign in
+
+
+def normalize_domains(raw: Iterable[str]) -> tuple[str, ...]:
+    """The configured allowlist, canonicalized: lowercase, trimmed, no leading
+    or trailing dot. Done once at load so the predicate has nothing to clean."""
+    cleaned = (d.strip().lower().strip(".") for d in raw if d)
+    return tuple(d for d in cleaned if d)
+
+
+def email_domain(email: str) -> str:
+    """The part after the last `@`, lowercased. Empty when there is no `@`."""
+    _, at, domain = email.rpartition("@")
+    if not at:
+        return ""
+    return domain.strip().lower().rstrip(".")
+
+
+def is_allowed_email(email: str, allowed_domains: Iterable[str]) -> bool:
+    """Whether an address belongs to the institution.
+
+    A configured domain admits itself and its subdomains, so `unipd.it` covers
+    `studenti.unipd.it` and `phd.unipd.it` without listing them. The suffix
+    test is on a dot boundary on purpose: `notunipd.it` must not pass because
+    it happens to end in the domain, and `unipd.it.evil.example` must not pass
+    because it happens to start with it.
+
+    An empty allowlist admits nobody - a deleted line in `cocco.toml` should
+    lock the door, not open it.
+    """
+    domain = email_domain(email)
+    if not domain:
+        return False
+    return any(
+        domain == allowed or domain.endswith("." + allowed)
+        for allowed in allowed_domains
     )
 
 
@@ -146,19 +214,20 @@ def _load_smtp_config(section: dict) -> SmtpConfig | None:
 def normalize_email(raw: str) -> str:
     """The canonical form of an address, or `ValueError`.
 
-    Case is folded, which is lossy for the local part in theory and irrelevant
-    in practice: every address here is an institutional one.
+    Canonicalization, not validation: the address arrives in Google's `email`
+    claim and is already well-formed. Case is folded, which is lossy for the
+    local part in theory and irrelevant in practice - every address here is an
+    institutional one.
     """
-    candidate = raw.strip()
+    candidate = raw.strip().lower()
     if not candidate:
         raise ValueError("an email address is required")
     if len(candidate) > MAX_EMAIL_LENGTH:
         raise ValueError("that email address is too long")
-    try:
-        validated = validate_email(candidate, check_deliverability=False)
-    except EmailNotValidError as err:
-        raise ValueError(str(err)) from err
-    return validated.normalized.lower()
+    local, at, domain = candidate.partition("@")
+    if not at or not local or not domain or "@" in domain or domain.strip(".") == "":
+        raise ValueError("that is not a usable email address")
+    return candidate
 
 
 def nickname_from_email(email: str) -> str:
@@ -166,30 +235,14 @@ def nickname_from_email(email: str) -> str:
     return email.split("@", 1)[0][:64] or email[:64]
 
 
-def generate_token() -> str:
-    """A bearer token for one magic link. 256 bits, so guessing is not a threat
-    model and a plain hash is the right way to store it."""
-    return secrets.token_urlsafe(32)
+def google_redirect_uri(base_url: str) -> str:
+    """Where Google sends the browser back.
 
-
-def hash_token(raw: str) -> str:
-    import hashlib
-
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def token_expiry(now: datetime) -> datetime:
-    return now + TOKEN_TTL
-
-
-def is_expired(expires_at: datetime, now: datetime) -> bool:
-    return expires_at <= now
-
-
-def build_magic_link(base_url: str, token: str) -> str:
-    # safe="" so nothing at all survives unescaped: `token_urlsafe` never emits
-    # a `/`, but the link must not depend on that.
-    return f"{base_url.rstrip('/')}/auth/verify?token={quote(token, safe='')}"
+    Must equal an Authorized redirect URI in the Google Cloud console character
+    for character - which is why it carries no query string, and why the
+    post-login destination travels in the session instead.
+    """
+    return f"{base_url.rstrip('/')}{GOOGLE_CALLBACK_PATH}"
 
 
 def safe_next_path(raw: str | None) -> str:
@@ -207,63 +260,13 @@ def safe_next_path(raw: str | None) -> str:
 
 
 ########################################################################
-# sending
-
-
-def format_magic_link_email(
-    config: SmtpConfig, to: str, link: str, ttl: timedelta = TOKEN_TTL
-) -> EmailMessage:
-    """The message itself, built but not sent, so the wording and the headers
-    are unit-testable without smtplib in the way."""
-    minutes = int(ttl.total_seconds() // 60)
-    message = EmailMessage()
-    message["Subject"] = "Your COCCO sign-in link"
-    message["From"] = f"{config.from_name} <{config.from_address}>"
-    message["To"] = to
-    message.set_content(
-        "Hello,\n\n"
-        "Use the link below to sign in to COCCO. It works once, and it expires "
-        f"in {minutes} minutes.\n\n"
-        f"{link}\n\n"
-        "If you did not ask to sign in, you can ignore this message.\n"
-    )
-    return message
-
-
-def send_magic_link(config: SmtpConfig | None, to: str, link: str) -> None:
-    """Deliver the link, or log it when SMTP is unconfigured.
-
-    A plain `def`, not `async def`: Starlette runs a sync background task in the
-    threadpool, which is where blocking smtplib belongs. It never raises - the
-    token has already been committed by the time this runs, so an SMTP outage
-    must not become a 500 on a request that already succeeded.
-    """
-    if config is None:
-        # The development path, and the only line anywhere that prints a live
-        # token. Labelled loudly so it is obvious when it shows up in a real log.
-        logger.warning("SMTP is not configured; magic link for %s: %s", to, link)
-        return
-    try:
-        with smtplib.SMTP(config.host, config.port, timeout=config.timeout) as smtp:
-            if config.starttls:
-                smtp.starttls()
-            if config.username:
-                smtp.login(config.username, config.password or "")
-            smtp.send_message(format_magic_link_email(config, to, link))
-    except Exception:
-        logger.exception("could not send the magic link to %s", to)
-    else:
-        logger.info("sent a magic link to %s", to)
-
-
-########################################################################
 # the account behind a confirmed address
 
 
 async def get_or_create_user(conn: AsyncConnection, email: str) -> schema.User:
     """The account for an address, created on first sight. Does not commit.
 
-    Two links for the same new address, consumed at once, both reach the
+    Two tabs finishing a first sign-in at the same moment both reach the
     insert; `user.email` is unique, so the loser catches the violation and
     re-reads the row the winner wrote.
     """

@@ -18,15 +18,10 @@ from cocco.model import (
     metadata,
 )
 from cocco.model import LeaderboardRanking, UserRole
-from cocco.auth import get_or_create_user, is_expired
+from cocco.auth import get_or_create_user
 from cocco.repository import (
-    consume_login_token,
-    count_recent_login_tokens,
     count_running_submissions,
     count_testcase_outcomes,
-    delete_expired_login_tokens,
-    delete_login_tokens_for_email,
-    insert_login_token,
     insert_user,
     pull_queued_submission,
     query_challenge,
@@ -652,83 +647,6 @@ async def _async_database():
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
     return engine
-
-
-async def test_login_token_is_spent_exactly_once():
-    engine = await _async_database()
-    now = datetime.now()
-    async with engine.connect() as conn:
-        await insert_login_token(
-            conn, "hash-a", "bob@unipd.it", now, now + timedelta(minutes=15)
-        )
-        await conn.commit()
-
-        row = await consume_login_token(conn, "hash-a", now)
-        assert row is not None
-        assert row.email == "bob@unipd.it"
-
-        # The second attempt - a double click, or a mail scanner that already
-        # prefetched the link - finds nothing left to spend.
-        assert await consume_login_token(conn, "hash-a", now) is None
-        # ...and so does a token nobody ever issued.
-        assert await consume_login_token(conn, "hash-b", now) is None
-    await engine.dispose()
-
-
-async def test_an_expired_token_is_still_burned_by_the_attempt():
-    """Expiry is checked by the caller, not in the SQL, so the row is consumed
-    either way: a stale link cannot be probed repeatedly."""
-    engine = await _async_database()
-    now = datetime.now()
-    async with engine.connect() as conn:
-        await insert_login_token(
-            conn, "hash-old", "bob@unipd.it", now, now - timedelta(minutes=1)
-        )
-        await conn.commit()
-
-        row = await consume_login_token(conn, "hash-old", now)
-        assert row is not None
-        assert is_expired(row.expires_at, now)
-        assert await consume_login_token(conn, "hash-old", now) is None
-    await engine.dispose()
-
-
-async def test_login_token_housekeeping():
-    engine = await _async_database()
-    now = datetime.now()
-    async with engine.connect() as conn:
-        await insert_login_token(
-            conn, "live", "bob@unipd.it", now, now + timedelta(minutes=15)
-        )
-        await insert_login_token(
-            conn, "stale", "bob@unipd.it", now - timedelta(hours=2),
-            now - timedelta(hours=1),
-        )
-        await insert_login_token(
-            conn, "other", "carol@unipd.it", now, now + timedelta(minutes=15)
-        )
-        await conn.commit()
-
-        # Only what was requested inside the window counts against the limit.
-        assert await count_recent_login_tokens(
-            conn, "bob@unipd.it", now - timedelta(hours=1)
-        ) == 1
-        assert await count_recent_login_tokens(
-            conn, "bob@unipd.it", now - timedelta(hours=3)
-        ) == 2
-
-        assert await delete_expired_login_tokens(conn, now) == 1
-        assert await consume_login_token(conn, "live", now) is not None
-
-        # A successful login kills every other outstanding link for that
-        # address, but leaves everybody else's alone.
-        await insert_login_token(
-            conn, "second", "bob@unipd.it", now, now + timedelta(minutes=15)
-        )
-        await delete_login_tokens_for_email(conn, "bob@unipd.it")
-        assert await consume_login_token(conn, "second", now) is None
-        assert await consume_login_token(conn, "other", now) is not None
-    await engine.dispose()
 
 
 async def test_get_or_create_user_is_idempotent():

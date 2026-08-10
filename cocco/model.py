@@ -75,32 +75,13 @@ User = Table(
     "user",
     metadata,
     Column("id", Integer, primary_key=True),
-    # The login identifier: a magic link proves an address, and the address is
-    # what we look the account up by. Two rows for one address would make
-    # "which user is this?" unanswerable.
+    # The login identifier: Google proves an address, and the address is what
+    # we look the account up by. Two rows for one address would make "which
+    # user is this?" unanswerable.
     Column("email", String, nullable=False, unique=True),
     Column("nickname", String, nullable=False),
     Column("image", LargeBinary, nullable=False),
     Column("image_mime", String, nullable=False),
-)
-
-
-LoginToken = Table(
-    "login_token",
-    metadata,
-    Column("id", Integer, primary_key=True),
-    # Only the sha256 of the token that went into the email. The raw token
-    # lives in the URL and nowhere else, so a database dump is not a pile of
-    # working magic links.
-    Column("token_hash", String, nullable=False, unique=True),
-    # An address, not a user id: the account is created when the link is
-    # consumed, so at this point there may well be no user to point at.
-    Column("email", String, nullable=False),
-    Column("created_at", DateTime, nullable=False, default=datetime.now),
-    Column("expires_at", DateTime, nullable=False),
-    # Set by the single UPDATE that spends the token, which is what makes a
-    # link usable exactly once.
-    Column("consumed_at", DateTime, nullable=True),
 )
 
 

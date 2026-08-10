@@ -16,7 +16,7 @@ Dependencies are managed with `uv` (Python 3.13). A `.envrc` / Nix `devShell` au
 - Start / stop PostgreSQL: `pg-start`, `pg-stop` (then `create-db cocco-dev` once)
 - Run the API (dev): `COCCO_DUMMY_AUTH=1 uv run fastapi dev cocco/main.py`
 - Reset and reseed the database: `COCCO_RESET_DB=1 uv run fastapi dev cocco/main.py`
-- Configure SMTP and the session secret: `cp cocco.example.toml cocco.toml` and edit it
+- Configure Google sign-in and the session secret: `cp cocco.example.toml cocco.toml` and edit it
 - Run the judge: `uv run python -m cocco.judge --database "postgresql+psycopg://$PGUSER@/$PGDATABASE?host=$PGHOST"`
 - Run all tests: `uv run pytest`
 - Run only unit tests (skip those requiring isolate + nix + postgres): `uv run pytest -m "not integration"`
@@ -30,7 +30,7 @@ The web app and the judge are **separate processes** that must agree on two thin
 
 `COCCO_RESET_DB=1` drops every table and reseeds dummy data on startup. Leave it unset in normal development: `fastapi dev` reloads on every file change, and each reload would wipe the data. There is no migration tool, so a schema change reaches an existing database only through one such reset.
 
-Runtime configuration lives in `cocco.toml` (path overridable with `COCCO_CONFIG`), read by `load_config` in the same shape `load_languages` reads `languages.toml`. It is gitignored — it holds an SMTP password and the session signing key — and `cocco.example.toml` is the commented template. **A missing file is not an error**: with no `[smtp]` table cocco logs the magic link to the server console instead of mailing it, which is what makes a fresh checkout usable. Without `COCCO_DUMMY_AUTH=1`, that logged link is how you sign in during development.
+Runtime configuration lives in `cocco.toml` (path overridable with `COCCO_CONFIG`), read by `load_config` in the same shape `load_languages` reads `languages.toml`. It is gitignored — it holds the Google client secret and the session signing key — and `cocco.example.toml` is the commented template. **A missing file is not an error**: with no `[auth]` credentials the app boots and the login page says Google sign-in is unconfigured. `COCCO_DUMMY_AUTH=1` is what makes a fresh checkout usable at all — it needs no credentials and no click, and `just dev` sets it by default.
 
 ## Architecture
 
@@ -81,29 +81,44 @@ Uploads carry no language field: `post_submission` maps the file extension to a 
 
 ### Authentication (`cocco/auth.py`)
 
-Login is by **magic link**: a visitor enters an address, gets a one-time URL mailed to it, and
-following that URL signs them in. There are no passwords and no sign-up step — **the account is
-created when the link is consumed**, never when it is requested, so typing addresses into the
-login form cannot fill the `user` table with unconfirmed rows. A new user has no enrollments and
-is therefore read-only everywhere until course staff enroll them.
+Login is **Google OIDC**, and nothing else. `GET /login` offers one button; `GET /auth/google`
+hands off to Authlib, which puts a `state`, a `nonce` and a PKCE verifier in the session and
+redirects to Google; `GET /auth/google/callback` calls `authorize_access_token`, which exchanges
+the code and verifies the ID token's signature, issuer, audience and nonce. There are no
+passwords and no sign-up step — **the account is created the first time an accepted address
+comes back**. A new user has no enrollments and is therefore read-only everywhere until course
+staff enroll them.
 
-The token is a `secrets.token_urlsafe(32)` stored **only as its sha256** in `login_token`: the
-raw token lives in the emailed URL and nowhere else. `consume_login_token` spends it with a
-single `UPDATE ... WHERE consumed_at IS NULL RETURNING`, so a double-clicked link — or one a
-mail scanner prefetched — cannot sign two browsers in. Expiry is checked by the caller rather
-than in the `WHERE`, which keeps the statement dialect-neutral for the SQLite tests and means an
-expired link is still burned by the attempt. A successful login deletes every other outstanding
-link for that address, so a forwarded one is dead.
+**The gate is `is_allowed_email`, on the `email` claim.** A configured domain admits itself and
+its subdomains, so `unipd.it` already covers `@studenti.unipd.it` and `@phd.unipd.it`; the suffix
+test is on a dot boundary, so `notunipd.it` does not sneak in, and an **empty allowlist admits
+nobody** — a deleted line in `cocco.toml` should lock the door, not open it. Google's `hd`
+parameter is passed as a hint to the account chooser when `[auth] google_hd` is set and is
+**never** the check: it is absent for consumer accounts, and it is not the identity.
+`email_verified` is required before the address is trusted at all.
+
+Every failure — a denied consent, a mismatched `state`, an unverified address, a domain that is
+not ours, missing credentials — renders `login.jinja` with one sentence. The callback is reached
+by a browser coming back from Google, so a traceback there is a dead end.
+
+`cocco/auth.py` never touches the network: it is the config, `is_allowed_email`, `safe_next_path`,
+`nickname_from_email`, `google_redirect_uri` and `get_or_create_user`. Authlib and the routes live
+in `main.py`, which is what keeps the interesting half unit-testable — `test_auth_routes.py`
+replaces the whole of Google with a two-method fake.
 
 The session is a signed cookie (Starlette's `SessionMiddleware`) holding nothing but `user_id`,
 so a renamed or deleted account takes effect on the next request. `same_site` must stay `"lax"`:
-a magic link is a top-level navigation out of a mail client, and under `"strict"` the cookie set
-by `/auth/verify` would not survive the redirect that follows it.
+the return from Google is a top-level cross-site navigation, and under `"strict"` the cookie
+carrying the `state` would not reach the callback, so every sign-in would fail as a state
+mismatch.
 
-`COCCO_DUMMY_AUTH=1` takes the address at face value — no token, no mail — and is the only thing
-`post_login` branches on. It is how `just dev` gets you in without a mail server; the seeded
-addresses are `alice@unipd.it` and `matteo.ceccarello@unipd.it` (staff) and `bob@unipd.it` and
-`charlie@unipd.it` (students).
+**`COCCO_DUMMY_AUTH=1` bypasses all of it.** `get_user` is the only place that branches on it,
+and it signs every request in as `COCCO_DUMMY_USER` (default `alice@unipd.it`) with no cookie, no
+click and no credentials — creating the account if it is missing, so it works against an empty
+database. `/login` and `/auth/google` merely redirect, and `/logout` is a no-op. Setting it on a
+public deployment is equivalent to publishing the admin password. The seeded cast is
+`alice@unipd.it` and `matteo.ceccarello@unipd.it` (teachers on every course) and `bob@unipd.it`
+and `charlie@unipd.it` (students).
 
 ### Authorization
 
@@ -113,7 +128,8 @@ that nothing distinguishes `teacher` from `admin` today — there is no site-wid
 this schema, so "may create a course" has nowhere to live yet.
 
 Nothing is reachable without a session: every route depends on `CurrentUser`, directly or through
-`require_challenge_editor`, and the only ways in are `/login`, `/auth/verify` and `/static`.
+`require_challenge_editor`, and the only ways in are `/login`, `/auth/google`,
+`/auth/google/callback` and `/static`.
 
 The challenge editor's routes all depend on `require_challenge_editor`, which 403s a non-staff user.
 Hiding a control in a template is presentation, never access control — anything that mutates a
@@ -138,6 +154,7 @@ author and otherwise requires `EDITOR_ROLES`.
 - **A hidden test case gives away nothing but its verdict.** `visible_outcomes` in `main.py` blanks an outcome's `message`, `stdout` and `stderr` unless the test case is a public sample or the viewer is course staff: `stdout`/`stderr` are the submitted program's own output — the obvious way to print a hidden input back out — and `message` can be the evaluator's diff, i.e. the expected output itself (`DiffEvaluator`). The verdict, the score and the resource usage are always shown. Compiler output is exempt, and has its own block on the submission page: it does not depend on any test input. Redact in that function, not in the template, so the rule stays unit testable.
 - **An anonymous htmx request gets `HX-Redirect`, not a 302.** `get_user` raises `NotAuthenticated` rather than returning a redirect — a dependency cannot return a `Response` — and the handler branches on the `HX-Request` header. This matters because most of the app is `f-*` fragments polled every few seconds: htmx follows a redirect inside the XHR, so a 302 would splice the whole login page into whatever div was polling, over and over. A 204 with `HX-Redirect` navigates the browser instead.
 - **A secret never has a fixed default.** With neither `COCCO_SECRET_KEY` nor `[session].secret_key` set, `load_config` generates a random key per process and logs a warning: an unconfigured deployment then logs everybody out on every restart and no two workers agree, which is loud. A constant in the source tree would be a signing key that ships with the code, which is silent.
-- **A `next` destination is filtered, never trusted.** `safe_next_path` keeps only a path on this site — one leading `/`, no scheme, no authority — so neither the `?next=` on the login page nor the one stashed in the session can be turned into an open redirect. The emailed link deliberately carries no destination at all; it is stashed in the requesting session, and a link opened in another browser simply lands on the root.
+- **A `next` destination is filtered, never trusted.** `safe_next_path` keeps only a path on this site — one leading `/`, no scheme, no authority — so neither the `?next=` on the login page nor the one stashed in the session can be turned into an open redirect. It is applied at both ends: before the destination is stashed, and again after it is read back. The OAuth redirect URI deliberately carries no destination at all — Google matches that URI character for character against the console registration, so `next` travels in the session instead, and a callback arriving without one lands on the root.
+- **CSRF rests on `same_site="lax"`, app-wide.** `POST /logout` is a form rather than a link so a planted `<img>` cannot fire it, and `lax` means the session cookie is not sent on a cross-site POST at all. That is the whole defence, and it is the same one every other mutating route in the app relies on — there is no CSRF token anywhere. A deliberate position, not an oversight: changing `same_site` would silently remove it.
 - **Source is highlighted server-side.** `render_source` (the `highlight` Jinja filter) runs Pygments over a submission's source, using `submission.language` — every name in `languages.toml` happens to be a Pygments alias too — and falls back to plain text otherwise. The token colours are hand-written under `.cocco-code` in `assets/styles.css`, not a generated Pygments theme.
 - **CSS is a build artifact.** Edit `assets/styles.css`, never `static/styles.css`. Tailwind only emits classes it can see, so it scans `templates/**/*.jinja` and `cocco/**/*.py` (`@source` directives); a class assembled dynamically at runtime will not be generated.

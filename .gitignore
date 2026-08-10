@@ -4,7 +4,7 @@
 .logs/
 node_modules/
 static/styles.css
-# Holds the SMTP password and the session signing key; see cocco.example.toml
+# Holds the Google client secret and the session signing key; see cocco.example.toml
 cocco.toml
 # Byte-compiled / optimized / DLL files
 __pycache__/

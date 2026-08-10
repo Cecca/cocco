@@ -4,8 +4,6 @@ Functions in this module return models from `cocco.models`,
 or their combinations
 """
 
-from datetime import datetime
-
 from sqlalchemy import Connection, and_, delete, func, insert, select, text, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -16,7 +14,6 @@ from cocco.model import (
     Course,
     Enrollment,
     LeaderboardRanking,
-    LoginToken,
     Submission,
     SubmissionStatus,
     TestCase,
@@ -92,8 +89,8 @@ async def insert_user(
 ) -> int:
     """Create a user and return their id. Does not commit.
 
-    Raises `IntegrityError` on an address that already exists - `user.email` is
-    unique, because it is what a magic link proves.
+    Raises `IntegrityError` on an address that already exists - `user.email`
+    is unique, because it is what Google proves.
     """
     stmt = (
         insert(User)
@@ -101,77 +98,6 @@ async def insert_user(
             email=email, nickname=nickname, image=image, image_mime=image_mime
         )
         .returning(User.c.id)
-    )
-    return (await conn.execute(stmt)).scalar_one()
-
-
-async def insert_login_token(
-    conn: AsyncConnection,
-    token_hash: str,
-    email: str,
-    created_at: datetime,
-    expires_at: datetime,
-) -> int:
-    """Record an outstanding magic link. Only the hash of the token is stored;
-    the token itself exists in the emailed URL and nowhere else."""
-    stmt = (
-        insert(LoginToken)
-        .values(
-            token_hash=token_hash,
-            email=email,
-            created_at=created_at,
-            expires_at=expires_at,
-        )
-        .returning(LoginToken.c.id)
-    )
-    return (await conn.execute(stmt)).scalar_one()
-
-
-async def consume_login_token(conn: AsyncConnection, token_hash: str, now: datetime):
-    """Spend a magic-link token, atomically, or return None if it is unknown or
-    was already spent.
-
-    One statement, so a double-clicked link - or one a corporate mail scanner
-    prefetched - cannot sign two browsers in. Expiry is deliberately *not* part
-    of the condition: an expired link is still burned by the attempt, and the
-    caller compares `expires_at` itself, which keeps the SQL dialect-neutral.
-    """
-    stmt = (
-        update(LoginToken)
-        .where(
-            and_(
-                LoginToken.c.token_hash == token_hash,
-                LoginToken.c.consumed_at.is_(None),
-            )
-        )
-        .values(consumed_at=now)
-        .returning(LoginToken.c.email, LoginToken.c.expires_at)
-    )
-    return (await conn.execute(stmt)).first()
-
-
-async def delete_login_tokens_for_email(conn: AsyncConnection, email: str) -> None:
-    """Invalidate every outstanding link for an address. Called once a login has
-    succeeded, so an older link that was forwarded on is dead."""
-    await conn.execute(delete(LoginToken).where(LoginToken.c.email == email))
-
-
-async def delete_expired_login_tokens(conn: AsyncConnection, now: datetime) -> int:
-    """Housekeeping, called opportunistically when a link is requested: there is
-    no scheduler in this app and the table is tiny."""
-    result = await conn.execute(
-        delete(LoginToken).where(LoginToken.c.expires_at <= now)
-    )
-    return result.rowcount
-
-
-async def count_recent_login_tokens(
-    conn: AsyncConnection, email: str, since: datetime
-) -> int:
-    """How many links were requested for an address since `since` - the
-    per-address half of the rate limit on the login form."""
-    stmt = select(func.count()).select_from(LoginToken).where(
-        and_(LoginToken.c.email == email, LoginToken.c.created_at >= since)
     )
     return (await conn.execute(stmt)).scalar_one()
 
@@ -664,7 +590,7 @@ async def query_user_role(
 
 
 async def query_user_by_email(conn: AsyncConnection, email: str):
-    """The sibling of `query_user`, keyed on the address a magic link proved."""
+    """The sibling of `query_user`, keyed on the address Google proved."""
     stmt = select(User.c.id, User.c.email, User.c.nickname).where(
         User.c.email == email
     )

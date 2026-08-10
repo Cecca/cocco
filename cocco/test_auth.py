@@ -1,24 +1,19 @@
-"""Tests for the pure half of the magic-link flow: nothing here needs a
-database, an app or a mail server."""
-
-import logging
-from datetime import datetime, timedelta
+"""Tests for the pure half of Google sign-in: nothing here needs a database,
+an app or a network."""
 
 import pytest
 
 from cocco.auth import (
+    DEFAULT_ALLOWED_DOMAINS,
     MAX_EMAIL_LENGTH,
-    SmtpConfig,
-    build_magic_link,
-    format_magic_link_email,
-    generate_token,
-    hash_token,
-    is_expired,
+    email_domain,
+    google_redirect_uri,
+    is_allowed_email,
     load_config,
     nickname_from_email,
+    normalize_domains,
     normalize_email,
     safe_next_path,
-    send_magic_link,
 )
 
 
@@ -27,39 +22,20 @@ def test_normalize_email_trims_and_lowercases():
 
 
 @pytest.mark.parametrize(
-    "raw",
-    ["", "   ", "not an email", "a@b@c", "@unipd.it", "alice@", "a" * 300 + "@x.it"],
+    "raw", ["", "   ", "not-an-email", "a@b@c", "@unipd.it", "alice@", "alice@."]
 )
 def test_normalize_email_rejects_garbage(raw):
     with pytest.raises(ValueError):
         normalize_email(raw)
 
 
-def test_normalize_email_length_cap_precedes_validation():
-    """The cap is checked before the address is parsed, so a huge form field
-    costs nothing."""
+def test_normalize_email_caps_the_length():
     with pytest.raises(ValueError):
         normalize_email("a" * (MAX_EMAIL_LENGTH + 1) + "@unipd.it")
 
 
 def test_nickname_from_email():
     assert nickname_from_email("matteo.ceccarello@unipd.it") == "matteo.ceccarello"
-
-
-def test_generate_token_is_unique_and_hashes_stably():
-    first, second = generate_token(), generate_token()
-    assert first != second
-    assert hash_token(first) == hash_token(first)
-    assert hash_token(first) != hash_token(second)
-    # The stored form must not be the token itself.
-    assert hash_token(first) != first
-
-
-def test_is_expired_at_the_boundary():
-    now = datetime(2026, 1, 1, 12, 0, 0)
-    assert is_expired(now, now)
-    assert is_expired(now - timedelta(seconds=1), now)
-    assert not is_expired(now + timedelta(seconds=1), now)
 
 
 @pytest.mark.parametrize(
@@ -74,28 +50,69 @@ def test_safe_next_path_keeps_a_local_path():
     assert safe_next_path("/courses/1/2") == "/courses/1/2"
 
 
-def test_build_magic_link_escapes_the_token():
-    link = build_magic_link("https://cocco.example.org/", "a+b/c")
-    assert link == "https://cocco.example.org/auth/verify?token=a%2Bb%2Fc"
-
-
-def test_format_magic_link_email_carries_the_link():
-    config = SmtpConfig(host="mail", from_address="cocco@unipd.it")
-    message = format_magic_link_email(
-        config, "bob@unipd.it", "https://x/auth/verify?token=t", timedelta(minutes=15)
+def test_google_redirect_uri_carries_no_query_string():
+    """It is matched character for character against the console registration,
+    so a destination could never ride along in it."""
+    assert (
+        google_redirect_uri("https://cocco.example.org/")
+        == "https://cocco.example.org/auth/google/callback"
     )
-    assert message["To"] == "bob@unipd.it"
-    assert message["From"] == "COCCO <cocco@unipd.it>"
-    assert message["Subject"]
-    body = message.get_content()
-    assert "https://x/auth/verify?token=t" in body
-    assert "15 minutes" in body
+    assert google_redirect_uri("http://localhost:8000") == (
+        "http://localhost:8000/auth/google/callback"
+    )
 
 
-def test_send_magic_link_logs_when_smtp_is_unconfigured(caplog):
-    with caplog.at_level(logging.WARNING, logger="cocco.auth"):
-        send_magic_link(None, "bob@unipd.it", "https://x/auth/verify?token=t")
-    assert "https://x/auth/verify?token=t" in caplog.text
+########################################################################
+# the domain allowlist
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        "alice@unipd.it",
+        "bob@studenti.unipd.it",
+        "carol@phd.unipd.it",
+        "dave@math.dei.unipd.it",
+        "erin@UNIPD.IT",
+        "frank@unipd.it.",  # a trailing root dot is still the same domain
+    ],
+)
+def test_the_institution_and_its_subdomains_are_admitted(email):
+    assert is_allowed_email(email, DEFAULT_ALLOWED_DOMAINS)
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        "eve@gmail.com",
+        "eve@notunipd.it",  # ends in the domain, but not on a dot boundary
+        "eve@unipd.it.evil.example",  # starts with it, which is worse
+        "eve@unipd.itx",
+        "eve@it",
+        "no-at-sign",
+        "",
+    ],
+)
+def test_everything_else_is_refused(email):
+    assert not is_allowed_email(email, DEFAULT_ALLOWED_DOMAINS)
+
+
+def test_an_empty_allowlist_admits_nobody():
+    """A deleted line in cocco.toml must lock the door, not open it."""
+    assert not is_allowed_email("alice@unipd.it", ())
+
+
+def test_several_institutions_can_be_listed():
+    domains = normalize_domains(["unipd.it", " .Example.ORG. ", "", "  "])
+    assert domains == ("unipd.it", "example.org")
+    assert is_allowed_email("a@sub.example.org", domains)
+    assert is_allowed_email("a@unipd.it", domains)
+    assert not is_allowed_email("a@elsewhere.it", domains)
+
+
+def test_email_domain_takes_the_last_at():
+    assert email_domain("a@b@unipd.it") == "unipd.it"
+    assert email_domain("no-at-sign") == ""
 
 
 ########################################################################
@@ -104,12 +121,15 @@ def test_send_magic_link_logs_when_smtp_is_unconfigured(caplog):
 
 def test_load_config_without_a_file(tmp_path):
     config = load_config(tmp_path / "absent.toml")
-    assert config.smtp is None
+    assert config.auth.google is None
+    assert config.auth.allowed_domains == DEFAULT_ALLOWED_DOMAINS
     assert config.base_url is None
     assert config.session.secret_key
 
 
-def test_load_config_reads_smtp_and_site(tmp_path):
+def test_load_config_reads_the_auth_table(tmp_path, monkeypatch):
+    monkeypatch.delenv("COCCO_GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("COCCO_GOOGLE_CLIENT_SECRET", raising=False)
     path = tmp_path / "cocco.toml"
     path.write_text(
         """
@@ -117,11 +137,11 @@ def test_load_config_reads_smtp_and_site(tmp_path):
         secret_key = "s3cret"
         https_only = true
 
-        [smtp]
-        host = "smtp.unipd.it"
-        from_address = "cocco@unipd.it"
-        port = 25
-        starttls = false
+        [auth]
+        allowed_domains = ["unipd.it", "Example.ORG"]
+        google_client_id = "an-id"
+        google_client_secret = "a-secret"
+        google_hd = "unipd.it"
 
         [site]
         base_url = "https://cocco.example.org"
@@ -130,21 +150,45 @@ def test_load_config_reads_smtp_and_site(tmp_path):
     config = load_config(path)
     assert config.session.secret_key == "s3cret"
     assert config.session.https_only
-    assert config.smtp is not None
-    assert (config.smtp.host, config.smtp.port, config.smtp.starttls) == (
-        "smtp.unipd.it",
-        25,
-        False,
-    )
+    assert config.auth.allowed_domains == ("unipd.it", "example.org")
+    assert config.auth.google is not None
+    assert config.auth.google.client_id == "an-id"
+    assert config.auth.google.client_secret == "a-secret"
+    assert config.auth.google.hd == "unipd.it"
     assert config.base_url == "https://cocco.example.org"
 
 
-def test_load_config_ignores_an_incomplete_smtp_section(tmp_path):
-    """A half-filled [smtp] falls back to logging the link rather than raising:
-    a misconfigured mail server must not stop the app from booting."""
+def test_half_a_credential_is_no_credential(tmp_path, monkeypatch, caplog):
+    """A typo must not stop the app from booting: it warns, and Google sign-in
+    is simply off."""
+    monkeypatch.delenv("COCCO_GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("COCCO_GOOGLE_CLIENT_SECRET", raising=False)
     path = tmp_path / "cocco.toml"
-    path.write_text('[smtp]\nhost = "smtp.unipd.it"\n')
-    assert load_config(path).smtp is None
+    path.write_text('[auth]\ngoogle_client_id = "an-id"\n')
+    with caplog.at_level("WARNING", logger="cocco.auth"):
+        config = load_config(path)
+    assert config.auth.google is None
+    assert "google_client_secret" in caplog.text
+
+
+def test_the_environment_beats_the_file_for_the_google_client(tmp_path, monkeypatch):
+    path = tmp_path / "cocco.toml"
+    path.write_text(
+        '[auth]\ngoogle_client_id = "from-file"\ngoogle_client_secret = "from-file"\n'
+    )
+    monkeypatch.setenv("COCCO_GOOGLE_CLIENT_ID", "from-env")
+    monkeypatch.setenv("COCCO_GOOGLE_CLIENT_SECRET", "also-from-env")
+    google = load_config(path).auth.google
+    assert google is not None
+    assert (google.client_id, google.client_secret) == ("from-env", "also-from-env")
+
+
+def test_an_empty_allowed_domains_list_is_honoured(tmp_path):
+    """Written explicitly, `[]` means nobody - it must not fall back to the
+    default, or the safe misconfiguration would silently become the unsafe one."""
+    path = tmp_path / "cocco.toml"
+    path.write_text("[auth]\nallowed_domains = []\n")
+    assert load_config(path).auth.allowed_domains == ()
 
 
 def test_environment_beats_the_file_for_the_secret(tmp_path, monkeypatch):

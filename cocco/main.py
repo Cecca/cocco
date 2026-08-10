@@ -26,22 +26,15 @@ from cocco.model import (
 )
 from cocco import schema
 from cocco.auth import (
-    MAX_LINKS_PER_ADDRESS,
-    MAX_LINKS_PER_CLIENT,
-    RATE_WINDOW,
-    TOKEN_TTL,
-    build_magic_link,
-    generate_token,
     get_or_create_user,
-    hash_token,
-    is_expired,
+    google_redirect_uri,
+    is_allowed_email,
     load_config,
     normalize_email,
     safe_next_path,
-    send_magic_link,
 )
+from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import (
-    BackgroundTasks,
     Depends,
     FastAPI,
     File,
@@ -62,21 +55,14 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from starlette.middleware.sessions import SessionMiddleware
-from collections import defaultdict, deque
-from datetime import datetime
 import logging
 import os
 
 from cocco.repository import (
-    consume_login_token,
-    count_recent_login_tokens,
     count_running_submissions,
     count_testcase_outcomes,
-    delete_expired_login_tokens,
-    delete_login_tokens_for_email,
     delete_testcase,
     insert_enrollment,
-    insert_login_token,
     insert_submission,
     insert_testcase,
     insert_user,
@@ -103,13 +89,21 @@ from cocco.repository import (
 
 logger = logging.getLogger(__name__)
 
-# SMTP, the session secret and the public base URL. A missing file is fine: the
-# defaults log the magic link instead of mailing it.
+# The Google client, the allowed domains, the session secret and the public
+# base URL. A missing file is fine: the app boots and the login page says that
+# Google sign-in is unconfigured.
 CONFIG = load_config(Path(os.environ.get("COCCO_CONFIG", "cocco.toml")))
 
-# Development shortcut: the login form takes an address at face value, with no
-# token and no mail. `post_login` is the only place that branches on it.
+# The development cast, up here because DUMMY_USER defaults to the first of
+# them. Alice and Matteo are course staff on everything the seed creates; Bob
+# and Charlie are students.
+DUMMY_STAFF = ["alice@unipd.it", "matteo.ceccarello@unipd.it"]
+DUMMY_STUDENTS = ["bob@unipd.it", "charlie@unipd.it"]
+
+# Development shortcut: no Google, no click, no credentials. `get_user` is the
+# only place that branches on it, so every route is signed in transparently.
 DUMMY_AUTH = os.environ.get("COCCO_DUMMY_AUTH") == "1"
+DUMMY_USER = os.environ.get("COCCO_DUMMY_USER") or DUMMY_STAFF[0]
 
 # Root of the app
 app = FastAPI(default_response_class=HTMLResponse)
@@ -122,11 +116,41 @@ app.add_middleware(
     session_cookie=CONFIG.session.cookie_name,
     max_age=CONFIG.session.max_age,
     https_only=CONFIG.session.https_only,
-    # Not "strict": a magic link is a top-level navigation out of a mail
-    # client, and under "strict" the cookie just set by /auth/verify would not
-    # be sent on the redirect that follows it.
+    # Not "strict": the return from Google is a top-level cross-site
+    # navigation, and under "strict" the cookie carrying the OAuth `state`
+    # would not be sent to the callback, so every sign-in would fail as a state
+    # mismatch.
     same_site="lax",
 )
+
+# Registered at import, but nothing is fetched here: Authlib pulls Google's
+# metadata document lazily, on the first `authorize_redirect`. That is what
+# lets a checkout with no credentials boot and merely say so on the login page.
+oauth = OAuth()
+if CONFIG.auth.google is not None:
+    oauth.register(
+        name="google",
+        client_id=CONFIG.auth.google.client_id,
+        client_secret=CONFIG.auth.google.client_secret,
+        server_metadata_url=CONFIG.auth.google.server_metadata_url,
+        client_kwargs={
+            # `profile` is deliberately not asked for: the nickname is derived
+            # from the address, so the name and the picture would be data we
+            # hold without using. Both of these are non-sensitive scopes, so
+            # Google asks for no verification review.
+            "scope": "openid email",
+            "code_challenge_method": "S256",
+        },
+    )
+
+
+def google_client():
+    """The registered client, or None when there are no credentials.
+
+    A function rather than a module constant so a test can replace the whole of
+    Google with two methods.
+    """
+    return oauth.create_client("google")
 
 # Static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -228,12 +252,6 @@ async def _seed_user(conn: AsyncConnection, email: str, nickname: str) -> int:
     return await insert_user(conn, email, nickname, image, image_mime)
 
 
-# The development cast. With COCCO_DUMMY_AUTH=1 any of these addresses gets you
-# straight in, so the staff view and the student view are both one login away.
-DUMMY_STAFF = ["alice@unipd.it", "matteo.ceccarello@unipd.it"]
-DUMMY_STUDENTS = ["bob@unipd.it", "charlie@unipd.it"]
-
-
 async def _populate_dummy_data(conn: AsyncConnection):
     import textwrap
 
@@ -294,7 +312,7 @@ async def _populate_dummy_data(conn: AsyncConnection):
         # students. `role` is per course, so this is two rows per person.
         for email in DUMMY_STAFF:
             await insert_enrollment(
-                conn, user_ids[email], course_id, UserRole.admin
+                conn, user_ids[email], course_id, UserRole.teacher
             )
         for email in DUMMY_STUDENTS:
             await insert_enrollment(
@@ -510,6 +528,16 @@ async def get_user(request: Request, db: DBDep) -> schema.User:
     The cookie holds nothing but the user id, so a renamed - or deleted -
     account takes effect on the very next request.
     """
+    if DUMMY_AUTH:
+        # Development only: there is no sign-in step at all. The address is
+        # resolved on every request rather than stashed in the session, and the
+        # account is created if it is missing, so this works against an empty
+        # database too - with no enrollments, which is exactly what a first
+        # real sign-in gets.
+        user = await get_or_create_user(db, DUMMY_USER)
+        await db.commit()
+        return user
+
     user_id = request.session.get("user_id")
     if user_id is not None:
         row = await query_user(db, user_id)
@@ -552,31 +580,18 @@ async def handle_not_authenticated(request: Request, exc: NotAuthenticated):
 ########################################################################
 # authentication
 #
-# A visitor proves an address by following a one-time link mailed to it, and
-# the account is created the first time such a link is followed. None of these
-# routes depends on `CurrentUser`: they are the way in.
-
-# The per-client half of the rate limit, a sliding window of request times. It
-# is per process, so `fastapi dev` resets it on every reload and two workers do
-# not agree - fine for a self-hosted judge, and it costs no new dependency.
-_LINK_REQUESTS: dict[str, deque[datetime]] = defaultdict(deque)
-
-
-def _client_budget_ok(request: Request, now: datetime) -> bool:
-    key = request.client.host if request.client else "unknown"
-    window = _LINK_REQUESTS[key]
-    while window and window[0] < now - RATE_WINDOW:
-        window.popleft()
-    if len(window) >= MAX_LINKS_PER_CLIENT:
-        return False
-    window.append(now)
-    return True
+# A visitor proves an address by signing in with Google, and the account is
+# created the first time an accepted address comes back. None of these routes
+# depends on `CurrentUser`: they are the way in.
 
 
 def _base_url(request: Request) -> str:
-    """The absolute origin the emailed link should point at. Configured
-    explicitly when there is a proxy in front, since only the deployment knows
-    the public name."""
+    """The absolute origin Google must redirect back to.
+
+    Configured explicitly when there is a proxy in front, since only the
+    deployment knows the public name - and a proxy that terminates TLS makes
+    `request.base_url` say `http`, which Google would refuse as a mismatch.
+    """
     if CONFIG.base_url:
         return CONFIG.base_url
     return str(request.base_url).rstrip("/")
@@ -587,7 +602,6 @@ def _login_page(
     *,
     next_path: str = "/",
     error: str | None = None,
-    sent_to: str | None = None,
     status_code: int = 200,
 ):
     return templates.TemplateResponse(
@@ -600,107 +614,175 @@ def _login_page(
             "user": None,
             "next": next_path,
             "error": error,
-            "sent_to": sent_to,
-            "ttl_minutes": int(TOKEN_TTL.total_seconds() // 60),
-            "dummy_auth": DUMMY_AUTH,
+            "google_configured": CONFIG.auth.google is not None,
+            "allowed_domains": CONFIG.auth.allowed_domains,
         },
     )
 
 
 def _sign_in(request: Request, user: schema.User, next_path: str):
-    # Never carry a prior session over into a new identity.
+    # Never carry a prior session over into a new identity - and this is also
+    # what drops the OAuth state Authlib left behind, now spent.
     request.session.clear()
     request.session["user_id"] = user.id
     return RedirectResponse(next_path, status_code=303)
 
 
+def _prune_stale_oauth_state(request: Request) -> None:
+    """Drop the leftovers of abandoned sign-ins.
+
+    Authlib stashes one entry per *started* flow in the session and removes
+    only the one that finishes, so a visitor who keeps bouncing off the consent
+    screen would grow the cookie without bound. Only the flow about to start
+    matters.
+    """
+    for key in [k for k in request.session if k.startswith("_state_google_")]:
+        del request.session[key]
+
+
 @app.get("/login")
 async def get_login(request: Request, next: str = "/"):
-    return _login_page(request, next_path=safe_next_path(next))
+    next_path = safe_next_path(next)
+    if DUMMY_AUTH:
+        # There is nothing to click: `get_user` signs every request in.
+        return RedirectResponse(next_path, status_code=303)
+    return _login_page(request, next_path=next_path)
 
 
-@app.post("/login")
-async def post_login(
-    request: Request,
-    db: DBDep,
-    background: BackgroundTasks,
-    email: Annotated[str, Form()],
-    next: Annotated[str, Form()] = "/",
-):
-    """Send a magic link - or, under COCCO_DUMMY_AUTH, just sign the visitor in.
+@app.get("/auth/google")
+async def get_auth_google(request: Request, next: str = "/"):
+    """Hand off to Google.
 
-    The response is the same whether or not the address is known and whether or
-    not a link was actually sent, so neither a rate limit nor the existence of
-    an account is observable from here. There is no account to enumerate
-    anyway: a first login creates one.
+    Authlib puts the `state`, the `nonce` and the PKCE verifier in the session
+    and returns the redirect to the consent screen.
     """
     next_path = safe_next_path(next)
+    if DUMMY_AUTH:
+        return RedirectResponse(next_path, status_code=303)
+
+    client = google_client()
+    if client is None:
+        return _login_page(
+            request,
+            next_path=next_path,
+            error="Google sign-in is not configured on this server.",
+            status_code=503,
+        )
+
+    # The destination rides in the session, not in the redirect URI: that URI is
+    # matched character for character against the console registration, so it
+    # cannot carry a query string. Unlike an emailed link this is the same
+    # browser throughout, which makes the session the natural place for it.
+    request.session["login_next"] = next_path
+    _prune_stale_oauth_state(request)
+
+    params = {}
+    if CONFIG.auth.google is not None and CONFIG.auth.google.hd:
+        # A hint for the account chooser, never a check: `hd` is absent for
+        # consumer accounts, and the gate is `is_allowed_email` on the address.
+        params["hd"] = CONFIG.auth.google.hd
+
     try:
-        address = normalize_email(email)
+        return await client.authorize_redirect(
+            request, google_redirect_uri(_base_url(request)), **params
+        )
+    except Exception:
+        # Typically the metadata document could not be fetched. A machine that
+        # is offline should say so rather than raise a 500.
+        logger.exception("could not start the Google sign-in flow")
+        return _login_page(
+            request,
+            next_path=next_path,
+            error="Could not reach Google right now. Please try again.",
+            status_code=502,
+        )
+
+
+@app.get("/auth/google/callback")
+async def get_auth_google_callback(request: Request, db: DBDep):
+    """Finish the flow: verify the ID token, check the domain, sign in.
+
+    Every failure lands on the login page with one sentence, never a traceback:
+    the visitor arrives here from Google, so a 500 would be a dead end.
+    """
+    # Read before `_sign_in` clears the session. A callback that arrives
+    # without one - a bookmarked URL, a cleared cookie - lands on the root.
+    next_path = safe_next_path(request.session.get("login_next"))
+
+    client = google_client()
+    if client is None:
+        return _login_page(
+            request,
+            error="Google sign-in is not configured on this server.",
+            status_code=503,
+        )
+
+    try:
+        token = await client.authorize_access_token(request)
+    except OAuthError as err:
+        # Covers the visitor pressing Cancel (`access_denied`), a mismatched or
+        # expired `state`, and a token endpoint that refused the code. Keep the
+        # clause this narrow: widening it would fold a failed state check into
+        # a success path, which is the one bug here that fails silently.
+        logger.info("a Google sign-in did not complete: %s", err.error)
+        return _login_page(
+            request,
+            next_path=next_path,
+            error="That sign-in did not complete. Please try again.",
+            status_code=400,
+        )
+
+    # Authlib has already verified the ID token's signature, issuer, audience
+    # and nonce; `userinfo` is its decoded claims.
+    claims = token.get("userinfo") or {}
+    try:
+        email = normalize_email(claims.get("email") or "")
     except ValueError:
         return _login_page(
             request,
             next_path=next_path,
-            error="That does not look like an email address.",
+            error="Google did not return an email address.",
             status_code=400,
         )
 
-    if DUMMY_AUTH:
-        # The development shortcut, and the only branch that skips confirming
-        # the address: `just dev` needs no mail server.
-        user = await get_or_create_user(db, address)
-        await db.commit()
-        return _sign_in(request, user, next_path)
-
-    now = datetime.now()
-    await delete_expired_login_tokens(db, now)
-    recent = await count_recent_login_tokens(db, address, now - RATE_WINDOW)
-    if recent < MAX_LINKS_PER_ADDRESS and _client_budget_ok(request, now):
-        token = generate_token()
-        await insert_login_token(
-            db, hash_token(token), address, now, now + TOKEN_TTL
-        )
-        # The token must be durable before the mail carrying it can arrive.
-        await db.commit()
-        link = build_magic_link(_base_url(request), token)
-        # A sync callable, so Starlette runs blocking smtplib in the threadpool.
-        background.add_task(send_magic_link, CONFIG.smtp, address, link)
-    else:
-        await db.commit()  # the expiry sweep above
-        logger.warning("rate-limited a magic-link request for %s", address)
-
-    request.session["login_next"] = next_path
-    return _login_page(request, next_path=next_path, sent_to=address)
-
-
-@app.get("/auth/verify")
-async def get_auth_verify(request: Request, db: DBDep, token: str = ""):
-    now = datetime.now()
-    row = await consume_login_token(db, hash_token(token), now)
-    if row is None or is_expired(row.expires_at, now):
-        # Unknown, already spent, or expired - all the same message, and the
-        # burn stands either way.
-        await db.commit()
+    if claims.get("email_verified") not in (True, "true"):
+        # Google says the address is unconfirmed, so it proves nothing. Matched
+        # against the two affirmative spellings rather than tested for
+        # truthiness: the string "false" is truthy, and this is the kind of
+        # mistake that would never fail visibly.
         return _login_page(
             request,
-            error="That link is no longer valid. Ask for a new one.",
-            status_code=400,
+            next_path=next_path,
+            error="That Google account's email address is not verified.",
+            status_code=403,
         )
 
-    user = await get_or_create_user(db, row.email)
-    # An older link that was forwarded on is now dead.
-    await delete_login_tokens_for_email(db, row.email)
-    await db.commit()
+    if not is_allowed_email(email, CONFIG.auth.allowed_domains):
+        logger.info("refused a sign-in from outside the allowed domains: %s", email)
+        domains = ", ".join("@" + d for d in CONFIG.auth.allowed_domains)
+        return _login_page(
+            request,
+            next_path=next_path,
+            error=(
+                f"{email} is not an institutional address. "
+                f"Sign in with your {domains} account."
+            ),
+            status_code=403,
+        )
 
-    # The link may well be opened in another browser, where the session that
-    # asked for it does not exist; then there is no destination but the root.
-    next_path = safe_next_path(request.session.get("login_next"))
+    user = await get_or_create_user(db, email)
+    await db.commit()
     return _sign_in(request, user, next_path)
 
 
 @app.post("/logout")
 async def post_logout(request: Request):
     request.session.clear()
+    if DUMMY_AUTH:
+        # Nothing to sign out of: `get_user` signs the next request straight
+        # back in. Bounce to the root rather than to a login page that would
+        # only redirect there anyway.
+        return RedirectResponse("/", status_code=303)
     return RedirectResponse("/login", status_code=303)
 
 
