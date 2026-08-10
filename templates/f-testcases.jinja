@@ -15,14 +15,17 @@
         <th class="w-12">#</th>
         <th>Input</th>
         <th>Expected output</th>
-        <th class="w-28">Public</th>
+        <th class="w-24">Active</th>
+        <th class="w-24">Public</th>
         <th class="w-32 text-right">Order</th>
         <th class="w-16"></th>
       </tr>
     </thead>
     <tbody>
       {% for testcase in testcases %}
-      <tr>
+      {# A retired case is dimmed: it is still listed, so it can be reinstated,
+         but nothing is graded on it. #}
+      <tr class="{{ '' if testcase.is_active else 'opacity-50' }}">
         <td class="font-mono font-semibold text-base-content/50">{{ loop.index }}</td>
 
         {% for kind, path in [("input", testcase.input_path),
@@ -40,6 +43,20 @@
           </form>
         </td>
         {% endfor %}
+
+        <td>
+          {# Unticking retires the case: the judge stops running it, and it
+             stops being downloadable even if it is still marked public. #}
+          <input type="checkbox" name="is_active" value="true"
+                 class="checkbox checkbox-sm checkbox-primary"
+                 {% if testcase.is_active %}checked{% endif %}
+                 aria-label="Graded by new submissions"
+                 title="Unticked, new submissions are not graded on this test case"
+                 hx-post="{{ url_for('post_testcase_active', course_id=course_id, challenge_id=challenge_id, testcase_id=testcase.id) }}"
+                 hx-trigger="change"
+                 hx-target="#testcases"
+                 hx-swap="innerHTML" />
+        </td>
 
         <td>
           {# Unchecked checkboxes are simply not submitted, so the route
@@ -70,17 +87,24 @@
         </td>
 
         <td class="text-right">
+          {# Deleting is only possible while nothing has been graded on the
+             case. The route enforces that; this only explains it. #}
+          {% if testcase.n_outcomes %}
+          <button type="button" class="btn btn-xs btn-ghost text-error" disabled
+                  title="{{ testcase.n_outcomes }} submission(s) were graded on this test case — untick Active instead">✕</button>
+          {% else %}
           <form hx-post="{{ url_for('post_testcase_delete', course_id=course_id, challenge_id=challenge_id, testcase_id=testcase.id) }}"
                 hx-target="#testcases"
                 hx-swap="innerHTML"
-                hx-confirm="Delete this test case? Both files are removed and past submissions lose their link to it.">
+                hx-confirm="Delete this test case? Both files are removed.">
             <button type="submit" class="btn btn-xs btn-ghost text-error" title="Delete">✕</button>
           </form>
+          {% endif %}
         </td>
       </tr>
       {% else %}
       <tr>
-        <td colspan="6" class="text-center text-sm text-base-content/45 py-6">
+        <td colspan="7" class="text-center text-sm text-base-content/45 py-6">
           No test cases yet — a submission to this challenge would score nothing.
         </td>
       </tr>

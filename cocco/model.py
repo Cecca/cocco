@@ -14,6 +14,7 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
+    text,
 )
 from sqlalchemy.types import TypeDecorator
 
@@ -113,6 +114,13 @@ TestCase = Table(
     # Sample test cases are public: their input and expected output can be
     # downloaded from the challenge page. All the others are hidden.
     Column("is_sample", Boolean, nullable=False, default=False),
+    # A retired test case keeps its files and its past outcomes, but no new
+    # submission is graded on it and it is no longer public. This is what course
+    # staff reach for instead of deleting: an outcome must keep pointing at the
+    # test case it was scored on.
+    Column(
+        "is_active", Boolean, nullable=False, default=True, server_default=text("true")
+    ),
 )
 
 

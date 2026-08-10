@@ -41,6 +41,7 @@ class TestCase(Base):
     input_path: str
     expected_output_path: str
     is_sample: bool = False
+    is_active: bool = True
 
 
 class Submission(Base):

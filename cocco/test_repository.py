@@ -19,9 +19,11 @@ from cocco.model import (
 )
 from cocco.model import UserRole
 from cocco.repository import (
+    count_testcase_outcomes,
     pull_queued_submission,
     query_challenge,
     query_challenge_testcases,
+    query_sample_testcase,
     query_user_role,
     query_user_submissions,
 )
@@ -129,7 +131,10 @@ def _make_example_database(db_url="sqlite:///:memory:"):
                         execution_order=order,
                         input_path=f"{challenge_title}/in_{order}.txt",
                         expected_output_path=f"{challenge_title}/out_{order}.txt",
-                        is_sample=order == 0,
+                        # the last one is public but retired, so the "retired
+                        # wins over public" rule is exercised
+                        is_sample=order in (0, 2),
+                        is_active=order != 2,
                     )
                     .returning(TestCase.c.id)
                 ).scalar_one()
@@ -276,6 +281,64 @@ async def test_get_queued_submission_returns_oldest_queued():
     assert result.submission_id == oldest_id
 
 
+async def test_queued_submission_skips_retired_testcases():
+    """Retiring a test case is what stops it grading new submissions."""
+    engine = _make_engine()
+
+    with engine.begin() as conn:
+        image, image_mime = generate_identicon("the-admin")
+        user_id = conn.execute(
+            insert(User)
+            .values(
+                email="me@example.com",
+                nickname="the-admin",
+                image=image,
+                image_mime=image_mime,
+            )
+            .returning(User.c.id)
+        ).scalar_one()
+        challenge_id = conn.execute(
+            insert(Challenge)
+            .values(
+                title="Hello",
+                description="say hi",
+                max_memory_bytes=1 << 20,
+                max_time_s=1.0,
+                evaluator=EqualityEvaluator(),
+            )
+            .returning(Challenge.c.id)
+        ).scalar_one()
+
+        for order, is_active in enumerate([True, False, True]):
+            conn.execute(
+                insert(TestCase).values(
+                    challenge_id=challenge_id,
+                    execution_order=order,
+                    input_path=f"in_{order}.txt",
+                    expected_output_path=f"out_{order}.txt",
+                    is_active=is_active,
+                )
+            )
+
+        conn.execute(
+            insert(Submission).values(
+                challenge_id=challenge_id,
+                user_id=user_id,
+                language="python",
+                filename="solution.py",
+                source="print('a')",
+                status=cm.SubmissionStatus.queued,
+                enqueued=datetime.now(),
+            )
+        )
+
+    with engine.connect() as conn:
+        result = await pull_queued_submission(conn)
+
+    assert result is not None
+    assert [t.execution_order for t in result.test_cases] == [0, 2]
+
+
 async def test_get_queued_submission_returns_none_when_empty():
     engine = _make_engine()
     with engine.connect() as conn:
@@ -306,7 +369,8 @@ async def test_challenge_page_queries():
         assert challenge["course_title"] == "Algorithms 101"
         assert challenge["position"] == 1
         assert challenge["viewer_role"] == "student"
-        # one of the three test cases per challenge is public
+        # Two of the three are marked public, but the third is retired, and a
+        # retired case is not offered to students however it is flagged.
         assert [s["execution_order"] for s in challenge["samples"]] == [0]
 
         # alice (user 2) teaches it, and is the one who gets the Edit button
@@ -336,8 +400,23 @@ async def test_challenge_page_queries():
         assert await query_user_role(conn, user_id=4, challenge_id=1) == UserRole.student
         assert await query_user_role(conn, user_id=4, challenge_id=5) is None
 
+        # The editor lists retired cases too - that is how one is reinstated
         testcases = await query_challenge_testcases(conn, 1)
         assert [tc.execution_order for tc in testcases] == [0, 1, 2]
-        assert [tc.is_sample for tc in testcases] == [True, False, False]
+        assert [tc.is_sample for tc in testcases] == [True, False, True]
+        assert [tc.is_active for tc in testcases] == [True, True, False]
+
+        # ...but the retired one is not downloadable despite is_sample
+        assert await query_sample_testcase(conn, 1, testcases[0].id) is not None
+        assert await query_sample_testcase(conn, 1, testcases[2].id) is None
+
+        # Every "Hello" submission was graded on all three, so none of them can
+        # be deleted; a case on an unattempted challenge still can.
+        assert [tc.n_outcomes for tc in testcases] == [3, 3, 3]
+        assert await count_testcase_outcomes(conn, testcases[0].id) == 3
+
+        untouched_cases = await query_challenge_testcases(conn, 5)
+        assert [tc.n_outcomes for tc in untouched_cases] == [0, 0, 0]
+        assert await count_testcase_outcomes(conn, untouched_cases[0].id) == 0
     await engine.dispose()
 

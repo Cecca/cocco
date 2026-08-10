@@ -47,8 +47,12 @@ async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
     if challenge is None:
         return None
 
+    # Retired test cases are skipped: they keep grading the submissions that
+    # already ran against them, but nothing new is scored on them.
     tests = conn.execute(
-        select(TestCase).where(TestCase.c.challenge_id == challenge.id)
+        select(TestCase).where(
+            and_(TestCase.c.challenge_id == challenge.id, TestCase.c.is_active)
+        )
     ).all()
 
     return SubmissionRunData(
@@ -177,7 +181,7 @@ async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int
                json_agg(json_build_object('id', id, 'execution_order', execution_order)
                         ORDER BY execution_order) AS samples
         FROM testcase
-        WHERE is_sample
+        WHERE is_sample AND is_active
         GROUP BY challenge_id
     ),
     positions AS (
@@ -258,13 +262,15 @@ async def query_sample_testcase(
     conn: AsyncConnection, challenge_id: int, testcase_id: int
 ):
     """The paths of a *public* test case, or None. Used to authorize downloads:
-    hidden test cases must never be served."""
+    hidden test cases must never be served, and neither must retired ones - a
+    sample nothing is graded against is not an example of anything."""
     stmt = select(TestCase.c.execution_order, TestCase.c.input_path,
                   TestCase.c.expected_output_path).where(
         and_(
             TestCase.c.id == testcase_id,
             TestCase.c.challenge_id == challenge_id,
             TestCase.c.is_sample,
+            TestCase.c.is_active,
         )
     )
     return (await conn.execute(stmt)).first()
@@ -290,17 +296,33 @@ async def query_user_role(
 
 
 async def query_challenge_testcases(conn: AsyncConnection, challenge_id: int):
-    """Every test case of a challenge, in execution order.
+    """Every test case of a challenge, in execution order, with the number of
+    outcomes scored against each.
 
     Unlike the `samples` array of `query_challenge`, this includes the hidden
-    ones - the editor lists them all.
+    and the retired ones - the editor lists them all, and unretiring one has to
+    be possible. `n_outcomes` is what tells the editor which rows can still be
+    deleted.
     """
     stmt = (
-        select(TestCase)
+        select(TestCase, func.count(TestOutcome.c.id).label("n_outcomes"))
+        .select_from(
+            TestCase.outerjoin(
+                TestOutcome, TestOutcome.c.testcase_id == TestCase.c.id
+            )
+        )
         .where(TestCase.c.challenge_id == challenge_id)
+        .group_by(TestCase.c.id)
         .order_by(TestCase.c.execution_order, TestCase.c.id)
     )
     return (await conn.execute(stmt)).all()
+
+
+async def count_testcase_outcomes(conn: AsyncConnection, testcase_id: int) -> int:
+    """How many submissions were graded on a test case. Non-zero means it must
+    not be deleted - see `delete_testcase`."""
+    stmt = select(func.count()).where(TestOutcome.c.testcase_id == testcase_id)
+    return (await conn.execute(stmt)).scalar_one()
 
 
 async def query_testcase(conn: AsyncConnection, challenge_id: int, testcase_id: int):
@@ -354,18 +376,15 @@ async def insert_testcase(
 
 
 async def delete_testcase(conn: AsyncConnection, testcase_id: int) -> None:
-    """Delete a test case, detaching any outcome that scored against it.
+    """Delete a test case nothing has been graded on.
 
-    `testoutcome.testcase_id` is a FK with no ON DELETE, so a test case a past
-    submission was graded on cannot simply be deleted. The outcomes are kept
-    with a null test case: their score and message are still the record of what
-    that submission did, and the submission history has to keep rendering.
+    The caller must have checked `count_testcase_outcomes` first. A test case a
+    submission was scored against is never deleted - detaching those outcomes
+    would leave scores in the history with nothing to say what produced them, so
+    staff retire the case (`is_active`) instead. The FK on
+    `testoutcome.testcase_id` has no ON DELETE and stays the backstop: it raises
+    rather than lets this quietly do the wrong thing.
     """
-    await conn.execute(
-        update(TestOutcome)
-        .where(TestOutcome.c.testcase_id == testcase_id)
-        .values(testcase_id=None)
-    )
     await conn.execute(delete(TestCase).where(TestCase.c.id == testcase_id))
 
 

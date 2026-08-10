@@ -24,10 +24,12 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Upload
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 import os
 
 from cocco.repository import (
+    count_testcase_outcomes,
     delete_testcase,
     insert_enrollment,
     insert_submission,
@@ -231,22 +233,25 @@ async def _populate_dummy_data(conn: AsyncConnection):
     assert first_challenge_id is not None
 
     # The first three are public samples, downloadable from the challenge page;
-    # the rest are hidden. Contents go on the filesystem, not in the database
-    # (DESIGN.md, "Test case inputs"), so they are written through `storage`.
+    # the rest are hidden. The last one is retired, so the editor shows both
+    # states without anyone having to click first. Contents go on the
+    # filesystem, not in the database (DESIGN.md, "Test case inputs"), so they
+    # are written through `storage`.
     cases = [
-        ("5 6\n0 1 4\n0 2 1\n2 1 2\n1 3 1\n2 3 5\n3 4 3\n0 4\n", "7\n", True),
-        ("4 2\n0 1 5\n2 3 7\n0 3\n", "-1\n", True),
+        ("5 6\n0 1 4\n0 2 1\n2 1 2\n1 3 1\n2 3 5\n3 4 3\n0 4\n", "7\n", True, True),
+        ("4 2\n0 1 5\n2 3 7\n0 3\n", "-1\n", True, True),
         (
             "6 9\n0 1 7\n0 2 9\n0 5 14\n1 2 10\n1 3 15\n2 3 11\n2 5 2\n"
             "3 4 6\n5 4 9\n0 4\n",
             "20\n",
             True,
+            True,
         ),
-        ("2 1\n0 1 3\n1 0\n", "3\n", False),
-        ("3 3\n0 1 2\n1 2 2\n0 2 10\n0 2\n", "4\n", False),
+        ("2 1\n0 1 3\n1 0\n", "3\n", False, True),
+        ("3 3\n0 1 2\n1 2 2\n0 2 10\n0 2\n", "4\n", False, False),
     ]
     testcase_id: int | None = None
-    for order, (test_input, expected, is_sample) in enumerate(cases):
+    for order, (test_input, expected, is_sample, is_active) in enumerate(cases):
         input_path = f"challenge_{first_challenge_id}/in_{order}.txt"
         output_path = f"challenge_{first_challenge_id}/out_{order}.txt"
         storage.write(input_path, test_input)
@@ -260,6 +265,7 @@ async def _populate_dummy_data(conn: AsyncConnection):
                     input_path=input_path,
                     expected_output_path=output_path,
                     is_sample=is_sample,
+                    is_active=is_active,
                 )
                 .returning(TestCase.c.id)
             )
@@ -719,12 +725,43 @@ async def post_testcase_delete(
     db: DBDep,
     role: ChallengeEditor,
 ):
+    """Delete a test case, but only one nothing has been graded on.
+
+    Once a submission has been scored against a test case, deleting it would
+    strand that score: staff retire the case instead, which stops new
+    submissions from using it while the history keeps making sense.
+    """
     testcase = await query_testcase(db, challenge_id, testcase_id)
     if testcase is None:
         raise HTTPException(status_code=404)
 
-    await delete_testcase(db, testcase_id)
-    await db.commit()
+    def refuse(graded: int | None):
+        subject = (
+            "This test case has already graded submissions"
+            if graded is None
+            else f"{graded} submission{'' if graded == 1 else 's'} "
+                 f"{'was' if graded == 1 else 'were'} graded on this test case"
+        )
+        return _render_testcases(
+            request, db, course_id, challenge_id,
+            f"{subject}, so it cannot be deleted. Untick Active to stop using "
+            "it for new submissions.",
+            ok=False,
+        )
+
+    graded = await count_testcase_outcomes(db, testcase_id)
+    if graded:
+        return await refuse(graded)
+
+    try:
+        await delete_testcase(db, testcase_id)
+        await db.commit()
+    except IntegrityError:
+        # The count and the delete are two statements, and a judge may have
+        # inserted outcomes in between. The FK catches it; this is not a 500.
+        await db.rollback()
+        return await refuse(None)
+
     # Only after the row is gone, so a failed commit cannot leave the database
     # pointing at files that no longer exist.
     storage.delete(testcase.input_path)
@@ -797,7 +834,36 @@ async def post_testcase_sample(
     await db.commit()
     return await _render_testcases(
         request, db, course_id, challenge_id,
-        "Now a public sample." if is_sample else "Now hidden.", ok=True,
+        "Now a public sample." if is_sample else "No longer public.", ok=True,
+    )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/testcases/{testcase_id}/active")
+async def post_testcase_active(
+    course_id: int,
+    challenge_id: int,
+    testcase_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+    is_active: Annotated[bool, Form()] = False,
+):
+    """Retire or reinstate a test case.
+
+    Retiring is the non-destructive alternative to deleting: the row, the files
+    and every outcome scored against it stay, but the judge stops running it and
+    it is no longer downloadable as a sample.
+    """
+    if await query_testcase(db, challenge_id, testcase_id) is None:
+        raise HTTPException(status_code=404)
+    await update_testcase(db, testcase_id, is_active=is_active)
+    await db.commit()
+    return await _render_testcases(
+        request, db, course_id, challenge_id,
+        "Active again — new submissions are graded on it."
+        if is_active
+        else "Retired — new submissions will skip it.",
+        ok=True,
     )
 
 
