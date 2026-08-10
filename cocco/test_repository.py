@@ -1,9 +1,12 @@
 from datetime import datetime, timedelta
 
+import pytest
 from sqlalchemy import create_engine, insert
-from icecream import ic
+from sqlalchemy.ext.asyncio import create_async_engine
 
 import cocco.model as cm
+from cocco.avatar import generate_identicon
+from cocco.evaluator import EqualityEvaluator
 from cocco.model import (
     Challenge,
     Course,
@@ -14,7 +17,11 @@ from cocco.model import (
     User,
     metadata,
 )
-from cocco.repository import get_user_focused_challenge_info, pull_queued_submission
+from cocco.repository import (
+    pull_queued_submission,
+    query_challenge,
+    query_user_submissions,
+)
 from cocco.schema import SubmissionRunData
 
 
@@ -37,14 +44,19 @@ def _make_example_database(db_url="sqlite:///:memory:"):
             ("dave@example.com", "dave"),
             ("erin@example.com", "erin"),
         ]
-        user_ids = {
-            nickname: conn.execute(
+        user_ids = {}
+        for email, nickname in users:
+            image, image_mime = generate_identicon(nickname)
+            user_ids[nickname] = conn.execute(
                 insert(User)
-                .values(email=email, nickname=nickname)
+                .values(
+                    email=email,
+                    nickname=nickname,
+                    image=image,
+                    image_mime=image_mime,
+                )
                 .returning(User.c.id)
             ).scalar_one()
-            for email, nickname in users
-        }
 
         courses = [
             ("Algorithms 101", "intro to algorithms"),
@@ -96,6 +108,7 @@ def _make_example_database(db_url="sqlite:///:memory:"):
                     max_memory_bytes=mem,
                     max_time_s=time_s,
                     max_threads=threads,
+                    evaluator=EqualityEvaluator(),
                 )
                 .returning(Challenge.c.id)
             ).scalar_one()
@@ -113,6 +126,7 @@ def _make_example_database(db_url="sqlite:///:memory:"):
                         execution_order=order,
                         input_path=f"{challenge_title}/in_{order}.txt",
                         expected_output_path=f"{challenge_title}/out_{order}.txt",
+                        is_sample=order == 0,
                     )
                     .returning(TestCase.c.id)
                 ).scalar_one()
@@ -147,6 +161,7 @@ def _make_example_database(db_url="sqlite:///:memory:"):
                     user_id=user_ids[nickname],
                     challenge_id=challenge_ids[challenge_title],
                     language=language,
+                    filename=f"solution.{language}",
                     source=source,
                     status=status,
                     enqueued=enqueued,
@@ -191,11 +206,14 @@ async def test_get_queued_submission_returns_oldest_queued():
     now = datetime.now()
 
     with engine.begin() as conn:
+        image, image_mime = generate_identicon("the-admin")
         user_id = conn.execute(
             insert(User)
             .values(
                 email="me@example.com",
-                nickname = "the-admin"
+                nickname="the-admin",
+                image=image,
+                image_mime=image_mime,
             )
             .returning(User.c.id)
         ).scalar_one()
@@ -206,6 +224,7 @@ async def test_get_queued_submission_returns_oldest_queued():
                 description="say hi",
                 max_memory_bytes=1 << 20,
                 max_time_s=1.0,
+                evaluator=EqualityEvaluator(),
             )
             .returning(Challenge.c.id)
         ).scalar_one()
@@ -216,6 +235,7 @@ async def test_get_queued_submission_returns_oldest_queued():
                 challenge_id=challenge_id,
                 user_id=user_id,
                 language="python",
+                filename="solution.py",
                 source="print('a')",
                 status=cm.SubmissionStatus.queued,
                 enqueued=now - timedelta(seconds=10),
@@ -228,6 +248,7 @@ async def test_get_queued_submission_returns_oldest_queued():
                 challenge_id=challenge_id,
                 user_id=user_id,
                 language="python",
+                filename="solution.py",
                 source="print('b')",
                 status=cm.SubmissionStatus.queued,
                 enqueued=now,
@@ -238,6 +259,7 @@ async def test_get_queued_submission_returns_oldest_queued():
                 challenge_id=challenge_id,
                 user_id=user_id,
                 language="python",
+                filename="solution.py",
                 source="print('c')",
                 status=cm.SubmissionStatus.running,
                 enqueued=now - timedelta(seconds=20),
@@ -258,11 +280,43 @@ async def test_get_queued_submission_returns_none_when_empty():
     assert result is None
 
 
-def test_user_focused_challenge_info():
+# The json_agg / row_to_json queries backing the web pages are Postgres-only,
+# so this needs a live server (see PGUSER/PGDATABASE/PGHOST in the devShell).
+@pytest.mark.integration
+async def test_challenge_page_queries():
     import os
-    url = f"postgresql+psycopg://{os.environ['PGUSER']}@/{os.environ['PGDATABASE']}?host={os.environ['PGHOST']}"
-    engine = _make_example_database(url)
-    with engine.connect() as conn:
-        res = get_user_focused_challenge_info(conn, 4, 1)
-        ic(res)
-    
+
+    url = (
+        f"postgresql+psycopg://{os.environ['PGUSER']}@/"
+        f"{os.environ['PGDATABASE']}?host={os.environ['PGHOST']}"
+    )
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        challenge = await query_challenge(conn, challenge_id=1)
+        assert challenge is not None
+        assert challenge["title"] == "Hello"
+        assert challenge["course_title"] == "Algorithms 101"
+        assert challenge["position"] == 1
+        # one of the three test cases per challenge is public
+        assert [s["execution_order"] for s in challenge["samples"]] == [0]
+
+        # carol (user 4) has two attempts on "Hello", newest first
+        submissions = await query_user_submissions(conn, user_id=4, challenge_id=1)
+        assert submissions is not None
+        assert [s["attempt"] for s in submissions] == [2, 1]
+        assert [s["filename"] for s in submissions] == ["solution.python", "solution.c"]
+        assert sum(1 for s in submissions if s["is_best"]) == 1
+
+        # a challenge nobody has attempted still comes back, with no samples lost
+        untouched = await query_challenge(conn, challenge_id=5)
+        assert untouched is not None
+        assert untouched["title"] == "Parallel sum"
+
+        # ...and its submission list is simply empty rather than None-ish
+        assert await query_user_submissions(conn, user_id=4, challenge_id=5) is None
+    await engine.dispose()
+

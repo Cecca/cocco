@@ -29,5 +29,5 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [
-    "integration: tests requiring isolate and nix to be available",
+    "integration: tests requiring external services (isolate, nix, postgres)",
 ]
