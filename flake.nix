@@ -52,6 +52,7 @@
           pkgs.uv
           pkgs.postgresql
           pkgs.nodejs_22
+          pkgs.just
           pgStart
           pgStop
           pgCreateDb
@@ -73,6 +74,12 @@
           echo " - pg-start"
           echo " - pg-stop"
           echo " - create-db"
+          echo ""
+          echo "To start the development environment"
+          echo ""
+          echo "   just dev"
+          echo ""
+          echo "===================================================================="
         '';
       };
     });

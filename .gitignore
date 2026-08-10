@@ -1,6 +1,7 @@
 .direnv
 *.db
 .pg/
+.logs/
 node_modules/
 static/styles.css
 # Byte-compiled / optimized / DLL files
