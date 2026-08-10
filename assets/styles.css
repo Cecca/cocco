@@ -1,7 +1,86 @@
 @import "tailwindcss";
-
 @source "../templates/**/*.jinja";
 @source "../cocco/**/*.py";
-
 @plugin "@tailwindcss/typography";
-@plugin "daisyui";
+/* No built-in themes: "cocco" below is the only one. */
+@plugin "daisyui" {
+  themes: false;
+}
+
+/* The "cocco" theme: warm, academic, amber accent.
+
+   Ported from the Claude Design source, which targets daisyUI v4 and writes
+   colours as bare oklch components (`--p: 70% 0.135 55`). daisyUI v5 wants
+   full `oklch()` values under `--color-*` names, so every value below is the
+   v4 triple wrapped in `oklch()`. */
+@plugin "daisyui/theme" {
+  name: "cocco";
+  default: true;
+  prefersdark: false;
+  color-scheme: light;
+
+  --color-primary: oklch(70% 0.135 55); /* amber */
+  --color-primary-content: oklch(99% 0.01 80);
+  --color-secondary: oklch(55% 0.03 250); /* muted slate */
+  --color-secondary-content: oklch(98% 0 0);
+  --color-accent: oklch(60% 0.11 150); /* success green */
+  --color-accent-content: oklch(99% 0 0);
+  --color-neutral: oklch(29% 0.01 60); /* warm near-black */
+  --color-neutral-content: oklch(96% 0.008 80);
+
+  --color-base-100: oklch(97% 0.008 85);
+  --color-base-200: oklch(95% 0.01 85);
+  --color-base-300: oklch(90% 0.014 85);
+  --color-base-content: oklch(28% 0.008 60);
+
+  --color-info: oklch(55% 0.09 240);
+  --color-info-content: oklch(99% 0 0);
+  --color-success: oklch(58% 0.11 150);
+  --color-success-content: oklch(99% 0 0);
+  --color-warning: oklch(72% 0.14 65); /* amber */
+  --color-warning-content: oklch(26% 0.05 65);
+  --color-error: oklch(55% 0.15 28); /* terracotta */
+  --color-error-content: oklch(99% 0 0);
+
+  --radius-box: 1rem;
+  --radius-field: 0.65rem;
+  --radius-selector: 1.9rem;
+  --border: 1px;
+}
+
+/* The three faces used across COCCO, loaded from Google Fonts in base.jinja */
+@theme {
+  --font-sans: "Public Sans", system-ui, sans-serif;
+  --font-serif: "Newsreader", Georgia, serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+}
+
+/* The desk behind the app card */
+body {
+  background: oklch(93% 0.012 85);
+}
+
+/* Dropzone — daisyUI has no native file-drop component */
+.cocco-dropzone {
+  border: 2px dashed oklch(85% 0.02 80);
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.cocco-dropzone.dragover {
+  border-color: var(--color-primary);
+  background: color-mix(in oklch, var(--color-primary) 6%, transparent);
+}
+
+/* htmx request-in-flight helpers */
+.htmx-indicator {
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+  opacity: 1;
+}
+.htmx-request .submit-label {
+  opacity: 0.5;
+}

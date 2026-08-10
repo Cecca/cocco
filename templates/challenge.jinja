@@ -1,44 +1,184 @@
 {% extends "base.jinja" %}
-{% block title %}
-{# {{ title }} #}
+{% block title %}{{ challenge.title }}{% endblock %}
+
+{% block nav_extra %}
+<li><a class="text-base-content font-bold border-b-2 border-primary pb-0.5">This challenge</a></li>
 {% endblock %}
 
-{% block content %}
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+  <div class="grid grid-cols-1 lg:grid-cols-[1fr_22rem] gap-6 items-start">
 
-<h1 class="text-3xl font-bold mb-6">{{ challenge.title }}</h1>
+    <!-- ── LEFT: problem + sample files ─────────────────────────────── -->
+    <div class="card bg-base-100 border border-base-300 shadow-sm">
+      <div class="card-body p-8">
+        <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+          <a href="{{ url_for('get_course', course_id=course_id) }}" class="hover:text-primary">
+            {{ challenge.course_title }}
+          </a>
+          · Challenge {{ "%02d" | format(challenge.position) }}
+        </p>
+        <h1 class="font-serif text-4xl font-semibold tracking-tight mt-1 mb-4">{{ challenge.title }}</h1>
 
-<article class="prose max-w-none">{{ challenge.description | markdown }}</article>
+        <!-- Limits enforced by the sandbox, straight from the challenge row -->
+        <div class="flex flex-wrap gap-2 mb-6">
+          <span class="badge badge-warning font-bold border-none"
+                style="background:color-mix(in oklch, var(--color-warning) 18%, transparent);color:oklch(45% 0.12 55);">
+            {{ challenge.max_time_s }} s limit
+          </span>
+          <span class="badge badge-ghost font-semibold">
+            {{ (challenge.max_memory_bytes / 1024 / 1024) | round(1) }} MB memory
+          </span>
+          <span class="badge badge-ghost font-semibold">
+            {{ challenge.max_threads }} thread{{ "s" if challenge.max_threads != 1 }}
+          </span>
+          <span class="badge badge-ghost font-semibold">unlimited attempts</span>
+        </div>
 
-<div class="divider"></div>
+        <article class="prose prose-sm max-w-none prose-pre:bg-neutral prose-pre:text-neutral-content prose-pre:rounded-xl">
+          {{ challenge.description | markdown }}
+        </article>
 
-<div class="grid grid-cols-2">
-  <div>
-    <form id='form' hx-encoding='multipart/form-data' hx-post='/upload'>
-      <fieldset class="fieldset bg-base-200 border-base-400 rounded-box w-xs border p-4">
-        <legend class="fieldset-legend text-lg">New submission updload</legend>
-        <label class="label">Submission file</label>
-        <input type='file' name='file' class="file-input" />
-        <label class="label">Language</label>
-        <button class="btn btn-primary">
-          Upload
-        </button>
-        {# <progress id='progress' value='0' max='100'></progress> #}
-      </fieldset>
-    </form>
-    {# <script> #}
-        {# htmx.on('#form', 'htmx:xhr:progress', function(evt) { #}
-          {# htmx.find('#progress').setAttribute('value', evt.detail.loaded/evt.detail.total * 100) #}
-        {# }); #}
-    {# </script> #}
+        {% if challenge.samples %}
+        <div class="flex items-baseline justify-between mt-7 mb-2.5">
+          <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50">Sample files</h3>
+          <span class="text-xs text-base-content/45">Download a pair to test locally</span>
+        </div>
+        <div class="flex flex-col gap-2.5">
+          {% for sample in challenge.samples %}
+          {% set n = sample.execution_order + 1 %}
+          <div class="flex items-center gap-4 rounded-xl border border-base-300 bg-base-100 px-4 py-2.5">
+            <div class="min-w-[6rem]">
+              <div class="font-mono text-sm font-bold">Sample {{ n }}</div>
+              <div class="text-xs text-base-content/45">input / expected output</div>
+            </div>
+            <div class="flex flex-wrap gap-2 flex-1">
+              {% for kind in ["input", "output"] %}
+              <a href="{{ url_for('get_sample_file', challenge_id=challenge.id, testcase_id=sample.id, kind=kind) }}"
+                 download
+                 class="btn btn-sm btn-ghost font-mono font-semibold gap-2 bg-base-200 hover:bg-base-300">
+                sample{{ n }}_{{ kind }}.txt <span class="text-primary text-base">↓</span>
+              </a>
+              {% endfor %}
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- ── RIGHT: submit + leaderboard ──────────────────────────────── -->
+    <div class="flex flex-col gap-5">
+
+      <div class="card bg-base-100 border border-base-300 shadow-sm">
+        <div class="card-body p-5">
+          <h2 class="font-bold text-[15px]">Submit a solution</h2>
+          <p class="text-xs text-base-content/55 -mt-1">Hand in as many as you like — your best score counts.</p>
+
+          <!-- The language is derived server-side from the file extension, so
+               there is no picker. The result alert lands in #submit-result;
+               the history table below picks the new attempt up on its next poll. -->
+          <form hx-post="{{ url_for('post_submission', course_id=course_id, challenge_id=challenge.id) }}"
+                hx-encoding="multipart/form-data"
+                hx-target="#submit-result"
+                hx-swap="innerHTML"
+                class="mt-2">
+
+            <label class="cocco-dropzone flex flex-col items-center gap-2 rounded-xl bg-base-100 px-4 py-6 text-center cursor-pointer"
+                   id="dropzone">
+              <span class="grid h-9 w-9 place-items-center rounded-lg border-2 border-primary text-primary text-xl font-bold">↑</span>
+              <span class="text-sm font-semibold" id="dropzone-label">Drag a file here or <span class="link link-primary">browse</span></span>
+              <span class="font-mono text-xs text-base-content/45">.py · .c · .cpp · .java · ≤ 1 MB</span>
+              <input type="file" name="solution" accept=".py,.c,.cpp,.cc,.cxx,.java" class="hidden" id="file-input" required />
+            </label>
+
+            <button type="submit" class="btn btn-primary w-full mt-3.5 shadow-md shadow-primary/30">
+              <span class="submit-label">Run &amp; submit</span>
+              <span class="htmx-indicator loading loading-spinner loading-sm"></span>
+            </button>
+          </form>
+
+          <div id="submit-result" class="empty:hidden mt-4"></div>
+        </div>
+      </div>
+
+      <div class="card bg-base-100 border border-base-300 shadow-sm">
+        <div class="card-body p-5">
+          <div class="flex items-center justify-between">
+            <h2 class="font-bold text-[15px]">Fastest solutions</h2>
+            <span class="font-mono text-xs text-success flex items-center gap-1.5">
+              <span class="h-1.5 w-1.5 rounded-full bg-success"></span>live
+            </span>
+          </div>
+          <p class="text-xs text-base-content/55 -mt-1 mb-2">Total running time of each student's fastest correct submission</p>
+
+          <div id="leaderboard"
+               hx-get="{{ url_for('get_fragment_leaderboard', challenge_id=challenge.id) }}"
+               hx-trigger="load, every 15s"
+               hx-swap="innerHTML"
+               class="flex flex-col gap-0.5">
+          </div>
+        </div>
+      </div>
+
+    </div>
   </div>
-  <div hx-get="{{ url_for('get_fragment_submissions', challenge_id=challenge.id) }}"
-       hx-trigger="load,every 2s">
+
+  <!-- ══ SUBMISSION HISTORY ══════════════════════════════════════════ -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+    <div class="card-body p-7">
+      <div class="flex items-center justify-between">
+        <h2 class="font-bold text-lg">Your submissions</h2>
+      </div>
+      <p class="flex items-center gap-2 text-[13px] text-base-content/55 mb-3">
+        <span class="h-2 w-2 rounded-sm bg-primary"></span>
+        Your best score counts — earlier attempts stay here for reference.
+      </p>
+
+      <div class="overflow-x-auto">
+        <table class="table">
+          <thead>
+            <tr class="text-xs uppercase tracking-wider text-base-content/45 font-mono">
+              <th class="w-20">Attempt</th>
+              <th>File</th>
+              <th class="w-52">Submitted</th>
+              <th class="w-28 text-right">Time</th>
+              <th class="w-40 text-right">Result</th>
+            </tr>
+          </thead>
+          <!-- Polled: a freshly queued submission shows up here within ~2s and
+               keeps updating as the judge works through its test cases. -->
+          <tbody id="submission-history"
+                 hx-get="{{ url_for('get_fragment_submissions', challenge_id=challenge.id) }}"
+                 hx-trigger="load, every 2s"
+                 hx-swap="innerHTML">
+          </tbody>
+        </table>
+      </div>
+    </div>
   </div>
-</div>
+</main>
 
+<script>
+  // Reflect the chosen file in the dropzone + basic drag styling.
+  // (htmx does the actual multipart upload on form submit.)
+  const dz    = document.getElementById("dropzone");
+  const input = document.getElementById("file-input");
+  const label = document.getElementById("dropzone-label");
 
-
+  input.addEventListener("change", () => {
+    if (input.files.length) label.textContent = input.files[0].name;
+  });
+  ["dragover", "dragenter"].forEach(ev =>
+    dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add("dragover"); }));
+  ["dragleave", "drop"].forEach(ev =>
+    dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove("dragover"); }));
+  dz.addEventListener("drop", e => {
+    if (e.dataTransfer.files.length) {
+      input.files = e.dataTransfer.files;
+      label.textContent = input.files[0].name;
+    }
+  });
+</script>
 {% endblock %}
-
-
-

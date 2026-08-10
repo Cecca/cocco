@@ -1,0 +1,25 @@
+{# Rows for #leaderboard: fastest correct submission per student. #}
+{% for entry in entries %}
+{% set is_me = entry.user_id == user.id %}
+<div class="flex items-center gap-3 rounded-lg px-2.5 py-2"
+     {% if is_me %}style="background:color-mix(in oklch, var(--color-primary) 14%, transparent);"{% endif %}>
+  <span class="w-5 font-mono text-sm {{ 'font-bold text-primary' if is_me else 'font-semibold text-base-content/45' }}">
+    {{ entry.rank }}
+  </span>
+  <img src="{{ url_for('user_avatar', user_id=entry.user_id) }}"
+       alt="{{ entry.nickname }}'s avatar"
+       class="w-7 h-7 rounded-full bg-base-200 object-cover" />
+  <span class="flex-1 text-sm {{ 'font-bold' if is_me }}"
+        {% if is_me %}style="color:oklch(45% 0.12 55);"{% endif %}>
+    {{ "You · " if is_me }}{{ entry.nickname }}
+  </span>
+  <span class="font-mono text-sm {{ 'font-bold' if is_me }}"
+        {% if is_me %}style="color:oklch(45% 0.12 55);"{% endif %}>
+    {{ entry.elapsed_s | duration }}
+  </span>
+</div>
+{% else %}
+<p class="text-sm text-base-content/45 py-2">
+  Nobody has solved this yet — be the first.
+</p>
+{% endfor %}
