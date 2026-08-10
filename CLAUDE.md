@@ -14,8 +14,9 @@ Dependencies are managed with `uv` (Python 3.13). A `.envrc` / Nix `devShell` au
 
 - Install deps: `uv sync`
 - Start / stop PostgreSQL: `pg-start`, `pg-stop` (then `create-db cocco-dev` once)
-- Run the API (dev): `uv run fastapi dev cocco/main.py`
+- Run the API (dev): `COCCO_DUMMY_AUTH=1 uv run fastapi dev cocco/main.py`
 - Reset and reseed the database: `COCCO_RESET_DB=1 uv run fastapi dev cocco/main.py`
+- Configure SMTP and the session secret: `cp cocco.example.toml cocco.toml` and edit it
 - Run the judge: `uv run python -m cocco.judge --database "postgresql+psycopg://$PGUSER@/$PGDATABASE?host=$PGHOST"`
 - Run all tests: `uv run pytest`
 - Run only unit tests (skip those requiring isolate + nix + postgres): `uv run pytest -m "not integration"`
@@ -27,7 +28,9 @@ Integration tests (`@pytest.mark.integration`) require `isolate` installed with 
 
 The web app and the judge are **separate processes** that must agree on two things: the database, and the storage root for test case files (`COCCO_STORAGE`, or the judge's `--storage`; both default to `/tmp/cocco-storage`). Submitting through the web UI only enqueues a row — nothing leaves `queued` unless a judge is running against the same database.
 
-`COCCO_RESET_DB=1` drops every table and reseeds dummy data on startup. Leave it unset in normal development: `fastapi dev` reloads on every file change, and each reload would wipe the data.
+`COCCO_RESET_DB=1` drops every table and reseeds dummy data on startup. Leave it unset in normal development: `fastapi dev` reloads on every file change, and each reload would wipe the data. There is no migration tool, so a schema change reaches an existing database only through one such reset.
+
+Runtime configuration lives in `cocco.toml` (path overridable with `COCCO_CONFIG`), read by `load_config` in the same shape `load_languages` reads `languages.toml`. It is gitignored — it holds an SMTP password and the session signing key — and `cocco.example.toml` is the commented template. **A missing file is not an error**: with no `[smtp]` table cocco logs the magic link to the server console instead of mailing it, which is what makes a fresh checkout usable. Without `COCCO_DUMMY_AUTH=1`, that logged link is how you sign in during development.
 
 ## Architecture
 
@@ -76,12 +79,41 @@ A submission has its own page, `get_submission` at `/submissions/{id}` — flat,
 
 Uploads carry no language field: `post_submission` maps the file extension to a language through `EXTENSION_TO_LANGUAGE`, built from the same `languages.toml` the judge loads. Upload failures come back as **200 with an error alert**, not a 4xx, because htmx does not swap error responses by default.
 
-Auth is still stubbed: `get_user` returns a hardcoded user.
+### Authentication (`cocco/auth.py`)
+
+Login is by **magic link**: a visitor enters an address, gets a one-time URL mailed to it, and
+following that URL signs them in. There are no passwords and no sign-up step — **the account is
+created when the link is consumed**, never when it is requested, so typing addresses into the
+login form cannot fill the `user` table with unconfirmed rows. A new user has no enrollments and
+is therefore read-only everywhere until course staff enroll them.
+
+The token is a `secrets.token_urlsafe(32)` stored **only as its sha256** in `login_token`: the
+raw token lives in the emailed URL and nowhere else. `consume_login_token` spends it with a
+single `UPDATE ... WHERE consumed_at IS NULL RETURNING`, so a double-clicked link — or one a
+mail scanner prefetched — cannot sign two browsers in. Expiry is checked by the caller rather
+than in the `WHERE`, which keeps the statement dialect-neutral for the SQLite tests and means an
+expired link is still burned by the attempt. A successful login deletes every other outstanding
+link for that address, so a forwarded one is dead.
+
+The session is a signed cookie (Starlette's `SessionMiddleware`) holding nothing but `user_id`,
+so a renamed or deleted account takes effect on the next request. `same_site` must stay `"lax"`:
+a magic link is a top-level navigation out of a mail client, and under `"strict"` the cookie set
+by `/auth/verify` would not survive the redirect that follows it.
+
+`COCCO_DUMMY_AUTH=1` takes the address at face value — no token, no mail — and is the only thing
+`post_login` branches on. It is how `just dev` gets you in without a mail server; the seeded
+addresses are `alice@unipd.it` and `matteo.ceccarello@unipd.it` (staff) and `bob@unipd.it` and
+`charlie@unipd.it` (students).
 
 ### Authorization
 
 `role` lives on `enrollment`, so permissions are **per course**, not site-wide. `EDITOR_ROLES`
-(teacher, admin, collaborator) is course staff; students and the unenrolled are read-only.
+(teacher, admin, collaborator) is course staff; students and the unenrolled are read-only. Note
+that nothing distinguishes `teacher` from `admin` today — there is no site-wide administrator in
+this schema, so "may create a course" has nowhere to live yet.
+
+Nothing is reachable without a session: every route depends on `CurrentUser`, directly or through
+`require_challenge_editor`, and the only ways in are `/login`, `/auth/verify` and `/static`.
 
 The challenge editor's routes all depend on `require_challenge_editor`, which 403s a non-staff user.
 Hiding a control in a template is presentation, never access control — anything that mutates a
@@ -104,5 +136,8 @@ author and otherwise requires `EDITOR_ROLES`.
 - **Scores are per test case, in `[0, 1]`.** A submission's headline score is the mean of its outcomes' scores, shown out of 100. This aggregation assumes higher-is-better, so it is wrong for a challenge using `RMSEEvaluator`.
 - **The leaderboard's criterion is per challenge.** `challenge.ranking` is set by course staff in the editor and drives `query_challenge_leaderboard`, whose three variants live in `_LEADERBOARD_CRITERIA` as literal SQL keyed by the enum — the criterion is never taken from a request as text. `running_time` is the strict board: a submission is on it only if it passed *every* test, ranked by the sum of the per-test times. `total_score` and `average_score` rank by score, descending, and deliberately admit partially correct submissions, because a partial-credit evaluator is the case where nobody passes everything; both assume higher-is-better and so are wrong for `RMSEEvaluator`, same as the headline score. Whichever the criterion, a student appears once, represented by their best submission, and every row carries all three metrics plus `n_tests` so the fragment can render the one that applies.
 - **A hidden test case gives away nothing but its verdict.** `visible_outcomes` in `main.py` blanks an outcome's `message`, `stdout` and `stderr` unless the test case is a public sample or the viewer is course staff: `stdout`/`stderr` are the submitted program's own output — the obvious way to print a hidden input back out — and `message` can be the evaluator's diff, i.e. the expected output itself (`DiffEvaluator`). The verdict, the score and the resource usage are always shown. Compiler output is exempt, and has its own block on the submission page: it does not depend on any test input. Redact in that function, not in the template, so the rule stays unit testable.
+- **An anonymous htmx request gets `HX-Redirect`, not a 302.** `get_user` raises `NotAuthenticated` rather than returning a redirect — a dependency cannot return a `Response` — and the handler branches on the `HX-Request` header. This matters because most of the app is `f-*` fragments polled every few seconds: htmx follows a redirect inside the XHR, so a 302 would splice the whole login page into whatever div was polling, over and over. A 204 with `HX-Redirect` navigates the browser instead.
+- **A secret never has a fixed default.** With neither `COCCO_SECRET_KEY` nor `[session].secret_key` set, `load_config` generates a random key per process and logs a warning: an unconfigured deployment then logs everybody out on every restart and no two workers agree, which is loud. A constant in the source tree would be a signing key that ships with the code, which is silent.
+- **A `next` destination is filtered, never trusted.** `safe_next_path` keeps only a path on this site — one leading `/`, no scheme, no authority — so neither the `?next=` on the login page nor the one stashed in the session can be turned into an open redirect. The emailed link deliberately carries no destination at all; it is stashed in the requesting session, and a link opened in another browser simply lands on the root.
 - **Source is highlighted server-side.** `render_source` (the `highlight` Jinja filter) runs Pygments over a submission's source, using `submission.language` — every name in `languages.toml` happens to be a Pygments alias too — and falls back to plain text otherwise. The token colours are hand-written under `.cocco-code` in `assets/styles.css`, not a generated Pygments theme.
 - **CSS is a build artifact.** Edit `assets/styles.css`, never `static/styles.css`. Tailwind only emits classes it can see, so it scans `templates/**/*.jinja` and `cocco/**/*.py` (`@source` directives); a class assembled dynamically at runtime will not be generated.

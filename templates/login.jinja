@@ -1,0 +1,55 @@
+{% extends "base.jinja" %}
+{% block title %}Sign in{% endblock %}
+
+{# A full page, and deliberately htmx-free: the flow ends in a redirect, which
+   is exactly what htmx is bad at, and signing in should work without JS. #}
+{% block content %}
+<div class="max-w-md mx-auto">
+  <div class="card bg-base-100 border border-base-300">
+    <div class="card-body gap-4">
+      <h1 class="text-2xl font-extrabold">Sign in to COCCO</h1>
+
+      {% if error %}
+      <div class="alert alert-error text-sm">{{ error }}</div>
+      {% endif %}
+
+      {% if sent_to %}
+      <div class="alert alert-success text-sm">
+        Check your inbox — we sent a sign-in link to
+        <span class="font-semibold">{{ sent_to }}</span>.
+        It works once, and it expires in {{ ttl_minutes }} minutes.
+      </div>
+      {% else %}
+      <p class="text-sm opacity-70">
+        Enter your email address and we will send you a link that signs you in.
+        There is no password, and no account to create first.
+      </p>
+      {% endif %}
+
+      <form method="post" action="{{ url_for('post_login') }}" class="flex flex-col gap-3">
+        <input type="hidden" name="next" value="{{ next }}" />
+        <label class="form-control">
+          <span class="label-text text-sm font-medium">Email address</span>
+          <input type="email" name="email" required autofocus
+                 autocomplete="email" placeholder="name@unipd.it"
+                 class="input input-bordered w-full" />
+        </label>
+        <button type="submit" class="btn btn-primary">
+          {% if dummy_auth %}Sign in{% else %}Send me a link{% endif %}
+        </button>
+      </form>
+
+      {% if dummy_auth %}
+      {# Development only: with COCCO_DUMMY_AUTH=1 the address is taken at face
+         value, so switching between the seeded personas is a copy and paste. #}
+      <div class="alert alert-warning text-xs flex-col items-start gap-1">
+        <span class="font-semibold">Dummy authentication is on</span>
+        <span>Any address signs in immediately, with no email sent. Seeded:</span>
+        <code class="text-xs">alice@unipd.it · matteo.ceccarello@unipd.it (staff)</code>
+        <code class="text-xs">bob@unipd.it · charlie@unipd.it (students)</code>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

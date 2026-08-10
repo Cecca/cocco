@@ -18,9 +18,16 @@ from cocco.model import (
     metadata,
 )
 from cocco.model import LeaderboardRanking, UserRole
+from cocco.auth import get_or_create_user, is_expired
 from cocco.repository import (
+    consume_login_token,
+    count_recent_login_tokens,
     count_running_submissions,
     count_testcase_outcomes,
+    delete_expired_login_tokens,
+    delete_login_tokens_for_email,
+    insert_login_token,
+    insert_user,
     pull_queued_submission,
     query_challenge,
     query_challenge_leaderboard,
@@ -30,6 +37,7 @@ from cocco.repository import (
     query_sample_testcase,
     query_submission,
     query_submission_outcomes,
+    query_user_by_email,
     query_user_role,
     query_user_submissions,
     regrade_challenge,
@@ -620,3 +628,135 @@ async def test_submission_page_queries():
         assert await query_submission_outcomes(conn, 999) is None
     await engine.dispose()
 
+
+
+########################################################################
+# Magic-link authentication. These helpers are plain Core, so unlike the page
+# queries they run on the fast in-memory engine - which matters, because they
+# are what enforces "a link works once".
+
+
+def _make_async_engine(db_url="sqlite+aiosqlite:///:memory:"):
+    """An async engine over one in-memory database.
+
+    `StaticPool` keeps every connection on the same SQLite database: with the
+    default pool a second connection would find an empty schema.
+    """
+    from sqlalchemy.pool import StaticPool
+
+    return create_async_engine(db_url, poolclass=StaticPool)
+
+
+async def _async_database():
+    engine = _make_async_engine()
+    async with engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+    return engine
+
+
+async def test_login_token_is_spent_exactly_once():
+    engine = await _async_database()
+    now = datetime.now()
+    async with engine.connect() as conn:
+        await insert_login_token(
+            conn, "hash-a", "bob@unipd.it", now, now + timedelta(minutes=15)
+        )
+        await conn.commit()
+
+        row = await consume_login_token(conn, "hash-a", now)
+        assert row is not None
+        assert row.email == "bob@unipd.it"
+
+        # The second attempt - a double click, or a mail scanner that already
+        # prefetched the link - finds nothing left to spend.
+        assert await consume_login_token(conn, "hash-a", now) is None
+        # ...and so does a token nobody ever issued.
+        assert await consume_login_token(conn, "hash-b", now) is None
+    await engine.dispose()
+
+
+async def test_an_expired_token_is_still_burned_by_the_attempt():
+    """Expiry is checked by the caller, not in the SQL, so the row is consumed
+    either way: a stale link cannot be probed repeatedly."""
+    engine = await _async_database()
+    now = datetime.now()
+    async with engine.connect() as conn:
+        await insert_login_token(
+            conn, "hash-old", "bob@unipd.it", now, now - timedelta(minutes=1)
+        )
+        await conn.commit()
+
+        row = await consume_login_token(conn, "hash-old", now)
+        assert row is not None
+        assert is_expired(row.expires_at, now)
+        assert await consume_login_token(conn, "hash-old", now) is None
+    await engine.dispose()
+
+
+async def test_login_token_housekeeping():
+    engine = await _async_database()
+    now = datetime.now()
+    async with engine.connect() as conn:
+        await insert_login_token(
+            conn, "live", "bob@unipd.it", now, now + timedelta(minutes=15)
+        )
+        await insert_login_token(
+            conn, "stale", "bob@unipd.it", now - timedelta(hours=2),
+            now - timedelta(hours=1),
+        )
+        await insert_login_token(
+            conn, "other", "carol@unipd.it", now, now + timedelta(minutes=15)
+        )
+        await conn.commit()
+
+        # Only what was requested inside the window counts against the limit.
+        assert await count_recent_login_tokens(
+            conn, "bob@unipd.it", now - timedelta(hours=1)
+        ) == 1
+        assert await count_recent_login_tokens(
+            conn, "bob@unipd.it", now - timedelta(hours=3)
+        ) == 2
+
+        assert await delete_expired_login_tokens(conn, now) == 1
+        assert await consume_login_token(conn, "live", now) is not None
+
+        # A successful login kills every other outstanding link for that
+        # address, but leaves everybody else's alone.
+        await insert_login_token(
+            conn, "second", "bob@unipd.it", now, now + timedelta(minutes=15)
+        )
+        await delete_login_tokens_for_email(conn, "bob@unipd.it")
+        assert await consume_login_token(conn, "second", now) is None
+        assert await consume_login_token(conn, "other", now) is not None
+    await engine.dispose()
+
+
+async def test_get_or_create_user_is_idempotent():
+    engine = await _async_database()
+    async with engine.connect() as conn:
+        created = await get_or_create_user(conn, "dave@unipd.it")
+        await conn.commit()
+        assert created.nickname == "dave"
+
+        again = await get_or_create_user(conn, "dave@unipd.it")
+        assert again.id == created.id
+
+        row = await query_user_by_email(conn, "dave@unipd.it")
+        assert row is not None and row.id == created.id
+        # An address that was never seen is simply absent.
+        assert await query_user_by_email(conn, "nobody@unipd.it") is None
+    await engine.dispose()
+
+
+async def test_a_duplicate_address_is_refused():
+    """`user.email` is unique: it is the login identifier, and it is the
+    backstop for two first logins racing each other."""
+    from sqlalchemy.exc import IntegrityError
+
+    engine = await _async_database()
+    async with engine.connect() as conn:
+        await insert_user(conn, "eve@unipd.it", "eve", b"<svg/>", "image/svg+xml")
+        await conn.commit()
+        with pytest.raises(IntegrityError):
+            await insert_user(conn, "eve@unipd.it", "eve2", b"<svg/>", "image/svg+xml")
+    await engine.dispose()

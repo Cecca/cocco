@@ -25,15 +25,31 @@
         {% block nav_extra %}{% endblock %}
       </ul>
     </div>
-    <div class="flex items-center gap-3">
-      <div class="hidden sm:flex flex-col items-end leading-tight">
-        <span class="font-semibold text-sm">{{ user.nickname }}</span>
-        <span class="text-xs opacity-60">{{ user.email }}</span>
+    {# The login page renders with no user, so everything below is guarded. #}
+    {% if user %}
+    <div class="dropdown dropdown-end">
+      <div tabindex="0" role="button" class="flex items-center gap-3 cursor-pointer">
+        <div class="hidden sm:flex flex-col items-end leading-tight">
+          <span class="font-semibold text-sm">{{ user.nickname }}</span>
+          <span class="text-xs opacity-60">{{ user.email }}</span>
+        </div>
+        <img src="{{ url_for('user_avatar', user_id=user.id) }}"
+             alt="{{ user.nickname }}'s avatar"
+             class="w-8 h-8 rounded-full bg-base-200 object-cover" />
       </div>
-      <img src="{{ url_for('user_avatar', user_id=user.id) }}"
-           alt="{{ user.nickname }}'s avatar"
-           class="w-8 h-8 rounded-full bg-base-200 object-cover" />
+      <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box z-10 mt-2 w-44 p-2 shadow border border-base-300">
+        <li>
+          {# A plain form, so signing out works without JS, and a POST, so it
+             cannot be triggered by a link someone else planted. #}
+          <form method="post" action="{{ url_for('post_logout') }}">
+            <button type="submit" class="w-full text-left">Sign out</button>
+          </form>
+        </li>
+      </ul>
     </div>
+    {% else %}
+    <a href="{{ url_for('get_login') }}" class="btn btn-sm btn-primary">Sign in</a>
+    {% endif %}
   </div>
 
   {% block body %}

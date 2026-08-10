@@ -1,0 +1,38 @@
+# Copy this to `cocco.toml` and edit it. Nothing here is required: without an
+# [smtp] table cocco logs the magic link to the server console instead of
+# mailing it, which is what you want in development.
+#
+# The path is `cocco.toml` in the working directory, overridable with
+# COCCO_CONFIG. `cocco.toml` is gitignored: it holds an SMTP password and the
+# session signing key.
+
+[session]
+# The signing key for the session cookie. Prefer the COCCO_SECRET_KEY
+# environment variable in production. If neither is set, cocco generates a
+# random key at startup and warns: sessions then die on every restart and no
+# two workers agree, which is loud - unlike a fixed secret in the source tree.
+#   python -c 'import secrets; print(secrets.token_urlsafe(32))'
+# secret_key = "..."
+
+# Set to true behind TLS, so the cookie is never sent in clear.
+https_only = false
+
+# How long a session lasts, in seconds. Two weeks.
+max_age = 1209600
+
+[smtp]
+# Both `host` and `from_address` are needed; with either missing, cocco falls
+# back to logging the link.
+host = "smtp.unipd.it"
+port = 587
+starttls = true
+from_address = "cocco@unipd.it"
+from_name = "COCCO"
+# username = "..."
+# password = "..."
+
+[site]
+# The absolute base for the links that go into emails. Leave it unset to derive
+# it from the incoming request, which is only correct if the reverse proxy sets
+# X-Forwarded-* and uvicorn runs with --proxy-headers.
+# base_url = "https://cocco.example.org"

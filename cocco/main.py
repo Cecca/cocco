@@ -25,7 +25,23 @@ from cocco.model import (
     metadata,
 )
 from cocco import schema
+from cocco.auth import (
+    MAX_LINKS_PER_ADDRESS,
+    MAX_LINKS_PER_CLIENT,
+    RATE_WINDOW,
+    TOKEN_TTL,
+    build_magic_link,
+    generate_token,
+    get_or_create_user,
+    hash_token,
+    is_expired,
+    load_config,
+    normalize_email,
+    safe_next_path,
+    send_magic_link,
+)
 from fastapi import (
+    BackgroundTasks,
     Depends,
     FastAPI,
     File,
@@ -35,20 +51,35 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from starlette.middleware.sessions import SessionMiddleware
+from collections import defaultdict, deque
+from datetime import datetime
+import logging
 import os
 
 from cocco.repository import (
+    consume_login_token,
+    count_recent_login_tokens,
     count_running_submissions,
     count_testcase_outcomes,
+    delete_expired_login_tokens,
+    delete_login_tokens_for_email,
     delete_testcase,
     insert_enrollment,
+    insert_login_token,
     insert_submission,
     insert_testcase,
+    insert_user,
     query_challenge,
     query_challenge_leaderboard,
     query_challenge_ranking,
@@ -70,8 +101,32 @@ from cocco.repository import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+# SMTP, the session secret and the public base URL. A missing file is fine: the
+# defaults log the magic link instead of mailing it.
+CONFIG = load_config(Path(os.environ.get("COCCO_CONFIG", "cocco.toml")))
+
+# Development shortcut: the login form takes an address at face value, with no
+# token and no mail. `post_login` is the only place that branches on it.
+DUMMY_AUTH = os.environ.get("COCCO_DUMMY_AUTH") == "1"
+
 # Root of the app
 app = FastAPI(default_response_class=HTMLResponse)
+
+# The session cookie carries nothing but a user id; everything shown about a
+# user is re-read from the database on every request.
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=CONFIG.session.secret_key,
+    session_cookie=CONFIG.session.cookie_name,
+    max_age=CONFIG.session.max_age,
+    https_only=CONFIG.session.https_only,
+    # Not "strict": a magic link is a top-level navigation out of a mail
+    # client, and under "strict" the cookie just set by /auth/verify would not
+    # be sent on the redirect that follows it.
+    same_site="lax",
+)
 
 # Static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -168,21 +223,26 @@ async def create_db_and_tables(dummy=False):
             await _populate_dummy_data(conn)
 
 
+async def _seed_user(conn: AsyncConnection, email: str, nickname: str) -> int:
+    image, image_mime = generate_identicon(nickname)
+    return await insert_user(conn, email, nickname, image, image_mime)
+
+
+# The development cast. With COCCO_DUMMY_AUTH=1 any of these addresses gets you
+# straight in, so the staff view and the student view are both one login away.
+DUMMY_STAFF = ["alice@unipd.it", "matteo.ceccarello@unipd.it"]
+DUMMY_STUDENTS = ["bob@unipd.it", "charlie@unipd.it"]
+
+
 async def _populate_dummy_data(conn: AsyncConnection):
     import textwrap
-    image, image_mime = generate_identicon("alice")
-    user_id = (
-        await conn.execute(
-            insert(User)
-            .values(
-                email="alice@example.com",
-                nickname="alice",
-                image=image,
-                image_mime=image_mime,
-            )
-            .returning(User.c.id)
-        )
-    ).scalar_one()
+
+    user_ids = {
+        email: await _seed_user(conn, email, email.split("@", 1)[0])
+        for email in DUMMY_STAFF + DUMMY_STUDENTS
+    }
+    # The student whose attempts the seeded submission history belongs to.
+    student_id = user_ids["bob@unipd.it"]
 
     evaluator = EqualityEvaluator()
     course_titles = ["Algorithms 101", "Data Structures"]
@@ -230,15 +290,16 @@ async def _populate_dummy_data(conn: AsyncConnection):
                 .returning(Course.c.id)
             )
         ).scalar_one()
-        # Teacher on one course, student on the other, so that both the staff
-        # and the read-only views of a challenge are reachable in development
-        # while `get_user` is still hardcoded.
-        await insert_enrollment(
-            conn,
-            user_id,
-            course_id,
-            UserRole.teacher if course_title == "Algorithms 101" else UserRole.student,
-        )
+        # Alice and Matteo are course staff on everything; Bob and Charlie are
+        # students. `role` is per course, so this is two rows per person.
+        for email in DUMMY_STAFF:
+            await insert_enrollment(
+                conn, user_ids[email], course_id, UserRole.admin
+            )
+        for email in DUMMY_STUDENTS:
+            await insert_enrollment(
+                conn, user_ids[email], course_id, UserRole.student
+            )
         for n in range(3):
             first = first_challenge_id is None
             challenge_id = (
@@ -394,30 +455,29 @@ async def _populate_dummy_data(conn: AsyncConnection):
             )
         )
 
-    await _seed_submission(user_id, "first_try.py", OutcomeEnum.runtime_error, 0.0, None)
-    await _seed_submission(user_id, "route_bfs.py", OutcomeEnum.success, 0.75, 0.412)
-    await _seed_submission(user_id, "shortest_route.py", OutcomeEnum.success, 1.0, 0.238)
+    # A history of attempts for one student, so the submission page and the
+    # per-student staff view have something to show.
+    await _seed_submission(
+        student_id, "first_try.py", OutcomeEnum.runtime_error, 0.0, None
+    )
+    await _seed_submission(student_id, "route_bfs.py", OutcomeEnum.success, 0.75, 0.412)
+    await _seed_submission(
+        student_id, "shortest_route.py", OutcomeEnum.success, 1.0, 0.238
+    )
+    await _seed_submission(
+        user_ids["charlie@unipd.it"], "charlie.py", OutcomeEnum.success, 0.5, 0.310
+    )
 
-    # A few classmates, so the leaderboard has something to rank
+    # A few classmates, so the leaderboard has something to rank. They are not
+    # enrolled: `query_challenge_standings` builds its cohort as the enrolled
+    # students plus anyone who submitted, so they show up regardless.
     for nickname, filename, elapsed_s in [
         ("bianchi", "dijkstra.py", 0.121),
         ("rossi", "heapq_solution.py", 0.164),
         ("ferrari", "route.py", 0.199),
         ("romano", "planner.py", 0.402),
     ]:
-        image, image_mime = generate_identicon(nickname)
-        classmate_id = (
-            await conn.execute(
-                insert(User)
-                .values(
-                    email=f"{nickname}@example.com",
-                    nickname=nickname,
-                    image=image,
-                    image_mime=image_mime,
-                )
-                .returning(User.c.id)
-            )
-        ).scalar_one()
+        classmate_id = await _seed_user(conn, f"{nickname}@example.com", nickname)
         await _seed_submission(
             classmate_id, filename, OutcomeEnum.success, 1.0, elapsed_s
         )
@@ -433,10 +493,215 @@ async def get_db():
 
 DBDep = Annotated[AsyncConnection, Depends(get_db)]
 
-async def get_user():
-    return schema.User(id=1, email="alice@example.org", nickname="alice")
+class NotAuthenticated(Exception):
+    """Raised by `get_user` when there is no session behind a request.
+
+    Not an `HTTPException`, because the right answer depends on who is asking:
+    a browser wants a redirect, htmx wants a header. See the handler below.
+    """
+
+    def __init__(self, next_path: str = "/"):
+        self.next_path = next_path
+
+
+async def get_user(request: Request, db: DBDep) -> schema.User:
+    """The signed-in user, or `NotAuthenticated`.
+
+    The cookie holds nothing but the user id, so a renamed - or deleted -
+    account takes effect on the very next request.
+    """
+    user_id = request.session.get("user_id")
+    if user_id is not None:
+        row = await query_user(db, user_id)
+        if row is not None:
+            return schema.User.model_validate(row)
+        # A session pointing at nobody: in development, typically the other
+        # side of a COCCO_RESET_DB.
+        request.session.clear()
+    raise NotAuthenticated(_return_path(request))
+
 
 CurrentUser = Annotated[schema.User, Depends(get_user)]
+
+
+def _return_path(request: Request) -> str:
+    """Where to send the visitor once they have signed in.
+
+    Only a plain GET of a page is worth coming back to: replaying a POST after
+    a login is not something to attempt, and a polled fragment is not a
+    destination - its page is.
+    """
+    if request.method != "GET" or request.headers.get("HX-Request") == "true":
+        return "/"
+    return safe_next_path(request.url.path)
+
+
+@app.exception_handler(NotAuthenticated)
+async def handle_not_authenticated(request: Request, exc: NotAuthenticated):
+    login_url = str(
+        request.url_for("get_login").include_query_params(next=exc.next_path)
+    )
+    if request.headers.get("HX-Request") == "true":
+        # htmx follows a 302 inside the XHR, so a redirect here would splice the
+        # login page into whatever div was polling - every two seconds, for as
+        # long as the tab stays open. HX-Redirect navigates the browser instead.
+        return Response(status_code=204, headers={"HX-Redirect": login_url})
+    return RedirectResponse(login_url, status_code=303)
+
+
+########################################################################
+# authentication
+#
+# A visitor proves an address by following a one-time link mailed to it, and
+# the account is created the first time such a link is followed. None of these
+# routes depends on `CurrentUser`: they are the way in.
+
+# The per-client half of the rate limit, a sliding window of request times. It
+# is per process, so `fastapi dev` resets it on every reload and two workers do
+# not agree - fine for a self-hosted judge, and it costs no new dependency.
+_LINK_REQUESTS: dict[str, deque[datetime]] = defaultdict(deque)
+
+
+def _client_budget_ok(request: Request, now: datetime) -> bool:
+    key = request.client.host if request.client else "unknown"
+    window = _LINK_REQUESTS[key]
+    while window and window[0] < now - RATE_WINDOW:
+        window.popleft()
+    if len(window) >= MAX_LINKS_PER_CLIENT:
+        return False
+    window.append(now)
+    return True
+
+
+def _base_url(request: Request) -> str:
+    """The absolute origin the emailed link should point at. Configured
+    explicitly when there is a proxy in front, since only the deployment knows
+    the public name."""
+    if CONFIG.base_url:
+        return CONFIG.base_url
+    return str(request.base_url).rstrip("/")
+
+
+def _login_page(
+    request: Request,
+    *,
+    next_path: str = "/",
+    error: str | None = None,
+    sent_to: str | None = None,
+    status_code: int = 200,
+):
+    return templates.TemplateResponse(
+        request=request,
+        name="login.jinja",
+        status_code=status_code,
+        context={
+            "title": "Sign in",
+            # `base.jinja` guards on this: there is nobody to put in the navbar.
+            "user": None,
+            "next": next_path,
+            "error": error,
+            "sent_to": sent_to,
+            "ttl_minutes": int(TOKEN_TTL.total_seconds() // 60),
+            "dummy_auth": DUMMY_AUTH,
+        },
+    )
+
+
+def _sign_in(request: Request, user: schema.User, next_path: str):
+    # Never carry a prior session over into a new identity.
+    request.session.clear()
+    request.session["user_id"] = user.id
+    return RedirectResponse(next_path, status_code=303)
+
+
+@app.get("/login")
+async def get_login(request: Request, next: str = "/"):
+    return _login_page(request, next_path=safe_next_path(next))
+
+
+@app.post("/login")
+async def post_login(
+    request: Request,
+    db: DBDep,
+    background: BackgroundTasks,
+    email: Annotated[str, Form()],
+    next: Annotated[str, Form()] = "/",
+):
+    """Send a magic link - or, under COCCO_DUMMY_AUTH, just sign the visitor in.
+
+    The response is the same whether or not the address is known and whether or
+    not a link was actually sent, so neither a rate limit nor the existence of
+    an account is observable from here. There is no account to enumerate
+    anyway: a first login creates one.
+    """
+    next_path = safe_next_path(next)
+    try:
+        address = normalize_email(email)
+    except ValueError:
+        return _login_page(
+            request,
+            next_path=next_path,
+            error="That does not look like an email address.",
+            status_code=400,
+        )
+
+    if DUMMY_AUTH:
+        # The development shortcut, and the only branch that skips confirming
+        # the address: `just dev` needs no mail server.
+        user = await get_or_create_user(db, address)
+        await db.commit()
+        return _sign_in(request, user, next_path)
+
+    now = datetime.now()
+    await delete_expired_login_tokens(db, now)
+    recent = await count_recent_login_tokens(db, address, now - RATE_WINDOW)
+    if recent < MAX_LINKS_PER_ADDRESS and _client_budget_ok(request, now):
+        token = generate_token()
+        await insert_login_token(
+            db, hash_token(token), address, now, now + TOKEN_TTL
+        )
+        # The token must be durable before the mail carrying it can arrive.
+        await db.commit()
+        link = build_magic_link(_base_url(request), token)
+        # A sync callable, so Starlette runs blocking smtplib in the threadpool.
+        background.add_task(send_magic_link, CONFIG.smtp, address, link)
+    else:
+        await db.commit()  # the expiry sweep above
+        logger.warning("rate-limited a magic-link request for %s", address)
+
+    request.session["login_next"] = next_path
+    return _login_page(request, next_path=next_path, sent_to=address)
+
+
+@app.get("/auth/verify")
+async def get_auth_verify(request: Request, db: DBDep, token: str = ""):
+    now = datetime.now()
+    row = await consume_login_token(db, hash_token(token), now)
+    if row is None or is_expired(row.expires_at, now):
+        # Unknown, already spent, or expired - all the same message, and the
+        # burn stands either way.
+        await db.commit()
+        return _login_page(
+            request,
+            error="That link is no longer valid. Ask for a new one.",
+            status_code=400,
+        )
+
+    user = await get_or_create_user(db, row.email)
+    # An older link that was forwarded on is now dead.
+    await delete_login_tokens_for_email(db, row.email)
+    await db.commit()
+
+    # The link may well be opened in another browser, where the session that
+    # asked for it does not exist; then there is no destination but the root.
+    next_path = safe_next_path(request.session.get("login_next"))
+    return _sign_in(request, user, next_path)
+
+
+@app.post("/logout")
+async def post_logout(request: Request):
+    request.session.clear()
+    return RedirectResponse("/login", status_code=303)
 
 
 async def require_challenge_editor(
@@ -447,8 +712,6 @@ async def require_challenge_editor(
     Hiding the Edit button in the template is a UI affordance, not access
     control: every route that mutates a challenge depends on this.
     """
-    if user.id is None:
-        raise HTTPException(status_code=403)
     role = await query_user_role(db, user_id=user.id, challenge_id=challenge_id)
     if role is None or role not in EDITOR_ROLES:
         raise HTTPException(status_code=403, detail="Not course staff")
@@ -467,8 +730,6 @@ async def authorize_submission(
     submission row first and because a student *is* allowed here: the rule is
     that you may read your own work, and course staff may read anyone's.
     """
-    if user.id is None:
-        raise HTTPException(status_code=403)
     role = await query_user_role(
         db, user_id=user.id, challenge_id=submission["challenge_id"]
     )
@@ -556,8 +817,6 @@ async def get_challenge(
     class's standings, and no submit form. `?as=student` gives them the page a
     student sees, which is the only way to check how the statement reads.
     """
-    if user.id is None:
-        raise HTTPException(status_code=404)
     challenge = await query_challenge(db, user_id=user.id, challenge_id=challenge_id)
     if challenge is None:
         raise HTTPException(status_code=404)
@@ -594,8 +853,6 @@ async def post_submission(
     does not swap the response of an error status by default, and the fragment
     is the whole point of the request.
     """
-    if user.id is None:
-        raise HTTPException(status_code=404)
 
     def alert(message: str, ok: bool = False):
         return templates.TemplateResponse(
@@ -647,8 +904,6 @@ async def post_submission(
 async def get_fragment_submissions(
     challenge_id: int, request: Request, db: DBDep, user: CurrentUser
 ):
-    if user.id is None:
-        raise HTTPException(status_code=404)
     submissions = await query_user_submissions(db, user_id=user.id, challenge_id=challenge_id)
     return templates.TemplateResponse(
         request=request,
@@ -681,13 +936,19 @@ async def get_fragment_leaderboard(
 
 
 @app.get("/challenges/{challenge_id}/samples/{testcase_id}/{kind}")
-async def get_sample_file(challenge_id: int, testcase_id: int, kind: str, db: DBDep):
+async def get_sample_file(
+    challenge_id: int, testcase_id: int, kind: str, db: DBDep, user: CurrentUser
+):
     """Serve the input or expected output of a *public* test case.
 
     `query_sample_testcase` returns nothing for hidden test cases, so those
-    404 rather than leaking the judge's data.
+    404 rather than leaking the judge's data. The viewer must additionally be
+    enrolled in the course: a sample belongs to the class it was set for, and
+    an id is easy to guess.
     """
     if kind not in ("input", "output"):
+        raise HTTPException(status_code=404)
+    if await query_user_role(db, user_id=user.id, challenge_id=challenge_id) is None:
         raise HTTPException(status_code=404)
     testcase = await query_sample_testcase(db, challenge_id, testcase_id)
     if testcase is None:
@@ -839,8 +1100,6 @@ async def get_challenge_student(
     role: ChallengeEditor,
 ):
     """Everything one student has handed in for one challenge."""
-    if user.id is None:
-        raise HTTPException(status_code=403)
     challenge = await query_challenge(db, user_id=user.id, challenge_id=challenge_id)
     if challenge is None:
         raise HTTPException(status_code=404)
@@ -952,8 +1211,6 @@ async def get_challenge_edit(
     user: CurrentUser,
     role: ChallengeEditor,
 ):
-    if user.id is None:
-        raise HTTPException(status_code=403)
     challenge = await query_challenge(db, user_id=user.id, challenge_id=challenge_id)
     if challenge is None:
         raise HTTPException(status_code=404)
@@ -1017,7 +1274,9 @@ async def post_challenge_edit(
 
 @app.post("/f/markdown-preview")
 async def post_markdown_preview(
-    request: Request, description: Annotated[str, Form()] = ""
+    request: Request,
+    user: CurrentUser,
+    description: Annotated[str, Form()] = "",
 ):
     """Render the editor's textarea through the same filter the challenge page
     uses, so the preview cannot drift from the real thing."""
@@ -1268,7 +1527,7 @@ async def post_testcase_move(
 
 
 @app.get("/users/{user_id}/avatar")
-async def user_avatar(user_id: int, db: DBDep):
+async def user_avatar(user_id: int, db: DBDep, user: CurrentUser):
     row = (
         await db.execute(
             select(User.c.image, User.c.image_mime).where(User.c.id == user_id)

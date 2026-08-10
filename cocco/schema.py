@@ -13,7 +13,9 @@ class Base(BaseModel):
 
 
 class User(Base):
-    id: int | None
+    # Not optional: a `User` only ever comes from a row, either the session's
+    # own or one embedded in a page query, so it is always persisted.
+    id: int
     email: str
     nickname: str
 
