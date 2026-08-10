@@ -469,7 +469,10 @@ async def run_submission(
 
 
 async def run_from_queue(engine: Engine, storage: Storage, evaluator: Evaluator) -> bool:
-    with engine.begin() as conn:
+    # `connect`, not `begin`: pull_queued_submission commits by itself as soon
+    # as it has claimed the submission, so that the row lock is not held while
+    # the challenge and its test cases are read.
+    with engine.connect() as conn:
         run_data = await repo.pull_queued_submission(conn)
         if run_data is None:
             return False
