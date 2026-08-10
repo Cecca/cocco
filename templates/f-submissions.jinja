@@ -52,8 +52,10 @@
 </tr>
 {% else %}
 <tr>
+  {# The staff view of a single student passes its own wording: "upload a
+     solution" is advice for the author of the submissions, not for a teacher. #}
   <td colspan="5" class="text-center text-sm text-base-content/45 py-6">
-    No attempts yet — upload a solution to get started.
+    {{ empty_message or "No attempts yet — upload a solution to get started." }}
   </td>
 </tr>
 {% endfor %}

@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, insert
+from sqlalchemy import create_engine, insert, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import cocco.model as cm
@@ -19,13 +19,16 @@ from cocco.model import (
 )
 from cocco.model import UserRole
 from cocco.repository import (
+    count_running_submissions,
     count_testcase_outcomes,
     pull_queued_submission,
     query_challenge,
+    query_challenge_standings,
     query_challenge_testcases,
     query_sample_testcase,
     query_user_role,
     query_user_submissions,
+    regrade_challenge,
 )
 from cocco.schema import SubmissionRunData
 
@@ -418,5 +421,70 @@ async def test_challenge_page_queries():
         untouched_cases = await query_challenge_testcases(conn, 5)
         assert [tc.n_outcomes for tc in untouched_cases] == [0, 0, 0]
         assert await count_testcase_outcomes(conn, untouched_cases[0].id) == 0
+
+        # ── the staff view ────────────────────────────────────────────────
+        # One row per student, best attempt first. alice only teaches the
+        # course, so she is not part of the cohort; carol and dave are.
+        standings = await query_challenge_standings(conn, 1)
+        assert standings is not None
+        assert [s["nickname"] for s in standings] == ["carol", "dave"]
+        carol, dave = standings
+        assert [carol["rank"], dave["rank"]] == [1, 2]
+        # Both peak at 2 of 3 tests; carol is ahead on the tie-break, time.
+        assert carol["score"] == pytest.approx(2 / 3)
+        assert dave["score"] == pytest.approx(2 / 3)
+        assert carol["elapsed_s"] < dave["elapsed_s"]
+        assert [carol["n_passed"], carol["n_tests"]] == [2, 3]
+        # Two attempts, but the row describes the better of them
+        assert [carol["n_attempts"], dave["n_attempts"]] == [2, 1]
+        assert [carol["n_pending"], dave["n_pending"]] == [0, 0]
+
+        # An enrolled student who has handed in nothing still gets a row: who is
+        # missing is the first thing a teacher looks for.
+        sum_board = await query_challenge_standings(conn, 2)
+        assert sum_board is not None
+        idle = next(s for s in sum_board if s["nickname"] == "dave")
+        assert idle["n_attempts"] == 0
+        assert idle["score"] is None
+        assert idle["last_enqueued"] is None
+
+        # A queued attempt is pending and keeps a *null* score, rather than
+        # being ranked as a zero it has not earned
+        pending = await query_challenge_standings(conn, 5)
+        assert pending is not None
+        assert sorted(s["nickname"] for s in pending) == ["dave", "erin"]
+        assert all(s["n_pending"] == 1 and s["score"] is None for s in pending)
+
+        # ── regrading ─────────────────────────────────────────────────────
+        # Nothing is running on "Hello", but dave's "Buffer copy" is - that is
+        # what makes the route refuse.
+        assert await count_running_submissions(conn, 1) == 0
+        assert await count_running_submissions(conn, 4) == 1
+
+        # Rewrites the fixture, so it goes last. The connection is never
+        # committed: like the other mutations, this one leaves that to the
+        # caller, and the assertions below read it back inside the transaction.
+        assert await regrade_challenge(conn, 1) == 3
+
+        statuses = (
+            await conn.execute(
+                select(Submission.c.status).where(Submission.c.challenge_id == 1)
+            )
+        ).scalars().all()
+        assert set(statuses) == {cm.SubmissionStatus.queued}
+        assert [tc.n_outcomes for tc in await query_challenge_testcases(conn, 1)] == [
+            0, 0, 0,
+        ]
+
+        # "Sum" is on the same course and shares nothing else: a missing
+        # challenge_id filter would have wiped it too.
+        assert [tc.n_outcomes for tc in await query_challenge_testcases(conn, 2)] == [
+            1, 1, 1,
+        ]
+        assert (
+            await conn.execute(
+                select(Submission.c.status).where(Submission.c.challenge_id == 2)
+            )
+        ).scalars().all() == [cm.SubmissionStatus.done]
     await engine.dispose()
 

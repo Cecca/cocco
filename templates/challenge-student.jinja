@@ -1,0 +1,71 @@
+{% extends "base.jinja" %}
+{% block title %}{{ student.nickname }} · {{ challenge.title }}{% endblock %}
+
+{% block nav_extra %}
+<li><a class="text-base-content font-bold border-b-2 border-primary pb-0.5">This challenge</a></li>
+{% endblock %}
+
+{# One student's attempts on one challenge, for course staff. Reached by
+   clicking a row of the standings; the route is behind require_challenge_editor
+   because this is somebody else's work. #}
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+
+  <div class="flex items-start justify-between gap-4 mb-6">
+    <div>
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+        <a href="{{ url_for('get_course', course_id=course_id) }}" class="hover:text-primary">
+          {{ challenge.course_title }}
+        </a>
+        ·
+        <a href="{{ url_for('get_challenge', course_id=course_id, challenge_id=challenge.id) }}"
+           class="hover:text-primary">{{ challenge.title }}</a>
+      </p>
+      <div class="flex items-center gap-3 mt-1.5">
+        <img src="{{ url_for('user_avatar', user_id=student.id) }}"
+             alt="{{ student.nickname }}'s avatar"
+             class="w-10 h-10 rounded-full bg-base-200 object-cover" />
+        <div>
+          <h1 class="font-serif text-3xl font-semibold tracking-tight leading-tight">{{ student.nickname }}</h1>
+          <p class="text-xs text-base-content/45">{{ student.email }}</p>
+        </div>
+      </div>
+    </div>
+    <a href="{{ url_for('get_challenge', course_id=course_id, challenge_id=challenge.id) }}"
+       class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+      ← Back to standings
+    </a>
+  </div>
+
+  <div class="card bg-base-100 border border-base-300 shadow-sm">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg">Attempts</h2>
+      <p class="flex items-center gap-2 text-[13px] text-base-content/55 mb-3">
+        <span class="h-2 w-2 rounded-sm bg-primary"></span>
+        Highlighted is the attempt that counts — the highest scoring one.
+      </p>
+
+      <div class="overflow-x-auto">
+        <table class="table">
+          <thead>
+            <tr class="text-xs uppercase tracking-wider text-base-content/45 font-mono">
+              <th class="w-20">Attempt</th>
+              <th>File</th>
+              <th class="w-52">Submitted</th>
+              <th class="w-28 text-right">Time</th>
+              <th class="w-40 text-right">Result</th>
+            </tr>
+          </thead>
+          <!-- Polled like the student's own history, so a regrade is visible
+               here as the judge works through the queue. -->
+          <tbody id="submission-history"
+                 hx-get="{{ url_for('get_fragment_student_submissions', challenge_id=challenge.id, student_id=student.id) }}"
+                 hx-trigger="load, every 2s"
+                 hx-swap="innerHTML">
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</main>
+{% endblock %}

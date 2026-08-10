@@ -7,75 +7,25 @@
 
 {% block body %}
 <main class="mx-auto max-w-6xl px-6 py-8">
+
+  {# Staff land on challenge-staff.jinja; they reach this page through
+     ?as=student, so give them the way back. #}
+  {% if viewing_as_student %}
+  <div class="flex items-center gap-3 rounded-xl border border-base-300 bg-base-200/50 px-4 py-2.5 mb-5">
+    <span class="text-sm text-base-content/60">
+      You are looking at this challenge the way a student does.
+    </span>
+    <a href="{{ url_for('get_challenge', course_id=course_id, challenge_id=challenge.id) }}"
+       class="btn btn-xs btn-ghost border border-base-300 font-semibold ml-auto">
+      ← Back to the staff view
+    </a>
+  </div>
+  {% endif %}
+
   <div class="grid grid-cols-1 lg:grid-cols-[1fr_22rem] gap-6 items-start">
 
     <!-- ── LEFT: problem + sample files ─────────────────────────────── -->
-    <div class="card bg-base-100 border border-base-300 shadow-sm">
-      <div class="card-body p-8">
-        <div class="flex items-start justify-between gap-4">
-          <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
-            <a href="{{ url_for('get_course', course_id=course_id) }}" class="hover:text-primary">
-              {{ challenge.course_title }}
-            </a>
-            · Challenge {{ "%02d" | format(challenge.position) }}
-          </p>
-          {# Course staff only. The real check is on the edit routes themselves. #}
-          {% if can_edit %}
-          <a href="{{ url_for('get_challenge_edit', course_id=course_id, challenge_id=challenge.id) }}"
-             class="btn btn-sm btn-ghost gap-1.5 font-semibold border border-base-300 -mt-1">
-            <span class="text-primary">✎</span> Edit
-          </a>
-          {% endif %}
-        </div>
-        <h1 class="font-serif text-4xl font-semibold tracking-tight mt-1 mb-4">{{ challenge.title }}</h1>
-
-        <!-- Limits enforced by the sandbox, straight from the challenge row -->
-        <div class="flex flex-wrap gap-2 mb-6">
-          <span class="badge badge-warning font-bold border-none"
-                style="background:color-mix(in oklch, var(--color-warning) 18%, transparent);color:oklch(45% 0.12 55);">
-            {{ challenge.max_time_s }} s limit
-          </span>
-          <span class="badge badge-ghost font-semibold">
-            {{ (challenge.max_memory_bytes / 1024 / 1024) | round(1) }} MB memory
-          </span>
-          <span class="badge badge-ghost font-semibold">
-            {{ challenge.max_threads }} thread{{ "s" if challenge.max_threads != 1 }}
-          </span>
-          <span class="badge badge-ghost font-semibold">unlimited attempts</span>
-        </div>
-
-        <article class="prose prose-sm max-w-none prose-pre:bg-neutral prose-pre:text-neutral-content prose-pre:rounded-xl">
-          {{ challenge.description | markdown }}
-        </article>
-
-        {% if challenge.samples %}
-        <div class="flex items-baseline justify-between mt-7 mb-2.5">
-          <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50">Sample files</h3>
-          <span class="text-xs text-base-content/45">Download a pair to test locally</span>
-        </div>
-        <div class="flex flex-col gap-2.5">
-          {% for sample in challenge.samples %}
-          {% set n = sample.execution_order + 1 %}
-          <div class="flex items-center gap-4 rounded-xl border border-base-300 bg-base-100 px-4 py-2.5">
-            <div class="min-w-[6rem]">
-              <div class="font-mono text-sm font-bold">Sample {{ n }}</div>
-              <div class="text-xs text-base-content/45">input / expected output</div>
-            </div>
-            <div class="flex flex-wrap gap-2 flex-1">
-              {% for kind in ["input", "output"] %}
-              <a href="{{ url_for('get_sample_file', challenge_id=challenge.id, testcase_id=sample.id, kind=kind) }}"
-                 download
-                 class="btn btn-sm btn-ghost font-mono font-semibold gap-2 bg-base-200 hover:bg-base-300">
-                sample{{ n }}_{{ kind }}.txt <span class="text-primary text-base">↓</span>
-              </a>
-              {% endfor %}
-            </div>
-          </div>
-          {% endfor %}
-        </div>
-        {% endif %}
-      </div>
-    </div>
+    {% include "_statement.jinja" %}
 
     <!-- ── RIGHT: submit + leaderboard ──────────────────────────────── -->
     <div class="flex flex-col gap-5">

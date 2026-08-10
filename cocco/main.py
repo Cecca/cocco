@@ -20,7 +20,16 @@ from cocco.model import (
     metadata,
 )
 from cocco import schema
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -29,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 import os
 
 from cocco.repository import (
+    count_running_submissions,
     count_testcase_outcomes,
     delete_testcase,
     insert_enrollment,
@@ -36,13 +46,16 @@ from cocco.repository import (
     insert_testcase,
     query_challenge,
     query_challenge_leaderboard,
+    query_challenge_standings,
     query_challenge_testcases,
     query_course_info,
     query_courses,
     query_sample_testcase,
     query_testcase,
+    query_user,
     query_user_role,
     query_user_submissions,
+    regrade_challenge,
     swap_testcase_order,
     update_challenge,
     update_testcase,
@@ -414,22 +427,38 @@ async def get_course(course_id: int, request: Request, db: DBDep, user: CurrentU
 
 @app.get("/courses/{course_id}/{challenge_id}")
 async def get_challenge(
-    course_id: int, challenge_id: int, request: Request, db: DBDep, user: CurrentUser
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    as_: Annotated[str | None, Query(alias="as")] = None,
 ):
+    """The challenge, in whichever of its two views fits the viewer.
+
+    Course staff get `challenge-staff.jinja`: the statement plus the whole
+    class's standings, and no submit form. `?as=student` gives them the page a
+    student sees, which is the only way to check how the statement reads.
+    """
     if user.id is None:
         raise HTTPException(status_code=404)
     challenge = await query_challenge(db, user_id=user.id, challenge_id=challenge_id)
     if challenge is None:
         raise HTTPException(status_code=404)
+    can_edit = challenge["viewer_role"] in EDITOR_ROLE_NAMES
+    staff_view = can_edit and as_ != "student"
     return templates.TemplateResponse(
         request=request,
-        name="challenge.jinja",
+        name="challenge-staff.jinja" if staff_view else "challenge.jinja",
         context={
             "user": user,
             "course_id": course_id,
             "challenge": challenge,
             "title": challenge["title"],
-            "can_edit": challenge["viewer_role"] in EDITOR_ROLE_NAMES,
+            "can_edit": can_edit,
+            # Staff looking at the student page got here on purpose, so offer
+            # them the way back.
+            "viewing_as_student": can_edit and not staff_view,
         },
     )
 
@@ -552,6 +581,143 @@ async def get_sample_file(challenge_id: int, testcase_id: int, kind: str, db: DB
         path,
         media_type="text/plain",
         filename=f"sample{testcase.execution_order + 1}_{kind}.txt",
+    )
+
+
+########################################################################
+# The staff view of a challenge. Like the editor below, every route here
+# depends on ChallengeEditor - these pages show one student's work to another
+# person, so the check is access control and not just an affordance.
+
+
+@app.get("/f/standings/{challenge_id}")
+async def get_fragment_standings(
+    challenge_id: int,
+    course_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+):
+    standings = await query_challenge_standings(db, challenge_id=challenge_id)
+    return templates.TemplateResponse(
+        request=request,
+        name="f-standings.jinja",
+        context={
+            "standings": standings or [],
+            "course_id": course_id,
+            "challenge_id": challenge_id,
+        },
+    )
+
+
+@app.get("/f/students/{challenge_id}/{student_id}")
+async def get_fragment_student_submissions(
+    challenge_id: int,
+    student_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+):
+    """One student's attempts, for the staff page. Same query and same fragment
+    as the student's own history - only the user id differs."""
+    submissions = await query_user_submissions(
+        db, user_id=student_id, challenge_id=challenge_id
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="f-submissions.jinja",
+        context={
+            "submissions": submissions or [],
+            "empty_message": "This student has not submitted anything yet.",
+        },
+    )
+
+
+@app.get("/courses/{course_id}/{challenge_id}/students/{student_id}")
+async def get_challenge_student(
+    course_id: int,
+    challenge_id: int,
+    student_id: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    role: ChallengeEditor,
+):
+    """Everything one student has handed in for one challenge."""
+    if user.id is None:
+        raise HTTPException(status_code=403)
+    challenge = await query_challenge(db, user_id=user.id, challenge_id=challenge_id)
+    if challenge is None:
+        raise HTTPException(status_code=404)
+    student = await query_user(db, student_id)
+    if student is None:
+        raise HTTPException(status_code=404)
+
+    # Only people the standings would list: someone who has submitted, or a
+    # student enrolled on the course. Anyone else is a stranger to this
+    # challenge and their name is none of this page's business.
+    enrolled = await query_user_role(db, user_id=student_id, challenge_id=challenge_id)
+    submissions = await query_user_submissions(
+        db, user_id=student_id, challenge_id=challenge_id
+    )
+    if enrolled is None and submissions is None:
+        raise HTTPException(status_code=404)
+
+    return templates.TemplateResponse(
+        request=request,
+        name="challenge-student.jinja",
+        context={
+            "user": user,
+            "course_id": course_id,
+            "challenge": challenge,
+            "student": student,
+            "title": f"{student.nickname} · {challenge['title']}",
+        },
+    )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/regrade")
+async def post_regrade(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+):
+    """Discard every outcome of this challenge and requeue every submission.
+
+    Refused while a judge is mid-run: that run would insert the outcomes of the
+    old grading after the reset and mark its submission done, leaving exactly
+    one stale score with nothing to mark it as stale. The window is a few
+    seconds, so asking staff to press the button again is enough.
+    """
+
+    def alert(message: str, ok: bool = False):
+        return templates.TemplateResponse(
+            request=request,
+            name="f-edit-result.jinja",
+            context={"ok": ok, "message": message},
+        )
+
+    running = await count_running_submissions(db, challenge_id)
+    if running:
+        return alert(
+            f"A judge is running {running} submission"
+            f"{'' if running == 1 else 's'} of this challenge right now. "
+            "Nothing was changed — try again in a moment."
+        )
+
+    requeued = await regrade_challenge(db, challenge_id)
+    # get_db hands out a plain connection with no surrounding transaction
+    await db.commit()
+
+    if not requeued:
+        return alert("There is nothing to regrade: nobody has submitted yet.", ok=True)
+    return alert(
+        f"{requeued} submission{'' if requeued == 1 else 's'} requeued on the "
+        "active test cases. Scores reappear in the table below as the judge "
+        "works through the queue.",
+        ok=True,
     )
 
 

@@ -1,0 +1,99 @@
+{% extends "base.jinja" %}
+{% block title %}{{ challenge.title }}{% endblock %}
+
+{% block nav_extra %}
+<li><a class="text-base-content font-bold border-b-2 border-primary pb-0.5">This challenge</a></li>
+{% endblock %}
+
+{# The staff view of a challenge, served from the same URL as challenge.jinja
+   when the viewer is course staff. No submit form - a teacher does not hand in
+   solutions to their own challenge - and the whole class instead of one
+   student's history. #}
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+
+  {% with staff_view = true %}
+  {% include "_statement.jinja" %}
+  {% endwith %}
+
+  <!-- ══ CLASS STANDINGS ═════════════════════════════════════════════ -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+    <div class="card-body p-7">
+      <div class="flex items-start justify-between gap-4">
+        <div>
+          <div class="flex items-center gap-2.5">
+            <h2 class="font-bold text-lg">Class standings</h2>
+            <span class="font-mono text-xs text-success flex items-center gap-1.5">
+              <span class="h-1.5 w-1.5 rounded-full bg-success"></span>live
+            </span>
+          </div>
+          <p class="text-[13px] text-base-content/55">
+            Every student's best attempt. Click a row for their full history.
+          </p>
+        </div>
+
+        <button type="button" class="btn btn-sm btn-outline btn-error font-semibold"
+                onclick="regrade_modal.showModal()">
+          ↻ Regrade all
+        </button>
+      </div>
+
+      <div id="regrade-result" class="empty:hidden mt-3"></div>
+
+      <div class="overflow-x-auto mt-3">
+        <table class="table">
+          <thead>
+            <tr class="text-xs uppercase tracking-wider text-base-content/45 font-mono">
+              <th class="w-12">#</th>
+              <th>Student</th>
+              <th class="w-40 text-right">Best score</th>
+              <th class="w-28 text-right">Time</th>
+              <th class="w-24 text-right">Attempts</th>
+              <th class="w-52">Last submitted</th>
+            </tr>
+          </thead>
+          <!-- Polled: slower than the student page's 2s, because this table is
+               the whole class and a regrade takes minutes to drain anyway. -->
+          <tbody id="standings"
+                 hx-get="{{ url_for('get_fragment_standings', challenge_id=challenge.id) }}?course_id={{ course_id }}"
+                 hx-trigger="load, every 5s"
+                 hx-swap="innerHTML">
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- Regrading throws work away, so it asks first. The route refuses anyway
+     while a judge is mid-run; this only guards against a stray click. -->
+<dialog id="regrade_modal" class="modal">
+  <div class="modal-box">
+    <h3 class="font-bold text-lg">Regrade every submission?</h3>
+    <p class="py-3 text-sm text-base-content/70">
+      Every recorded outcome for <span class="font-semibold">{{ challenge.title }}</span>
+      is deleted and every submission goes back in the queue to be run again on
+      the <span class="font-semibold">active</span> test cases.
+    </p>
+    <p class="text-sm text-base-content/70">
+      Scores against retired test cases are discarded for good, and the students'
+      current scores disappear until the judge has worked through the queue.
+    </p>
+    <div class="modal-action">
+      <form method="dialog">
+        <button class="btn btn-sm btn-ghost">Cancel</button>
+      </form>
+      <button type="button" class="btn btn-sm btn-error"
+              hx-post="{{ url_for('post_regrade', course_id=course_id, challenge_id=challenge.id) }}"
+              hx-target="#regrade-result"
+              hx-swap="innerHTML"
+              onclick="regrade_modal.close()">
+        Regrade
+      </button>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop">
+    <button>close</button>
+  </form>
+</dialog>
+{% endblock %}

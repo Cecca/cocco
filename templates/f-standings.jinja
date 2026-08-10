@@ -1,0 +1,65 @@
+{# Rows for #standings: one per student, best attempt first. Polled every 5s,
+   so it has to render students whose attempts are still queued or running -
+   which is every one of them for a while after a regrade. #}
+{% for row in standings %}
+{% set href = url_for('get_challenge_student', course_id=course_id, challenge_id=challenge_id, student_id=row.user_id) %}
+{# The whole row is clickable for convenience; the nickname is a real link so
+   the page is still reachable with a keyboard. #}
+<tr class="hover cursor-pointer" onclick="location.href='{{ href }}'">
+  <td class="font-mono font-semibold text-base-content/50">
+    {{ row.rank if row.score is not none else "—" }}
+  </td>
+  <td>
+    <div class="flex items-center gap-2.5">
+      <img src="{{ url_for('user_avatar', user_id=row.user_id) }}"
+           alt="{{ row.nickname }}'s avatar"
+           class="w-7 h-7 rounded-full bg-base-200 object-cover" />
+      <a href="{{ href }}" class="font-semibold hover:text-primary">{{ row.nickname }}</a>
+      {% if row.n_pending %}
+      <span class="badge badge-ghost badge-sm gap-1.5 font-mono">
+        <span class="loading loading-spinner loading-xs"></span>{{ row.n_pending }} pending
+      </span>
+      {% endif %}
+    </div>
+  </td>
+  <td class="text-right">
+    {% if row.n_attempts == 0 %}
+    <span class="text-sm text-base-content/40">nothing handed in</span>
+    {% elif row.score is none %}
+    <span class="badge badge-ghost gap-1.5 font-mono font-semibold">not graded yet</span>
+    {% else %}
+    {# Spelled out rather than built from a variable: Tailwind only emits the
+       utilities it can literally see in these templates. #}
+    {% if row.score >= 0.9 %}
+    {% set badge = "badge-success" %}
+    {% set dot = "bg-success" %}
+    {% set tint = "background:color-mix(in oklch, var(--color-success) 16%, transparent);color:oklch(38% 0.1 150);" %}
+    {% elif row.score >= 0.5 %}
+    {% set badge = "badge-warning" %}
+    {% set dot = "bg-warning" %}
+    {% set tint = "background:color-mix(in oklch, var(--color-warning) 18%, transparent);color:oklch(45% 0.12 55);" %}
+    {% else %}
+    {% set badge = "badge-error" %}
+    {% set dot = "bg-error" %}
+    {% set tint = "background:color-mix(in oklch, var(--color-error) 14%, transparent);color:oklch(45% 0.15 28);" %}
+    {% endif %}
+    <span class="badge {{ badge }} gap-1.5 font-mono font-bold border-none"
+          style="{{ tint }}"
+          title="{{ row.n_passed }} of {{ row.n_tests }} tests passed">
+      <span class="h-1.5 w-1.5 rounded-full {{ dot }}"></span>{{ row.score | score }} / 100
+    </span>
+    {% endif %}
+  </td>
+  <td class="text-right font-mono text-sm text-base-content/60">{{ row.elapsed_s | duration }}</td>
+  <td class="text-right font-mono text-sm text-base-content/60">{{ row.n_attempts }}</td>
+  <td class="text-sm text-base-content/60">
+    {{ row.last_enqueued | datetime if row.last_enqueued else "—" }}
+  </td>
+</tr>
+{% else %}
+<tr>
+  <td colspan="6" class="text-center text-sm text-base-content/45 py-6">
+    Nobody is enrolled on this course yet, and nobody has submitted.
+  </td>
+</tr>
+{% endfor %}

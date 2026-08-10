@@ -17,6 +17,7 @@ from cocco.model import (
     SubmissionStatus,
     TestCase,
     TestOutcome,
+    User,
     UserRole,
 )
 
@@ -258,6 +259,116 @@ async def query_challenge_leaderboard(
     return res.scalar_one_or_none()
 
 
+async def query_challenge_standings(conn: AsyncConnection, challenge_id: int):
+    """How the whole class is doing on a challenge - one row per student.
+
+    This is the staff view of `query_user_submissions`: every student is
+    represented by their best attempt, ranked by score and then by total running
+    time. Students who are enrolled but have handed in nothing appear too, with
+    a null score, which is exactly what a teacher wants to see.
+
+    The cohort is the union of the enrolled students and everyone who has
+    submitted: a submission can outlive an enrollment, and a course may be
+    seeded with submissions before anyone is enrolled.
+
+    As in `query_user_submissions`, `score` is the mean of the per-test scores
+    and so only means anything for a higher-is-better evaluator.
+    """
+    query = text("""
+    WITH
+    cohort AS (
+        SELECT user_id FROM submission WHERE challenge_id = :challenge_id
+        UNION
+        SELECT enrollment.user_id
+        FROM enrollment
+        JOIN challenge ON challenge.course_id = enrollment.course_id
+        WHERE challenge.id = :challenge_id AND enrollment.role = 'student'
+    ),
+    outcomes AS (
+        SELECT submission_id,
+               avg(coalesce(score, 0)) AS score,
+               sum(elapsed_s) AS elapsed_s,
+               count(*) FILTER (WHERE outcome = 'success') AS n_passed,
+               count(*) AS n_tests
+        FROM testoutcome
+        GROUP BY submission_id
+    ),
+    -- Left joined, exactly as in query_user_submissions: a queued or running
+    -- attempt has no outcomes yet and must keep a *null* score rather than a
+    -- zero, both so it is not ranked as a failure and so it can be counted as
+    -- pending below.
+    attempts AS (
+        SELECT submission.id,
+               submission.user_id,
+               submission.status,
+               submission.enqueued,
+               outcomes.score,
+               outcomes.elapsed_s,
+               outcomes.n_passed,
+               outcomes.n_tests
+        FROM submission
+        LEFT JOIN outcomes ON outcomes.submission_id = submission.id
+        WHERE submission.challenge_id = :challenge_id
+    ),
+    best AS (
+        SELECT DISTINCT ON (user_id)
+               user_id, id AS best_submission_id, score, elapsed_s,
+               n_passed, n_tests
+        FROM attempts
+        ORDER BY user_id, score DESC NULLS LAST, elapsed_s ASC NULLS LAST
+    ),
+    totals AS (
+        SELECT user_id,
+               count(*) AS n_attempts,
+               count(*) FILTER (WHERE status IN ('queued', 'running')) AS n_pending,
+               max(enqueued) AS last_enqueued
+        FROM attempts
+        GROUP BY user_id
+    ),
+    board AS (
+        SELECT row_number() OVER (
+                   ORDER BY best.score DESC NULLS LAST,
+                            best.elapsed_s ASC NULLS LAST,
+                            "user".nickname
+               ) AS rank,
+               cohort.user_id,
+               "user".nickname,
+               best.best_submission_id,
+               best.score,
+               best.elapsed_s,
+               best.n_passed,
+               best.n_tests,
+               coalesce(totals.n_attempts, 0) AS n_attempts,
+               coalesce(totals.n_pending, 0) AS n_pending,
+               totals.last_enqueued
+        FROM cohort
+        JOIN "user" ON "user".id = cohort.user_id
+        LEFT JOIN best ON best.user_id = cohort.user_id
+        LEFT JOIN totals ON totals.user_id = cohort.user_id
+    )
+    SELECT json_agg(board ORDER BY board.rank) FROM board;
+    """)
+
+    res = await conn.execute(query, dict(challenge_id=challenge_id))
+    return res.scalar_one_or_none()
+
+
+async def count_running_submissions(conn: AsyncConnection, challenge_id: int) -> int:
+    """How many submissions of a challenge a judge is working on right now.
+
+    A regrade refuses while this is non-zero: the in-flight run would write its
+    outcomes and mark the submission done *after* the reset, leaving one stale
+    grade behind with nothing to say it is stale.
+    """
+    stmt = select(func.count()).where(
+        and_(
+            Submission.c.challenge_id == challenge_id,
+            Submission.c.status == SubmissionStatus.running,
+        )
+    )
+    return (await conn.execute(stmt)).scalar_one()
+
+
 async def query_sample_testcase(
     conn: AsyncConnection, challenge_id: int, testcase_id: int
 ):
@@ -293,6 +404,14 @@ async def query_user_role(
         )
     )
     return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def query_user(conn: AsyncConnection, user_id: int):
+    """A user's public identity, without the avatar blob."""
+    stmt = select(User.c.id, User.c.email, User.c.nickname).where(
+        User.c.id == user_id
+    )
+    return (await conn.execute(stmt)).first()
 
 
 async def query_challenge_testcases(conn: AsyncConnection, challenge_id: int):
@@ -336,6 +455,40 @@ async def query_testcase(conn: AsyncConnection, challenge_id: int, testcase_id: 
 
 # The following mutations deliberately do not commit: the caller owns the
 # transaction, as with `insert_enrollment` and `insert_submission`.
+
+
+async def regrade_challenge(conn: AsyncConnection, challenge_id: int) -> int:
+    """Throw away every recorded outcome of a challenge and requeue its
+    submissions. Returns how many were requeued.
+
+    This is how a fixed expected output or a corrected time limit is applied
+    retroactively, without asking students to submit again. Two consequences are
+    deliberate:
+
+    - Outcomes scored against *retired* test cases go with the rest and never
+      come back, because `pull_queued_submission` only runs the active ones.
+      Regrading is the destructive option; retiring a test case is the one that
+      preserves history.
+    - Afterwards no outcome points at any of the challenge's test cases, so
+      `count_testcase_outcomes` is zero for all of them and they become
+      deletable again. That is consistent rather than a hole in the rule: there
+      are no scores left for a delete to strand.
+
+    The caller must check `count_running_submissions` first, or a judge that is
+    mid-run will write the outcomes of the old grading after the reset.
+    """
+    submission_ids = select(Submission.c.id).where(
+        Submission.c.challenge_id == challenge_id
+    )
+    await conn.execute(
+        delete(TestOutcome).where(TestOutcome.c.submission_id.in_(submission_ids))
+    )
+    result = await conn.execute(
+        update(Submission)
+        .where(Submission.c.challenge_id == challenge_id)
+        .values(status=SubmissionStatus.queued)
+    )
+    return result.rowcount
 
 
 async def update_challenge(conn: AsyncConnection, challenge_id: int, **fields) -> None:

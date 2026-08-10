@@ -68,7 +68,9 @@ Insert helpers (`insert_enrollment`, `insert_submission`) deliberately do not co
 
 FastAPI app exposed as `cocco.main:app` (see `[tool.fastapi]` in `pyproject.toml`). Server-rendered Jinja templates in `templates/`, styled with Tailwind v4 + daisyUI v5 (`assets/styles.css` → `static/styles.css`), made live with htmx.
 
-Pages return a full document; anything that needs to stay fresh is a fragment template named `f-*.jinja` served from a `/f/...` route and polled with `hx-get` + `hx-trigger="load, every Ns"`. That polling is what makes a submission visibly move from `queued` to `running` to a score without a page reload.
+Pages return a full document; anything that needs to stay fresh is a fragment template named `f-*.jinja` served from a `/f/...` route and polled with `hx-get` + `hx-trigger="load, every Ns"`. That polling is what makes a submission visibly move from `queued` to `running` to a score without a page reload. A partial that is only ever `{% include %}`d, never served, gets a `_` prefix instead — `_statement.jinja` is the problem statement shared by the two challenge views.
+
+One challenge URL, two pages: `get_challenge` renders `challenge-staff.jinja` for course staff and `challenge.jinja` for everyone else, and `?as=student` lets staff see what a student sees. The staff page drops the submit form and shows `query_challenge_standings` — the whole class, one row per student, each linking to `get_challenge_student` for that student's attempts.
 
 Uploads carry no language field: `post_submission` maps the file extension to a language through `EXTENSION_TO_LANGUAGE`, built from the same `languages.toml` the judge loads. Upload failures come back as **200 with an error alert**, not a 4xx, because htmx does not swap error responses by default.
 
@@ -81,7 +83,8 @@ Auth is still stubbed: `get_user` returns a hardcoded user.
 
 The challenge editor's routes all depend on `require_challenge_editor`, which 403s a non-staff user.
 Hiding a control in a template is presentation, never access control — anything that mutates a
-challenge must go through that dependency.
+challenge must go through that dependency. The staff view's routes depend on it too, and there it
+guards *reads*: the standings and the per-student page show one student's work to someone else.
 
 ## Conventions specific to this repo
 
@@ -90,6 +93,7 @@ challenge must go through that dependency.
 - **Large inputs live on disk.** Test case inputs/outputs are passed by path, not read into memory, and isolate takes stdin directly from a file descriptor. Preserve this when adding features — uploaded test files go through `Storage.save_stream`, never `await upload.read()`.
 - **All file access goes through `Storage`.** `Storage.resolve` refuses any path that would land outside the storage root, and `safe_filename` reduces a user-supplied name to a bare, harmless one. Test case paths come from the database and ultimately from teacher input, so never join them onto a base directory by hand.
 - **A test case that has graded something is never deleted, only retired.** `delete_testcase` refuses (via `count_testcase_outcomes` in the route, with the `testoutcome.testcase_id` FK as the backstop) once any outcome points at it: detaching those outcomes would leave scores in the history with nothing to say what produced them. Clearing `is_active` is the supported move — the row, the files and the past outcomes all stay, but the judge stops running it and it stops being downloadable. `is_active` is checked in `pull_queued_submission`, in `query_challenge`'s `samples` CTE and in `query_sample_testcase`; the editor's `query_challenge_testcases` deliberately does not filter it, so a retired case can be reinstated.
+- **Regrading is the one place outcomes are deliberately destroyed.** `regrade_challenge` deletes every outcome of a challenge and puts every submission back to `queued`, so a fixed expected output can be applied without asking students to resubmit. Outcomes scored on *retired* test cases go too and never come back, since the judge only runs active ones — that is the difference between regrading and retiring, and it is why the confirmation dialog spells it out. Afterwards `count_testcase_outcomes` is zero for the challenge's test cases, so they are deletable again; nothing is left for a delete to strand. The route checks `count_running_submissions` first and refuses while a judge is mid-run, whose outcomes would otherwise land after the reset.
 - **Language runtimes are pinned by `flake.lock`.** Changing a compiler version means updating the flake, not the system.
 - **Scores are per test case, in `[0, 1]`.** A submission's headline score is the mean of its outcomes' scores, shown out of 100. This aggregation assumes higher-is-better, so it is wrong for a challenge using `RMSEEvaluator`.
 - **CSS is a build artifact.** Edit `assets/styles.css`, never `static/styles.css`. Tailwind only emits classes it can see, so it scans `templates/**/*.jinja` and `cocco/**/*.py` (`@source` directives); a class assembled dynamically at runtime will not be generated.
