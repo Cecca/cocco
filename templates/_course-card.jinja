@@ -32,6 +32,12 @@
          class="btn btn-sm btn-ghost gap-1.5 font-semibold border border-base-300">
         <span class="text-primary">✎</span> Edit
       </a>
+      {% elif not course.role and course.requires_key %}
+      {# A course with a key cannot be joined from here: the field, and the
+         message when the key is wrong, need more room than a list row has. The
+         preview is where both live. #}
+      <a href="{{ url_for('get_course', course_id=course.id) }}"
+         class="btn btn-sm btn-secondary btn-outline">Enroll…</a>
       {% elif not course.role %}
       {# Joins as a student, and only as a student - `insert_self_enrollment`
          fixes the role, so nothing about this form decides it. The target is

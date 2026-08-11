@@ -117,6 +117,21 @@ field can spell `teacher`, and the `ON CONFLICT DO NOTHING` there makes a double
 *and* guarantees an existing role is never overwritten, so a teacher who clicks it is not demoted
 to student. There is no way back out: leaving a course is still a course-staff matter.
 
+**`course.enrollment_key` is what makes that door selective.** NULL is a course anyone signed in
+may join; a value is a shared secret course staff set in the editor and announce to the class, and
+`post_course_enroll` refuses — with `hmac.compare_digest`, on the trimmed but otherwise exact
+string — before writing anything. It is stored and shown **in plaintext**, deliberately: staff have
+to read it back to say it out loud, which is the whole point of a key like this, and it guards a
+class list rather than an account. A rule follows from that: the **course editor is the only place
+it is ever printed**. `query_courses` and `query_course` report `enrollment_key IS NOT NULL` as
+`requires_key` and list their columns rather than `SELECT *`, so the value cannot ride along into a
+page served to the very people it is keeping out, and `query_enrollment_key` is the single read of
+the column, which exists to compare it. The field itself lives only on the course preview — a
+wrong-key message has nowhere to go inside a home-page card, so a key-protected course's card
+offers `Enroll…`, a link there instead. The preview and the refusal are the same fragment,
+`f-enroll.jinja`, inlined on first paint and swapped back with the message on a bad key, so what a
+refused student is looking at is the form they just typed into.
+
 Courses are created at `/courses/new` (`course-new.jinja`), reached from a button the home page
 shows only to an administrator; the form is the title and description halves of the course editor,
 and on success it answers `204` + `HX-Redirect` to the new course's editor, the way

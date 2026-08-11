@@ -1,7 +1,8 @@
+import json
 from datetime import datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, insert, select
+from sqlalchemy import create_engine, insert, select, update
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import cocco.model as cm
@@ -37,7 +38,9 @@ from cocco.repository import (
     query_course_challenges,
     query_course_info,
     query_course_role,
+    query_course,
     query_courses,
+    query_enrollment_key,
     query_ordered_challenge_ids,
     query_sample_testcase,
     query_submission,
@@ -1037,6 +1040,50 @@ async def test_self_enrollment():
         assert (
             await query_course_role(conn, user_id=bob, course_id=systems["id"])
         ) == UserRole.teacher
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_the_enrollment_key_is_reported_but_never_returned():
+    """Both course queries feed pages served to people who do not know the key,
+    so they answer whether one is wanted and never what it is."""
+    url = _postgres_url()
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        carol = (await query_user_by_email(conn, "carol@example.com")).id
+        # carol is a student on Algorithms 101 and not on Systems Programming,
+        # so one of each half of the home page gets a key
+        await conn.execute(
+            update(Course)
+            .where(Course.c.title.in_(["Algorithms 101", "Systems Programming"]))
+            .values(enrollment_key="Sesame-2026")
+        )
+        await conn.commit()
+
+        courses = await query_courses(conn, user_id=carol)
+        by_title = {
+            c["title"]: c for c in courses["enrolled"] + courses["non_enrolled"]
+        }
+        assert by_title["Algorithms 101"]["requires_key"] is True
+        assert by_title["Systems Programming"]["requires_key"] is True
+        assert by_title["Data Structures"]["requires_key"] is False
+        # Not "absent from the rendered page" - absent from the document
+        assert all("enrollment_key" not in c for c in by_title.values())
+        assert "Sesame-2026" not in json.dumps(courses)
+
+        systems_id = by_title["Systems Programming"]["id"]
+        preview = await query_course(conn, systems_id)
+        assert preview.requires_key is True
+        assert "enrollment_key" not in preview._mapping
+
+        # ...and the one query that does read it, which exists to compare it
+        assert await query_enrollment_key(conn, systems_id) == "Sesame-2026"
+        data_structures = by_title["Data Structures"]["id"]
+        assert await query_enrollment_key(conn, data_structures) is None
     await engine.dispose()
 
 

@@ -42,6 +42,27 @@
       </div>
     </div>
 
+    {# Above the description, so the Save button below stays at the foot of the
+       form it saves. #}
+    <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+      <div class="card-body p-7">
+        <div class="flex items-baseline justify-between">
+          <h2 class="font-bold text-lg">Enrollment key</h2>
+          <span class="font-mono text-xs text-base-content/45">optional</span>
+        </div>
+        <p class="text-[13px] text-base-content/55 -mt-1">
+          Leave it empty and anyone signed in can join. Set it and students have
+          to quote it on the course page before they are enrolled. It is shown
+          here in the clear so you can read it out to the class.
+        </p>
+        <input type="text" name="enrollment_key"
+               value="{{ course.enrollment_key or '' }}"
+               autocomplete="off"
+               placeholder="No key — anyone can join"
+               class="input w-full mt-3 font-mono" />
+      </div>
+    </div>
+
     <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
       <div class="card-body p-7">
         <div class="flex items-baseline justify-between">

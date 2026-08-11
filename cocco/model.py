@@ -84,6 +84,13 @@ Course = Table(
     Column("id", Integer, primary_key=True),
     Column("title", String, nullable=False),
     Column("description", String, nullable=False),
+    # The shared secret a student has to quote to enroll, or NULL for a course
+    # anyone signed in may join. Plaintext deliberately: course staff read it
+    # back off the editor to announce it to the class, which is the whole point
+    # of a key like this, and it guards a class list rather than an account.
+    # Only ever *printed* by the course editor, which is staff-only - every
+    # other query reports whether it is set, never what it is.
+    Column("enrollment_key", String, nullable=True),
 )
 
 

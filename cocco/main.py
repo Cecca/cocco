@@ -55,6 +55,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from starlette.middleware.sessions import SessionMiddleware
+import hmac
 import io
 import logging
 import os
@@ -82,6 +83,7 @@ from cocco.repository import (
     query_course_info,
     query_course_role,
     query_courses,
+    query_enrollment_key,
     query_evaluator_path,
     query_ordered_challenge_ids,
     query_sample_testcase,
@@ -1147,6 +1149,31 @@ async def post_course_new(
     )
 
 
+async def _render_enroll(
+    request: Request,
+    db: AsyncConnection,
+    course_id: int,
+    next: str = "",
+    error: str | None = None,
+):
+    """The way into a course, as the preview shows it: the `Enroll!` button, and
+    the key field when the course wants one.
+
+    Shared by `get_course`, which inlines it on first paint, and by
+    `post_course_enroll`, which swaps it back with a message when the key was
+    wrong - so what a refused student is looking at is the same form they typed
+    into. It is handed `requires_key` and never the key itself.
+    """
+    course = await query_course(db, course_id)
+    if course is None:
+        raise HTTPException(status_code=404)
+    return templates.TemplateResponse(
+        request=request,
+        name="f-enroll.jinja",
+        context={"course": course, "next": next, "error": error},
+    )
+
+
 @app.get("/courses/{course_id}")
 async def get_course(course_id: int, request: Request, db: DBDep, user: CurrentUser):
     """The course, or - for someone not enrolled on it - a preview of it.
@@ -1206,6 +1233,7 @@ async def post_course_enroll(
     user: CurrentUser,
     q: Annotated[str, Form()] = "",
     next: Annotated[str, Form()] = "",
+    key: Annotated[str, Form()] = "",
 ):
     """Enroll the viewer on a course, from either `Enroll!` button.
 
@@ -1219,18 +1247,35 @@ async def post_course_enroll(
     `is_allowed_email`; who may sign up for *this* course is, for now, anyone
     who can.
 
-    Two callers, so two answers. From the home page it renders the whole list,
-    both halves, because the point of the click is that the course moves from
-    "Other courses" up into "Your courses"; `q` comes back with it so enrolling
-    under a typed filter does not silently reset the list. From a course
-    preview there is no list to re-render - the page has to become the course
-    page - so that form sends `next` and gets the `HX-Redirect` idiom
+    A course with an enrollment key set admits nobody who cannot quote it. The
+    field is only on the preview - the home page's card links there instead of
+    offering a button - so a wrong key is answered with that same fragment and
+    a message, rather than with the courses list: 200 and not a 4xx, because
+    htmx does not swap the body of an error response and the fragment is the
+    entire point of the request.
+
+    Otherwise two callers, so two answers. From the home page it renders the
+    whole list, both halves, because the point of the click is that the course
+    moves from "Other courses" up into "Your courses"; `q` comes back with it
+    so enrolling under a typed filter does not silently reset the list. From a
+    course preview there is no list to re-render - the page has to become the
+    course page - so that form sends `next` and gets the `HX-Redirect` idiom
     `post_course_new` uses. `next` is filtered through `safe_next_path` like
     every other destination in the app: it arrives in a request, so it is not
     trusted to be a path on this site.
     """
     if not await course_exists(db, course_id):
         raise HTTPException(status_code=404)
+
+    expected = await query_enrollment_key(db, course_id)
+    if expected is not None and not hmac.compare_digest(key.strip(), expected):
+        # Trimmed, because a key read off a slide is pasted with whitespace,
+        # but otherwise exact - it is a string a teacher chose, and deciding
+        # that case does not count is not ours to make. `compare_digest`
+        # rather than `==` so the comparison does not time out early.
+        return await _render_enroll(
+            request, db, course_id, next, error="That key is not right."
+        )
 
     await insert_self_enrollment(db, user_id=user.id, course_id=course_id)
     # get_db hands out a plain connection with no surrounding transaction
@@ -1301,8 +1346,9 @@ async def post_course_edit(
     role: CourseEditor,
     title: Annotated[str, Form()],
     description: Annotated[str, Form()],
+    enrollment_key: Annotated[str, Form()] = "",
 ):
-    """Save the course's title and description."""
+    """Save the course's title, description and enrollment key."""
 
     def alert(message: str, ok: bool = False):
         return templates.TemplateResponse(
@@ -1315,9 +1361,22 @@ async def post_course_edit(
     if not title:
         return alert("A course needs a title.")
 
-    await update_course(db, course_id, title=title, description=description)
+    # An empty box is NULL, not the empty string: NULL is what "anyone may
+    # join" is spelled as, and clearing the field has to reopen the course
+    # rather than set a key nobody can type.
+    key = enrollment_key.strip() or None
+    await update_course(
+        db,
+        course_id,
+        title=title,
+        description=description,
+        enrollment_key=key,
+    )
     await db.commit()
-    return alert("Saved.", ok=True)
+    return alert(
+        "Saved. Students need the enrollment key to join." if key else "Saved.",
+        ok=True,
+    )
 
 
 @app.post("/courses/{course_id}/challenges/{challenge_id}/move")

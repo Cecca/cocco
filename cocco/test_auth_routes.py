@@ -26,7 +26,11 @@ from sqlalchemy.pool import StaticPool
 
 from cocco.auth import GoogleConfig, get_or_create_user
 from cocco.model import Challenge, Course, Enrollment, UserRole, metadata
-from cocco.repository import query_course_role, query_user_by_email
+from cocco.repository import (
+    query_course_role,
+    query_enrollment_key,
+    query_user_by_email,
+)
 
 # A signed-in visitor asking for something that does not need Postgres. Most
 # pages run `json_agg` queries that only Postgres has, so this avatar route -
@@ -649,3 +653,140 @@ async def test_a_refusal_is_a_page_not_json(
     # Rendered through `base.jinja`, with the signed-in navbar and a way out
     assert "dave@unipd.it" in response.text
     assert "Back to the courses" in response.text
+
+
+########################################################################
+# the enrollment key: an optional shared secret on the way in
+
+THE_KEY = "Sesame-2026"
+
+
+@pytest.fixture
+async def a_locked_course(app_engine):
+    """A course nobody is on, that wants a key."""
+    async with app_engine.begin() as conn:
+        course_id = (
+            await conn.execute(
+                insert(Course)
+                .values(
+                    title="Compilers",
+                    description="Lexing, parsing, code generation.",
+                    enrollment_key=THE_KEY,
+                )
+                .returning(Course.c.id)
+            )
+        ).scalar_one()
+    return course_id
+
+
+async def _role_of(app_engine, email: str, course_id: int):
+    async with app_engine.connect() as conn:
+        user = await query_user_by_email(conn, email)
+        if user is None:
+            return None
+        return await query_course_role(conn, user_id=user.id, course_id=course_id)
+
+
+@pytest.mark.parametrize(
+    "attempt", ["", "sesame-2026", "Sesame-2025", "Sesame", "Sesame-2026x"]
+)
+async def test_a_wrong_enrollment_key_enrolls_nobody(
+    client, monkeypatch, no_google, a_locked_course, app_engine, attempt
+):
+    """Including the empty one, and including a differently cased one: the key
+    is a string the teacher chose, so deciding that case does not count is not
+    ours to make."""
+    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    url = f"/courses/{a_locked_course}/enroll"
+
+    response = client.post(url, data={"key": attempt, "next": "/courses/1"})
+    assert response.status_code == 200
+    assert "That key is not right" in response.text
+    assert await _role_of(app_engine, "dave@unipd.it", a_locked_course) is None
+
+
+async def test_the_right_enrollment_key_enrolls(
+    client, monkeypatch, no_google, a_locked_course, app_engine
+):
+    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    course_url = f"/courses/{a_locked_course}"
+
+    response = client.post(
+        f"{course_url}/enroll", data={"key": THE_KEY, "next": course_url}
+    )
+    assert response.status_code == 204
+    assert response.headers["HX-Redirect"] == course_url
+    assert (
+        await _role_of(app_engine, "dave@unipd.it", a_locked_course)
+        == UserRole.student
+    )
+
+
+async def test_a_pasted_enrollment_key_is_trimmed(
+    client, monkeypatch, no_google, a_locked_course, app_engine
+):
+    """A key read off a slide arrives with whitespace around it, and that is
+    not the student getting it wrong."""
+    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    course_url = f"/courses/{a_locked_course}"
+
+    response = client.post(
+        f"{course_url}/enroll", data={"key": f"  {THE_KEY}\n", "next": course_url}
+    )
+    assert response.status_code == 204
+    assert (
+        await _role_of(app_engine, "dave@unipd.it", a_locked_course)
+        == UserRole.student
+    )
+
+
+async def test_a_course_without_a_key_asks_for_none(
+    client, monkeypatch, no_google, a_course, app_engine
+):
+    """The open path is untouched: no `key` field is sent at all, and nothing
+    demands one. Posted with `next`, as the preview does, because the home
+    page's answer is the courses fragment and that is a `json_agg` query."""
+    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    ours, _ = a_course
+    course_url = f"/courses/{ours['course_id']}"
+
+    response = client.post(f"{course_url}/enroll", data={"next": course_url})
+    assert response.status_code == 204
+    assert (
+        await _role_of(app_engine, "dave@unipd.it", ours["course_id"])
+        == UserRole.student
+    )
+
+
+async def test_the_preview_asks_for_the_key_and_never_shows_it(
+    client, monkeypatch, no_google, a_locked_course
+):
+    """The page is served to people who have not proved they know the key, so
+    `query_course` reports `requires_key` and nothing more."""
+    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+
+    response = client.get(f"/courses/{a_locked_course}")
+    assert response.status_code == 200
+    assert "This course needs an enrollment key" in response.text
+    assert 'name="key"' in response.text
+    assert THE_KEY not in response.text
+
+
+async def test_the_editor_saves_and_clears_the_key(
+    client, monkeypatch, no_google, a_course, app_engine
+):
+    """Staff set the key from the course editor, and emptying the box reopens
+    the course rather than setting a key nobody can type."""
+    ours, _ = a_course
+    await _enroll(app_engine, "alice@unipd.it", ours["course_id"], UserRole.teacher)
+    _set_dummy_auth(monkeypatch, True, "alice@unipd.it")
+    url = f"/courses/{ours['course_id']}/edit"
+    saved = {"title": "Algorithms 101", "description": "About it."}
+
+    client.post(url, data=saved | {"enrollment_key": f"  {THE_KEY}  "})
+    async with app_engine.connect() as conn:
+        assert await query_enrollment_key(conn, ours["course_id"]) == THE_KEY
+
+    client.post(url, data=saved | {"enrollment_key": "   "})
+    async with app_engine.connect() as conn:
+        assert await query_enrollment_key(conn, ours["course_id"]) is None

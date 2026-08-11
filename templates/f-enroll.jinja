@@ -1,0 +1,55 @@
+{# The way into a course, as its preview shows a non-member.
+
+   Rendered standalone by `post_course_enroll` when the key was wrong, and
+   inlined by `course.jinja` on first paint, so the form a refused student is
+   looking at is the one they typed into.
+
+   Context: `course` (from `query_course`, so `requires_key` and never the key
+   itself), `next` - where to land once the row exists - and `error`, the
+   sentence to show when there is one. #}
+
+<div id="enroll" class="rounded-xl border border-dashed border-base-300 bg-base-200/40 px-6 py-8">
+  {% if course.requires_key %}
+
+  <p class="text-center text-sm text-base-content/60">
+    This course needs an enrollment key.
+    <span class="text-base-content/45">Ask the course staff for it.</span>
+  </p>
+
+  {# One form, so Enter in the field submits it. The whole panel is the target:
+     the error belongs to the attempt, and swapping it away with the form keeps
+     a stale message from outliving the next try. #}
+  <form hx-post="{{ url_for('post_course_enroll', course_id=course.id) }}"
+        hx-target="#enroll"
+        hx-swap="outerHTML"
+        hx-disabled-elt="find button"
+        class="mt-4 flex items-start justify-center gap-2">
+    <input type="hidden" name="next" value="{{ next }}" />
+    <div>
+      <input type="text" name="key" required autocomplete="off"
+             placeholder="Enrollment key"
+             aria-label="Enrollment key"
+             class="input {% if error %}input-error{% endif %}" />
+      {% if error %}
+      <p role="alert" class="text-error text-[13px] mt-1.5">{{ error }}</p>
+      {% endif %}
+    </div>
+    <button type="submit" class="btn btn-secondary">Enroll!</button>
+  </form>
+
+  {% else %}
+
+  <p class="text-center text-sm text-base-content/60">
+    You are not enrolled on this course. Enroll to see its challenges.
+  </p>
+  <form hx-post="{{ url_for('post_course_enroll', course_id=course.id) }}"
+        hx-target="#enroll"
+        hx-swap="outerHTML"
+        hx-disabled-elt="find button"
+        class="mt-4 flex justify-center">
+    <input type="hidden" name="next" value="{{ next }}" />
+    <button type="submit" class="btn btn-secondary">Enroll!</button>
+  </form>
+
+  {% endif %}
+</div>

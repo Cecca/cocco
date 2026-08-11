@@ -1011,11 +1011,21 @@ async def query_courses(conn: AsyncConnection, user_id: int, q: str = ""):
     `ILIKE '%'||:q||'%'`, so a title typed with a `%` or a `_` in it is matched
     literally instead of turning into a wildcard, and there is no escaping to
     get wrong. An empty `q` is no filter at all.
+
+    The columns are listed rather than `SELECT *`: `course.enrollment_key` is a
+    secret, and a star would put it in the JSON of every card - including the
+    courses the viewer is not on, which are precisely the ones it guards. What
+    the card needs is `requires_key`, which is the question and not the answer.
     """
     query = text("""
     WITH
     courses as (
-        SELECT *
+        SELECT
+            c.id,
+            c.title,
+            c.description,
+            c.enrollment_key IS NOT NULL AS requires_key,
+            e.role
         FROM course c
         LEFT JOIN (SELECT * FROM enrollment WHERE user_id = :user_id) e
         ON c.id = e.course_id
@@ -1049,11 +1059,29 @@ async def query_course(conn: AsyncConnection, course_id: int):
     It also carries the description, which is what `get_course` renders for a
     visitor who is not enrolled: they see the course, not its contents, so the
     challenge list is never even fetched for them.
+
+    `requires_key` and not the key: this feeds a page shown to people who have
+    not proved they know it. `query_enrollment_key` is the one that reads the
+    value, and it exists to compare it.
     """
-    stmt = select(Course.c.id, Course.c.title, Course.c.description).where(
-        Course.c.id == course_id
-    )
+    stmt = select(
+        Course.c.id,
+        Course.c.title,
+        Course.c.description,
+        (Course.c.enrollment_key.is_not(None)).label("requires_key"),
+    ).where(Course.c.id == course_id)
     return (await conn.execute(stmt)).first()
+
+
+async def query_enrollment_key(conn: AsyncConnection, course_id: int) -> str | None:
+    """The course's enrollment key, or None if it has none and anyone may join.
+
+    The only read of the column, and it is read to be compared against what a
+    student typed - never to be rendered. Everything a page needs is
+    `requires_key`.
+    """
+    stmt = select(Course.c.enrollment_key).where(Course.c.id == course_id)
+    return (await conn.execute(stmt)).scalar_one_or_none()
 
 
 # The challenges of one course, in the order the course page lists them, each

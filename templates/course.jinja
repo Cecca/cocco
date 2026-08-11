@@ -19,17 +19,6 @@
            class="btn btn-sm btn-ghost gap-1.5 font-semibold border border-base-300 -mt-1">
           <span class="text-primary">✎</span> Edit course
         </a>
-        {% elif not is_member %}
-        {# The way in, in the place staff get their one affordance. `next` sends
-           the browser back here once the row exists, and this page is then the
-           course rather than a preview of it. #}
-        <form hx-post="{{ url_for('post_course_enroll', course_id=course.id) }}"
-              hx-disabled-elt="find button"
-              class="-mt-1">
-          <input type="hidden" name="next"
-                 value="{{ url_for('get_course', course_id=course.id).path }}" />
-          <button type="submit" class="btn btn-sm btn-secondary">Enroll!</button>
-        </form>
         {% endif %}
       </div>
       <h1 class="font-serif text-4xl font-semibold tracking-tight mt-1 mb-4">{{ course.title }}</h1>
@@ -41,10 +30,15 @@
   </div>
 
   {# A non-member gets the course, not its contents: `get_course` never even
-     fetched the challenges for them. #}
+     fetched the challenges for them. What they get instead is the way in - the
+     same fragment `post_course_enroll` swaps back when the key was wrong.
+     `next` brings them here again once the row exists, and this page is then
+     the course rather than a preview of it. #}
   {% if not is_member %}
-  <div class="mt-8 rounded-xl border border-dashed border-base-300 bg-base-200/40 px-4 py-8 text-center text-sm text-base-content/50">
-    You are not enrolled on this course. Enroll to see its challenges.
+  <div class="mt-8">
+    {% with next = url_for('get_course', course_id=course.id).path, error = None %}
+    {% include "f-enroll.jinja" %}
+    {% endwith %}
   </div>
   {% else %}
 
