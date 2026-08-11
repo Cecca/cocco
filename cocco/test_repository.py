@@ -6,7 +6,6 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 import cocco.model as cm
 from cocco.avatar import generate_identicon
-from cocco.evaluator import EqualityEvaluator
 from cocco.model import (
     Challenge,
     Course,
@@ -123,7 +122,6 @@ def _make_example_database(db_url="sqlite:///:memory:"):
                     max_memory_bytes=mem,
                     max_time_s=time_s,
                     max_threads=threads,
-                    evaluator=EqualityEvaluator(),
                 )
                 .returning(Challenge.c.id)
             ).scalar_one()
@@ -242,7 +240,6 @@ async def test_get_queued_submission_returns_oldest_queued():
                 description="say hi",
                 max_memory_bytes=1 << 20,
                 max_time_s=1.0,
-                evaluator=EqualityEvaluator(),
             )
             .returning(Challenge.c.id)
         ).scalar_one()
@@ -289,6 +286,54 @@ async def test_get_queued_submission_returns_oldest_queued():
 
     assert result is not None
     assert result.submission_id == oldest_id
+    # No evaluator of its own, so the judge falls back to the bundled default.
+    assert result.evaluator_path is None
+
+
+async def test_queued_submission_carries_the_challenge_evaluator():
+    """The judge learns which checker to grade with from the run data, and
+    from nowhere else."""
+    engine = _make_engine()
+
+    with engine.begin() as conn:
+        image, image_mime = generate_identicon("the-admin")
+        user_id = conn.execute(
+            insert(User)
+            .values(
+                email="me@example.com",
+                nickname="the-admin",
+                image=image,
+                image_mime=image_mime,
+            )
+            .returning(User.c.id)
+        ).scalar_one()
+        challenge_id = conn.execute(
+            insert(Challenge)
+            .values(
+                title="Hello",
+                description="say hi",
+                max_memory_bytes=1 << 20,
+                max_time_s=1.0,
+                evaluator_path="evaluator_1/checker.py",
+            )
+            .returning(Challenge.c.id)
+        ).scalar_one()
+        conn.execute(
+            insert(Submission).values(
+                challenge_id=challenge_id,
+                user_id=user_id,
+                language="python",
+                filename="solution.py",
+                source="print('a')",
+                status=cm.SubmissionStatus.queued,
+            )
+        )
+
+    with engine.connect() as conn:
+        result: SubmissionRunData | None = await pull_queued_submission(conn)
+
+    assert result is not None
+    assert result.evaluator_path == "evaluator_1/checker.py"
 
 
 async def test_queued_submission_skips_retired_testcases():
@@ -314,7 +359,6 @@ async def test_queued_submission_skips_retired_testcases():
                 description="say hi",
                 max_memory_bytes=1 << 20,
                 max_time_s=1.0,
-                evaluator=EqualityEvaluator(),
             )
             .returning(Challenge.c.id)
         ).scalar_one()

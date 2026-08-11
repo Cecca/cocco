@@ -34,6 +34,14 @@ For **compiled languages** (C, C++, Java, ...):
 For **interpreted languages** (Python, ...):
 1. Run the interpreter directly inside isolate, with the source file copied into the sandbox working directory.
 
+## Evaluation
+
+Grading is a **program, not a plugin**. Each challenge names a script that course staff uploaded; the judge compiles it once per submission and runs it once per test case, down the same isolate + Nix path as the submission itself, handing it three paths on argv (actual output, expected output, test input) and reading one JSON object off its stdout.
+
+The rejected alternative was to keep evaluators as Python classes inside the judge process. Two problems: a teacher who needs a special judge — several valid answers, a domain metric, checking a solution against the instance — would have to patch and redeploy the judge, and every checker would have to be Python. Running them in-process also means teacher code with no CPU or memory bound in the middle of the judge loop; the same `difflib` checker that used to be able to hang the judge is now simply killed by isolate and reported.
+
+That this is safe rests on isolate's defaults as much as on its limits: a box gets a fresh network namespace unless `--share-net` is passed, so an uploaded checker cannot reach the network, the database, or anything else the judge host can see.
+
 ## Test case inputs
 
 Test inputs can be several megabytes. They are stored on the **filesystem** (not in the database), with only the file path recorded in the database. Isolate accepts stdin from a file path directly, so large inputs are passed without any HTTP overhead.

@@ -2,8 +2,9 @@
 This module contains Pydantic schemas for user input validation, or the output
 of complex database queries.
 """
+import math
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cocco.model import OutcomeEnum, SubmissionStatus
 
@@ -81,6 +82,34 @@ class SubmissionRunData(Base):
     max_memory_bytes: int
     max_time_s: float
     test_cases: list[TestCase]
+    # The challenge's evaluator script, relative to the storage root. None
+    # means the bundled default - see `cocco.evaluators`.
+    evaluator_path: str | None = None
+
+
+class EvaluatorResult(Base):
+    """The single JSON object an evaluator script prints on stdout.
+
+    `score` is conventionally in [0, 1] and higher-is-better, which is what the
+    headline score and the leaderboards assume, but nothing enforces it: an
+    evaluator is free to use its own scale, and then those aggregates are the
+    thing that is wrong, not the score.
+
+    It must however be finite. `json.loads` accepts Python's `Infinity` and
+    `NaN` spellings, no other language emits them, and neither survives a round
+    trip through anything else - so accepting them would quietly make the
+    contract Python-only, which is the opposite of the point.
+    """
+
+    score: float
+    message: str = ""
+
+    @field_validator("score")
+    @classmethod
+    def _finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("score must be a finite number")
+        return value
 
 
 class SubmissionWithOutcomes(Base):

@@ -2,7 +2,6 @@ from datetime import datetime
 from enum import Enum
 
 from sqlalchemy import (
-    JSON,
     Boolean,
     Column,
     DateTime,
@@ -16,9 +15,6 @@ from sqlalchemy import (
     Table,
     text,
 )
-from sqlalchemy.types import TypeDecorator
-
-from cocco.evaluator import Evaluator, evaluator_adapter
 
 
 class UserRole(str, Enum):
@@ -55,17 +51,12 @@ class OutcomeEnum(Enum):
     out_of_memory = "out_of_memory"
     runtime_error = "runtime_error"
     judge_internal_error = "judge_internal_error"
-
-
-class EvaluatorType(TypeDecorator):
-    impl = JSON
-    cache_ok = True
-
-    def process_bind_param(self, value: Evaluator | None, dialect):
-        return None if value is None else value.model_dump()
-
-    def process_result_value(self, value, dialect):
-        return None if value is None else evaluator_adapter.validate_python(value)
+    # The challenge's evaluator is what broke, not the submission. Kept apart
+    # from `judge_internal_error` because this is the one failure course staff
+    # can actually fix, and apart from `timeout`/`runtime_error` because those
+    # are verdicts on the student's program - a checker that times out must
+    # never be reported as the submission timing out.
+    evaluator_error = "evaluator_error"
 
 
 metadata = MetaData()
@@ -116,7 +107,11 @@ Challenge = Table(
     Column("max_memory_bytes", Integer, nullable=False),
     Column("max_time_s", Float, nullable=False),
     Column("max_threads", Integer, nullable=False, default=1),
-    Column("evaluator", EvaluatorType, nullable=False),
+    # The challenge's checker. NULL means the bundled default (exact match),
+    # read straight out of `cocco/evaluators`; otherwise a path, relative to
+    # the storage root, to a script course staff uploaded. Its language comes
+    # from its extension, exactly as a submission's does.
+    Column("evaluator_path", String, nullable=True),
     # Which leaderboard the challenge page shows. Course staff pick it in the
     # editor; the judge is unaware of it.
     Column(

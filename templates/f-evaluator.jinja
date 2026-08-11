@@ -1,0 +1,86 @@
+{# The challenge's evaluator. Every mutation returns this whole fragment, so
+   what is on screen is always what will grade the next submission. Rendered
+   both standalone (htmx) and inlined by challenge-edit.jinja. #}
+
+{% if message %}
+<div role="alert" class="alert {{ 'alert-success' if ok else 'alert-error' }} text-sm mb-4">
+  <span>{{ message }}</span>
+</div>
+{% endif %}
+
+<div class="flex flex-wrap items-center gap-3 rounded-xl border border-base-300 bg-base-200/40 p-4">
+  <div class="flex-1 min-w-48">
+    {% if evaluator_name %}
+      <div class="font-mono text-sm font-semibold">{{ evaluator_name }}</div>
+      <div class="text-xs text-base-content/55 mt-0.5">
+        Uploaded{% if evaluator_language %}, run as {{ evaluator_language }}{% endif %}.
+      </div>
+    {% else %}
+      <div class="text-sm font-semibold">Default — exact match</div>
+      <div class="text-xs text-base-content/55 mt-0.5">
+        Full marks when the output equals the expected output, ignoring
+        surrounding whitespace, and zero otherwise.
+      </div>
+    {% endif %}
+  </div>
+
+  <a href="{{ url_for('get_evaluator_download', course_id=course_id, challenge_id=challenge_id) }}"
+     class="btn btn-sm btn-ghost">Download</a>
+
+  {% if evaluator_name %}
+  <form hx-post="{{ url_for('post_evaluator_reset', course_id=course_id, challenge_id=challenge_id) }}"
+        hx-target="#evaluator"
+        hx-swap="innerHTML"
+        hx-confirm="Go back to the default evaluator? {{ evaluator_name }} is deleted.">
+    <button type="submit" class="btn btn-sm btn-ghost text-error">Reset to default</button>
+  </form>
+  {% endif %}
+</div>
+
+<!-- ── UPLOAD ───────────────────────────────────────────────────────── -->
+<form hx-post="{{ url_for('post_evaluator', course_id=course_id, challenge_id=challenge_id) }}"
+      hx-encoding="multipart/form-data"
+      hx-target="#evaluator"
+      hx-swap="innerHTML"
+      class="mt-4 rounded-xl border border-base-300 bg-base-200/40 p-4">
+  <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Upload an evaluator</h3>
+  <div class="flex flex-wrap items-end gap-4">
+    <div>
+      <label class="text-xs text-base-content/55">Script</label>
+      <input type="file" name="evaluator_file" required
+             class="file-input file-input-sm w-72 mt-1" />
+    </div>
+    <button type="submit" class="btn btn-sm btn-primary">
+      <span class="submit-label">Upload</span>
+      <span class="htmx-indicator loading loading-spinner loading-xs"></span>
+    </button>
+  </div>
+</form>
+
+<!-- ── START FROM A BUNDLED ONE ─────────────────────────────────────── -->
+<form hx-post="{{ url_for('post_evaluator_bundled', course_id=course_id, challenge_id=challenge_id) }}"
+      hx-target="#evaluator"
+      hx-swap="innerHTML"
+      hx-confirm="Replace this challenge's evaluator with a copy of the bundled one?"
+      class="mt-4 rounded-xl border border-base-300 bg-base-200/40 p-4">
+  <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Start from a bundled evaluator</h3>
+  <div class="flex flex-wrap items-end gap-4">
+    <div>
+      <label class="text-xs text-base-content/55">Evaluator</label>
+      <select name="name" class="select select-sm w-72 mt-1">
+        {% for filename, (bundled_title, bundled_description) in bundled.items() %}
+        <option value="{{ filename }}">{{ bundled_title }} — {{ filename }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <button type="submit" class="btn btn-sm">
+      <span class="submit-label">Copy in</span>
+      <span class="htmx-indicator loading loading-spinner loading-xs"></span>
+    </button>
+  </div>
+  <ul class="mt-3 space-y-1 text-xs text-base-content/55">
+    {% for filename, (bundled_title, bundled_description) in bundled.items() %}
+    <li><span class="font-semibold">{{ bundled_title }}</span> — {{ bundled_description }}</li>
+    {% endfor %}
+  </ul>
+</form>

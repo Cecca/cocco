@@ -24,4 +24,4 @@ compiler_args = ["{source}"]
 output_ext = ".class"
 interpreter = "java"
 interpreter_args = ["{name}"]
-additional_processes = 20 # processes needed for the JVM
+additional_processes = 64 # the JVM needs a lot: GC, JIT and signal-handler threads

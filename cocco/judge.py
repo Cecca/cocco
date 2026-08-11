@@ -10,12 +10,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Sequence
 
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
 from cocco import repository as repo
+from cocco.evaluators import DEFAULT_EVALUATOR, bundled_path
 from cocco.schema import (
     Challenge,
+    EvaluatorResult,
     Submission,
     SubmissionRunData,
     TestCase,
@@ -26,7 +29,6 @@ from cocco.model import (
     OutcomeEnum,
 )
 from cocco.storage import Storage
-from cocco.evaluator import EqualityEvaluator, Evaluator
 
 
 logger = logging.getLogger(__name__)
@@ -58,7 +60,18 @@ class BoxPool:
 _IDS_POOL = BoxPool()
 
 
+# `nix build` on an already-realised store path still costs tens of
+# milliseconds of process startup and evaluation, and `Language.run` resolves
+# its runtime on *every* invocation - now twice per test case, once for the
+# submission and once for the evaluator. The store path for a given flake
+# output cannot change while the process lives, so remember it.
+_RUNTIME_CACHE: Dict[tuple[str, str], Path] = {}
+
+
 async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
+    cached = _RUNTIME_CACHE.get((runtime_name, bin_name))
+    if cached is not None:
+        return cached
     logger.debug("resolving runtime %s for binary %s", runtime_name, bin_name)
     p = await asyncio.create_subprocess_shell(
         " ".join(
@@ -81,6 +94,7 @@ async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
         binary = Path(f"{path}/bin/{bin_name}")
         if binary.is_file():
             logger.debug("resolved %s -> %s", bin_name, binary)
+            _RUNTIME_CACHE[(runtime_name, bin_name)] = binary
             return binary
     raise ValueError(f"could not find binary {bin_name} in {nix_store_paths}")
 
@@ -125,7 +139,22 @@ async def isolate_run(
     mem_limit_kb: int = 512 * 1024,
     processes: int = 1,
     additional_files: List[Path] = [],
+    box_files: Dict[str, Path] | None = None,
 ) -> RunOutcome:
+    """Run `exe` in a fresh isolate box.
+
+    `args` that happen to name an existing file or directory are copied into
+    the box and rewritten to their *basename*: the box is one flat directory,
+    so every path collapses into a single namespace. `box_files` is the
+    explicit form of the same thing - a box-relative name to put a file under,
+    whatever it is called outside - and is the only way to be sure two
+    unrelated paths do not land on the same name.
+
+    Ordering is load-bearing and easy to reverse by accident: `box_files` is
+    copied first, then `args`, then `additional_files`, so a later stage
+    silently wins a name collision with an earlier one.
+    """
+    box_files = box_files or {}
     async with _IDS_POOL.acquire() as box_id:
         logger.debug(
             "isolate run on box %s: exe=%s args=%s time=%.2fs mem=%dKB",
@@ -151,9 +180,19 @@ async def isolate_run(
             )
         box_path = Path(stdout.decode().strip()) / "box"
 
+        for box_name, source in box_files.items():
+            if os.path.isdir(source):
+                shutil.copytree(source, box_path / box_name)
+            else:
+                shutil.copy(source, box_path / box_name)
+
         filtered_args = []
         for arg in args:
-            if os.path.isfile(arg):
+            # A name we placed ourselves is already in the box under exactly
+            # that name; the `isfile` heuristic below must not touch it.
+            if arg in box_files:
+                filtered_args.append(arg)
+            elif os.path.isfile(arg):
                 arg = Path(arg)
                 shutil.copy(arg, box_path / arg.name)
                 filtered_args.append(arg.name)
@@ -321,6 +360,7 @@ class Language:
         time_limit: float = 2.0,
         mem_limit_kb: int = 262144,
         processes: int = 1,
+        box_files: Dict[str, Path] | None = None,
     ) -> RunOutcome:
         args = args or []
         if self.is_interpreted:
@@ -340,6 +380,7 @@ class Language:
                 mem_limit_kb=mem_limit_kb,
                 processes=processes + self.additional_processes,
                 additional_files=[executable],
+                box_files=box_files,
             )
         return await isolate_run(
             # For compiled executables, we strip the absolute path, which is instead needed
@@ -351,6 +392,7 @@ class Language:
             mem_limit_kb=mem_limit_kb,
             processes=processes + self.additional_processes,
             additional_files=[executable],
+            box_files=box_files,
         )
 
 
@@ -362,11 +404,242 @@ def load_languages(path: Path) -> Dict[str, Language]:
     return languages
 
 
+def extension_to_language(languages: Dict[str, Language]) -> Dict[str, str]:
+    """Extension (no dot, lowercased) -> language name."""
+    return {
+        ext.lower(): name
+        for name, language in languages.items()
+        for ext in language.extensions
+    }
+
+
+def language_for_filename(
+    filename: str, languages: Dict[str, Language]
+) -> Language | None:
+    """The language a file name implies, or None if the extension is unknown.
+
+    The same rule for a submitted solution and for an uploaded evaluator: the
+    extension is the only thing that says what a file is, which is why neither
+    carries a language field.
+    """
+    if "." not in filename:
+        return None
+    extension = filename.rsplit(".", 1)[-1].lower()
+    name = extension_to_language(languages).get(extension)
+    return languages[name] if name is not None else None
+
+
+# An evaluator is course staff's code checking a whole output, not a student's
+# solving one instance: a line diff of a multi-megabyte expected output is
+# legitimately far more work than producing it was. Its budget is therefore
+# fixed here rather than taken from the challenge - a teacher must not have to
+# widen the *students'* limits to get their checker to finish.
+EVALUATOR_TIME_LIMIT_S = 10.0
+EVALUATOR_MEM_LIMIT_KB = 1024 * 1024  # 1 GB
+
+# The names the evaluator's three arguments take inside the box. The leading
+# dot is what makes them safe: `safe_filename` strips leading dots, so no
+# uploaded file - test case or evaluator - can be named this, and no compiled
+# binary named after one can either.
+_ACTUAL_IN_BOX = ".actual_output"
+_EXPECTED_IN_BOX = ".expected_output"
+_INPUT_IN_BOX = ".test_input"
+
+# The evaluator reads its three files by path; stdin is deliberately empty, so
+# that "what does my checker read?" has one answer.
+_DEV_NULL = Path("/dev/null")
+
+# A compiler's complaint about the *evaluator* is emitted against every test
+# case, and `visible_outcomes` only redacts hidden ones - so on a public sample
+# this reaches students. Enough to identify the problem, not enough to paste
+# the checker's source into the page.
+MAX_EVALUATOR_COMPILE_OUTPUT = 2000
+
+
+class EvaluatorError(Exception):
+    """The challenge's evaluator is unusable: missing, in no known language, or
+    it did not compile. Nothing to do with the submission, and it fails every
+    test case rather than any one of them."""
+
+
+@dataclass(frozen=True)
+class Evaluator:
+    """A challenge's checker, compiled once per submission and run once per
+    test case."""
+
+    language: Language
+    executable: Path
+    source_name: str
+
+
+@dataclass(frozen=True)
+class Evaluation:
+    score: float
+    message: str
+    outcome: OutcomeEnum
+
+
+def parse_evaluator_output(stdout: str) -> EvaluatorResult:
+    """Parse the JSON object an evaluator printed, or raise `ValueError`."""
+    try:
+        return EvaluatorResult.model_validate_json(stdout)
+    except ValidationError as e:
+        raise ValueError(str(e)) from e
+
+
+def _describe_evaluator_failure(res: RunOutcome) -> str:
+    """Why an evaluator run did not produce a usable result.
+
+    Deliberately not `_classify_isolate_failure`: that turns a timeout into
+    `OutcomeEnum.timeout`, which is a verdict on the *student's* program. A
+    checker that runs too long says nothing about the submission, and letting
+    it masquerade as one would also put a bogus row on the `running_time`
+    leaderboard, which admits only submissions that passed every test.
+    """
+    if res.status == "TO":
+        return f"The evaluator timed out after {EVALUATOR_TIME_LIMIT_S:g} s."
+    if res.oom:
+        return (
+            "The evaluator ran out of memory (limit "
+            f"{EVALUATOR_MEM_LIMIT_KB // 1024} MB)."
+        )
+    detail = res.stderr.strip()[-MAX_EVALUATOR_COMPILE_OUTPUT:]
+    return (
+        f"The evaluator exited with status {res.status} (rc={res.retcode})."
+        + (f"\n{detail}" if detail else "")
+    )
+
+
+async def prepare_evaluator(
+    storage: Storage,
+    evaluator_path: str | None,
+    languages: Dict[str, Language],
+    workdir: Path,
+) -> Evaluator:
+    """Resolve and compile a challenge's evaluator. Raises `EvaluatorError`.
+
+    A NULL `evaluator_path` means the bundled default, which lives in the
+    source tree and not in storage - so a fix to it reaches every challenge
+    that never chose a checker of its own.
+    """
+    if evaluator_path is None:
+        source = bundled_path(DEFAULT_EVALUATOR)
+    else:
+        source = storage.resolve(evaluator_path)
+        if not source.is_file():
+            raise EvaluatorError(
+                f"The evaluator script {evaluator_path} is missing from storage."
+            )
+
+    language = language_for_filename(source.name, languages)
+    if language is None:
+        known = ", ".join(sorted("." + e for e in extension_to_language(languages)))
+        raise EvaluatorError(
+            f"The evaluator {source.name} is in no language this judge knows. "
+            f"Accepted extensions: {known}."
+        )
+
+    # Under its own name, not a generated one: `javac` requires `Foo.java` for
+    # `public class Foo`, and the extension is what tells a compiler what it is
+    # being handed.
+    local = workdir / source.name
+    shutil.copy(source, local)
+
+    compiled = await language.compile(local, workdir)
+    if not compiled.success or compiled.executable is None:
+        output = "\n".join(
+            part for part in (compiled.stdout, compiled.stderr) if part
+        ).strip()
+        raise EvaluatorError(
+            f"The evaluator {source.name} failed to compile:\n"
+            + output[:MAX_EVALUATOR_COMPILE_OUTPUT]
+        )
+
+    logger.debug("prepared evaluator %s (%s)", source.name, language.name)
+    return Evaluator(
+        language=language, executable=compiled.executable, source_name=source.name
+    )
+
+
+async def evaluate(
+    evaluator: Evaluator,
+    actual_output: str,
+    expected_output_path: Path,
+    test_input_path: Path,
+    workdir: Path,
+) -> Evaluation:
+    """Score one test case by running the challenge's evaluator on it.
+
+    Never raises for evaluator misbehaviour: a checker that crashes, hangs or
+    prints nonsense is a normal per-test result, reported as `evaluator_error`
+    with a message course staff can act on.
+    """
+    # The submission's output arrives as a str - isolate's box, and the file it
+    # was captured from, are long gone by now - so it is the one of the three
+    # that has to be put back on disk.
+    actual_path = workdir / _ACTUAL_IN_BOX
+    actual_path.write_text(actual_output, encoding="utf-8")
+
+    res = await evaluator.language.run(
+        evaluator.executable,
+        _DEV_NULL,
+        args=[_ACTUAL_IN_BOX, _EXPECTED_IN_BOX, _INPUT_IN_BOX],
+        time_limit=EVALUATOR_TIME_LIMIT_S,
+        mem_limit_kb=EVALUATOR_MEM_LIMIT_KB,
+        box_files={
+            _ACTUAL_IN_BOX: actual_path,
+            _EXPECTED_IN_BOX: expected_output_path,
+            _INPUT_IN_BOX: test_input_path,
+        },
+    )
+
+    if res.status != "OK":
+        return Evaluation(
+            score=0.0,
+            message=_describe_evaluator_failure(res),
+            outcome=OutcomeEnum.evaluator_error,
+        )
+
+    try:
+        result = parse_evaluator_output(res.stdout)
+    except ValueError as e:
+        logger.info(
+            "evaluator %s printed unusable output: %s", evaluator.source_name, e
+        )
+        return Evaluation(
+            score=0.0,
+            message=(
+                "The evaluator did not print a valid result "
+                '(expected one JSON object, e.g. {"score": 1.0}). '
+                f"It printed:\n{res.stdout[:1000]}"
+            ),
+            outcome=OutcomeEnum.evaluator_error,
+        )
+
+    return Evaluation(
+        score=result.score, message=result.message, outcome=OutcomeEnum.success
+    )
+
+
+def _every_test(
+    run_data: SubmissionRunData, outcome: OutcomeEnum, message: str
+) -> List[TestOutcome]:
+    """The same verdict on every test case, for a failure that is not about any
+    one of them: the submission did not compile, or the evaluator is broken."""
+    return [
+        TestOutcome(
+            submission_id=run_data.submission_id,
+            testcase_id=test_case.id,
+            outcome=outcome,
+            score=0.0,
+            message=message[:MAX_OUTPUT_LENGTH],
+        )
+        for test_case in run_data.test_cases
+    ]
 
 
 async def run_submission(
     storage: Storage,
-    evaluator: Evaluator,
     run_data: SubmissionRunData,
 ) -> List[TestOutcome]:
     logger.info(
@@ -375,100 +648,130 @@ async def run_submission(
         run_data.language,
         len(run_data.test_cases),
     )
-    runtime: Language = load_languages(Path("languages.toml"))[run_data.language]
+    languages = load_languages(Path("languages.toml"))
+    runtime: Language = languages[run_data.language]
 
     outcomes = []
     with tempfile.TemporaryDirectory() as temp:
         temp = Path(temp)
-        source_fname = temp / ("source" + runtime.extensions[0])
+        # The dot matters: a compiler is told what it has been handed by the
+        # extension, and `languages.toml` spells extensions without one.
+        source_fname = temp / ("source." + runtime.extensions[0])
         with open(source_fname, "w") as fp:
             fp.write(run_data.source)
 
         # First we compile
         compile_result = await runtime.compile(source_fname, temp)
-        if compile_result.success:
-            assert compile_result.executable is not None
-            for test_case in run_data.test_cases:
-                try:
-                    exec_res = await runtime.run(
-                        compile_result.executable,
-                        storage.resolve(test_case.input_path),
-                        [],
-                        time_limit=run_data.max_time_s,
-                        mem_limit_kb=run_data.max_memory_bytes // 1024,
-                        processes=run_data.max_threads,
-                    )
-                    if exec_res.status != "OK":
-                        logger.info(
-                            "submission %s test %s failed: status=%s message=%s",
-                            run_data.submission_id,
-                            test_case.id,
-                            exec_res.status,
-                            exec_res.message,
-                        )
-                        score = 0.0
-                        eval_msg = exec_res.message or exec_res.status
-                        outcome = _classify_isolate_failure(exec_res)
-                    else:
-                        (score, eval_msg) = evaluator.evaluate(
-                            storage.read(test_case.expected_output_path),
-                            exec_res.stdout,
-                        )
-                        outcome = OutcomeEnum.success
-                        logger.debug(
-                            "submission %s test %s scored %.3f",
-                            run_data.submission_id,
-                            test_case.id,
-                            score,
-                        )
-                    test_outcome = TestOutcome(
-                        submission_id=run_data.submission_id,
-                        testcase_id=test_case.id,
-                        outcome=outcome,
-                        score=score,
-                        elapsed_s=exec_res.elapsed_time_s,
-                        peak_memory_bytes=exec_res.max_rss_kb * 1024,
-                        message=eval_msg,
-                        # outputs are truncated to prevent flooding attacks
-                        stdout=exec_res.stdout[:MAX_OUTPUT_LENGTH],
-                        stderr=exec_res.stderr[:MAX_OUTPUT_LENGTH],
-                    )
-                except Exception as e:
-                    logger.exception(
-                        "submission %s test %s: judge internal error",
-                        run_data.submission_id,
-                        test_case.id,
-                    )
-                    test_outcome = TestOutcome(
-                        submission_id=run_data.submission_id,
-                        testcase_id=test_case.id,
-                        outcome=OutcomeEnum.judge_internal_error,
-                        score=0.0,
-                        message=f"Judge internal error: {e!r}",
-                    )
-                outcomes.append(test_outcome)
-
-        else:
+        if not compile_result.success:
             logger.info(
                 "submission %s failed to compile, marking all %d tests as compile_failure",
                 run_data.submission_id,
                 len(run_data.test_cases),
             )
-            for test_case in run_data.test_cases:
+            # The evaluator is deliberately not prepared here: there is no
+            # output to check, so a broken checker is not this run's problem.
+            return _every_test(
+                run_data,
+                OutcomeEnum.compile_failure,
+                f"stdout:\n{compile_result.stdout}\n\nstderr:\n{compile_result.stderr}",
+            )
+        assert compile_result.executable is not None
+
+        # Once per submission, not once per test case, and after the
+        # submission compiled so a broken checker cannot mask a broken
+        # solution.
+        evaluator_dir = temp / "evaluator"
+        evaluator_dir.mkdir()
+        try:
+            evaluator = await prepare_evaluator(
+                storage, run_data.evaluator_path, languages, evaluator_dir
+            )
+        except EvaluatorError as e:
+            logger.error(
+                "submission %s: challenge evaluator is unusable: %s",
+                run_data.submission_id,
+                e,
+            )
+            return _every_test(run_data, OutcomeEnum.evaluator_error, str(e))
+
+        for test_case in run_data.test_cases:
+            try:
+                exec_res = await runtime.run(
+                    compile_result.executable,
+                    storage.resolve(test_case.input_path),
+                    [],
+                    time_limit=run_data.max_time_s,
+                    mem_limit_kb=run_data.max_memory_bytes // 1024,
+                    processes=run_data.max_threads,
+                )
+                if exec_res.status != "OK":
+                    logger.info(
+                        "submission %s test %s failed: status=%s message=%s",
+                        run_data.submission_id,
+                        test_case.id,
+                        exec_res.status,
+                        exec_res.message,
+                    )
+                    score = 0.0
+                    eval_msg = exec_res.message or exec_res.status
+                    outcome = _classify_isolate_failure(exec_res)
+                else:
+                    # The evaluator sees the whole output; only what is stored
+                    # on the outcome below is truncated.
+                    evaluation = await evaluate(
+                        evaluator,
+                        exec_res.stdout,
+                        storage.resolve(test_case.expected_output_path),
+                        storage.resolve(test_case.input_path),
+                        evaluator_dir,
+                    )
+                    score = evaluation.score
+                    eval_msg = evaluation.message
+                    outcome = evaluation.outcome
+                    logger.debug(
+                        "submission %s test %s scored %.3f (%s)",
+                        run_data.submission_id,
+                        test_case.id,
+                        score,
+                        outcome.value,
+                    )
                 test_outcome = TestOutcome(
                     submission_id=run_data.submission_id,
                     testcase_id=test_case.id,
-                    outcome=OutcomeEnum.compile_failure,
-                    score=0.0,
-                    message=f"stdout:\n{compile_result.stdout}\n\nstderr:\n{compile_result.stderr}",
+                    outcome=outcome,
+                    score=score,
+                    # The submission's own time and memory, never the
+                    # evaluator's: these are what the running_time leaderboard
+                    # ranks by.
+                    elapsed_s=exec_res.elapsed_time_s,
+                    peak_memory_bytes=exec_res.max_rss_kb * 1024,
+                    # Truncated like the outputs: the message now comes from a
+                    # teacher's script running with a gigabyte to play with,
+                    # and the column it lands in has no length limit.
+                    message=eval_msg[:MAX_OUTPUT_LENGTH],
+                    # outputs are truncated to prevent flooding attacks
+                    stdout=exec_res.stdout[:MAX_OUTPUT_LENGTH],
+                    stderr=exec_res.stderr[:MAX_OUTPUT_LENGTH],
                 )
-                outcomes.append(test_outcome)
-
+            except Exception as e:
+                logger.exception(
+                    "submission %s test %s: judge internal error",
+                    run_data.submission_id,
+                    test_case.id,
+                )
+                test_outcome = TestOutcome(
+                    submission_id=run_data.submission_id,
+                    testcase_id=test_case.id,
+                    outcome=OutcomeEnum.judge_internal_error,
+                    score=0.0,
+                    message=f"Judge internal error: {e!r}",
+                )
+            outcomes.append(test_outcome)
 
     return outcomes
 
 
-async def run_from_queue(engine: Engine, storage: Storage, evaluator: Evaluator) -> bool:
+async def run_from_queue(engine: Engine, storage: Storage) -> bool:
     # `connect`, not `begin`: pull_queued_submission commits by itself as soon
     # as it has claimed the submission, so that the row lock is not held while
     # the challenge and its test cases are read.
@@ -482,7 +785,7 @@ async def run_from_queue(engine: Engine, storage: Storage, evaluator: Evaluator)
     outcomes: List[TestOutcome] = []
     try:
         # TODO: make the path to languages.toml configurable
-        outcomes = await run_submission(storage, evaluator, run_data)
+        outcomes = await run_submission(storage, run_data)
     except Exception as e:
         logger.exception(
             "submission %s failed during execution; marking as judge_internal_error",
@@ -512,12 +815,10 @@ async def run_from_queue(engine: Engine, storage: Storage, evaluator: Evaluator)
     return True
 
 
-async def run_loop(
-    engine: Engine, storage: Storage, evaluator: Evaluator, wait_time=5
-):
+async def run_loop(engine: Engine, storage: Storage, wait_time=5):
     logger.info("judge run loop started (poll interval %ss)", wait_time)
     while True:
-        has_run = await run_from_queue(engine, storage, evaluator)
+        has_run = await run_from_queue(engine, storage)
         if not has_run:
             logger.debug("judge waiting for %f seconds", wait_time)
             await asyncio.sleep(wait_time)
@@ -558,7 +859,6 @@ if __name__ == "__main__":
         storage = Storage(args.storage)
         engine = create_engine(args.database)
         metadata.create_all(engine)
-        evaluator = EqualityEvaluator()
-        await run_loop(engine, storage, evaluator)
+        await run_loop(engine, storage)
 
     asyncio.run(main())

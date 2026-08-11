@@ -89,7 +89,7 @@
           <p class="text-[13px] text-base-content/55 sm:mt-6">
             Ranking by time shows only students who passed every test; the two score
             rankings include partially correct submissions. Both score rankings assume
-            higher is better, so neither suits a challenge scored with RMSE.
+            higher is better, so neither suits an evaluator that scores an error.
           </p>
         </div>
       </div>
@@ -134,6 +134,33 @@
       </div>
     </div>
   </form>
+
+  {# Outside the form above, like the test cases below it: nested forms are
+     invalid HTML, and this card has upload and reset forms of its own. Above
+     the test cases because you pick the checker before writing what it
+     checks. #}
+  <!-- ══ EVALUATOR ═════════════════════════════════════════════════════ -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg">Evaluator</h2>
+      <p class="text-[13px] text-base-content/55 -mt-1 mb-3">
+        The script that turns a submission's output into a score. It runs in the
+        same sandbox as submissions — in any language this judge supports, picked
+        from the file's extension — once per test case, as
+        <code class="text-xs">script &lt;actual&gt; &lt;expected&gt; &lt;input&gt;</code>,
+        and must print one JSON object on stdout:
+        <code class="text-xs">{"score": 0.5, "message": "shown to the student"}</code>.
+        Exiting non-zero means the checker broke, never that the answer was wrong.
+        Changing the evaluator does not rescore anything already submitted — use
+        Regrade on the challenge page for that.
+      </p>
+
+      <!-- Every mutation returns this whole card, so it always matches the database -->
+      <div id="evaluator">
+        {% include "f-evaluator.jinja" %}
+      </div>
+    </div>
+  </div>
 
   <!-- ══ TEST CASES ════════════════════════════════════════════════════ -->
   <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">

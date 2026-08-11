@@ -8,8 +8,8 @@ from pygments.lexers import TextLexer, get_lexer_by_name
 from pygments.util import ClassNotFound
 from sqlalchemy import insert, select
 from cocco.avatar import generate_identicon
-from cocco.evaluator import EqualityEvaluator
-from cocco.judge import load_languages
+from cocco.evaluators import BUNDLED, DEFAULT_EVALUATOR, bundled_path
+from cocco.judge import extension_to_language, load_languages
 from cocco.storage import Storage, safe_filename
 from cocco.model import (
     Challenge,
@@ -55,6 +55,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from starlette.middleware.sessions import SessionMiddleware
+import io
 import logging
 import os
 
@@ -73,6 +74,7 @@ from cocco.repository import (
     query_challenge_testcases,
     query_course_info,
     query_courses,
+    query_evaluator_path,
     query_sample_testcase,
     query_submission,
     query_submission_outcomes,
@@ -168,15 +170,17 @@ templates = Jinja2Templates(directory="templates")
 storage = Storage(Path(os.environ.get("COCCO_STORAGE", "/tmp/cocco-storage")))
 
 # Uploads are mapped to a language by their extension, so the challenge page
-# needs no language picker. `languages.toml` is the same file the judge loads.
+# needs no language picker. `languages.toml` is the same file the judge loads,
+# and so is the mapping - an evaluator script is recognised by exactly the rule
+# a submitted solution is.
 LANGUAGES = load_languages(Path("languages.toml"))
-EXTENSION_TO_LANGUAGE = {
-    ext.lower(): name
-    for name, language in LANGUAGES.items()
-    for ext in language.extensions
-}
+EXTENSION_TO_LANGUAGE = extension_to_language(LANGUAGES)
 
 MAX_UPLOAD_BYTES = 1 << 20
+
+# An evaluator is a source file, not test data, so it lives under the same
+# ceiling as a submitted solution rather than the test case one.
+MAX_EVALUATOR_BYTES = MAX_UPLOAD_BYTES
 
 # Test case inputs are routinely far larger than a solution file, so they get
 # their own, much higher ceiling - and are streamed to disk, never buffered.
@@ -262,7 +266,6 @@ async def _populate_dummy_data(conn: AsyncConnection):
     # The student whose attempts the seeded submission history belongs to.
     student_id = user_ids["bob@unipd.it"]
 
-    evaluator = EqualityEvaluator()
     course_titles = ["Algorithms 101", "Data Structures"]
     first_challenge_id: int | None = None
     shortest_route = textwrap.dedent("""\
@@ -340,7 +343,9 @@ async def _populate_dummy_data(conn: AsyncConnection):
                         max_memory_bytes=256 << 20,
                         max_time_s=5.0,
                         max_threads=1,
-                        evaluator=evaluator,
+                        # No evaluator of its own: graded by the bundled
+                        # default, exact match.
+                        evaluator_path=None,
                     )
                     .returning(Challenge.c.id)
                 )
@@ -823,9 +828,10 @@ async def authorize_submission(
 
 # Fields of an outcome that are free text produced by the run rather than by the
 # judge's own bookkeeping. `stdout`/`stderr` are the submitted program's output,
-# and `message` can be the evaluator's diff - i.e. the expected output itself
-# (see DiffEvaluator). On a hidden test case all three would hand a student the
-# test data, so they are only shown for samples, or to course staff.
+# and `message` comes from the challenge's evaluator, which has just read both
+# the hidden input and the expected output - the bundled diff.py puts the
+# expected output in it verbatim. On a hidden test case all three would hand a
+# student the test data, so they are only shown for samples, or to course staff.
 _OUTCOME_FREE_TEXT = ("message", "stdout", "stderr")
 
 
@@ -1301,9 +1307,10 @@ async def get_challenge_edit(
         request=request,
         name="challenge-edit.jinja",
         context={
+            # The evaluator card is an included fragment, so the page has to
+            # carry the same context the fragment's own route builds.
+            **await _evaluator_context(db, course_id, challenge_id),
             "user": user,
-            "course_id": course_id,
-            "challenge_id": challenge_id,
             "challenge": challenge,
             "testcases": testcases,
             "title": f"Editing {challenge['title']}",
@@ -1352,6 +1359,227 @@ async def post_challenge_edit(
     )
     await db.commit()
     return alert("Saved.", ok=True)
+
+
+########################################################################
+# The challenge's evaluator: the script that turns a program's output into a
+# score. NULL means the bundled default; anything else is a file course staff
+# uploaded, living beside the challenge's test data rather than inside it.
+
+
+def _evaluator_dir(challenge_id: int) -> str:
+    # A sibling of `_testcase_dir`, not a directory inside it: a test case file
+    # may itself be named "evaluator", and then the two would disagree about
+    # whether that name is a file or a directory. Test case paths never contain
+    # a slash in the name, so these two trees cannot collide.
+    return f"evaluator_{challenge_id}"
+
+
+async def _evaluator_context(
+    db: DBDep, course_id: int, challenge_id: int
+) -> dict:
+    """What `f-evaluator.jinja` needs, whether it is served on its own or
+    included by the editor page."""
+    path = await query_evaluator_path(db, challenge_id)
+    language = None
+    if path is not None:
+        language = EXTENSION_TO_LANGUAGE.get(
+            path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        )
+    return {
+        "course_id": course_id,
+        "challenge_id": challenge_id,
+        # None means the bundled default, which is not in storage and has no
+        # path to show.
+        "evaluator_name": None if path is None else path.rsplit("/", 1)[-1],
+        "evaluator_language": language,
+        "bundled": BUNDLED,
+    }
+
+
+async def _render_evaluator(
+    request: Request,
+    db: DBDep,
+    course_id: int,
+    challenge_id: int,
+    message: str | None = None,
+    ok: bool = True,
+):
+    """The evaluator card's fragment. Every mutation returns this, so what is
+    shown is always what the database says will grade the next submission."""
+    context = await _evaluator_context(db, course_id, challenge_id)
+    return templates.TemplateResponse(
+        request=request,
+        name="f-evaluator.jinja",
+        context={**context, "message": message, "ok": ok},
+    )
+
+
+async def _replace_evaluator(
+    db: DBDep, challenge_id: int, new_path: str, contents: bytes
+) -> None:
+    """Point the challenge at a new evaluator, and drop the file it replaces.
+
+    The old file goes only after the new path is committed, so a failed commit
+    cannot leave the database naming a script that is no longer on disk.
+    """
+    previous = await query_evaluator_path(db, challenge_id)
+    storage.save_stream(new_path, io.BytesIO(contents))
+    await update_challenge(db, challenge_id, evaluator_path=new_path)
+    await db.commit()
+    if previous is not None and previous != new_path:
+        storage.delete(previous)
+
+
+@app.post("/courses/{course_id}/{challenge_id}/evaluator")
+async def post_evaluator(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+    evaluator_file: Annotated[UploadFile, File()],
+):
+    """Upload a script to grade this challenge with."""
+
+    async def refuse(message: str):
+        return await _render_evaluator(
+            request, db, course_id, challenge_id, message, ok=False
+        )
+
+    try:
+        name = safe_filename(evaluator_file.filename or "")
+    except ValueError as e:
+        return await refuse(str(e))
+
+    # Checked before the read, so a huge upload is refused rather than
+    # buffered. `size` may be absent, hence the second check below.
+    if evaluator_file.size is not None and evaluator_file.size > MAX_EVALUATOR_BYTES:
+        return await refuse(
+            f"That file is {evaluator_file.size / 1024:.0f} KB — the limit is "
+            f"{MAX_EVALUATOR_BYTES // 1024} KB. An evaluator is a script, not "
+            "test data."
+        )
+
+    contents = await evaluator_file.read()
+    if len(contents) > MAX_EVALUATOR_BYTES:
+        return await refuse(
+            f"That file is {len(contents) / 1024:.0f} KB — the limit is "
+            f"{MAX_EVALUATOR_BYTES // 1024} KB. An evaluator is a script, not "
+            "test data."
+        )
+
+    # Load-bearing, not cosmetic: the extension is the only thing that tells
+    # the judge how to compile and run the script, so a name it cannot read is
+    # refused here rather than becoming an evaluator_error on every submission.
+    extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    language = EXTENSION_TO_LANGUAGE.get(extension)
+    if language is None:
+        known = ", ".join(sorted("." + e for e in EXTENSION_TO_LANGUAGE))
+        return await refuse(
+            f"Cannot tell the language of {name!r}. Accepted: {known}."
+        )
+
+    try:
+        contents.decode("utf-8")
+    except UnicodeDecodeError:
+        return await refuse(f"{name} is not valid UTF-8 text.")
+
+    await _replace_evaluator(
+        db, challenge_id, f"{_evaluator_dir(challenge_id)}/{name}", contents
+    )
+    return await _render_evaluator(
+        request,
+        db,
+        course_id,
+        challenge_id,
+        f"{name} will grade submissions from now on, as {language}.",
+        ok=True,
+    )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/evaluator/bundled")
+async def post_evaluator_bundled(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+    name: Annotated[str, Form()],
+):
+    """Copy one of the bundled evaluators in, as a starting point to edit."""
+    try:
+        # `bundled_path` refuses anything that is not a key of BUNDLED, so a
+        # request value never becomes a path.
+        source = bundled_path(name)
+    except KeyError:
+        return await _render_evaluator(
+            request, db, course_id, challenge_id, "Unknown evaluator.", ok=False
+        )
+
+    await _replace_evaluator(
+        db,
+        challenge_id,
+        f"{_evaluator_dir(challenge_id)}/{name}",
+        source.read_bytes(),
+    )
+    return await _render_evaluator(
+        request,
+        db,
+        course_id,
+        challenge_id,
+        f"Copied {name} in. Download it to adapt it to this challenge.",
+        ok=True,
+    )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/evaluator/reset")
+async def post_evaluator_reset(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+):
+    """Go back to the bundled default, and remove the uploaded script."""
+    previous = await query_evaluator_path(db, challenge_id)
+    await update_challenge(db, challenge_id, evaluator_path=None)
+    await db.commit()
+    if previous is not None:
+        storage.delete(previous)
+    return await _render_evaluator(
+        request,
+        db,
+        course_id,
+        challenge_id,
+        "Back to the default evaluator: exact match.",
+        ok=True,
+    )
+
+
+@app.get("/courses/{course_id}/{challenge_id}/evaluator/download")
+async def get_evaluator_download(
+    course_id: int,
+    challenge_id: int,
+    db: DBDep,
+    role: ChallengeEditor,
+):
+    """The current evaluator's source, for staff only.
+
+    Gated even though it is a read: a checker describes the shape of the
+    answer, and on a challenge with hidden test cases handing it to a student
+    turns "work out the format" into "read the format".
+    """
+    relative = await query_evaluator_path(db, challenge_id)
+    if relative is None:
+        path = bundled_path(DEFAULT_EVALUATOR)
+    else:
+        path = storage.resolve(relative)
+    if not path.is_file():
+        raise HTTPException(status_code=404)
+    # text/plain whatever the extension says, so a script named .html can
+    # never be served as a page on this origin.
+    return FileResponse(path, media_type="text/plain", filename=path.name)
 
 
 @app.post("/f/markdown-preview")

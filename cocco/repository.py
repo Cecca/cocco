@@ -65,6 +65,7 @@ async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
         max_memory_bytes=challenge.max_memory_bytes,
         max_time_s=challenge.max_time_s,
         test_cases=[schema.TestCase.model_validate(t) for t in tests],
+        evaluator_path=challenge.evaluator_path,
     )
 
 
@@ -144,8 +145,9 @@ async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_
     rows the challenge page polls for.
 
     The aggregate `score` is the mean of the per-test scores. Note that this is
-    only meaningful for higher-is-better evaluators; `RMSEEvaluator` returns a
-    score where lower is better, and this aggregation gets it backwards.
+    only meaningful for higher-is-better evaluators: nothing stops a challenge's
+    evaluator from scoring on another scale - an error metric, say - and this
+    aggregation then gets it backwards.
     """
     query = text("""
     WITH
@@ -680,6 +682,21 @@ async def regrade_challenge(conn: AsyncConnection, challenge_id: int) -> int:
         .values(status=SubmissionStatus.queued)
     )
     return result.rowcount
+
+
+async def query_evaluator_path(
+    conn: AsyncConnection, challenge_id: int
+) -> str | None:
+    """The challenge's evaluator script, or None for the bundled default.
+
+    Its own query rather than a read of `query_challenge`: that one needs a
+    viewer to compute their role, joins five tables, and the editor asks this
+    on every mutation of the evaluator card.
+    """
+    result = await conn.execute(
+        select(Challenge.c.evaluator_path).where(Challenge.c.id == challenge_id)
+    )
+    return result.scalar_one_or_none()
 
 
 async def update_challenge(conn: AsyncConnection, challenge_id: int, **fields) -> None:
