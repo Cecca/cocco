@@ -102,19 +102,20 @@ so one request refreshes everything — and the input sits **outside** `#courses
 because an input rebuilt on every keystroke loses focus. The page inlines that same fragment on
 first paint.
 
-The `Enroll!` button on a course the viewer is not on is `post_course_enroll`, and it renders the
-same fragment — with the filter box's `q` included, so enrolling under a filter keeps it — because
-the point of the click is that the course *moves* from the bottom half to the top. Its
-authorization is `CurrentUser` and deliberately nothing more: an enrollment is not what grants
-access here, since `get_course`, `get_challenge` and `post_submission` all depend on the session
-alone, so what the row actually changes is the role badge, which half the course sits under, and
-whether the person appears in the roster `query_challenge_standings` shows staff. The gate on who
-may sign in at all is `is_allowed_email`. The role is fixed inside `insert_self_enrollment` rather
-than taken from the request — this is the one path into `enrollment` that no course staff approved,
-so it must not be able to name a role — and the `ON CONFLICT DO NOTHING` there is what makes a
-double click a no-op *and* guarantees an existing role is never overwritten, so a teacher who
-clicks it is not demoted to student. There is no way back out: leaving a course is still a
-course-staff matter.
+The `Enroll!` button on a course the viewer is not on is `post_course_enroll`, and there are two of
+them: on the home page's card, where it renders the courses fragment back — with the filter box's
+`q` included, so enrolling under a filter keeps it — because the point of the click is that the
+course *moves* from the bottom half to the top; and on the course preview, which has no list to
+re-render, so that one sends `next` and gets a `204` + `HX-Redirect` back to the same course, now
+opened up. `next` goes through `safe_next_path` like every other destination.
+
+Its authorization is `CurrentUser` and deliberately nothing more: it is the way in, and a
+membership gate here would lock the door from the inside. It is therefore **the only route under a
+course a non-member may call**, which is why the row it writes has to be the one row it can write:
+the role is fixed inside `insert_self_enrollment` rather than taken from the request, so no form
+field can spell `teacher`, and the `ON CONFLICT DO NOTHING` there makes a double click a no-op
+*and* guarantees an existing role is never overwritten, so a teacher who clicks it is not demoted
+to student. There is no way back out: leaving a course is still a course-staff matter.
 
 Courses are created at `/courses/new` (`course-new.jinja`), reached from a button the home page
 shows only to an administrator; the form is the title and description halves of the course editor,
@@ -170,7 +171,32 @@ when checking what course staff *without* `admin` may do.
 ### Authorization
 
 `role` lives on `enrollment`, so permissions are **per course**, not site-wide. `EDITOR_ROLES`
-(teacher, admin, collaborator) is course staff; students and the unenrolled are read-only.
+(teacher, admin, collaborator) is course staff; students may read the course and submit to it.
+
+**Enrollment is the gate on a course's contents, not a label on them.** The unenrolled are not
+read-only, they are shut out: `require_course_member` 403s anyone with no role on the course in the
+path, `require_challenge_viewer` adds the `challenge_in_course` cross-check to it exactly as
+`require_challenge_editor` does — otherwise a student of one course could name their own course in
+front of another course's challenge — and `require_challenge_member` is the same check for the
+three routes whose URL carries only a challenge (`/f/submissions/{id}`, `/f/leaderboard/{id}`, the
+sample download). Keying those on the challenge is not the mistake the editor check avoids: with
+one id in the path there is no second key to disagree with. `EDITOR_ROLES` is a subset of
+"enrolled", so staff pass the membership check without a second one — but staff of *one* course are
+strangers on every other.
+
+Four things are deliberately outside the gate, and each would break something if it were not: the
+home page and `/f/courses`, which must list every course or nobody could find one to enroll on;
+`post_course_enroll`, the way in; and `get_course`, which for a non-member renders a **preview** —
+the title, the description and the `Enroll!` button, and nothing of the contents. The preview is
+not merely a template that hides things: `get_course` branches before the query, so
+`query_course_info` never runs for someone who may not see its result.
+
+Refusals are pages, not JSON. `Forbidden` is an `HTTPException` subclass carrying the sentence to
+show, and `handle_forbidden` renders `403.jinja` through `base.jinja`; the handler is registered on
+that subclass alone so FastAPI's defaults still answer everything else. It needs the viewer for the
+navbar and an exception handler cannot ask for a dependency, so `get_user` stashes
+`request.state.user`. Polled fragments are unaffected — htmx does not swap the body of an error
+response.
 
 The one exception is **creating a course**, the only permission that names no course, because the
 course does not exist yet. There is still no site-wide administrator in this schema, so the check
@@ -191,7 +217,8 @@ guards *reads*: the standings and the per-student page show one student's work t
 
 The submission page is the exception to the dependency: a student must be able to open their own
 work, so `get_submission` and its fragment call `authorize_submission` instead, which allows the
-author and otherwise requires `EDITOR_ROLES`.
+author and otherwise requires `EDITOR_ROLES`. It needs no membership check of its own — the author
+was enrolled when they submitted, because `post_submission` is behind the gate too.
 
 ## Conventions specific to this repo
 

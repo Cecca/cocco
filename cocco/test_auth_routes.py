@@ -1,10 +1,16 @@
-"""End-to-end tests of the auth routes, over an in-memory database.
+"""End-to-end tests of the auth *and* authorization routes, over an in-memory
+database.
 
 Importing `cocco.main` reads PGUSER/PGDATABASE/PGHOST and mounts `static/`, so
 these run from the repository root inside the devShell - but they never connect
 to Postgres: `get_db` is overridden with a SQLite connection, which is enough
 because the auth routes use plain Core only. Google is replaced wholesale by
 `_FakeGoogleClient`, so nothing here reaches the network either.
+
+The authorization tests at the bottom run here for the same reason, and it is
+not a coincidence: a refusal happens in a *dependency*, so the route body - and
+with it every Postgres-only page query - never runs. Which means the interesting
+half, "who is turned away", is a unit test.
 """
 
 from dataclasses import replace
@@ -14,12 +20,13 @@ from authlib.integrations.base_client.errors import MismatchingStateError
 from authlib.integrations.starlette_client import OAuthError
 from fastapi.responses import RedirectResponse
 from fastapi.testclient import TestClient
+from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from cocco.auth import GoogleConfig
-from cocco.model import metadata
-from cocco.repository import query_user_by_email
+from cocco.auth import GoogleConfig, get_or_create_user
+from cocco.model import Challenge, Course, Enrollment, UserRole, metadata
+from cocco.repository import query_course_role, query_user_by_email
 
 # A signed-in visitor asking for something that does not need Postgres. Most
 # pages run `json_agg` queries that only Postgres has, so this avatar route -
@@ -31,8 +38,16 @@ VERIFIED = {"email": "dave@unipd.it", "email_verified": True}
 
 
 @pytest.fixture
-def app_engine():
+async def app_engine():
+    """An empty database with the schema on it.
+
+    The tables are created here rather than in `client` because not every test
+    needs a client: the authorization dependencies are worth calling directly,
+    and they still need somewhere to look a role up.
+    """
     engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
+    async with engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
     yield engine
 
 
@@ -40,9 +55,6 @@ def app_engine():
 async def client(app_engine, monkeypatch):
     """A client whose app talks to `app_engine` and never reaches Google."""
     import cocco.main as main
-
-    async with app_engine.begin() as conn:
-        await conn.run_sync(metadata.create_all)
 
     async def _get_db():
         async with app_engine.connect() as conn:
@@ -428,3 +440,212 @@ async def test_dummy_auth_skips_the_login_page(client, monkeypatch, no_google):
     response = client.get("/auth/google", follow_redirects=False)
     assert response.status_code == 303
     assert response.headers["location"] == "/"
+
+
+########################################################################
+# authorization: enrollment is the gate on a course's contents
+
+
+@pytest.fixture
+async def a_course(app_engine):
+    """Two courses, one challenge each, and nobody enrolled on either.
+
+    Who is on which course is the whole subject of these tests, so no fixture
+    decides it. The second course exists to be the one the viewer is *not* on,
+    which is what makes the cross-course checks mean anything.
+    """
+    ours, theirs = {}, {}
+    async with app_engine.begin() as conn:
+        for target, title in ((ours, "Algorithms 101"), (theirs, "Systems")):
+            target["course_id"] = (
+                await conn.execute(
+                    insert(Course)
+                    .values(title=title, description=f"About {title}.")
+                    .returning(Course.c.id)
+                )
+            ).scalar_one()
+            target["challenge_id"] = (
+                await conn.execute(
+                    insert(Challenge)
+                    .values(
+                        title=f"{title} - Shortest Route Planner",
+                        description="Find the shortest route.",
+                        course_id=target["course_id"],
+                        max_memory_bytes=1 << 20,
+                        max_time_s=1.0,
+                        max_threads=1,
+                    )
+                    .returning(Challenge.c.id)
+                )
+            ).scalar_one()
+    return ours, theirs
+
+
+async def _enroll(app_engine, email: str, course_id: int, role: UserRole):
+    """Sign `email` up for a course, creating the account if it is new."""
+    async with app_engine.begin() as conn:
+        user = await get_or_create_user(conn, email)
+        await conn.execute(
+            insert(Enrollment).values(
+                user_id=user.id, course_id=course_id, role=role
+            )
+        )
+    return user
+
+
+def _gated_urls(course_id: int, challenge_id: int):
+    """Every route a course's contents hide behind, as (method, url)."""
+    return [
+        ("get", f"/courses/{course_id}/{challenge_id}"),
+        ("post", f"/courses/{course_id}/{challenge_id}/submissions"),
+        ("get", f"/f/submissions/{challenge_id}"),
+        ("get", f"/f/leaderboard/{challenge_id}"),
+        ("get", f"/challenges/{challenge_id}/samples/1/input"),
+    ]
+
+
+async def test_a_non_member_is_refused_a_courses_contents(
+    client, monkeypatch, no_google, a_course
+):
+    """The gate itself: signed in is not enough, enrollment is the check."""
+    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    ours, _ = a_course
+
+    for method, url in _gated_urls(ours["course_id"], ours["challenge_id"]):
+        response = getattr(client, method)(url)
+        assert response.status_code == 403, url
+        assert "not enrolled" in response.text, url
+
+
+async def test_staff_of_one_course_are_not_staff_of_another(
+    client, monkeypatch, no_google, a_course, app_engine
+):
+    """`role` lives on `enrollment` and is per course, so a teacher is a
+    stranger everywhere they were not enrolled."""
+    ours, theirs = a_course
+    await _enroll(app_engine, "alice@unipd.it", ours["course_id"], UserRole.teacher)
+    _set_dummy_auth(monkeypatch, True, "alice@unipd.it")
+
+    for method, url in _gated_urls(theirs["course_id"], theirs["challenge_id"]):
+        assert getattr(client, method)(url).status_code == 403, url
+
+
+async def test_a_member_cannot_reach_another_courses_challenge_through_their_own(
+    client, monkeypatch, no_google, a_course, app_engine
+):
+    """The reason `require_challenge_viewer` re-checks `challenge_in_course`:
+    the role comes from the `course_id` in the path, so naming a course one is
+    enrolled on in front of somebody else's challenge must not work. The pair
+    is a URL for a challenge that does not exist under that course - 404."""
+    ours, theirs = a_course
+    await _enroll(app_engine, "dave@unipd.it", ours["course_id"], UserRole.student)
+    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+
+    smuggled = f"/courses/{ours['course_id']}/{theirs['challenge_id']}"
+    assert client.get(smuggled).status_code == 404
+
+
+async def test_the_gate_admits_every_role(app_engine, a_course):
+    """Called directly, because the far side of the gate is a page query only
+    Postgres can run. `EDITOR_ROLES` is a subset of "enrolled", so staff pass
+    the membership check without a second one."""
+    from cocco.main import Forbidden, require_challenge_member, require_course_member
+
+    ours, _ = a_course
+    for i, role in enumerate(UserRole):
+        user = await _enroll(
+            app_engine, f"member{i}@unipd.it", ours["course_id"], role
+        )
+        async with app_engine.connect() as conn:
+            assert await require_course_member(ours["course_id"], conn, user) == role
+            assert (
+                await require_challenge_member(ours["challenge_id"], conn, user)
+                == role
+            )
+
+    stranger = await _enroll(
+        app_engine, "erin@unipd.it", a_course[1]["course_id"], UserRole.student
+    )
+    async with app_engine.connect() as conn:
+        with pytest.raises(Forbidden):
+            await require_course_member(ours["course_id"], conn, stranger)
+        with pytest.raises(Forbidden):
+            await require_challenge_member(ours["challenge_id"], conn, stranger)
+
+
+async def test_the_course_page_previews_for_a_non_member(
+    client, monkeypatch, no_google, a_course
+):
+    """The one deliberate hole in the gate: the course page is where a link
+    from the home page lands and where the way in lives, so it shows the title,
+    the description and `Enroll!` - and nothing of the contents."""
+    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    ours, _ = a_course
+
+    response = client.get(f"/courses/{ours['course_id']}")
+    assert response.status_code == 200
+    assert "Algorithms 101" in response.text
+    assert "About Algorithms 101." in response.text
+    assert "not enrolled" in response.text
+    assert "Enroll!" in response.text
+    # The challenge list is not merely hidden by the template: `get_course`
+    # never ran the query that would have fetched it.
+    assert "Shortest Route Planner" not in response.text
+
+
+async def test_enrolling_from_the_preview_comes_back_to_the_course(
+    client, monkeypatch, no_google, a_course, app_engine
+):
+    """`next` is what turns the preview into the course page, and it is
+    filtered like every other destination in the app."""
+    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    ours, _ = a_course
+    course_url = f"/courses/{ours['course_id']}"
+
+    # The preview offers it, so the preview is where it is posted from
+    assert f'value="{course_url}"' in client.get(course_url).text
+
+    response = client.post(f"{course_url}/enroll", data={"next": course_url})
+    assert response.status_code == 204
+    assert response.headers["HX-Redirect"] == course_url
+
+    # ...and the row that opens the gate is there. What is behind the gate is
+    # a `json_agg` page query, so `test_the_gate_admits_every_role` is where
+    # the opening itself is checked.
+    async with app_engine.connect() as conn:
+        dave = await query_user_by_email(conn, "dave@unipd.it")
+        assert (
+            await query_course_role(
+                conn, user_id=dave.id, course_id=ours["course_id"]
+            )
+            == UserRole.student
+        )
+
+
+async def test_a_hostile_next_on_enrolling_is_filtered(
+    client, monkeypatch, no_google, a_course
+):
+    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    ours, _ = a_course
+
+    response = client.post(
+        f"/courses/{ours['course_id']}/enroll",
+        data={"next": "https://evil.test/phish"},
+    )
+    assert response.headers["HX-Redirect"] == "/"
+
+
+async def test_a_refusal_is_a_page_not_json(
+    client, monkeypatch, no_google, a_course
+):
+    """These are URLs an ordinary visitor can now reach by clicking, so the
+    answer has to be readable."""
+    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    ours, _ = a_course
+
+    response = client.get(f"/courses/{ours['course_id']}/{ours['challenge_id']}")
+    assert response.status_code == 403
+    assert response.headers["content-type"].startswith("text/html")
+    # Rendered through `base.jinja`, with the signed-in navbar and a way out
+    assert "dave@unipd.it" in response.text
+    assert "Back to the courses" in response.text

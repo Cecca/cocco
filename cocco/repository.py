@@ -1045,8 +1045,14 @@ async def query_course(conn: AsyncConnection, course_id: int):
 
     `query_course_info` is the page query; this is for the pages that only
     need the title, and being plain Core it runs anywhere.
+
+    It also carries the description, which is what `get_course` renders for a
+    visitor who is not enrolled: they see the course, not its contents, so the
+    challenge list is never even fetched for them.
     """
-    stmt = select(Course.c.id, Course.c.title).where(Course.c.id == course_id)
+    stmt = select(Course.c.id, Course.c.title, Course.c.description).where(
+        Course.c.id == course_id
+    )
     return (await conn.execute(stmt)).first()
 
 

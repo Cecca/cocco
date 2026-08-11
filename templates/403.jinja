@@ -1,0 +1,27 @@
+{# The refusal page, rendered by `handle_forbidden` for every `Forbidden`.
+
+   Context: `message`, the exception's `detail` written as a sentence for the
+   person reading it, and `user`, which may be absent - `base.jinja` guards the
+   navbar on it. #}
+{% extends "base.jinja" %}
+{% block title %}{{ title }}{% endblock %}
+
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+  <div class="card bg-base-100 border border-base-300 shadow-sm">
+    <div class="card-body p-8">
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+        Not allowed
+      </p>
+      <h1 class="font-serif text-4xl font-semibold tracking-tight mt-1 mb-3">403</h1>
+      <p class="text-base-content/70">{{ message }}</p>
+      <div class="mt-6">
+        <a href="{{ url_for('index') }}"
+           class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+          Back to the courses
+        </a>
+      </div>
+    </div>
+  </div>
+</main>
+{% endblock %}

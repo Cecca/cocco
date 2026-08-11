@@ -562,6 +562,11 @@ async def get_user(request: Request, db: DBDep) -> schema.User:
 
     The cookie holds nothing but the user id, so a renamed - or deleted -
     account takes effect on the very next request.
+
+    The user is also stashed on `request.state`, for the one caller that cannot
+    ask for a dependency: `handle_forbidden` renders a whole page, navbar
+    included, and this has always run by the time an authorization dependency
+    can refuse.
     """
     if DUMMY_AUTH:
         # Development only: there is no sign-in step at all. The address is
@@ -571,13 +576,16 @@ async def get_user(request: Request, db: DBDep) -> schema.User:
         # real sign-in gets.
         user = await get_or_create_user(db, DUMMY_USER)
         await db.commit()
+        request.state.user = user
         return user
 
     user_id = request.session.get("user_id")
     if user_id is not None:
         row = await query_user(db, user_id)
         if row is not None:
-            return schema.User.model_validate(row)
+            user = schema.User.model_validate(row)
+            request.state.user = user
+            return user
         # A session pointing at nobody: in development, typically the other
         # side of a COCCO_RESET_DB.
         request.session.clear()
@@ -610,6 +618,45 @@ async def handle_not_authenticated(request: Request, exc: NotAuthenticated):
         # long as the tab stays open. HX-Redirect navigates the browser instead.
         return Response(status_code=204, headers={"HX-Redirect": login_url})
     return RedirectResponse(login_url, status_code=303)
+
+
+class Forbidden(HTTPException):
+    """A 403 that renders as a page.
+
+    Its own class rather than a plain `HTTPException` so the handler below can
+    be registered on it alone: FastAPI's defaults still answer everything else,
+    and a 404 for an unparseable id does not go through a template.
+
+    `detail` is written for the person reading it, not for a log - it is the
+    sentence the page shows.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(status_code=403, detail=detail)
+
+
+@app.exception_handler(Forbidden)
+async def handle_forbidden(request: Request, exc: Forbidden):
+    """The refusal, as a page.
+
+    Enrollment is the gate on every course, so a 403 is now something an
+    ordinary visitor can reach by clicking rather than by typing a URL, and raw
+    JSON is not an answer for them. Polled fragments are unharmed: htmx does not
+    swap the body of an error response, so a fragment behind a course the viewer
+    left simply stops updating.
+    """
+    return templates.TemplateResponse(
+        request=request,
+        name="403.jinja",
+        status_code=403,
+        context={
+            "message": exc.detail,
+            "title": "Not allowed",
+            # Stashed by `get_user`; absent only if something refused before
+            # anyone was identified, and `base.jinja` guards the navbar anyway.
+            "user": getattr(request.state, "user", None),
+        },
+    )
 
 
 ########################################################################
@@ -834,7 +881,7 @@ async def require_admin(db: DBDep, user: CurrentUser) -> schema.User:
     Hiding the button on the home page is an affordance, not this check.
     """
     if not await user_is_admin(db, user.id):
-        raise HTTPException(status_code=403, detail="Not an administrator")
+        raise Forbidden("Only an administrator can create a course.")
     return user
 
 
@@ -852,11 +899,76 @@ async def require_course_editor(
     """
     role = await query_course_role(db, user_id=user.id, course_id=course_id)
     if role is None or role not in EDITOR_ROLES:
-        raise HTTPException(status_code=403, detail="Not course staff")
+        raise Forbidden("Only this course's staff can do that.")
     return role
 
 
 CourseEditor = Annotated[UserRole, Depends(require_course_editor)]
+
+
+async def require_course_member(
+    course_id: int, db: DBDep, user: CurrentUser
+) -> UserRole:
+    """Authorize anyone enrolled on `course_id`, of any role, or raise 403.
+
+    This is the gate on a course's contents. `EDITOR_ROLES` is a subset of
+    "enrolled", so staff pass it without a second check, and it is deliberately
+    the same `query_course_role` `require_course_editor` uses: the role is per
+    course, so the course in the path is the key.
+
+    What it does *not* guard is the course page itself - `get_course` shows a
+    non-member the title, the description and the way in - nor the home page,
+    which has to go on listing every course or nobody could find one to enroll
+    on, nor `post_course_enroll`, which is that way in.
+    """
+    role = await query_course_role(db, user_id=user.id, course_id=course_id)
+    if role is None:
+        raise Forbidden("You are not enrolled on this course.")
+    return role
+
+
+CourseMember = Annotated[UserRole, Depends(require_course_member)]
+
+
+async def require_challenge_viewer(
+    challenge_id: int, course_id: int, db: DBDep, role: CourseMember
+) -> UserRole:
+    """Authorize reading `challenge_id` under `course_id`, or raise 403 - or 404.
+
+    `require_challenge_editor` with the membership gate in place of the staff
+    one, and for the same reason: the role comes from the course in the path, so
+    the challenge in the path has to be checked against it. Otherwise a student
+    of one course could name their own course in front of another course's
+    challenge and read it. A mismatched pair is a URL for a challenge that does
+    not exist under that course, hence 404.
+    """
+    if not await challenge_in_course(db, challenge_id, course_id):
+        raise HTTPException(status_code=404)
+    return role
+
+
+ChallengeViewer = Annotated[UserRole, Depends(require_challenge_viewer)]
+
+
+async def require_challenge_member(
+    challenge_id: int, db: DBDep, user: CurrentUser
+) -> UserRole:
+    """The same gate, for the routes whose URL names only a challenge.
+
+    Keyed on the challenge because there is nothing else to key on: these are
+    the fragments and the sample download, whose paths carry no `course_id`.
+    That is not the mistake `require_challenge_editor` avoids - there the course
+    is in the path too, and staff of one course naming it in front of another's
+    challenge is a real attack. With one id there is no second key to disagree
+    with, and the challenge determines its course.
+    """
+    role = await query_user_role(db, user_id=user.id, challenge_id=challenge_id)
+    if role is None:
+        raise Forbidden("You are not enrolled on the course this challenge belongs to.")
+    return role
+
+
+ChallengeMember = Annotated[UserRole, Depends(require_challenge_member)]
 
 
 async def require_challenge_editor(
@@ -892,7 +1004,7 @@ async def authorize_submission(
     )
     is_staff = role in EDITOR_ROLES
     if not is_staff and submission["user_id"] != user.id:
-        raise HTTPException(status_code=403, detail="Not your submission")
+        raise Forbidden("That submission is not yours.")
     return is_staff
 
 
@@ -1037,12 +1149,38 @@ async def post_course_new(
 
 @app.get("/courses/{course_id}")
 async def get_course(course_id: int, request: Request, db: DBDep, user: CurrentUser):
+    """The course, or - for someone not enrolled on it - a preview of it.
+
+    The one page under `/courses/` with no membership gate, and deliberately:
+    the home page lists every course, so this is where a link from it lands, and
+    it is where the `Enroll!` button makes the most sense. A non-member sees the
+    title and the description, which the home page's card already shows
+    truncated, and nothing else. The challenge list is not merely hidden in the
+    template - `query_course_info` is never run for them.
+    """
+    role = await query_course_role(db, user_id=user.id, course_id=course_id)
+    if role is None:
+        course = await query_course(db, course_id)
+        if course is None:
+            raise HTTPException(status_code=404)
+        return templates.TemplateResponse(
+            request=request,
+            name="course.jinja",
+            context={
+                "course": course,
+                "course_id": course_id,
+                "title": course.title,
+                "user": user,
+                "can_edit": False,
+                "is_member": False,
+            },
+        )
+
     # The viewer is part of the query: each challenge card says whether *this*
     # person has already submitted to it.
     course = await query_course_info(db, course_id, user_id=user.id)
     if course is None:
         raise HTTPException(status_code=404)
-    role = await query_course_role(db, user_id=user.id, course_id=course_id)
     return templates.TemplateResponse(
         request=request,
         name="course.jinja",
@@ -1055,6 +1193,7 @@ async def get_course(course_id: int, request: Request, db: DBDep, user: CurrentU
             # routes behind them check for themselves - see
             # `require_course_editor`.
             "can_edit": role in EDITOR_ROLES,
+            "is_member": True,
         },
     )
 
@@ -1066,24 +1205,29 @@ async def post_course_enroll(
     db: DBDep,
     user: CurrentUser,
     q: Annotated[str, Form()] = "",
+    next: Annotated[str, Form()] = "",
 ):
-    """Enroll the viewer on a course, from the home page's `Enroll!` button.
+    """Enroll the viewer on a course, from either `Enroll!` button.
 
-    Authorization is `CurrentUser` and deliberately nothing else. An enrollment
-    is not what grants access here: `get_course`, `get_challenge` and even
-    `post_submission` depend on the session alone, so anyone signed in can
-    already read any course and submit to any challenge. What the row changes is
-    the role badge, which half of the home page the course sits under, and
-    whether this person shows up in the roster `query_challenge_standings` puts
-    in front of staff. The gate on who may sign in at all is `is_allowed_email`.
+    Authorization is `CurrentUser` and deliberately nothing else: this is the
+    way in, and a membership gate here would lock the door from the inside. It
+    is the only route under a course that a non-member may call, which is why
+    the enrollment it writes has to be the one thing it can write - the role is
+    not a parameter, see `insert_self_enrollment`, which fixes it at `student`
+    and leaves an existing enrollment alone, so this can neither promote anyone
+    nor demote a teacher who clicks it. Who may sign in at all is
+    `is_allowed_email`; who may sign up for *this* course is, for now, anyone
+    who can.
 
-    The role is not a parameter - see `insert_self_enrollment`, which fixes it at
-    `student` and leaves an existing enrollment alone, so this cannot promote
-    anyone and cannot demote a teacher who clicks it.
-
-    Returns the whole list, both halves: the point of the click is that the
-    course moves from "Other courses" up into "Your courses". `q` comes back
-    with it so enrolling under a typed filter does not silently reset the list.
+    Two callers, so two answers. From the home page it renders the whole list,
+    both halves, because the point of the click is that the course moves from
+    "Other courses" up into "Your courses"; `q` comes back with it so enrolling
+    under a typed filter does not silently reset the list. From a course
+    preview there is no list to re-render - the page has to become the course
+    page - so that form sends `next` and gets the `HX-Redirect` idiom
+    `post_course_new` uses. `next` is filtered through `safe_next_path` like
+    every other destination in the app: it arrives in a request, so it is not
+    trusted to be a path on this site.
     """
     if not await course_exists(db, course_id):
         raise HTTPException(status_code=404)
@@ -1091,6 +1235,11 @@ async def post_course_enroll(
     await insert_self_enrollment(db, user_id=user.id, course_id=course_id)
     # get_db hands out a plain connection with no surrounding transaction
     await db.commit()
+
+    if next:
+        return Response(
+            status_code=204, headers={"HX-Redirect": safe_next_path(next)}
+        )
     return await _render_courses(request, db, user, q)
 
 
@@ -1214,6 +1363,7 @@ async def get_challenge(
     request: Request,
     db: DBDep,
     user: CurrentUser,
+    role: ChallengeViewer,
     as_: Annotated[str | None, Query(alias="as")] = None,
 ):
     """The challenge, in whichever of its two views fits the viewer.
@@ -1221,6 +1371,8 @@ async def get_challenge(
     Course staff get `challenge-staff.jinja`: the statement plus the whole
     class's standings, and no submit form. `?as=student` gives them the page a
     student sees, which is the only way to check how the statement reads.
+
+    Enrollment is the gate: a challenge belongs to the class it was set for.
     """
     challenge = await query_challenge(db, user_id=user.id, challenge_id=challenge_id)
     if challenge is None:
@@ -1250,9 +1402,13 @@ async def post_submission(
     request: Request,
     db: DBDep,
     user: CurrentUser,
+    role: ChallengeViewer,
     solution: Annotated[UploadFile, File()],
 ):
     """Enqueue an uploaded solution. The judge process picks it up from there.
+
+    Behind the same gate as reading the challenge, so every submission on record
+    is by someone who was enrolled when they made it.
 
     Errors are reported as a 200 with an error alert rather than a 4xx: htmx
     does not swap the response of an error status by default, and the fragment
@@ -1307,7 +1463,8 @@ async def post_submission(
 
 @app.get("/f/submissions/{challenge_id}")
 async def get_fragment_submissions(
-    challenge_id: int, request: Request, db: DBDep, user: CurrentUser
+    challenge_id: int, request: Request, db: DBDep, user: CurrentUser,
+    role: ChallengeMember,
 ):
     submissions = await query_user_submissions(db, user_id=user.id, challenge_id=challenge_id)
     return templates.TemplateResponse(
@@ -1321,7 +1478,8 @@ async def get_fragment_submissions(
 
 @app.get("/f/leaderboard/{challenge_id}")
 async def get_fragment_leaderboard(
-    challenge_id: int, request: Request, db: DBDep, user: CurrentUser
+    challenge_id: int, request: Request, db: DBDep, user: CurrentUser,
+    role: ChallengeMember,
 ):
     ranking = await query_challenge_ranking(db, challenge_id)
     if ranking is None:
@@ -1342,18 +1500,18 @@ async def get_fragment_leaderboard(
 
 @app.get("/challenges/{challenge_id}/samples/{testcase_id}/{kind}")
 async def get_sample_file(
-    challenge_id: int, testcase_id: int, kind: str, db: DBDep, user: CurrentUser
+    challenge_id: int, testcase_id: int, kind: str, db: DBDep, user: CurrentUser,
+    role: ChallengeMember,
 ):
     """Serve the input or expected output of a *public* test case.
 
     `query_sample_testcase` returns nothing for hidden test cases, so those
     404 rather than leaking the judge's data. The viewer must additionally be
-    enrolled in the course: a sample belongs to the class it was set for, and
-    an id is easy to guess.
+    enrolled in the course - a sample belongs to the class it was set for, and
+    an id is easy to guess - which is now `ChallengeMember`, the same gate as
+    the challenge page the download link sits on.
     """
     if kind not in ("input", "output"):
-        raise HTTPException(status_code=404)
-    if await query_user_role(db, user_id=user.id, challenge_id=challenge_id) is None:
         raise HTTPException(status_code=404)
     testcase = await query_sample_testcase(db, challenge_id, testcase_id)
     if testcase is None:
