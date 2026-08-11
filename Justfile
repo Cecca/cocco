@@ -9,9 +9,10 @@ export COCCO_STORAGE := env_var_or_default("COCCO_STORAGE", "/tmp/cocco-storage"
 
 # Development runs with authentication bypassed, so `just dev` needs no Google
 # credentials. COCCO_DUMMY_AUTH=0 exercises the real flow; COCCO_DUMMY_USER
-# picks who you are signed in as.
+# picks who you are signed in as - the seed's administrator by default, since
+# alice@unipd.it is a plain teacher and cannot create a course.
 export COCCO_DUMMY_AUTH := env_var_or_default("COCCO_DUMMY_AUTH", "1")
-export COCCO_DUMMY_USER := env_var_or_default("COCCO_DUMMY_USER", "alice@unipd.it")
+export COCCO_DUMMY_USER := env_var_or_default("COCCO_DUMMY_USER", "matteo.ceccarello@unipd.it")
 
 # Start PostgreSQL, the web app and the judge; logs land in .logs/
 default: dev

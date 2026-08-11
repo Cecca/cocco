@@ -1,9 +1,11 @@
-"""End-to-end tests of creating a challenge, over an in-memory database.
+"""End-to-end tests of creating a challenge and a course, over an in-memory
+database.
 
 Same harness as `test_auth_routes.py`, and for the same reason: `get_db` is
 overridden with SQLite, which works because everything these routes touch -
-`query_course`, `query_course_role`, `challenge_in_course`, `insert_challenge` -
-is plain Core. The course page itself is not tested here: it runs the
+`query_course`, `query_course_role`, `challenge_in_course`, `insert_challenge`,
+`user_is_admin`, `insert_course` - is plain Core. The course page itself is not
+tested here, nor is the home page carrying the "New course" button: both run the
 `json_agg` query only Postgres has.
 """
 
@@ -17,6 +19,9 @@ from cocco.model import Challenge, Course, Enrollment, User, UserRole, metadata
 
 TEACHER = "alice@unipd.it"
 STUDENT = "bob@unipd.it"
+# Staff too, but with `admin` rather than `teacher`: the one difference between
+# them is that an admin may create a course.
+ADMIN = "matteo.ceccarello@unipd.it"
 
 # A valid form, so a test only has to say what it wants to be wrong about.
 FORM = {
@@ -43,11 +48,12 @@ async def world(app_engine):
     """Two courses: alice teaches the first, bob studies it, nobody the second.
 
     The second course is what a teacher of the first must not be able to reach
-    through, and its challenge is what they must not be able to edit.
+    through, and its challenge is what they must not be able to edit. Matteo
+    administers the first, which is what makes him an admin anywhere.
     """
     async with app_engine.connect() as conn:
         ids = {}
-        for email, nickname in ((TEACHER, "alice"), (STUDENT, "bob")):
+        for email, nickname in ((TEACHER, "alice"), (STUDENT, "bob"), (ADMIN, "matteo")):
             ids[nickname] = (
                 await conn.execute(
                     insert(User)
@@ -71,6 +77,11 @@ async def world(app_engine):
         await conn.execute(
             insert(Enrollment).values(
                 user_id=ids["bob"], course_id=ids["course"], role=UserRole.student
+            )
+        )
+        await conn.execute(
+            insert(Enrollment).values(
+                user_id=ids["matteo"], course_id=ids["course"], role=UserRole.admin
             )
         )
         ids["other_challenge"] = (
@@ -249,6 +260,72 @@ async def test_a_course_cannot_lose_its_title(client, world, app_engine):
             await conn.execute(select(Course).where(Course.c.id == course_id))
         ).one()
     assert row.title == "Algorithms 101"
+
+
+COURSE_FORM = {"title": "Graph Theory", "description": "# Graphs\n\nAll of them."}
+
+
+async def test_creating_a_course_is_admin_only(client, world, monkeypatch):
+    """Teaching a course is not the same as being allowed to make one.
+
+    Alice is course staff and may do everything else in the editor; this is the
+    one thing `EDITOR_ROLES` does not open.
+    """
+    _sign_in_as(monkeypatch, ADMIN)
+    assert client.get("/courses/new").status_code == 200
+
+    for email in (TEACHER, STUDENT):
+        _sign_in_as(monkeypatch, email)
+        assert client.get("/courses/new").status_code == 403
+        # ...and hiding the button is not what stops them: the POST refuses too.
+        assert client.post("/courses/new", data=COURSE_FORM).status_code == 403
+
+
+async def test_a_created_course_lands_on_its_editor(
+    client, world, app_engine, monkeypatch
+):
+    _sign_in_as(monkeypatch, ADMIN)
+    response = client.post("/courses/new", data=COURSE_FORM)
+
+    # 204 + HX-Redirect, not a 302: htmx would splice a whole page into the
+    # alert div this form targets.
+    assert response.status_code == 204
+
+    async with app_engine.connect() as conn:
+        row = (
+            await conn.execute(
+                select(Course).where(Course.c.title == "Graph Theory")
+            )
+        ).one()
+        role = (
+            await conn.execute(
+                select(Enrollment.c.role).where(
+                    (Enrollment.c.course_id == row.id)
+                    & (Enrollment.c.user_id == world["matteo"])
+                )
+            )
+        ).scalar_one()
+
+    assert response.headers["HX-Redirect"].endswith(f"/courses/{row.id}/edit")
+    assert row.description == "# Graphs\n\nAll of them."
+    # Staff of the course they just made - otherwise that editor would 403 on
+    # them. Being an admin elsewhere is not staff here.
+    assert role == UserRole.teacher
+
+
+async def test_a_new_course_needs_a_title(client, world, app_engine, monkeypatch):
+    """200 with an alert, never a 4xx: htmx does not swap an error response."""
+    _sign_in_as(monkeypatch, ADMIN)
+    response = client.post("/courses/new", data={**COURSE_FORM, "title": "   "})
+    assert response.status_code == 200
+    assert "A course needs a title." in response.text
+
+    async with app_engine.connect() as conn:
+        created = await conn.execute(
+            select(Course.c.id).where(Course.c.title != "")
+        )
+    # Only the two the fixture made
+    assert len(created.all()) == 2
 
 
 async def test_moving_a_challenge_of_another_course_is_a_404(client, world):

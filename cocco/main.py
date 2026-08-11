@@ -65,6 +65,7 @@ from cocco.repository import (
     count_testcase_outcomes,
     delete_testcase,
     insert_challenge,
+    insert_course,
     insert_enrollment,
     insert_submission,
     insert_testcase,
@@ -94,6 +95,7 @@ from cocco.repository import (
     update_challenge,
     update_course,
     update_testcase,
+    user_is_admin,
 )
 
 
@@ -104,16 +106,22 @@ logger = logging.getLogger(__name__)
 # Google sign-in is unconfigured.
 CONFIG = load_config(Path(os.environ.get("COCCO_CONFIG", "cocco.toml")))
 
-# The development cast, up here because DUMMY_USER defaults to the first of
-# them. Alice and Matteo are course staff on everything the seed creates; Bob
-# and Charlie are students.
-DUMMY_STAFF = ["alice@unipd.it", "matteo.ceccarello@unipd.it"]
+# The development cast, up here because DUMMY_USER defaults to the admin.
+# Matteo is the administrator, Alice a plain teacher - the two are course staff
+# alike, and the difference only shows on "New course", which `require_admin`
+# gates. Bob and Charlie are students.
+DUMMY_ADMIN = "matteo.ceccarello@unipd.it"
+DUMMY_TEACHERS = ["alice@unipd.it"]
+DUMMY_STAFF = [DUMMY_ADMIN, *DUMMY_TEACHERS]
 DUMMY_STUDENTS = ["bob@unipd.it", "charlie@unipd.it"]
 
 # Development shortcut: no Google, no click, no credentials. `get_user` is the
 # only place that branches on it, so every route is signed in transparently.
 DUMMY_AUTH = os.environ.get("COCCO_DUMMY_AUTH") == "1"
-DUMMY_USER = os.environ.get("COCCO_DUMMY_USER") or DUMMY_STAFF[0]
+# The admin rather than any of the staff: a fresh checkout should be able to
+# create a course, and `COCCO_DUMMY_USER=alice@unipd.it` is then the way to see
+# what a teacher sees.
+DUMMY_USER = os.environ.get("COCCO_DUMMY_USER") or DUMMY_ADMIN
 
 # Root of the app
 app = FastAPI(default_response_class=HTMLResponse)
@@ -319,9 +327,14 @@ async def _populate_dummy_data(conn: AsyncConnection):
                 .returning(Course.c.id)
             )
         ).scalar_one()
-        # Alice and Matteo are course staff on everything; Bob and Charlie are
-        # students. `role` is per course, so this is two rows per person.
-        for email in DUMMY_STAFF:
+        # Matteo administers everything and Alice teaches it; Bob and Charlie
+        # are students. `role` is per course, so this is one row per person per
+        # course - and Matteo's `admin` rows are the only thing in the seed that
+        # makes "New course" reachable at all.
+        await insert_enrollment(
+            conn, user_ids[DUMMY_ADMIN], course_id, UserRole.admin
+        )
+        for email in DUMMY_TEACHERS:
             await insert_enrollment(
                 conn, user_ids[email], course_id, UserRole.teacher
             )
@@ -802,6 +815,26 @@ async def post_logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
+async def require_admin(db: DBDep, user: CurrentUser) -> schema.User:
+    """Authorize creating a course, or raise 403.
+
+    The only permission in the app that names no course, because the course does
+    not exist yet: `role` lives on `enrollment`, so the closest the schema comes
+    to a site-wide administrator is holding `admin` somewhere, and that is what
+    `user_is_admin` asks. Deliberately narrower than `require_course_editor` - a
+    teacher runs a course they were given, an admin brings new ones into being.
+
+    Returns the user, so a route that needs the creator does not ask twice.
+    Hiding the button on the home page is an affordance, not this check.
+    """
+    if not await user_is_admin(db, user.id):
+        raise HTTPException(status_code=403, detail="Not an administrator")
+    return user
+
+
+Admin = Annotated[schema.User, Depends(require_admin)]
+
+
 async def require_course_editor(
     course_id: int, db: DBDep, user: CurrentUser
 ) -> UserRole:
@@ -901,8 +934,73 @@ async def index(request: Request, db: DBDep, user: CurrentUser):
             "courses": courses,
             "title": "COCCO: Coding Challenges Companion",
             "user": user,
+            # Only an administrator is offered "New course". The route behind
+            # the button checks for itself - see `require_admin`.
+            "can_create_course": await user_is_admin(db, user.id),
         },
     )
+
+
+########################################################################
+# Creating a course. Administrators only, through `Admin`.
+#
+# Declared here, above `get_course`, and that is load-bearing for the same
+# reason the course editor is declared above `get_challenge`: `/courses/{course_id}`
+# matches any single segment, so a `/courses/new` declared after it would be
+# routed there and rejected as an unparseable id before this ever ran.
+
+
+@app.get("/courses/new")
+async def get_course_new(request: Request, user: Admin):
+    """The empty course form."""
+    return templates.TemplateResponse(
+        request=request,
+        name="course-new.jinja",
+        context={"user": user, "title": "New course"},
+    )
+
+
+@app.post("/courses/new")
+async def post_course_new(
+    request: Request,
+    db: DBDep,
+    user: Admin,
+    title: Annotated[str, Form()],
+    description: Annotated[str, Form()],
+):
+    """Create the course, enroll its creator, and send the browser to the editor."""
+
+    def alert(message: str, ok: bool = False):
+        return templates.TemplateResponse(
+            request=request,
+            name="f-edit-result.jinja",
+            context={"ok": ok, "message": message},
+        )
+
+    title = title.strip()
+    if not title:
+        return alert("A course needs a title.")
+
+    course_id = await insert_course(db, title=title, description=description)
+    # Being an admin somewhere does not make one staff here: without this row
+    # the creator could not open the editor of the course they just made.
+    await insert_enrollment(db, user.id, course_id, UserRole.teacher)
+    # get_db hands out a plain connection with no surrounding transaction
+    await db.commit()
+
+    # A 204 with HX-Redirect rather than a 303, for the reason spelled out in
+    # `post_challenge_new`: htmx would splice a whole page into the alert div
+    # this form targets. The editor is the right landing place - the new course
+    # has no challenges yet, and that is where they are added.
+    return Response(
+        status_code=204,
+        headers={
+            "HX-Redirect": str(
+                request.url_for("get_course_edit", course_id=course_id)
+            )
+        },
+    )
+
 
 @app.get("/courses/{course_id}")
 async def get_course(course_id: int, request: Request, db: DBDep, user: CurrentUser):

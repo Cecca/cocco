@@ -91,6 +91,12 @@ A submission has its own page, `get_submission` at `/submissions/{id}` — flat,
 
 Uploads carry no language field: `post_submission` maps the file extension to a language through `EXTENSION_TO_LANGUAGE`, built from the same `languages.toml` the judge loads. Upload failures come back as **200 with an error alert**, not a 4xx, because htmx does not swap error responses by default.
 
+Courses are created at `/courses/new` (`course-new.jinja`), reached from a button the home page
+shows only to an administrator; the form is the title and description halves of the course editor,
+and on success it answers `204` + `HX-Redirect` to the new course's editor, the way
+`post_challenge_new` lands on the challenge editor. Like the editor below, it is **declared above
+`get_course`** — `/courses/{course_id}` would otherwise swallow `/courses/new`.
+
 The course has an editor of its own at `/courses/{course_id}/edit` — the course's title and description (the same markdown textarea and `post_markdown_preview` the challenge form uses) plus the challenge list, reorderable with ↑/↓. It is **declared above `get_challenge`**, and that is load-bearing: `/courses/{course_id}/{challenge_id}` matches any single segment, so a `/courses/1/edit` declared after it would route there and be rejected as an unparseable id. The cards themselves are `_challenge-card.jinja`, shared by the course page and by `f-course-challenges.jinja` — the fragment every move swaps in — so the student's list and the editor's cannot drift apart.
 
 ### Authentication (`cocco/auth.py`)
@@ -127,19 +133,27 @@ carrying the `state` would not reach the callback, so every sign-in would fail a
 mismatch.
 
 **`COCCO_DUMMY_AUTH=1` bypasses all of it.** `get_user` is the only place that branches on it,
-and it signs every request in as `COCCO_DUMMY_USER` (default `alice@unipd.it`) with no cookie, no
+and it signs every request in as `COCCO_DUMMY_USER` (default `matteo.ceccarello@unipd.it`, the
+seed's administrator, so a fresh checkout can create a course) with no cookie, no
 click and no credentials — creating the account if it is missing, so it works against an empty
 database. `/login` and `/auth/google` merely redirect, and `/logout` is a no-op. Setting it on a
 public deployment is equivalent to publishing the admin password. The seeded cast is
-`alice@unipd.it` and `matteo.ceccarello@unipd.it` (teachers on every course) and `bob@unipd.it`
-and `charlie@unipd.it` (students).
+`matteo.ceccarello@unipd.it` (`admin` on every course) and `alice@unipd.it` (`teacher` on every
+course) and `bob@unipd.it` and `charlie@unipd.it` (students). Alice is there to be signed in as
+when checking what course staff *without* `admin` may do.
 
 ### Authorization
 
 `role` lives on `enrollment`, so permissions are **per course**, not site-wide. `EDITOR_ROLES`
-(teacher, admin, collaborator) is course staff; students and the unenrolled are read-only. Note
-that nothing distinguishes `teacher` from `admin` today — there is no site-wide administrator in
-this schema, so "may create a course" has nowhere to live yet.
+(teacher, admin, collaborator) is course staff; students and the unenrolled are read-only.
+
+The one exception is **creating a course**, the only permission that names no course, because the
+course does not exist yet. There is still no site-wide administrator in this schema, so the check
+is the closest thing it can express: `user_is_admin` asks whether the person holds `admin` on
+*any* enrollment, and `require_admin` (the `Admin` dependency) 403s everyone else — deliberately
+narrower than `EDITOR_ROLES`, since a teacher runs a course they were given and an admin brings
+new ones into being. That is the only thing `admin` means today. The creator is enrolled on the
+new course as `teacher`, otherwise they could not open the editor they are redirected to.
 
 Nothing is reachable without a session: every route depends on `CurrentUser`, directly or through
 `require_challenge_editor`, and the only ways in are `/login`, `/auth/google`,

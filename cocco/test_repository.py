@@ -23,6 +23,7 @@ from cocco.repository import (
     count_running_submissions,
     count_testcase_outcomes,
     insert_challenge,
+    insert_course,
     insert_enrollment,
     insert_user,
     pull_queued_submission,
@@ -43,6 +44,7 @@ from cocco.repository import (
     query_user_submissions,
     regrade_challenge,
     reorder_challenges,
+    user_is_admin,
 )
 from cocco.schema import SubmissionRunData
 
@@ -747,6 +749,30 @@ async def test_course_role_is_the_editors_check():
         assert await query_course_role(conn, user_id=student, course_id=course_id) == UserRole.student
         # Enrolled on one course says nothing about another
         assert await query_course_role(conn, user_id=teacher, course_id=other_id) is None
+    await engine.dispose()
+
+
+async def test_admin_is_not_just_another_editor():
+    """The check behind "may create a course": holding `admin` *somewhere*.
+
+    A teacher is course staff everywhere it matters and still fails it - that
+    distinction is the whole point of the flag, and the schema has nowhere else
+    to put it, since `role` lives on `enrollment`.
+    """
+    engine = await _async_database()
+    async with engine.connect() as conn:
+        course_id = await insert_course(conn, title="Algorithms 101", description="intro")
+        admin = await insert_user(conn, "matteo@unipd.it", "matteo", b"", "image/svg+xml")
+        teacher = await insert_user(conn, "alice@unipd.it", "alice", b"", "image/svg+xml")
+        stranger = await insert_user(conn, "bob@unipd.it", "bob", b"", "image/svg+xml")
+        await insert_enrollment(conn, admin, course_id, UserRole.admin)
+        await insert_enrollment(conn, teacher, course_id, UserRole.teacher)
+        await conn.commit()
+
+        assert await user_is_admin(conn, admin)
+        assert not await user_is_admin(conn, teacher)
+        # Enrolled nowhere at all
+        assert not await user_is_admin(conn, stranger)
     await engine.dispose()
 
 

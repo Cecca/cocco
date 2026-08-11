@@ -4,7 +4,17 @@
 {% endblock %}
 
 {% block content %}
-<h1 class="text-3xl font-bold mb-6">Courses</h1>
+<div class="flex items-center justify-between gap-4 mb-6">
+  <h1 class="text-3xl font-bold">Courses</h1>
+  {# Only an administrator is offered this; `require_admin` behind the route is
+     what actually stops everyone else. #}
+  {% if can_create_course %}
+  <a href="{{ url_for('get_course_new') }}"
+     class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+    New course
+  </a>
+  {% endif %}
+</div>
 
 <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
   {% for course in courses.enrolled %}

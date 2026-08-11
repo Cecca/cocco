@@ -618,6 +618,30 @@ async def query_course_role(
     return (await conn.execute(stmt)).scalar_one_or_none()
 
 
+async def user_is_admin(conn: AsyncConnection, user_id: int) -> bool:
+    """Whether this person is an administrator of any course.
+
+    `role` lives on `enrollment`, so the schema has no site-wide administrator
+    to ask about: holding `admin` somewhere is the closest thing it can express,
+    and it is what "may create a course" is keyed on - the one permission that
+    names no course, because the course does not exist yet.
+
+    Deliberately narrower than `EDITOR_ROLES`: a teacher runs a course they were
+    given, an admin brings new ones into being.
+    """
+    stmt = (
+        select(Enrollment.c.user_id)
+        .where(
+            and_(
+                Enrollment.c.user_id == user_id,
+                Enrollment.c.role == UserRole.admin,
+            )
+        )
+        .limit(1)
+    )
+    return (await conn.execute(stmt)).first() is not None
+
+
 async def challenge_in_course(
     conn: AsyncConnection, challenge_id: int, course_id: int
 ) -> bool:
@@ -794,6 +818,21 @@ async def update_challenge(conn: AsyncConnection, challenge_id: int, **fields) -
     await conn.execute(
         update(Challenge).where(Challenge.c.id == challenge_id).values(**fields)
     )
+
+
+async def insert_course(conn: AsyncConnection, title: str, description: str) -> int:
+    """Create a course and return its id.
+
+    It carries no enrollment: a course with no staff is not useful, but who
+    belongs on it is the caller's decision - the create route enrolls whoever
+    made it. Like the other insert helpers here, this does not commit.
+    """
+    stmt = (
+        insert(Course)
+        .values(title=title, description=description)
+        .returning(Course.c.id)
+    )
+    return (await conn.execute(stmt)).scalar_one()
 
 
 async def update_course(conn: AsyncConnection, course_id: int, **fields) -> None:
