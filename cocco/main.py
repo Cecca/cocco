@@ -60,9 +60,11 @@ import logging
 import os
 
 from cocco.repository import (
+    challenge_in_course,
     count_running_submissions,
     count_testcase_outcomes,
     delete_testcase,
+    insert_challenge,
     insert_enrollment,
     insert_submission,
     insert_testcase,
@@ -72,7 +74,9 @@ from cocco.repository import (
     query_challenge_ranking,
     query_challenge_standings,
     query_challenge_testcases,
+    query_course,
     query_course_info,
+    query_course_role,
     query_courses,
     query_evaluator_path,
     query_sample_testcase,
@@ -791,17 +795,37 @@ async def post_logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
-async def require_challenge_editor(
-    challenge_id: int, db: DBDep, user: CurrentUser
+async def require_course_editor(
+    course_id: int, db: DBDep, user: CurrentUser
 ) -> UserRole:
-    """Authorize an edit of `challenge_id`, or raise 403.
+    """Authorize course staff on `course_id`, or raise 403.
 
-    Hiding the Edit button in the template is a UI affordance, not access
-    control: every route that mutates a challenge depends on this.
+    Keyed on the course rather than on a challenge, so it also answers the one
+    question a challenge cannot: whether this person may create one here.
+    Hiding a button in the template is a UI affordance, not access control.
     """
-    role = await query_user_role(db, user_id=user.id, challenge_id=challenge_id)
+    role = await query_course_role(db, user_id=user.id, course_id=course_id)
     if role is None or role not in EDITOR_ROLES:
         raise HTTPException(status_code=403, detail="Not course staff")
+    return role
+
+
+CourseEditor = Annotated[UserRole, Depends(require_course_editor)]
+
+
+async def require_challenge_editor(
+    challenge_id: int, course_id: int, db: DBDep, role: CourseEditor
+) -> UserRole:
+    """Authorize an edit of `challenge_id`, or raise 403 - or 404.
+
+    The role comes from the course in the path, so the challenge in the path
+    has to be checked against it rather than assumed: otherwise staff of one
+    course could name their own course in front of someone else's challenge
+    and edit it. A mismatched pair is a URL for a challenge that does not
+    exist under that course, hence 404 rather than 403.
+    """
+    if not await challenge_in_course(db, challenge_id, course_id):
+        raise HTTPException(status_code=404)
     return role
 
 
@@ -875,18 +899,21 @@ async def index(request: Request, db: DBDep, user: CurrentUser):
 
 @app.get("/courses/{course_id}")
 async def get_course(course_id: int, request: Request, db: DBDep, user: CurrentUser):
-    from icecream import ic
     course = await query_course_info(db, course_id)
     if course is None:
         raise HTTPException(status_code=404)
-    ic(course)
+    role = await query_course_role(db, user_id=user.id, course_id=course_id)
     return templates.TemplateResponse(
         request=request,
         name="course.jinja",
         context={
             "course": course,
+            "course_id": course_id,
             "title": course["title"],
             "user": user,
+            # Only staff are offered the New challenge button. The route
+            # behind it checks for itself - see `require_course_editor`.
+            "can_edit": role in EDITOR_ROLES,
         },
     )
 
@@ -1154,8 +1181,9 @@ async def get_fragment_standings(
     )
 
 
-@app.get("/f/students/{challenge_id}/{student_id}")
+@app.get("/f/students/{course_id}/{challenge_id}/{student_id}")
 async def get_fragment_student_submissions(
+    course_id: int,
     challenge_id: int,
     student_id: int,
     request: Request,
@@ -1163,7 +1191,11 @@ async def get_fragment_student_submissions(
     role: ChallengeEditor,
 ):
     """One student's attempts, for the staff page. Same query and same fragment
-    as the student's own history - only the user id differs."""
+    as the student's own history - only the user id differs.
+
+    The course is in the path because the authorization the fragment inherits
+    is the course's, not the challenge's.
+    """
     submissions = await query_user_submissions(
         db, user_id=student_id, challenge_id=challenge_id
     )
@@ -1264,8 +1296,135 @@ async def post_regrade(
 
 
 ########################################################################
+# Creating a challenge. Course staff only - and course-scoped, because there
+# is no challenge yet to hang the permission on.
+
+# What a new challenge starts as. The limits are the seed's, and they have to
+# be realistic: a CPython interpreter alone needs well over a few MB, so a
+# tighter default would kill the first submission ever made.
+NEW_CHALLENGE_DEFAULTS = {
+    "title": "",
+    "description": "",
+    "max_time_s": 5.0,
+    "max_memory_bytes": 256 << 20,
+    "max_threads": 1,
+    "ranking": LeaderboardRanking.running_time.value,
+}
+
+
+def _challenge_fields(
+    description: str,
+    max_time_s: float,
+    max_memory_mb: float,
+    max_threads: int,
+    ranking: str,
+) -> tuple[dict | None, str | None]:
+    """The columns a challenge form writes, or the message explaining why not.
+
+    The create and the edit form are the same form - `_challenge-form.jinja` -
+    so they are validated once, here, and the caller only decides what to do
+    with the result.
+    """
+    if max_time_s <= 0 or max_memory_mb <= 0 or max_threads < 1:
+        return None, "Limits must be positive."
+
+    try:
+        criterion = LeaderboardRanking(ranking)
+    except ValueError:
+        return None, "Unknown leaderboard ranking."
+
+    return {
+        "description": description,
+        "max_time_s": max_time_s,
+        "max_memory_bytes": int(max_memory_mb * 1024 * 1024),
+        "max_threads": max_threads,
+        "ranking": criterion,
+    }, None
+
+
+@app.get("/courses/{course_id}/challenges/new")
+async def get_challenge_new(
+    course_id: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    role: CourseEditor,
+):
+    """The empty challenge form. Same form the editor shows, plus a title."""
+    course = await query_course(db, course_id)
+    if course is None:
+        raise HTTPException(status_code=404)
+    return templates.TemplateResponse(
+        request=request,
+        name="challenge-new.jinja",
+        context={
+            "user": user,
+            "course": course,
+            "course_id": course_id,
+            "challenge": NEW_CHALLENGE_DEFAULTS,
+            "title": f"New challenge in {course.title}",
+        },
+    )
+
+
+@app.post("/courses/{course_id}/challenges/new")
+async def post_challenge_new(
+    course_id: int,
+    request: Request,
+    db: DBDep,
+    role: CourseEditor,
+    title: Annotated[str, Form()],
+    description: Annotated[str, Form()],
+    max_time_s: Annotated[float, Form()],
+    max_memory_mb: Annotated[float, Form()],
+    max_threads: Annotated[int, Form()],
+    ranking: Annotated[str, Form()],
+):
+    """Create the challenge and send the browser to its editor."""
+
+    def alert(message: str, ok: bool = False):
+        return templates.TemplateResponse(
+            request=request,
+            name="f-edit-result.jinja",
+            context={"ok": ok, "message": message},
+        )
+
+    title = title.strip()
+    if not title:
+        return alert("A challenge needs a title.")
+
+    fields, error = _challenge_fields(
+        description, max_time_s, max_memory_mb, max_threads, ranking
+    )
+    if fields is None:
+        return alert(error or "Invalid challenge.")
+
+    challenge_id = await insert_challenge(db, course_id=course_id, title=title, **fields)
+    # get_db hands out a plain connection with no surrounding transaction
+    await db.commit()
+
+    # A 204 with HX-Redirect rather than a 303: htmx follows a redirect inside
+    # the XHR, which would splice the whole editor page into the little alert
+    # div this form targets. The editor is the right landing place - the new
+    # challenge still has no test cases and no evaluator.
+    return Response(
+        status_code=204,
+        headers={
+            "HX-Redirect": str(
+                request.url_for(
+                    "get_challenge_edit",
+                    course_id=course_id,
+                    challenge_id=challenge_id,
+                )
+            )
+        },
+    )
+
+
+########################################################################
 # The challenge editor. Every route here depends on ChallengeEditor, which
-# 403s anyone who is not staff on the challenge's course.
+# 403s anyone who is not staff on the course named in the URL, and 404s a
+# challenge that does not belong to it.
 
 
 def _testcase_dir(challenge_id: int) -> str:
@@ -1340,23 +1499,13 @@ async def post_challenge_edit(
             context={"ok": ok, "message": message},
         )
 
-    if max_time_s <= 0 or max_memory_mb <= 0 or max_threads < 1:
-        return alert("Limits must be positive.")
-
-    try:
-        criterion = LeaderboardRanking(ranking)
-    except ValueError:
-        return alert("Unknown leaderboard ranking.")
-
-    await update_challenge(
-        db,
-        challenge_id,
-        description=description,
-        max_time_s=max_time_s,
-        max_memory_bytes=int(max_memory_mb * 1024 * 1024),
-        max_threads=max_threads,
-        ranking=criterion,
+    fields, error = _challenge_fields(
+        description, max_time_s, max_memory_mb, max_threads, ranking
     )
+    if fields is None:
+        return alert(error or "Invalid challenge.")
+
+    await update_challenge(db, challenge_id, **fields)
     await db.commit()
     return alert("Saved.", ok=True)
 

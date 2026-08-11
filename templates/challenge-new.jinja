@@ -1,0 +1,35 @@
+{% extends "base.jinja" %}
+{% block title %}New challenge{% endblock %}
+
+{% block nav_extra %}
+<li><a class="text-base-content font-bold border-b-2 border-primary pb-0.5">New challenge</a></li>
+{% endblock %}
+
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+
+  <div class="flex items-start justify-between gap-4 mb-6">
+    <div>
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+        <a href="{{ url_for('get_course', course_id=course_id) }}" class="hover:text-primary">
+          {{ course.title }}
+        </a>
+      </p>
+      <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">New challenge</h1>
+      <p class="text-[13px] text-base-content/55 mt-1">
+        The evaluator and the test cases are set up on the editor, which is where
+        this form lands once the challenge exists.
+      </p>
+    </div>
+    <a href="{{ url_for('get_course', course_id=course_id) }}"
+       class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+      ← Back to course
+    </a>
+  </div>
+
+  {% set action_url = url_for('post_challenge_new', course_id=course_id) %}
+  {% set show_title = true %}
+  {% set submit_label = "Create challenge" %}
+  {% include "_challenge-form.jinja" %}
+</main>
+{% endblock %}

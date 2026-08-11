@@ -19,8 +19,11 @@ from cocco.model import (
 from cocco.model import LeaderboardRanking, UserRole
 from cocco.auth import get_or_create_user
 from cocco.repository import (
+    challenge_in_course,
     count_running_submissions,
     count_testcase_outcomes,
+    insert_challenge,
+    insert_enrollment,
     insert_user,
     pull_queued_submission,
     query_challenge,
@@ -28,6 +31,8 @@ from cocco.repository import (
     query_challenge_ranking,
     query_challenge_standings,
     query_challenge_testcases,
+    query_course_info,
+    query_course_role,
     query_sample_testcase,
     query_submission,
     query_submission_outcomes,
@@ -707,6 +712,115 @@ async def test_get_or_create_user_is_idempotent():
         assert row is not None and row.id == created.id
         # An address that was never seen is simply absent.
         assert await query_user_by_email(conn, "nobody@unipd.it") is None
+    await engine.dispose()
+
+
+async def test_course_role_is_the_editors_check():
+    """The editor authorizes on the course, not on a challenge: that is what
+    lets it answer the question a challenge cannot, "may I create one here?"."""
+    engine = await _async_database()
+    async with engine.connect() as conn:
+        course_id = (
+            await conn.execute(
+                insert(Course)
+                .values(title="Algorithms 101", description="intro")
+                .returning(Course.c.id)
+            )
+        ).scalar_one()
+        other_id = (
+            await conn.execute(
+                insert(Course)
+                .values(title="Data Structures", description="trees")
+                .returning(Course.c.id)
+            )
+        ).scalar_one()
+        teacher = await insert_user(conn, "alice@unipd.it", "alice", b"", "image/svg+xml")
+        student = await insert_user(conn, "bob@unipd.it", "bob", b"", "image/svg+xml")
+        await insert_enrollment(conn, teacher, course_id, UserRole.teacher)
+        await insert_enrollment(conn, student, course_id, UserRole.student)
+        await conn.commit()
+
+        assert await query_course_role(conn, user_id=teacher, course_id=course_id) == UserRole.teacher
+        assert await query_course_role(conn, user_id=student, course_id=course_id) == UserRole.student
+        # Enrolled on one course says nothing about another
+        assert await query_course_role(conn, user_id=teacher, course_id=other_id) is None
+    await engine.dispose()
+
+
+async def test_insert_challenge_and_its_course():
+    engine = await _async_database()
+    async with engine.connect() as conn:
+        course_id = (
+            await conn.execute(
+                insert(Course)
+                .values(title="Algorithms 101", description="intro")
+                .returning(Course.c.id)
+            )
+        ).scalar_one()
+        other_id = (
+            await conn.execute(
+                insert(Course)
+                .values(title="Data Structures", description="trees")
+                .returning(Course.c.id)
+            )
+        ).scalar_one()
+
+        challenge_id = await insert_challenge(
+            conn,
+            course_id=course_id,
+            title="Hello",
+            description="say hi",
+            max_time_s=5.0,
+            max_memory_bytes=256 << 20,
+            max_threads=1,
+            ranking=LeaderboardRanking.total_score,
+        )
+        await conn.commit()
+
+        row = (
+            await conn.execute(select(Challenge).where(Challenge.c.id == challenge_id))
+        ).one()
+        assert row.title == "Hello"
+        assert row.course_id == course_id
+        assert row.ranking == LeaderboardRanking.total_score
+        # No checker of its own: graded by the bundled equality.py
+        assert row.evaluator_path is None
+
+        # The guard behind the editor's URL: the course in the path has to be
+        # the challenge's own, or staff of one course could edit another's.
+        assert await challenge_in_course(conn, challenge_id, course_id)
+        assert not await challenge_in_course(conn, challenge_id, other_id)
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_course_page_query_survives_an_empty_course():
+    """A course with no challenges is a real course - it is the one whose page
+    staff open to create the first one - so it must not come back as NULL."""
+    url = _postgres_url()
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        empty_id = (
+            await conn.execute(
+                insert(Course)
+                .values(title="Compilers", description="not started yet")
+                .returning(Course.c.id)
+            )
+        ).scalar_one()
+        await conn.commit()
+
+        populated = await query_course_info(conn, 1)
+        assert populated is not None
+        assert [c["title"] for c in populated["challenges"]] == ["Hello", "Sum"]
+
+        empty = await query_course_info(conn, empty_id)
+        assert empty is not None
+        assert empty["title"] == "Compilers"
+        assert empty["challenges"] == []
     await engine.dispose()
 
 

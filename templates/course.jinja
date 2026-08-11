@@ -11,7 +11,17 @@
 
 
 <ul class="list bg-base-100 rounded-box shadow-md">
-<li class="p-4 pb-2 text-xl opacity-90 tracking-wide">Challenges</li>
+<li class="p-4 pb-2 flex items-center justify-between gap-4">
+  <span class="text-xl opacity-90 tracking-wide">Challenges</span>
+  {# Course staff only. The button is an affordance: `require_course_editor`
+     on the route behind it is the actual check. #}
+  {% if can_edit %}
+  <a href="{{ url_for('get_challenge_new', course_id=course.id) }}"
+     class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+    New challenge
+  </a>
+  {% endif %}
+</li>
 
 {% for challenge in course.challenges %}
 <li class="list-row">
@@ -20,6 +30,10 @@
       {{ challenge.title }}
     </div>
   </a>
+</li>
+{% else %}
+<li class="list-row text-sm opacity-60">
+  No challenges yet.
 </li>
 {% endfor %}
 </ul>

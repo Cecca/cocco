@@ -576,7 +576,13 @@ async def query_user_role(
     conn: AsyncConnection, user_id: int, challenge_id: int
 ) -> UserRole | None:
     """The viewer's role in the course a challenge belongs to, or None if they
-    are not enrolled. This is the authorization check for the editor."""
+    are not enrolled.
+
+    For a caller that already knows the course - every route under
+    `/courses/{course_id}/...` does - `query_course_role` is the one to use:
+    it answers the same question without a challenge, which is what makes it
+    usable before one exists.
+    """
     stmt = (
         select(Enrollment.c.role)
         .select_from(
@@ -589,6 +595,37 @@ async def query_user_role(
         )
     )
     return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def query_course_role(
+    conn: AsyncConnection, user_id: int, course_id: int
+) -> UserRole | None:
+    """The viewer's role on a course, or None if they are not enrolled.
+
+    This is the authorization check behind the editor: `role` lives on
+    `enrollment`, so it is a straight lookup, and it holds for a course that
+    has no challenges yet - which is exactly when a challenge is created.
+    """
+    stmt = select(Enrollment.c.role).where(
+        and_(Enrollment.c.course_id == course_id, Enrollment.c.user_id == user_id)
+    )
+    return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def challenge_in_course(
+    conn: AsyncConnection, challenge_id: int, course_id: int
+) -> bool:
+    """Whether a challenge really belongs to the course naming it in the URL.
+
+    The editor takes the viewer's role from the `course_id` in the path, so
+    that id has to be checked against the challenge rather than trusted:
+    otherwise staff of one course could put their own course id in front of
+    another course's challenge and edit it.
+    """
+    stmt = select(Challenge.c.id).where(
+        and_(Challenge.c.id == challenge_id, Challenge.c.course_id == course_id)
+    )
+    return (await conn.execute(stmt)).first() is not None
 
 
 async def query_user_by_email(conn: AsyncConnection, email: str):
@@ -697,6 +734,40 @@ async def query_evaluator_path(
         select(Challenge.c.evaluator_path).where(Challenge.c.id == challenge_id)
     )
     return result.scalar_one_or_none()
+
+
+async def insert_challenge(
+    conn: AsyncConnection,
+    course_id: int,
+    title: str,
+    description: str,
+    max_time_s: float,
+    max_memory_bytes: int,
+    max_threads: int,
+    ranking: LeaderboardRanking,
+) -> int:
+    """Create a challenge on a course and return its id.
+
+    `evaluator_path` is left NULL on purpose: a brand new challenge has chosen
+    no checker, and the judge grades those with the bundled `equality.py`.
+    Like the other insert helpers here, this does not commit - the caller owns
+    the transaction.
+    """
+    stmt = (
+        insert(Challenge)
+        .values(
+            course_id=course_id,
+            title=title,
+            description=description,
+            max_time_s=max_time_s,
+            max_memory_bytes=max_memory_bytes,
+            max_threads=max_threads,
+            ranking=ranking,
+            evaluator_path=None,
+        )
+        .returning(Challenge.c.id)
+    )
+    return (await conn.execute(stmt)).scalar_one()
 
 
 async def update_challenge(conn: AsyncConnection, challenge_id: int, **fields) -> None:
@@ -815,6 +886,16 @@ async def query_courses(conn: AsyncConnection, user_id: int):
     return res.scalar()
 
 
+async def query_course(conn: AsyncConnection, course_id: int):
+    """A course and nothing else - no challenges, no aggregate.
+
+    `query_course_info` is the page query; this is for the pages that only
+    need the title, and being plain Core it runs anywhere.
+    """
+    stmt = select(Course.c.id, Course.c.title).where(Course.c.id == course_id)
+    return (await conn.execute(stmt)).first()
+
+
 async def query_course_info(conn: AsyncConnection, course_id: int):
     query = text("""
     WITH
@@ -824,9 +905,19 @@ async def query_course_info(conn: AsyncConnection, course_id: int):
         WHERE c.id = :course_id
     ),
     c AS (
-        SELECT course.*, json_agg(challenge) as challenges
+        -- LEFT JOIN, and the coalesce of `query_courses`: a course with no
+        -- challenges yet is a real course - it is the one whose page course
+        -- staff open to create the first challenge - and an inner join would
+        -- return no row at all, which the route reports as a 404.
+        SELECT
+            course.*,
+            coalesce(
+                json_agg(challenge ORDER BY challenge.id)
+                    FILTER (WHERE challenge.id IS NOT NULL),
+                '[]'::json
+            ) as challenges
         FROM course
-        JOIN challenge on course.id = challenge.course_id
+        LEFT JOIN challenge on course.id = challenge.course_id
         GROUP BY course.id, course.title, course.description
     )
     SELECT row_to_json(c) FROM c;

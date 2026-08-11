@@ -59,7 +59,7 @@
           <!-- Polled like the student's own history, so a regrade is visible
                here as the judge works through the queue. -->
           <tbody id="submission-history"
-                 hx-get="{{ url_for('get_fragment_student_submissions', challenge_id=challenge.id, student_id=student.id) }}"
+                 hx-get="{{ url_for('get_fragment_student_submissions', course_id=course_id, challenge_id=challenge.id, student_id=student.id) }}"
                  hx-trigger="load, every 2s"
                  hx-swap="innerHTML">
           </tbody>
