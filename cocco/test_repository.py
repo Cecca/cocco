@@ -22,9 +22,11 @@ from cocco.repository import (
     challenge_in_course,
     count_running_submissions,
     count_testcase_outcomes,
+    course_exists,
     insert_challenge,
     insert_course,
     insert_enrollment,
+    insert_self_enrollment,
     insert_user,
     pull_queued_submission,
     query_challenge,
@@ -984,6 +986,57 @@ async def test_courses_page_query():
 
         # An empty filter is no filter, i.e. the unfiltered call above
         assert await query_courses(conn, user_id=carol, q="") == courses
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_self_enrollment():
+    """The home page's `Enroll!` button: it makes students, only students, and
+    never unmakes anything. Postgres-only - it rests on ON CONFLICT."""
+    url = _postgres_url()
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        carol = (await query_user_by_email(conn, "carol@example.com")).id
+        systems = (await query_courses(conn, user_id=carol))["non_enrolled"][0]
+        assert systems["title"] == "Systems Programming"
+
+        assert await course_exists(conn, systems["id"])
+        # A POST naming a course that is not there is a 404, not a foreign key
+        # violation on the way in
+        assert not await course_exists(conn, 10_000)
+
+        await insert_self_enrollment(conn, user_id=carol, course_id=systems["id"])
+        await conn.commit()
+        assert (
+            await query_course_role(conn, user_id=carol, course_id=systems["id"])
+        ) == UserRole.student
+
+        # ...and the course has crossed over to the half the button moved it to
+        after = await query_courses(conn, user_id=carol)
+        assert [c["title"] for c in after["enrolled"]] == [
+            "Algorithms 101",
+            "Data Structures",
+            "Systems Programming",
+        ]
+        assert after["non_enrolled"] == []
+
+        # A double click is a silent no-op rather than an IntegrityError
+        await insert_self_enrollment(conn, user_id=carol, course_id=systems["id"])
+        await conn.commit()
+        assert await query_courses(conn, user_id=carol) == after
+
+        # The guarantee that matters: an existing role is never overwritten, so
+        # this can neither promote anyone nor demote the course's own teacher.
+        bob = (await query_user_by_email(conn, "bob@example.com")).id
+        await insert_self_enrollment(conn, user_id=bob, course_id=systems["id"])
+        await conn.commit()
+        assert (
+            await query_course_role(conn, user_id=bob, course_id=systems["id"])
+        ) == UserRole.teacher
     await engine.dispose()
 
 

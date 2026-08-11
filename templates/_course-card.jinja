@@ -33,9 +33,19 @@
         <span class="text-primary">✎</span> Edit
       </a>
       {% elif not course.role %}
-      {# A placeholder: there is no self-enrollment route yet, so this button
-         does nothing. Enrolment happens through course staff. #}
-      <button class="btn btn-sm btn-secondary">Enroll!</button>
+      {# Joins as a student, and only as a student - `insert_self_enrollment`
+         fixes the role, so nothing about this form decides it. The target is
+         the whole list, both halves: the course has to move out of "Other
+         courses" and up into "Your courses", which re-rendering this one card
+         could not do. `q` comes from the filter box, which lives outside the
+         swapped region, so enrolling under a filter keeps it. #}
+      <form hx-post="{{ url_for('post_course_enroll', course_id=course.id) }}"
+            hx-include="[name='q']"
+            hx-target="#courses"
+            hx-swap="innerHTML"
+            hx-disabled-elt="find button">
+        <button type="submit" class="btn btn-sm btn-secondary">Enroll!</button>
+      </form>
       {% endif %}
       <a href="{{ url_for('get_course', course_id=course.id) }}"
          class="btn btn-sm btn-ghost font-mono text-base-content/50 hover:text-primary"

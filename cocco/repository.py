@@ -5,6 +5,7 @@ or their combinations
 """
 
 from sqlalchemy import Connection, and_, delete, func, insert, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from cocco import schema
@@ -110,6 +111,35 @@ async def insert_enrollment(conn: AsyncConnection, user_id: int, course_id: int,
         role=role
     )
     await conn.execute(stmt)
+
+
+async def insert_self_enrollment(conn: AsyncConnection, user_id: int, course_id: int):
+    """Enroll `user_id` on `course_id` as a student, unless they are on it already.
+
+    The role is fixed here rather than taken from the caller: this is the one
+    path into `enrollment` that no course staff approved, so it must not be able
+    to name a role. `ON CONFLICT DO NOTHING` on the (user_id, course_id) primary
+    key makes a double click - or two of them racing - a no-op instead of an
+    IntegrityError, and is what guarantees an existing role is never
+    overwritten: a teacher who reaches this route is not demoted to student.
+
+    Like `insert_enrollment`, this does not commit: the caller owns the
+    transaction.
+    """
+    stmt = (
+        pg_insert(Enrollment)
+        .values(user_id=user_id, course_id=course_id, role=UserRole.student)
+        .on_conflict_do_nothing(index_elements=["user_id", "course_id"])
+    )
+    await conn.execute(stmt)
+
+
+async def course_exists(conn: AsyncConnection, course_id: int) -> bool:
+    """Whether the course is there at all. A POST naming a course that is not is
+    a 404, rather than the foreign key violation - and 500 - an insert of an
+    enrollment pointing at it would raise."""
+    stmt = select(Course.c.id).where(Course.c.id == course_id)
+    return (await conn.execute(stmt)).first() is not None
 
 
 async def insert_submission(

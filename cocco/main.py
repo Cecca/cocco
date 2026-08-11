@@ -63,10 +63,12 @@ from cocco.repository import (
     challenge_in_course,
     count_running_submissions,
     count_testcase_outcomes,
+    course_exists,
     delete_testcase,
     insert_challenge,
     insert_course,
     insert_enrollment,
+    insert_self_enrollment,
     insert_submission,
     insert_testcase,
     insert_user,
@@ -947,6 +949,20 @@ async def index(request: Request, db: DBDep, user: CurrentUser, q: str = ""):
     )
 
 
+async def _render_courses(
+    request: Request, db: AsyncConnection, user: schema.User, q: str
+):
+    """Both halves of the courses list. Shared by the filter box's GET and by
+    `post_course_enroll`, so the list a click leaves behind is the one the box
+    would have produced."""
+    courses = await query_courses(db, user_id=user.id, q=q)
+    return templates.TemplateResponse(
+        request=request,
+        name="f-courses.jinja",
+        context={"courses": courses, "q": q, "user": user},
+    )
+
+
 @app.get("/f/courses")
 async def get_fragment_courses(request: Request, db: DBDep, user: CurrentUser, q: str = ""):
     """Both halves of the courses list, re-rendered as the filter box is typed
@@ -955,12 +971,7 @@ async def get_fragment_courses(request: Request, db: DBDep, user: CurrentUser, q
 
     No authorization beyond `CurrentUser`: this is exactly what `index` shows,
     and every course is visible to every signed-in user."""
-    courses = await query_courses(db, user_id=user.id, q=q)
-    return templates.TemplateResponse(
-        request=request,
-        name="f-courses.jinja",
-        context={"courses": courses, "q": q, "user": user},
-    )
+    return await _render_courses(request, db, user, q)
 
 
 ########################################################################
@@ -1046,6 +1057,41 @@ async def get_course(course_id: int, request: Request, db: DBDep, user: CurrentU
             "can_edit": role in EDITOR_ROLES,
         },
     )
+
+
+@app.post("/courses/{course_id}/enroll")
+async def post_course_enroll(
+    course_id: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    q: Annotated[str, Form()] = "",
+):
+    """Enroll the viewer on a course, from the home page's `Enroll!` button.
+
+    Authorization is `CurrentUser` and deliberately nothing else. An enrollment
+    is not what grants access here: `get_course`, `get_challenge` and even
+    `post_submission` depend on the session alone, so anyone signed in can
+    already read any course and submit to any challenge. What the row changes is
+    the role badge, which half of the home page the course sits under, and
+    whether this person shows up in the roster `query_challenge_standings` puts
+    in front of staff. The gate on who may sign in at all is `is_allowed_email`.
+
+    The role is not a parameter - see `insert_self_enrollment`, which fixes it at
+    `student` and leaves an existing enrollment alone, so this cannot promote
+    anyone and cannot demote a teacher who clicks it.
+
+    Returns the whole list, both halves: the point of the click is that the
+    course moves from "Other courses" up into "Your courses". `q` comes back
+    with it so enrolling under a typed filter does not silently reset the list.
+    """
+    if not await course_exists(db, course_id):
+        raise HTTPException(status_code=404)
+
+    await insert_self_enrollment(db, user_id=user.id, course_id=course_id)
+    # get_db hands out a plain connection with no surrounding transaction
+    await db.commit()
+    return await _render_courses(request, db, user, q)
 
 
 ########################################################################

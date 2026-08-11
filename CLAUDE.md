@@ -100,8 +100,21 @@ rather than `ILIKE '%'||:q||'%'`: a substring test, so a title typed with a `%` 
 matched literally and there is no escaping to get wrong. It swaps `f-courses.jinja` — both halves,
 so one request refreshes everything — and the input sits **outside** `#courses`, its own target,
 because an input rebuilt on every keystroke loses focus. The page inlines that same fragment on
-first paint. The `Enroll!` button on a course the viewer is not on is a placeholder: there is no
-self-enrollment route, and enrolment happens through course staff.
+first paint.
+
+The `Enroll!` button on a course the viewer is not on is `post_course_enroll`, and it renders the
+same fragment — with the filter box's `q` included, so enrolling under a filter keeps it — because
+the point of the click is that the course *moves* from the bottom half to the top. Its
+authorization is `CurrentUser` and deliberately nothing more: an enrollment is not what grants
+access here, since `get_course`, `get_challenge` and `post_submission` all depend on the session
+alone, so what the row actually changes is the role badge, which half the course sits under, and
+whether the person appears in the roster `query_challenge_standings` shows staff. The gate on who
+may sign in at all is `is_allowed_email`. The role is fixed inside `insert_self_enrollment` rather
+than taken from the request — this is the one path into `enrollment` that no course staff approved,
+so it must not be able to name a role — and the `ON CONFLICT DO NOTHING` there is what makes a
+double click a no-op *and* guarantees an existing role is never overwritten, so a teacher who
+clicks it is not demoted to student. There is no way back out: leaving a course is still a
+course-staff matter.
 
 Courses are created at `/courses/new` (`course-new.jinja`), reached from a button the home page
 shows only to an administrator; the form is the title and description halves of the course editor,
