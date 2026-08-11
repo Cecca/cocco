@@ -31,8 +31,10 @@ from cocco.repository import (
     query_challenge_ranking,
     query_challenge_standings,
     query_challenge_testcases,
+    query_course_challenges,
     query_course_info,
     query_course_role,
+    query_ordered_challenge_ids,
     query_sample_testcase,
     query_submission,
     query_submission_outcomes,
@@ -40,6 +42,7 @@ from cocco.repository import (
     query_user_role,
     query_user_submissions,
     regrade_challenge,
+    reorder_challenges,
 )
 from cocco.schema import SubmissionRunData
 
@@ -430,7 +433,7 @@ async def test_challenge_page_queries():
         assert challenge is not None
         assert challenge["title"] == "Hello"
         assert challenge["course_title"] == "Algorithms 101"
-        assert challenge["position"] == 1
+        assert challenge["number"] == 1
         assert challenge["viewer_role"] == "student"
         # Two of the three are marked public, but the third is retired, and a
         # retired case is not offered to students however it is flagged.
@@ -813,14 +816,89 @@ async def test_course_page_query_survives_an_empty_course():
         ).scalar_one()
         await conn.commit()
 
-        populated = await query_course_info(conn, 1)
+        carol = (await query_user_by_email(conn, "carol@example.com")).id
+
+        populated = await query_course_info(conn, 1, user_id=carol)
         assert populated is not None
         assert [c["title"] for c in populated["challenges"]] == ["Hello", "Sum"]
 
-        empty = await query_course_info(conn, empty_id)
+        empty = await query_course_info(conn, empty_id, user_id=carol)
         assert empty is not None
         assert empty["title"] == "Compilers"
         assert empty["challenges"] == []
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_the_course_page_says_who_has_submitted():
+    """The badge on a challenge card. `n_mine` is the viewer's own history, so
+    it is what a student's "Submitted" means; `n_submitters` is the class, and
+    only course staff are shown it."""
+    url = _postgres_url()
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        carol = (await query_user_by_email(conn, "carol@example.com")).id
+        erin = (await query_user_by_email(conn, "erin@example.com")).id
+
+        # Carol submitted twice to Hello and once to Sum; dave submitted to
+        # Hello as well, so that one has two distinct submitters.
+        hers = {
+            c["title"]: (c["n_mine"], c["n_submitters"])
+            for c in await query_course_challenges(conn, 1, user_id=carol)
+        }
+        assert hers == {"Hello": (2, 2), "Sum": (1, 1)}
+
+        # Erin is enrolled elsewhere: same challenges, none of them hers, and
+        # the class counts are unchanged by who is looking.
+        theirs = {
+            c["title"]: (c["n_mine"], c["n_submitters"])
+            for c in await query_course_challenges(conn, 1, user_id=erin)
+        }
+        assert theirs == {"Hello": (0, 2), "Sum": (0, 1)}
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_challenges_are_listed_in_their_stored_order():
+    """`position` is what the arrows write, and both the page query and the
+    fragment order by it - with the id breaking a tie, so challenges nobody has
+    reordered keep the order they were created in."""
+    url = _postgres_url()
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        alice = (await query_user_by_email(conn, "alice@example.com")).id
+
+        # Seeded without touching `position`, so every row sits at the default
+        # and the ids alone decide. This is also the case a plain swap cannot
+        # handle: exchanging two zeroes moves nothing.
+        ordered = await query_ordered_challenge_ids(conn, 1)
+        assert [c["title"] for c in await query_course_challenges(conn, 1, user_id=alice)] == [
+            "Hello",
+            "Sum",
+        ]
+
+        await reorder_challenges(conn, list(reversed(ordered)))
+        await conn.commit()
+
+        assert await query_ordered_challenge_ids(conn, 1) == list(reversed(ordered))
+        assert [c["title"] for c in await query_course_challenges(conn, 1, user_id=alice)] == [
+            "Sum",
+            "Hello",
+        ]
+        # The page query nests the same list, and the number it prints on a
+        # challenge follows the order rather than the raw column.
+        course = await query_course_info(conn, 1, user_id=alice)
+        assert [c["title"] for c in course["challenges"]] == ["Sum", "Hello"]
+        moved = await query_challenge(conn, user_id=alice, challenge_id=ordered[0])
+        assert moved["number"] == 2
     await engine.dispose()
 
 

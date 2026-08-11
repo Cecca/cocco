@@ -1,43 +1,62 @@
 {% extends "base.jinja" %}
-{% block title %}
-{{ title }}
-{% endblock %}
+{% block title %}{{ course.title }}{% endblock %}
 
-{% block content %}
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
 
-<h1 class="text-3xl font-bold mb-6">{{ course.title }}</h1>
+  <!-- ══ THE COURSE ══════════════════════════════════════════════════ -->
+  {# The same card `_statement.jinja` opens a challenge with: breadcrumb,
+     serif title, the Edit affordance for staff, then the markdown body. #}
+  <div class="card bg-base-100 border border-base-300 shadow-sm">
+    <div class="card-body p-8">
+      <div class="flex items-start justify-between gap-4">
+        <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+          <a href="{{ url_for('index') }}" class="hover:text-primary">Courses</a>
+        </p>
+        {# Course staff only. The real check is on the edit routes themselves. #}
+        {% if can_edit %}
+        <a href="{{ url_for('get_course_edit', course_id=course.id) }}"
+           class="btn btn-sm btn-ghost gap-1.5 font-semibold border border-base-300 -mt-1">
+          <span class="text-primary">✎</span> Edit course
+        </a>
+        {% endif %}
+      </div>
+      <h1 class="font-serif text-4xl font-semibold tracking-tight mt-1 mb-4">{{ course.title }}</h1>
 
-<article class="prose max-w-none">{{ course.description | markdown }}</article>
-
-
-<ul class="list bg-base-100 rounded-box shadow-md">
-<li class="p-4 pb-2 flex items-center justify-between gap-4">
-  <span class="text-xl opacity-90 tracking-wide">Challenges</span>
-  {# Course staff only. The button is an affordance: `require_course_editor`
-     on the route behind it is the actual check. #}
-  {% if can_edit %}
-  <a href="{{ url_for('get_challenge_new', course_id=course.id) }}"
-     class="btn btn-sm btn-ghost border border-base-300 font-semibold">
-    New challenge
-  </a>
-  {% endif %}
-</li>
-
-{% for challenge in course.challenges %}
-<li class="list-row">
-  <a href="{{ url_for('get_challenge', course_id=course.id, challenge_id=challenge.id) }}">
-    <div>
-      {{ challenge.title }}
+      <article class="prose prose-sm max-w-none prose-pre:bg-neutral prose-pre:text-neutral-content prose-pre:rounded-xl">
+        {{ course.description | markdown }}
+      </article>
     </div>
-  </a>
-</li>
-{% else %}
-<li class="list-row text-sm opacity-60">
-  No challenges yet.
-</li>
-{% endfor %}
-</ul>
+  </div>
 
+  <!-- ══ CHALLENGES ══════════════════════════════════════════════════ -->
+  <div class="flex items-baseline justify-between gap-4 mt-8 mb-3">
+    <div>
+      <h2 class="font-bold text-lg">Challenges</h2>
+      <p class="text-[13px] text-base-content/55">
+        In the order the course sets them. Your best score on each one counts.
+      </p>
+    </div>
+    {# Course staff only. `require_course_editor` on the route behind it is the
+       actual check. #}
+    {% if can_edit %}
+    <a href="{{ url_for('get_challenge_new', course_id=course.id) }}"
+       class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+      New challenge
+    </a>
+    {% endif %}
+  </div>
+
+  <div class="flex flex-col gap-3">
+    {% for challenge in course.challenges %}
+    {% with n = loop.index %}
+    {% include "_challenge-card.jinja" %}
+    {% endwith %}
+    {% else %}
+    <div class="rounded-xl border border-dashed border-base-300 bg-base-200/40 px-4 py-8 text-center text-sm text-base-content/50">
+      No challenges yet.
+    </div>
+    {% endfor %}
+  </div>
+</main>
 {% endblock %}
-
-

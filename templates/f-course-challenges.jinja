@@ -1,0 +1,20 @@
+{# The course editor's challenge list. Every move returns this whole fragment,
+   so the order on screen is always the order in the database. Rendered both
+   standalone (htmx, from `post_challenge_move`) and inlined by
+   `course-edit.jinja`.
+
+   Context: `challenges`, `course_id`. Only staff ever see it, so `can_edit`
+   is set here rather than passed in. #}
+
+<div class="flex flex-col gap-3">
+  {% for challenge in challenges %}
+  {% with n = loop.index, can_edit = true, reorder = true,
+          first = loop.first, last = loop.last %}
+  {% include "_challenge-card.jinja" %}
+  {% endwith %}
+  {% else %}
+  <div class="rounded-xl border border-dashed border-base-300 bg-base-200/40 px-4 py-8 text-center text-sm text-base-content/50">
+    No challenges yet — there is nothing to arrange until you create one.
+  </div>
+  {% endfor %}
+</div>

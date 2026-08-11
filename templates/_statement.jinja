@@ -12,7 +12,7 @@
         <a href="{{ url_for('get_course', course_id=course_id) }}" class="hover:text-primary">
           {{ challenge.course_title }}
         </a>
-        · Challenge {{ "%02d" | format(challenge.position) }}
+        · Challenge {{ "%02d" | format(challenge.number) }}
       </p>
       {# Course staff only. The real check is on the edit routes themselves. #}
       {% if can_edit %}

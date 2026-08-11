@@ -1,0 +1,117 @@
+{% extends "base.jinja" %}
+{% block title %}Editing {{ course.title }}{% endblock %}
+
+{% block nav_extra %}
+<li><a class="text-base-content font-bold border-b-2 border-primary pb-0.5">Editing</a></li>
+{% endblock %}
+
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+
+  <div class="flex items-start justify-between gap-4 mb-6">
+    <div>
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+        <a href="{{ url_for('index') }}" class="hover:text-primary">Courses</a>
+      </p>
+      <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ course.title }}</h1>
+    </div>
+    <a href="{{ url_for('get_course', course_id=course.id) }}"
+       class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+      ← Back to course
+    </a>
+  </div>
+
+  <!-- ══ TITLE + DESCRIPTION ═════════════════════════════════════════ -->
+  {# One form for both, the way the challenge form covers the statement and the
+     limits with a single Save. The challenge list below is outside it: nested
+     forms are invalid HTML, and every arrow down there is a form of its own. #}
+  <form hx-post="{{ url_for('post_course_edit', course_id=course.id) }}"
+        hx-target="#edit-result"
+        hx-swap="innerHTML">
+
+    <div class="card bg-base-100 border border-base-300 shadow-sm">
+      <div class="card-body p-7">
+        <h2 class="font-bold text-lg">Title</h2>
+        <p class="text-[13px] text-base-content/55 -mt-1">
+          How the course is listed on the home page.
+        </p>
+        <input type="text" name="title" required
+               value="{{ course.title }}"
+               placeholder="Algorithms 101"
+               class="input w-full mt-3" />
+      </div>
+    </div>
+
+    <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+      <div class="card-body p-7">
+        <div class="flex items-baseline justify-between">
+          <h2 class="font-bold text-lg">Description</h2>
+          <span class="font-mono text-xs text-base-content/45">markdown</span>
+        </div>
+        <p class="text-[13px] text-base-content/55 -mt-1">
+          The short introduction at the top of the course page — what the course
+          is about, how it is graded, where to ask for help.
+        </p>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 mt-3">
+          <div>
+            <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Source</label>
+            <!-- The same preview route the challenge editor uses, so it runs
+                 the same markdown filter the course page will. -->
+            <textarea name="description"
+                      id="description"
+                      rows="16"
+                      class="textarea font-mono text-sm w-full mt-1.5 leading-relaxed"
+                      hx-post="{{ url_for('post_markdown_preview') }}"
+                      hx-trigger="load, keyup changed delay:400ms"
+                      hx-target="#preview"
+                      hx-swap="innerHTML">{{ course.description }}</textarea>
+          </div>
+          <div>
+            <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Preview</label>
+            <div id="preview"
+                 class="rounded-xl border border-base-300 bg-base-200/40 p-5 mt-1.5 min-h-[10rem] overflow-x-auto">
+            </div>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-4 mt-5">
+          <button type="submit" class="btn btn-primary shadow-md shadow-primary/30">
+            <span class="submit-label">Save changes</span>
+            <span class="htmx-indicator loading loading-spinner loading-sm"></span>
+          </button>
+          {# Where the alert lands. The title in the header above is the one
+             that was loaded, so it only catches up on the next page load. #}
+          <div id="edit-result" class="empty:hidden flex-1"></div>
+        </div>
+      </div>
+    </div>
+  </form>
+
+  <!-- ══ CHALLENGES ══════════════════════════════════════════════════ -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+    <div class="card-body p-7">
+      <div class="flex items-start justify-between gap-4">
+        <div>
+          <h2 class="font-bold text-lg">Challenges</h2>
+          <p class="text-[13px] text-base-content/55">
+            The order students see them in. Moving one only changes the listing —
+            no submission, score or test case is touched.
+          </p>
+        </div>
+        <a href="{{ url_for('get_challenge_new', course_id=course.id) }}"
+           class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+          New challenge
+        </a>
+      </div>
+
+      <!-- Every move returns this whole list, so it always matches the database -->
+      <div id="course-challenges" class="mt-4">
+        {% with challenges = course.challenges %}
+        {% include "f-course-challenges.jinja" %}
+        {% endwith %}
+      </div>
+    </div>
+  </div>
+</main>
+{% endblock %}

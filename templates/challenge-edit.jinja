@@ -14,7 +14,7 @@
         <a href="{{ url_for('get_course', course_id=course_id) }}" class="hover:text-primary">
           {{ challenge.course_title }}
         </a>
-        · Challenge {{ "%02d" | format(challenge.position) }}
+        · Challenge {{ "%02d" | format(challenge.number) }}
       </p>
       <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ challenge.title }}</h1>
     </div>

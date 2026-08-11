@@ -75,10 +75,12 @@ from cocco.repository import (
     query_challenge_standings,
     query_challenge_testcases,
     query_course,
+    query_course_challenges,
     query_course_info,
     query_course_role,
     query_courses,
     query_evaluator_path,
+    query_ordered_challenge_ids,
     query_sample_testcase,
     query_submission,
     query_submission_outcomes,
@@ -87,8 +89,10 @@ from cocco.repository import (
     query_user_role,
     query_user_submissions,
     regrade_challenge,
+    reorder_challenges,
     swap_testcase_order,
     update_challenge,
+    update_course,
     update_testcase,
 )
 
@@ -342,6 +346,9 @@ async def _populate_dummy_data(conn: AsyncConnection):
                             else f"challenge {n + 1} of {course_title}"
                         ),
                         course_id=course_id,
+                        # Listed in the order they are created here; course
+                        # staff reorder them with the arrows in the editor.
+                        position=n,
                         # A CPython interpreter alone needs well over a few MB,
                         # so these have to be realistic or every run is killed.
                         max_memory_bytes=256 << 20,
@@ -899,7 +906,9 @@ async def index(request: Request, db: DBDep, user: CurrentUser):
 
 @app.get("/courses/{course_id}")
 async def get_course(course_id: int, request: Request, db: DBDep, user: CurrentUser):
-    course = await query_course_info(db, course_id)
+    # The viewer is part of the query: each challenge card says whether *this*
+    # person has already submitted to it.
+    course = await query_course_info(db, course_id, user_id=user.id)
     if course is None:
         raise HTTPException(status_code=404)
     role = await query_course_role(db, user_id=user.id, course_id=course_id)
@@ -911,11 +920,126 @@ async def get_course(course_id: int, request: Request, db: DBDep, user: CurrentU
             "course_id": course_id,
             "title": course["title"],
             "user": user,
-            # Only staff are offered the New challenge button. The route
-            # behind it checks for itself - see `require_course_editor`.
+            # Only staff are offered the Edit and New challenge buttons. The
+            # routes behind them check for themselves - see
+            # `require_course_editor`.
             "can_edit": role in EDITOR_ROLES,
         },
     )
+
+
+########################################################################
+# The course editor: the course's own description, and the order its challenges
+# are listed in. Course staff only, through `CourseEditor`.
+#
+# Declared here, above `get_challenge`, and that is load-bearing: its path is
+# `/courses/{course_id}/{challenge_id}`, whose `{challenge_id}` matches any
+# single segment, so a `/courses/1/edit` declared after it would be routed
+# there and rejected as an unparseable id before this ever ran.
+
+
+async def _render_course_challenges(
+    request: Request, db: DBDep, course_id: int, user: schema.User
+):
+    """The reorderable challenge list. Every move returns this whole fragment,
+    so the cards always sit in the order the database has them."""
+    challenges = await query_course_challenges(db, course_id, user_id=user.id)
+    return templates.TemplateResponse(
+        request=request,
+        name="f-course-challenges.jinja",
+        context={
+            "challenges": challenges,
+            "course_id": course_id,
+            "user": user,
+        },
+    )
+
+
+@app.get("/courses/{course_id}/edit")
+async def get_course_edit(
+    course_id: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    role: CourseEditor,
+):
+    course = await query_course_info(db, course_id, user_id=user.id)
+    if course is None:
+        raise HTTPException(status_code=404)
+    return templates.TemplateResponse(
+        request=request,
+        name="course-edit.jinja",
+        context={
+            "course": course,
+            "course_id": course_id,
+            "title": f"Editing {course['title']}",
+            "user": user,
+        },
+    )
+
+
+@app.post("/courses/{course_id}/edit")
+async def post_course_edit(
+    course_id: int,
+    request: Request,
+    db: DBDep,
+    role: CourseEditor,
+    title: Annotated[str, Form()],
+    description: Annotated[str, Form()],
+):
+    """Save the course's title and description."""
+
+    def alert(message: str, ok: bool = False):
+        return templates.TemplateResponse(
+            request=request,
+            name="f-edit-result.jinja",
+            context={"ok": ok, "message": message},
+        )
+
+    title = title.strip()
+    if not title:
+        return alert("A course needs a title.")
+
+    await update_course(db, course_id, title=title, description=description)
+    await db.commit()
+    return alert("Saved.", ok=True)
+
+
+@app.post("/courses/{course_id}/challenges/{challenge_id}/move")
+async def post_challenge_move(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    role: ChallengeEditor,
+    direction: Annotated[str, Form()],
+):
+    """Move a challenge one place up or down the course page. Arrows rather
+    than drag-and-drop, exactly as `post_testcase_move`: no JS build step, and
+    this is a list of integers.
+
+    Unlike that one it hands the whole reordered course to the repository
+    rather than naming two rows to exchange - see `reorder_challenges` for why
+    a swap is not enough here.
+    """
+    if direction not in ("up", "down"):
+        raise HTTPException(status_code=404)
+
+    ordered = await query_ordered_challenge_ids(db, course_id)
+    index = next((i for i, cid in enumerate(ordered) if cid == challenge_id), None)
+    if index is None:
+        raise HTTPException(status_code=404)
+
+    neighbour = index - 1 if direction == "up" else index + 1
+    if not 0 <= neighbour < len(ordered):
+        # Already at the end; nothing to do rather than an error
+        return await _render_course_challenges(request, db, course_id, user)
+
+    ordered[index], ordered[neighbour] = ordered[neighbour], ordered[index]
+    await reorder_challenges(db, ordered)
+    await db.commit()
+    return await _render_course_challenges(request, db, course_id, user)
 
 @app.get("/courses/{course_id}/{challenge_id}")
 async def get_challenge(

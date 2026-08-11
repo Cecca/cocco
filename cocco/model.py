@@ -121,6 +121,12 @@ Challenge = Table(
         default=LeaderboardRanking.running_time,
         server_default=text("'running_time'"),
     ),
+    # Where the challenge sits on its course page, the way `execution_order`
+    # places a test case within its challenge. Course staff reorder them in the
+    # course editor. Ties are broken by id everywhere this is ordered by, so a
+    # course whose challenges all still sit at the default keeps the order they
+    # were created in - and the arrows are the only thing that ever writes it.
+    Column("position", Integer, nullable=False, default=0, server_default=text("0")),
 )
 
 

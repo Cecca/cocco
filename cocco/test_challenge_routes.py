@@ -192,6 +192,76 @@ async def test_a_bad_form_comes_back_as_an_alert(
     assert created.first() is None
 
 
+async def test_the_course_editor_is_staff_only(client, world, monkeypatch):
+    """The course's own page is readable by anyone signed in; editing it is not.
+
+    Only the routes that render nothing from the Postgres-only page query are
+    asserted here - see the module docstring - which is exactly the refusal.
+    """
+    course_id = world["course"]
+    _sign_in_as(monkeypatch, STUDENT)
+
+    assert client.get(f"/courses/{course_id}/edit").status_code == 403
+    assert (
+        client.post(
+            f"/courses/{course_id}/edit",
+            data={"title": "Hijacked", "description": "mine now"},
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            f"/courses/{course_id}/challenges/{world['other_challenge']}/move",
+            data={"direction": "up"},
+        ).status_code
+        == 403
+    )
+
+
+async def test_the_course_editor_saves_the_description(client, world, app_engine):
+    course_id = world["course"]
+    response = client.post(
+        f"/courses/{course_id}/edit",
+        data={"title": "Algorithms 102", "description": "# Welcome\n\nRead this."},
+    )
+    # 200 with an alert, like every other htmx form in the app
+    assert response.status_code == 200
+    assert "Saved." in response.text
+
+    async with app_engine.connect() as conn:
+        row = (
+            await conn.execute(select(Course).where(Course.c.id == course_id))
+        ).one()
+    assert row.title == "Algorithms 102"
+    assert row.description == "# Welcome\n\nRead this."
+
+
+async def test_a_course_cannot_lose_its_title(client, world, app_engine):
+    course_id = world["course"]
+    response = client.post(
+        f"/courses/{course_id}/edit", data={"title": "   ", "description": "..."}
+    )
+    assert response.status_code == 200
+    assert "A course needs a title." in response.text
+
+    async with app_engine.connect() as conn:
+        row = (
+            await conn.execute(select(Course).where(Course.c.id == course_id))
+        ).one()
+    assert row.title == "Algorithms 101"
+
+
+async def test_moving_a_challenge_of_another_course_is_a_404(client, world):
+    """The arrows go through `require_challenge_editor` like every other
+    mutation: naming your own course in front of someone else's challenge is a
+    URL for a challenge that does not exist, not a way to reorder theirs."""
+    response = client.post(
+        f"/courses/{world['course']}/challenges/{world['other_challenge']}/move",
+        data={"direction": "up"},
+    )
+    assert response.status_code == 404
+
+
 async def test_the_course_in_the_url_has_to_own_the_challenge(client, world):
     """The editor takes the role from the course in the path, so a teacher of
     one course must not be able to name it in front of another's challenge."""

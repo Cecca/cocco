@@ -1,0 +1,86 @@
+{# One challenge, as a card. Shared by the course page and by the course
+   editor's reorderable list, so the two cannot drift apart. Never served from
+   a route, hence the `_` prefix.
+
+   Context: `challenge` (a row of `query_course_challenges`, carrying `n_mine`
+   and `n_submitters`), `course_id`, `n` - its 1-based place in the list - and
+   optionally:
+
+     `can_edit`  add the Edit link, and read the badge as staff do
+     `reorder`   add the ↑/↓ column, with `first` / `last` disabling an end
+#}
+<div class="card bg-base-100 border border-base-300 shadow-sm transition-colors hover:border-primary/40">
+  <div class="card-body flex-row items-center gap-4 p-5">
+
+    {% if reorder %}
+    {# Two one-field forms rather than drag-and-drop: the whole list comes back
+       from the route, so what is on screen is what is stored. #}
+    <div class="flex flex-col gap-1">
+      {% for direction, glyph, disabled in [("up", "↑", first), ("down", "↓", last)] %}
+      <form hx-post="{{ url_for('post_challenge_move', course_id=course_id, challenge_id=challenge.id) }}"
+            hx-target="#course-challenges"
+            hx-swap="innerHTML">
+        <input type="hidden" name="direction" value="{{ direction }}" />
+        <button type="submit" class="btn btn-xs btn-ghost font-mono"
+                title="Move {{ direction }}"
+                {% if disabled %}disabled{% endif %}>{{ glyph }}</button>
+      </form>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <div class="min-w-0 flex-1">
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+        Challenge {{ "%02d" | format(n) }}
+      </p>
+      <h3 class="font-serif text-xl font-semibold tracking-tight mt-0.5">
+        <a href="{{ url_for('get_challenge', course_id=course_id, challenge_id=challenge.id) }}"
+           class="hover:text-primary">
+          {{ challenge.title }}
+        </a>
+      </h3>
+
+      <div class="flex flex-wrap items-center gap-2 mt-2">
+        {# The viewer's own history. A student sees this and nothing else, so
+           "Submitted" here always means "by you". #}
+        {% if challenge.n_mine %}
+        <span class="badge badge-success gap-1.5 font-semibold border-none"
+              style="background:color-mix(in oklch, var(--color-success) 16%, transparent);color:oklch(38% 0.1 150);"
+              title="{{ challenge.n_mine }} submission{{ 's' if challenge.n_mine != 1 }}">
+          <span class="h-1.5 w-1.5 rounded-full bg-success"></span>Submitted
+        </span>
+        {% endif %}
+
+        {# The class's, for staff only: it is how many students have started,
+           and a student must not learn that from someone else's work. #}
+        {% if can_edit %}
+        {% if challenge.n_submitters %}
+        <span class="badge badge-ghost font-semibold"
+              title="Students who have submitted at least once">
+          {{ challenge.n_submitters }} student{{ 's' if challenge.n_submitters != 1 }} submitted
+        </span>
+        {% else %}
+        <span class="badge badge-ghost font-semibold text-base-content/50">No submissions yet</span>
+        {% endif %}
+        {% endif %}
+
+        <span class="badge badge-ghost font-mono text-xs">{{ challenge.max_time_s }} s</span>
+        <span class="badge badge-ghost font-mono text-xs">
+          {{ (challenge.max_memory_bytes / 1024 / 1024) | round | int }} MB
+        </span>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-2">
+      {% if can_edit %}
+      <a href="{{ url_for('get_challenge_edit', course_id=course_id, challenge_id=challenge.id) }}"
+         class="btn btn-sm btn-ghost gap-1.5 font-semibold border border-base-300">
+        <span class="text-primary">✎</span> Edit
+      </a>
+      {% endif %}
+      <a href="{{ url_for('get_challenge', course_id=course_id, challenge_id=challenge.id) }}"
+         class="btn btn-sm btn-ghost font-mono text-base-content/50 hover:text-primary"
+         aria-label="Open {{ challenge.title }}">→</a>
+    </div>
+  </div>
+</div>

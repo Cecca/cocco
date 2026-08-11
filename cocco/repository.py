@@ -299,8 +299,13 @@ async def query_submission_outcomes(conn: AsyncConnection, submission_id: int):
 
 
 async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int):
-    """The challenge itself, its course, its position within the course, the
+    """The challenge itself, its course, its number within the course, the
     viewer's role in that course and its public sample test cases.
+
+    `number` is not `challenge.position`: the column is the sort key the course
+    editor's arrows write, and a swap leaves gaps in it. What the page prints
+    is the rank of that key within the course, which is why the two are
+    different fields here.
 
     Submissions are deliberately not part of this document: the challenge page
     loads them through `query_user_submissions` and keeps them fresh by polling.
@@ -315,20 +320,21 @@ async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int
         WHERE is_sample AND is_active
         GROUP BY challenge_id
     ),
-    positions AS (
+    numbers AS (
         SELECT id,
-               row_number() OVER (PARTITION BY course_id ORDER BY id) AS position
+               row_number() OVER (PARTITION BY course_id ORDER BY position, id)
+                   AS number
         FROM challenge
     ),
     cs AS (
         SELECT challenge.*,
                course.title AS course_title,
-               positions.position AS position,
+               numbers.number AS number,
                enrollment.role AS viewer_role,
                coalesce(samples.samples, '[]'::json) AS samples
         FROM challenge
         LEFT JOIN course ON course.id = challenge.course_id
-        LEFT JOIN positions ON positions.id = challenge.id
+        LEFT JOIN numbers ON numbers.id = challenge.id
         LEFT JOIN samples ON samples.challenge_id = challenge.id
         LEFT JOIN enrollment ON enrollment.course_id = challenge.course_id
                             AND enrollment.user_id = :user_id
@@ -748,11 +754,22 @@ async def insert_challenge(
 ) -> int:
     """Create a challenge on a course and return its id.
 
+    It lands after the ones already there, exactly as `insert_testcase` appends
+    within a challenge: a new challenge is the next one of the course, and the
+    arrows in the course editor are for moving it somewhere else.
+
     `evaluator_path` is left NULL on purpose: a brand new challenge has chosen
     no checker, and the judge grades those with the bundled `equality.py`.
     Like the other insert helpers here, this does not commit - the caller owns
     the transaction.
     """
+    next_position = (
+        await conn.execute(
+            select(func.coalesce(func.max(Challenge.c.position) + 1, 0)).where(
+                Challenge.c.course_id == course_id
+            )
+        )
+    ).scalar_one()
     stmt = (
         insert(Challenge)
         .values(
@@ -763,6 +780,7 @@ async def insert_challenge(
             max_memory_bytes=max_memory_bytes,
             max_threads=max_threads,
             ranking=ranking,
+            position=next_position,
             evaluator_path=None,
         )
         .returning(Challenge.c.id)
@@ -776,6 +794,64 @@ async def update_challenge(conn: AsyncConnection, challenge_id: int, **fields) -
     await conn.execute(
         update(Challenge).where(Challenge.c.id == challenge_id).values(**fields)
     )
+
+
+async def update_course(conn: AsyncConnection, course_id: int, **fields) -> None:
+    if not fields:
+        return
+    await conn.execute(
+        update(Course).where(Course.c.id == course_id).values(**fields)
+    )
+
+
+async def query_ordered_challenge_ids(
+    conn: AsyncConnection, course_id: int
+) -> list[int]:
+    """The ids of a course's challenges in the order the course page lists
+    them - which is all a move needs to find the neighbour to swap with.
+
+    Deliberately not `query_course_challenges`: the neighbour is two ids, and
+    this way the ordering rule is written once, in plain Core, rather than a
+    second time inside the page query's SQL.
+    """
+    stmt = (
+        select(Challenge.c.id)
+        .where(Challenge.c.course_id == course_id)
+        .order_by(Challenge.c.position, Challenge.c.id)
+    )
+    return list((await conn.execute(stmt)).scalars())
+
+
+async def reorder_challenges(conn: AsyncConnection, ordered_ids: list[int]) -> None:
+    """Renumber a course's challenges so that `position` is their index in
+    `ordered_ids`. The caller supplies the whole course, in the order it should
+    end up in.
+
+    A dense rewrite rather than the sentinel swap `swap_testcase_order` does,
+    because `position` defaults to 0: every challenge of a course that predates
+    the column - and every one the seed creates without it - starts out tied
+    with all the others, and exchanging two zeroes moves nothing. Renumbering
+    the whole course breaks every tie the first time an arrow is pressed, and
+    keeps the numbers dense afterwards.
+
+    Written in two passes through negative sentinels for the reason
+    `swap_testcase_order` uses one: should `position` ever gain a unique
+    constraint per course, assigning the final numbers one at a time would
+    collide with the rows that have not been rewritten yet. `insert_challenge`
+    only ever writes positions from 0 up, so the negatives are free.
+    """
+    for index, challenge_id in enumerate(ordered_ids):
+        await conn.execute(
+            update(Challenge)
+            .where(Challenge.c.id == challenge_id)
+            .values(position=-(index + 1))
+        )
+    for index, challenge_id in enumerate(ordered_ids):
+        await conn.execute(
+            update(Challenge)
+            .where(Challenge.c.id == challenge_id)
+            .values(position=index)
+        )
 
 
 async def insert_testcase(
@@ -896,32 +972,87 @@ async def query_course(conn: AsyncConnection, course_id: int):
     return (await conn.execute(stmt)).first()
 
 
-async def query_course_info(conn: AsyncConnection, course_id: int):
-    query = text("""
-    WITH
-    course as (
-        SELECT *
-        FROM course c
-        WHERE c.id = :course_id
+# The challenges of one course, in the order the course page lists them, each
+# carrying what the card on that page has to decide its badge with:
+#
+# - `n_mine`, how many times the viewer submitted, which is what a student's
+#   "Submitted" badge means;
+# - `n_submitters`, how many distinct people did, which is the same badge as
+#   course staff see it - and what tells them which challenge the class has
+#   actually started.
+#
+# Takes :course_id and :user_id. The ordering is `position, id`: `position` is
+# what the arrows write, and the id breaks a tie, so challenges that have never
+# been reordered stay in the order they were created in.
+_COURSE_CHALLENGES_CTE = """
+    submitted AS (
+        SELECT submission.challenge_id,
+               count(*) FILTER (WHERE submission.user_id = :user_id) AS n_mine,
+               count(DISTINCT submission.user_id) AS n_submitters
+        FROM submission
+        JOIN challenge ON challenge.id = submission.challenge_id
+        WHERE challenge.course_id = :course_id
+        GROUP BY submission.challenge_id
     ),
+    -- LEFT JOIN and coalesce: a challenge nobody has submitted to has no row
+    -- in `submitted` at all, and it is still a challenge the page must list.
+    challenges AS (
+        SELECT challenge.*,
+               coalesce(submitted.n_mine, 0) AS n_mine,
+               coalesce(submitted.n_submitters, 0) AS n_submitters
+        FROM challenge
+        LEFT JOIN submitted ON submitted.challenge_id = challenge.id
+        WHERE challenge.course_id = :course_id
+    )
+"""
+
+
+async def query_course_info(conn: AsyncConnection, course_id: int, user_id: int):
+    """The course, its description and its challenges as the page lists them.
+
+    One document rather than a query per card: see `_COURSE_CHALLENGES_CTE` for
+    what each challenge carries. The course editor reads the same thing - it
+    shows the same list, plus the arrows - so every reorder re-renders from
+    here and cannot drift from what is stored.
+    """
+    query = text(f"""
+    WITH
+    {_COURSE_CHALLENGES_CTE},
     c AS (
-        -- LEFT JOIN, and the coalesce of `query_courses`: a course with no
-        -- challenges yet is a real course - it is the one whose page course
-        -- staff open to create the first challenge - and an inner join would
-        -- return no row at all, which the route reports as a 404.
+        -- The subquery and its coalesce, rather than a join and a GROUP BY: a
+        -- course with no challenges yet is a real course - it is the one whose
+        -- page course staff open to create the first challenge - and it must
+        -- come back with an empty list, not as no row at all, which the route
+        -- would report as a 404.
         SELECT
             course.*,
             coalesce(
-                json_agg(challenge ORDER BY challenge.id)
-                    FILTER (WHERE challenge.id IS NOT NULL),
+                (SELECT json_agg(challenges ORDER BY challenges.position, challenges.id)
+                 FROM challenges),
                 '[]'::json
             ) as challenges
         FROM course
-        LEFT JOIN challenge on course.id = challenge.course_id
-        GROUP BY course.id, course.title, course.description
+        WHERE course.id = :course_id
     )
     SELECT row_to_json(c) FROM c;
     """)
-    res = await conn.execute(query, dict(course_id=course_id))
+    res = await conn.execute(query, dict(course_id=course_id, user_id=user_id))
+    return res.scalar()
+
+
+async def query_course_challenges(conn: AsyncConnection, course_id: int, user_id: int):
+    """Just the list `query_course_info` nests, for the fragment the reorder
+    arrows swap: a move changes the order of the cards and nothing about the
+    course itself."""
+    query = text(f"""
+    WITH
+    {_COURSE_CHALLENGES_CTE}
+    SELECT coalesce(
+        json_agg(challenges ORDER BY challenges.position, challenges.id),
+        '[]'::json
+    )
+    FROM challenges;
+    """)
+    res = await conn.execute(query, dict(course_id=course_id, user_id=user_id))
     return res.scalar()
 
