@@ -3,49 +3,45 @@
 {{ title }}
 {% endblock %}
 
-{% block content %}
-<div class="flex items-center justify-between gap-4 mb-6">
-  <h1 class="text-3xl font-bold">Courses</h1>
-  {# Only an administrator is offered this; `require_admin` behind the route is
-     what actually stops everyone else. #}
-  {% if can_create_course %}
-  <a href="{{ url_for('get_course_new') }}"
-     class="btn btn-sm btn-ghost border border-base-300 font-semibold">
-    New course
-  </a>
-  {% endif %}
-</div>
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
 
-<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-  {% for course in courses.enrolled %}
-    <div class="card bg-base-100 shadow-sm">
-      <div class="card-body">
-        <h2 class="card-title">{{ course.title }}</h2>
-        <p>{{ course.description }}</p>
-        <div class="card-actions justify-end">
-          <a href="{{ url_for('get_course', course_id=course.id) }}">
-          <button class="btn btn-primary">Go!</button>
-          </a>
-        </div>
+  <!-- ══ THE COURSES ═════════════════════════════════════════════════ -->
+  {# The card `course.jinja` opens with: mono eyebrow, serif title, the one
+     affordance staff get, and here the filter box. #}
+  <div class="card bg-base-100 border border-base-300 shadow-sm">
+    <div class="card-body p-8">
+      <div class="flex items-start justify-between gap-4">
+        <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+          Coding Challenges Companion
+        </p>
+        {# Only an administrator is offered this; `require_admin` behind the route is
+           what actually stops everyone else. #}
+        {% if can_create_course %}
+        <a href="{{ url_for('get_course_new') }}"
+           class="btn btn-sm btn-ghost border border-base-300 font-semibold -mt-1">
+          New course
+        </a>
+        {% endif %}
       </div>
-    </div>
-  {% endfor %}
-</div>
+      <h1 class="font-serif text-4xl font-semibold tracking-tight mt-1 mb-4">Courses</h1>
 
-<div class="divider">other courses</div>
-
-<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-  {% for course in courses.non_enrolled %}
-    <div class="card bg-base-100 shadow-sm">
-      <div class="card-body">
-        <h2 class="card-title">{{ course.title }}</h2>
-        <p>{{ course.description }}</p>
-        <div class="card-actions justify-end">
-          <button class="btn btn-secondary">Enroll!</button>
-        </div>
-      </div>
+      {# Outside `#courses`, which is what the swap replaces: an input inside
+         its own target would be rebuilt on every keystroke and lose focus. #}
+      <input type="search" name="q" value="{{ q }}"
+             placeholder="Filter courses by name…"
+             aria-label="Filter courses by name"
+             class="input w-full"
+             hx-get="{{ url_for('get_fragment_courses') }}"
+             hx-trigger="input changed delay:200ms, search"
+             hx-include="this"
+             hx-target="#courses"
+             hx-swap="innerHTML" />
     </div>
-  {% endfor %}
-</div>
+  </div>
+
+  <div id="courses" class="mt-8">
+    {% include "f-courses.jinja" %}
+  </div>
+</main>
 {% endblock %}
-

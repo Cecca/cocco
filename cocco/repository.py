@@ -973,7 +973,15 @@ async def swap_testcase_order(conn: AsyncConnection, a_id: int, b_id: int) -> No
     )
 
 
-async def query_courses(conn: AsyncConnection, user_id: int):
+async def query_courses(conn: AsyncConnection, user_id: int, q: str = ""):
+    """Every course, split into the ones this user is enrolled on and the rest.
+
+    `q` filters both halves by title. It is the home page's filter box, so it
+    is a substring test rather than a pattern: `position()` and not
+    `ILIKE '%'||:q||'%'`, so a title typed with a `%` or a `_` in it is matched
+    literally instead of turning into a wildcard, and there is no escaping to
+    get wrong. An empty `q` is no filter at all.
+    """
     query = text("""
     WITH
     courses as (
@@ -981,15 +989,16 @@ async def query_courses(conn: AsyncConnection, user_id: int):
         FROM course c
         LEFT JOIN (SELECT * FROM enrollment WHERE user_id = :user_id) e
         ON c.id = e.course_id
+        WHERE :q = '' OR position(lower(:q) in lower(c.title)) > 0
     ),
     -- coalesce: json_agg over no rows is NULL, and a user enrolled in every
     -- course (or none) would otherwise hand the template a null to iterate
     enrolled_courses AS (
-        SELECT coalesce(json_agg(courses), '[]'::json) AS enrolled
+        SELECT coalesce(json_agg(courses ORDER BY courses.title), '[]'::json) AS enrolled
         FROM courses WHERE role IS NOT null
     ),
     non_enrolled_courses AS (
-        SELECT coalesce(json_agg(courses), '[]'::json) AS non_enrolled
+        SELECT coalesce(json_agg(courses ORDER BY courses.title), '[]'::json) AS non_enrolled
         FROM courses WHERE role IS null
     ),
     u AS (
@@ -997,7 +1006,7 @@ async def query_courses(conn: AsyncConnection, user_id: int):
     )
     SELECT row_to_json(u) FROM u;
     """)
-    res = await conn.execute(query, dict(user_id=user_id))
+    res = await conn.execute(query, dict(user_id=user_id, q=q))
     return res.scalar()
 
 

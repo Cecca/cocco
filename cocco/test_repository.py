@@ -35,6 +35,7 @@ from cocco.repository import (
     query_course_challenges,
     query_course_info,
     query_course_role,
+    query_courses,
     query_ordered_challenge_ids,
     query_sample_testcase,
     query_submission,
@@ -925,6 +926,64 @@ async def test_challenges_are_listed_in_their_stored_order():
         assert [c["title"] for c in course["challenges"]] == ["Sum", "Hello"]
         moved = await query_challenge(conn, user_id=alice, challenge_id=ordered[0])
         assert moved["number"] == 2
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_courses_page_query():
+    """The home page's list: every course, split by whether the viewer is on
+    it, and filtered by the page's search box."""
+    url = _postgres_url()
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        carol = (await query_user_by_email(conn, "carol@example.com")).id
+
+        # carol is a student on two of the three courses. Both halves come back
+        # sorted by title, and the enrolled rows carry the role the card prints.
+        courses = await query_courses(conn, user_id=carol)
+        assert [c["title"] for c in courses["enrolled"]] == [
+            "Algorithms 101",
+            "Data Structures",
+        ]
+        assert {c["role"] for c in courses["enrolled"]} == {"student"}
+        assert [c["title"] for c in courses["non_enrolled"]] == ["Systems Programming"]
+
+        # Somebody with no enrollments at all gets an empty list, not a null:
+        # that is what the `coalesce` in the query is for.
+        root = (await query_user_by_email(conn, "root@example.com")).id
+        as_root = await query_courses(conn, user_id=root)
+        assert as_root["enrolled"] == []
+        assert len(as_root["non_enrolled"]) == 3
+
+        # The filter is a case-insensitive substring of the title, and it
+        # applies to both halves at once.
+        filtered = await query_courses(conn, user_id=carol, q="dATa")
+        assert [c["title"] for c in filtered["enrolled"]] == ["Data Structures"]
+        assert filtered["non_enrolled"] == []
+
+        crossing = await query_courses(conn, user_id=carol, q="st")
+        assert [c["title"] for c in crossing["enrolled"]] == ["Data Structures"]
+        assert [c["title"] for c in crossing["non_enrolled"]] == ["Systems Programming"]
+
+        # The title only - "trees, graphs, hashing" is a description
+        assert await query_courses(conn, user_id=carol, q="hashing") == {
+            "enrolled": [],
+            "non_enrolled": [],
+        }
+
+        # A substring test, not a pattern: the characters LIKE would read as
+        # wildcards match themselves and nothing else.
+        for pattern in ("100%", "_", "%"):
+            wild = await query_courses(conn, user_id=carol, q=pattern)
+            assert wild["enrolled"] == []
+            assert wild["non_enrolled"] == []
+
+        # An empty filter is no filter, i.e. the unfiltered call above
+        assert await query_courses(conn, user_id=carol, q="") == courses
     await engine.dispose()
 
 

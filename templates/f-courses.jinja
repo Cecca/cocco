@@ -1,0 +1,54 @@
+{# Both halves of the courses list: the courses the viewer is on, then
+   everything else. Rendered standalone (htmx, from `get_fragment_courses`, on
+   every keystroke in the filter box) and inlined by `index-logged-in.jinja` on
+   first paint, so the filtered list and the initial one cannot drift apart.
+
+   Context: `courses` (`{enrolled, non_enrolled}` from `query_courses`) and
+   `q`, the filter as it was typed - the empty states say different things
+   depending on whether one is in force. #}
+
+<div class="flex items-baseline justify-between gap-4 mb-3">
+  <div>
+    <h2 class="font-bold text-lg">Your courses</h2>
+    <p class="text-[13px] text-base-content/55">
+      The ones you are enrolled on, whether as staff or as a student.
+    </p>
+  </div>
+</div>
+
+<div class="flex flex-col gap-3">
+  {% for course in courses.enrolled %}
+  {% include "_course-card.jinja" %}
+  {% else %}
+  <div class="rounded-xl border border-dashed border-base-300 bg-base-200/40 px-4 py-8 text-center text-sm text-base-content/50">
+    {% if q %}
+    None of your courses match “{{ q }}”.
+    {% else %}
+    You are not enrolled on any course yet.
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+
+<div class="flex items-baseline justify-between gap-4 mt-8 mb-3">
+  <div>
+    <h2 class="font-bold text-lg">Other courses</h2>
+    <p class="text-[13px] text-base-content/55">
+      Everything else on this server. You can look, but only staff can enroll you.
+    </p>
+  </div>
+</div>
+
+<div class="flex flex-col gap-3">
+  {% for course in courses.non_enrolled %}
+  {% include "_course-card.jinja" %}
+  {% else %}
+  <div class="rounded-xl border border-dashed border-base-300 bg-base-200/40 px-4 py-8 text-center text-sm text-base-content/50">
+    {% if q %}
+    No other course matches “{{ q }}”.
+    {% else %}
+    There are no other courses.
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>

@@ -91,6 +91,18 @@ A submission has its own page, `get_submission` at `/submissions/{id}` — flat,
 
 Uploads carry no language field: `post_submission` maps the file extension to a language through `EXTENSION_TO_LANGUAGE`, built from the same `languages.toml` the judge loads. Upload failures come back as **200 with an error alert**, not a 4xx, because htmx does not swap error responses by default.
 
+The home page (`index`, `index-logged-in.jinja`) is the courses list, in two halves: the courses the
+viewer is enrolled on — as staff or as a student, `query_courses` splits on `role IS NULL` — and
+everything else. Both are `_course-card.jinja`, the counterpart of `_challenge-card.jinja` and
+deliberately its twin, so the page reads as the same product as a course page. The filter box is
+`q`, passed straight to `query_courses`, which matches it against the **title** with `position()`
+rather than `ILIKE '%'||:q||'%'`: a substring test, so a title typed with a `%` or a `_` in it is
+matched literally and there is no escaping to get wrong. It swaps `f-courses.jinja` — both halves,
+so one request refreshes everything — and the input sits **outside** `#courses`, its own target,
+because an input rebuilt on every keystroke loses focus. The page inlines that same fragment on
+first paint. The `Enroll!` button on a course the viewer is not on is a placeholder: there is no
+self-enrollment route, and enrolment happens through course staff.
+
 Courses are created at `/courses/new` (`course-new.jinja`), reached from a button the home page
 shows only to an administrator; the form is the title and description halves of the course editor,
 and on success it answers `204` + `HX-Redirect` to the new course's editor, the way

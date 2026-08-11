@@ -1,0 +1,45 @@
+{# One course, as a card. The counterpart of `_challenge-card.jinja` and
+   deliberately the same shape, so the courses page and a course page read as
+   one product. Never served from a route, hence the `_` prefix.
+
+   Context: `course` (a row of `query_courses`, i.e. the course columns plus
+   the viewer's enrollment columns - `role` is NULL for a course they are not
+   on). `EDITOR_ROLE_NAMES` is a Jinja global.
+#}
+<div class="card bg-base-100 border border-base-300 shadow-sm transition-colors hover:border-primary/40">
+  <div class="card-body flex-row items-center gap-4 p-5">
+
+    <div class="min-w-0 flex-1">
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+        {{ course.role if course.role else "Course" }}
+      </p>
+      <h3 class="font-serif text-xl font-semibold tracking-tight mt-0.5">
+        <a href="{{ url_for('get_course', course_id=course.id) }}"
+           class="hover:text-primary">
+          {{ course.title }}
+        </a>
+      </h3>
+      {# The description is markdown; two lines of its source is a blurb, and
+         the rendered body belongs to the course page. #}
+      {% if course.description %}
+      <p class="text-[13px] text-base-content/55 mt-1 line-clamp-2">{{ course.description }}</p>
+      {% endif %}
+    </div>
+
+    <div class="flex items-center gap-2">
+      {% if course.role in EDITOR_ROLE_NAMES %}
+      <a href="{{ url_for('get_course_edit', course_id=course.id) }}"
+         class="btn btn-sm btn-ghost gap-1.5 font-semibold border border-base-300">
+        <span class="text-primary">✎</span> Edit
+      </a>
+      {% elif not course.role %}
+      {# A placeholder: there is no self-enrollment route yet, so this button
+         does nothing. Enrolment happens through course staff. #}
+      <button class="btn btn-sm btn-secondary">Enroll!</button>
+      {% endif %}
+      <a href="{{ url_for('get_course', course_id=course.id) }}"
+         class="btn btn-sm btn-ghost font-mono text-base-content/50 hover:text-primary"
+         aria-label="Open {{ course.title }}">→</a>
+    </div>
+  </div>
+</div>

@@ -257,6 +257,10 @@ templates.env.filters["datetime"] = render_datetime
 templates.env.filters["score"] = render_score
 templates.env.filters["duration"] = render_duration
 
+# A global rather than a context key: `_course-card.jinja` is included from two
+# places and only needs to know whether a `role` string means course staff.
+templates.env.globals["EDITOR_ROLE_NAMES"] = EDITOR_ROLE_NAMES
+
 
 async def create_db_and_tables(dummy=False):
     async with engine.begin() as conn:
@@ -925,19 +929,37 @@ async def on_startup():
 
 
 @app.get("/")
-async def index(request: Request, db: DBDep, user: CurrentUser):
-    courses = await query_courses(db, user_id=user.id)
+async def index(request: Request, db: DBDep, user: CurrentUser, q: str = ""):
+    courses = await query_courses(db, user_id=user.id, q=q)
     return templates.TemplateResponse(
         request=request,
         name="index-logged-in.jinja",
         context={
             "courses": courses,
+            "q": q,
             "title": "COCCO: Coding Challenges Companion",
             "user": user,
+            "nav": "courses",
             # Only an administrator is offered "New course". The route behind
             # the button checks for itself - see `require_admin`.
             "can_create_course": await user_is_admin(db, user.id),
         },
+    )
+
+
+@app.get("/f/courses")
+async def get_fragment_courses(request: Request, db: DBDep, user: CurrentUser, q: str = ""):
+    """Both halves of the courses list, re-rendered as the filter box is typed
+    in. The page inlines this same fragment on first paint, so the filtered
+    list and the initial one cannot drift apart.
+
+    No authorization beyond `CurrentUser`: this is exactly what `index` shows,
+    and every course is visible to every signed-in user."""
+    courses = await query_courses(db, user_id=user.id, q=q)
+    return templates.TemplateResponse(
+        request=request,
+        name="f-courses.jinja",
+        context={"courses": courses, "q": q, "user": user},
     )
 
 
