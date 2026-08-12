@@ -1,7 +1,6 @@
 """Tests for the pure helpers of the HTTP layer. Nothing here needs a database
 or a running app - the routes themselves are exercised by hand for now."""
 
-from pathlib import Path
 
 import pytest
 
@@ -26,7 +25,7 @@ def _outcome(is_sample: bool, **overrides):
     return outcome
 
 
-@pytest.mark.parametrize("language", sorted(load_languages(Path("languages.toml"))))
+@pytest.mark.parametrize("language", sorted(load_languages()))
 def test_render_source_knows_every_language(language):
     """Every name in languages.toml is a Pygments alias too, which is the whole
     reason the submission's `language` column can be used as the lexer name."""

@@ -397,7 +397,15 @@ class Language:
         )
 
 
-def load_languages(path: Path) -> Dict[str, Language]:
+# `languages.toml` is part of the checkout rather than a runtime setting - see
+# the comment in `run_from_queue` on why it is deliberately not configurable -
+# so it is resolved relative to this module and never to the working directory,
+# the same rule `cocco/evaluators/` states for the bundled scripts. Without it,
+# `python -m cocco.judge` works from the repository root and nowhere else.
+LANGUAGES_PATH = Path(__file__).resolve().parent.parent / "languages.toml"
+
+
+def load_languages(path: Path = LANGUAGES_PATH) -> Dict[str, Language]:
     with open(path, "rb") as fp:
         data = tomllib.load(fp)
     languages = {name: Language(name=name, **cfg) for name, cfg in data.items()}
@@ -649,7 +657,7 @@ async def run_submission(
         run_data.language,
         len(run_data.test_cases),
     )
-    languages = load_languages(Path("languages.toml"))
+    languages = load_languages()
     runtime: Language = languages[run_data.language]
 
     outcomes = []

@@ -1,4 +1,3 @@
-from pathlib import Path
 from typing import Annotated
 import markdown as md
 from markupsafe import Markup
@@ -210,10 +209,11 @@ templates = Jinja2Templates(directory="templates")
 storage = Storage(CONFIG.storage.root)
 
 # Uploads are mapped to a language by their extension, so the challenge page
-# needs no language picker. `languages.toml` is the same file the judge loads,
-# and so is the mapping - an evaluator script is recognised by exactly the rule
-# a submitted solution is.
-LANGUAGES = load_languages(Path("languages.toml"))
+# needs no language picker. `languages.toml` is the same file the judge loads -
+# literally, since `load_languages` resolves it against the checkout rather
+# than the working directory - and so is the mapping: an evaluator script is
+# recognised by exactly the rule a submitted solution is.
+LANGUAGES = load_languages()
 EXTENSION_TO_LANGUAGE = extension_to_language(LANGUAGES)
 
 MAX_UPLOAD_BYTES = 1 << 20

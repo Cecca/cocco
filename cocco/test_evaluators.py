@@ -17,7 +17,7 @@ from cocco.evaluators import BUNDLED, DEFAULT_EVALUATOR, bundled_path
 from cocco.schema import EvaluatorResult
 
 
-LANGUAGES = cj.load_languages(Path("languages.toml"))
+LANGUAGES = cj.load_languages()
 
 
 def run_bundled(

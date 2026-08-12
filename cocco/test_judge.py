@@ -32,7 +32,7 @@ async def test_python_run():
 
 @pytest.mark.integration
 async def test_language_python():
-    python = cj.load_languages(Path("languages.toml"))["python"]
+    python = cj.load_languages()["python"]
     with tempfile.TemporaryDirectory(delete=False) as tmp:
         tmp = Path(tmp)
         script_path = tmp / "script.py"
@@ -52,7 +52,7 @@ async def test_language_python():
 
 @pytest.mark.integration
 async def test_language_c():
-    c = cj.load_languages(Path("languages.toml"))["c"]
+    c = cj.load_languages()["c"]
     with tempfile.TemporaryDirectory(delete=False) as tmp:
         tmp = Path(tmp)
         script_path = tmp / "hello.c"
@@ -81,7 +81,7 @@ async def test_language_c():
 
 @pytest.mark.integration
 async def test_language_cpp():
-    cpp = cj.load_languages(Path("languages.toml"))["cpp"]
+    cpp = cj.load_languages()["cpp"]
     with tempfile.TemporaryDirectory(delete=False) as tmp:
         tmp = Path(tmp)
         script_path = tmp / "hello.cpp"
@@ -111,7 +111,7 @@ async def test_language_cpp():
 
 @pytest.mark.integration
 async def test_language_java():
-    python = cj.load_languages(Path("languages.toml"))["java"]
+    python = cj.load_languages()["java"]
     with tempfile.TemporaryDirectory(delete=False) as tmp:
         tmp = Path(tmp)
         script_path = tmp / "Test.java"
@@ -482,7 +482,7 @@ async def test_missing_evaluator_is_reported_not_raised(tmp_path: Path):
         await cj.prepare_evaluator(
             Storage(tmp_path),
             "nowhere/checker.py",
-            cj.load_languages(Path("languages.toml")),
+            cj.load_languages(),
             tmp_path,
         )
 
@@ -494,7 +494,7 @@ async def test_evaluator_in_unknown_language_is_reported(tmp_path: Path):
         await cj.prepare_evaluator(
             storage,
             "checkers/checker.txt",
-            cj.load_languages(Path("languages.toml")),
+            cj.load_languages(),
             tmp_path,
         )
 
