@@ -69,7 +69,9 @@ The evaluator's sandbox budget is fixed in `judge.py` (`EVALUATOR_TIME_LIMIT_S`,
 
 SQLAlchemy Core `Table`s on a shared `MetaData` form the domain: `User` (with `UserRole` via `Enrollment`, and `Administrator` beside it — every `UserRole` is a *per-course* thing, so the site-wide power to create a course is its own table, keyed on the email so it can name someone who has never signed in), `Course` → `Challenge` → `TestCase` (inputs/expected outputs referenced by filesystem path, not stored in the DB — see `DESIGN.md` "Test case inputs"; `is_sample` marks the ones students may download, `is_active` the ones new submissions are graded on), `Submission` → `TestOutcome`. There is no queue table: a submission is queued when its `status` is `SubmissionStatus.queued`. `Challenge.ranking` (a `LeaderboardRanking`) is presentation-only — it picks the leaderboard the challenge page shows and the judge never reads it.
 
-`cocco/schema.py` holds the Pydantic mirrors used for validation and for the judge's `SubmissionRunData`.
+`User.blocked_at` / `blocked_reason` are the **blacklist**, and they are columns on the row rather than a table of their own — deliberately the opposite of `Administrator`, and for the opposite reason. That table is keyed on an address because it must name people who have never signed in; a block always names someone who already did something, so the account exists. Living on the row means `get_user` — which already reads it on every request — asks the question for free, and a block therefore takes effect on the blocked person's very next click. `_USER_COLUMNS` in `repository.py` is the one column list behind both `query_user` and `query_user_by_email`, spelled once because a list that carried `blocked_at` in one of them and not the other would let a blocked person in through whichever door forgot.
+
+`cocco/schema.py` holds the Pydantic mirrors used for validation and for the judge's `SubmissionRunData`. `schema.User` carries the two block fields **without defaults**: `get_user` refuses on them, so a query that selected a trimmed column list has to fail loudly at validation rather than quietly report everybody as welcome.
 
 ### Queries (`cocco/repository.py`)
 
@@ -137,6 +139,24 @@ shows only to an administrator; the form is the title and description halves of 
 and on success it answers `204` + `HX-Redirect` to the new course's editor, the way
 `post_challenge_new` lands on the challenge editor. Like the editor below, it is **declared above
 `get_course`** — `/courses/{course_id}` would otherwise swallow `/courses/new`.
+
+`/admin` (`admin.jinja`) is the site's own page, reached from a second button beside that one and
+the only other thing behind `Admin`. Unlike `/courses/new` its position among the routes is *not*
+load-bearing: `/admin` is a literal segment that collides with no path parameter. It has **one swap
+target**, `#users`, and every route on it — the filter box's GET and all three mutations — answers
+with the same `f-users.jinja`, alert included: that is `post_course_enroll` answering with the list
+it changed, with `f-enroll.jinja`'s rule folded in, and it means the sentence and the new state
+arrive in one swap instead of two that have to be kept in step. Both the filter box **and the
+appoint form sit outside `#users`**. For the filter that is the rule the home page already states,
+an input rebuilt on every keystroke loses focus; for the appoint form it is one step further —
+the filter re-renders that div on *every keystroke*, so a form inside it would have a half-typed
+address wiped by somebody typing in the box above. Every mutation carries `q`, so acting under a
+filter leaves the filter in force. `post_administrator`'s `email` is a **defaulted** `Form` field
+rather than a required one, because a missing field is a `422` and htmx drops the body of an error
+response — the person who submitted an empty box would see nothing at all. Blocking is an inline
+per-row form with a reason box, not the `<dialog class="modal">` `challenge-staff.jinja` uses for
+a regrade: that precedent is for an irreversible action, blocking is undone by the button that
+replaces it, and N dialogs with N unique ids would be rebuilt on every keystroke in the filter.
 
 The course has an editor of its own at `/courses/{course_id}/edit` — the course's title and description (the same markdown textarea and `post_markdown_preview` the challenge form uses) plus the challenge list, reorderable with ↑/↓. It is **declared above `get_challenge`**, and that is load-bearing: `/courses/{course_id}/{challenge_id}` matches any single segment, so a `/courses/1/edit` declared after it would route there and be rejected as an unparseable id. The cards themselves are `_challenge-card.jinja`, shared by the course page and by `f-course-challenges.jinja` — the fragment every move swaps in — so the student's list and the editor's cannot drift apart.
 
@@ -232,6 +252,37 @@ the table on every boot with `ON CONFLICT DO NOTHING`, because a brand new deplo
 to appoint its first administrator. It only ever adds — deleting the line demotes nobody, and
 removing an administrator is a `DELETE` on the table.
 
+**`/admin` is the second thing `Admin` guards**, which is why `require_admin`'s sentence names the
+permission ("Only a site administrator can do that.") rather than either of the two places it is
+used. The page lists everyone, appoints administrators and blocks accounts. Appointing takes an
+**address**, not a user id — that is what the table holds, and naming somebody before their first
+sign-in is the point of it — and it is the only place in the app where a human types an address,
+so it is the only one that calls `normalize_email` and refuses an address outside
+`allowed_domains`. `_load_auth_config` merely *warns* about the same thing, because a bad line in
+`cocco.toml` must not stop the app from booting; a form has somebody in front of it who can fix
+the typo. **There is no revoke**: removing an administrator is still a `DELETE`.
+
+That absence is load-bearing, and two guards follow from it. **An administrator is never blocked**
+— enforced inside `block_user`'s `WHERE` clause, not by a check before the write, so an
+appointment cannot land between the two — and **a blocked address is never appointed**. Either one
+alone would leave a way to make an administrator who cannot sign in and cannot be unmade. It is
+also what keeps `just dev` safe: `COCCO_DUMMY_USER` defaults to the seeded administrator. The two
+escape hatches belong side by side: `DELETE FROM administrator WHERE email = '…';` and
+`UPDATE "user" SET blocked_at = NULL WHERE email = '…';`
+
+**The block is enforced in `get_user`, on both branches** — including the `DUMMY_AUTH` one, or
+dummy auth would be the single configuration in which the feature does not exist, which is the
+configuration it gets developed in — and again in the Google callback, so a blocked person gets a
+sentence on the page they are looking at instead of a session that dies on the first click.
+`Blocked` is a `Forbidden` subclass, so it stays a page and would degrade to `403.jinja` if its
+handler were ever removed; `handle_blocked` renders `blocked.jinja` with **no viewer at all**,
+because the navbar's avatar is itself behind `CurrentUser` and would 403 into a broken image on the
+very page explaining the block — which is why `get_user` refuses *before* it stashes
+`request.state.user`. The session is **not** cleared: that would bounce every later request to a
+login page that explains nothing. Polled fragments simply freeze and poll into 403s, exactly as
+they do for a student unenrolled mid-session; deliberately not the `HX-Redirect`
+`handle_not_authenticated` sends, which would conflate being blocked with being signed out.
+
 **An administrator is course staff on every course**, enrolled or not. That lives in exactly one
 place: `effective_course_role` (and `effective_challenge_role`, for the routes whose URL carries
 only a challenge) returns the enrollment's role, or `teacher` when the asker is an administrator —
@@ -271,6 +322,7 @@ was enrolled when they submitted, because `post_submission` is behind the gate t
 - **An isolate box is one flat directory.** `isolate_run` copies every path argument in under its *basename*, so unrelated paths collapse into one namespace, and the copy order — `box_files`, then `args`, then `additional_files` — decides who wins a collision. `box_files` is the explicit form and the only safe one when more than one file is involved: the evaluator gets its three arguments as `.actual_output`, `.expected_output` and `.test_input`, names nothing can collide with because `safe_filename` strips leading dots from every upload. Without it, a checker uploaded as `expected_output.c` compiles to a binary named `expected_output` that lands on top of the expected output it was meant to read.
 - **Scores are per test case, in `[0, 1]`.** A submission's headline score is the mean of its outcomes' scores, shown out of 100. This aggregation assumes higher-is-better, so it is wrong for a challenge whose evaluator uses another scale — nothing enforces the range, and an evaluator is free to return any finite float.
 - **The leaderboard's criterion is per challenge.** `challenge.ranking` is set by course staff in the editor and drives `query_challenge_leaderboard`, whose three variants live in `_LEADERBOARD_CRITERIA` as literal SQL keyed by the enum — the criterion is never taken from a request as text. `running_time` is the strict board: a submission is on it only if it passed *every* test, ranked by the sum of the per-test times. `total_score` and `average_score` rank by score, descending, and deliberately admit partially correct submissions, because a partial-credit evaluator is the case where nobody passes everything; both assume higher-is-better and so are wrong for an evaluator that is not, same as the headline score. Whichever the criterion, a student appears once, represented by their best submission, and every row carries all three metrics plus `n_tests` so the fragment can render the one that applies.
+- **A block stops a person, it does not retract their work.** The judge grades a blocked student's queued submissions — `pull_queued_submission` does not know who submitted and should not learn: skipping those rows would strand them as `queued` forever, showing as pending in every teacher's standings and muddying the `count_running_submissions` check that guards a regrade. Standings and leaderboards go on listing them for the same reason: they are the record of what happened on a course, and it did happen. Nothing blocked is seeded either — a blocked `COCCO_DUMMY_USER` would lock a developer out of their own fresh checkout, which is exactly the trap "an administrator is never blocked" exists to avoid.
 - **A hidden test case gives away nothing but its verdict.** `visible_outcomes` in `main.py` blanks an outcome's `message`, `stdout` and `stderr` unless the test case is a public sample or the viewer is course staff: `stdout`/`stderr` are the submitted program's own output — the obvious way to print a hidden input back out — and `message` is now written by a *teacher's script that has just read the hidden input and the expected output*, which makes the rule matter more, not less — `diff.py` puts the expected output in it verbatim. The verdict, the score and the resource usage are always shown. Compiler output is exempt, and has its own block on the submission page: it does not depend on any test input. Redact in that function, not in the template, so the rule stays unit testable.
 - **An anonymous htmx request gets `HX-Redirect`, not a 302.** `get_user` raises `NotAuthenticated` rather than returning a redirect — a dependency cannot return a `Response` — and the handler branches on the `HX-Request` header. This matters because most of the app is `f-*` fragments polled every few seconds: htmx follows a redirect inside the XHR, so a 302 would splice the whole login page into whatever div was polling, over and over. A 204 with `HX-Redirect` navigates the browser instead.
 - **A secret never has a fixed default.** With neither `COCCO_SECRET_KEY` nor `[session].secret_key` set, `load_config` generates a random key per process and logs a warning: an unconfigured deployment then logs everybody out on every restart and no two workers agree, which is loud. A constant in the source tree would be a signing key that ships with the code, which is silent.

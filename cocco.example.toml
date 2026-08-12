@@ -26,16 +26,21 @@ max_age = 1209600
 # admits nobody: a misconfiguration should lock the door, not open it.
 allowed_domains = ["unipd.it"]
 
-# The site's administrators: the people who may create a course. Unlike
-# `teacher` or `student`, this is not a role on any enrollment - a course being
-# created does not exist yet - so it lives in its own table, and these addresses
-# are inserted into it on every startup.
+# The site's administrators: the people who may create a course and open the
+# admin page at /admin. Unlike `teacher` or `student`, this is not a role on any
+# enrollment - a course being created does not exist yet - so it lives in its
+# own table, and these addresses are inserted into it on every startup.
 #
 # A *bootstrap*, not the truth. It is how a brand new deployment gets its first
 # administrator, since there is nobody there to appoint one; afterwards the
-# table is what is asked. So it only ever adds: deleting a line from here
-# demotes nobody, and the way to remove an administrator is
+# table is what is asked, and /admin is where further ones are appointed. So it
+# only ever adds: deleting a line from here demotes nobody, and the way to
+# remove an administrator is
 #   DELETE FROM administrator WHERE email = '...';
+# There is deliberately no revoke button - and for the same reason, /admin will
+# not block an administrator, since a blocked one could never be let back in.
+# Undoing a block by hand, if it ever comes to that, is
+#   UPDATE "user" SET blocked_at = NULL, blocked_reason = NULL WHERE email = '...';
 #
 # An address is listed before its owner has ever signed in - the account is
 # created on the first accepted callback from Google - so it must be one

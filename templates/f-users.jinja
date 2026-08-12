@@ -1,0 +1,140 @@
+{# Everyone the site knows about. Rendered standalone by every route on the
+   admin page - the filter box's GET and all three mutations - and inlined by
+   `admin.jinja` on first paint, so the list a click leaves behind is the one
+   the box would have produced.
+
+   Context: `users` (`{accounts, pending_administrators}` from `query_users`),
+   `q`, the filter as it was typed - the empty state says different things
+   depending on whether one is in force - and `message`/`ok`, the alert every
+   mutation answers with. The alert lives *inside* the swap rather than in a
+   div of its own: one target means the sentence and the new state arrive
+   together instead of having to be kept in step. #}
+
+{% if message %}
+<div class="mb-4">
+  {% include "f-edit-result.jinja" %}
+</div>
+{% endif %}
+
+<div class="overflow-x-auto">
+  <table class="table">
+    <thead>
+      <tr class="text-xs uppercase tracking-wider text-base-content/45 font-mono">
+        <th>Person</th>
+        <th class="w-28 text-right">Courses</th>
+        <th class="w-32 text-right">Submissions</th>
+        <th class="w-44">Last submitted</th>
+        <th class="w-80"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for u in users.accounts %}
+      <tr class="hover">
+        <td>
+          <div class="flex items-center gap-2.5">
+            <img src="{{ url_for('user_avatar', user_id=u.id) }}"
+                 alt="{{ u.nickname }}'s avatar"
+                 class="w-7 h-7 rounded-full bg-base-200 object-cover" />
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="font-semibold">{{ u.nickname }}</span>
+                {% if u.is_admin %}
+                <span class="badge badge-primary badge-sm font-mono">admin</span>
+                {% endif %}
+                {% if u.is_blocked %}
+                <span class="badge badge-error badge-sm font-mono">blocked</span>
+                {% endif %}
+              </div>
+              <div class="text-[13px] text-base-content/55 font-mono">{{ u.email }}</div>
+              {% if u.is_blocked %}
+              <div class="text-[13px] text-error mt-0.5">
+                Blocked {{ u.blocked_at | datetime }}.
+                {{ u.blocked_reason or "No reason was recorded." }}
+              </div>
+              {% endif %}
+            </div>
+          </div>
+        </td>
+        <td class="text-right font-mono text-sm text-base-content/60">{{ u.n_courses }}</td>
+        <td class="text-right font-mono text-sm text-base-content/60">{{ u.n_submissions }}</td>
+        <td class="text-sm text-base-content/60">
+          {{ u.last_submitted | datetime if u.last_submitted else "—" }}
+        </td>
+        <td>
+          {% if u.is_admin %}
+          {# The invariant, made visible: `block_user` refuses on an
+             administrator in its WHERE clause. Appointing is one-way through
+             the app, so a blocked administrator would be a lockout with no way
+             back. #}
+          <span class="text-[13px] text-base-content/45">
+            An administrator cannot be blocked.
+          </span>
+          {% elif u.is_blocked %}
+          <form hx-post="{{ url_for('post_user_unblock', user_id=u.id) }}"
+                hx-target="#users"
+                hx-swap="innerHTML"
+                hx-disabled-elt="find button">
+            <input type="hidden" name="q" value="{{ q }}" />
+            <button type="submit" class="btn btn-xs btn-ghost border border-base-300 font-semibold">
+              Unblock
+            </button>
+          </form>
+          {% else %}
+          {# An inline form rather than a confirmation dialog: blocking is undone
+             by the button that replaces this one, so there is nothing to
+             confirm - what it needs is somewhere to type the reason. A
+             `<dialog>` per row would also be rebuilt on every keystroke in the
+             filter box above. #}
+          <form hx-post="{{ url_for('post_user_block', user_id=u.id) }}"
+                hx-target="#users"
+                hx-swap="innerHTML"
+                hx-disabled-elt="find button"
+                class="flex items-center gap-1.5">
+            <input type="hidden" name="q" value="{{ q }}" />
+            <input type="text" name="reason" autocomplete="off"
+                   placeholder="reason (shown to them)"
+                   aria-label="Why {{ u.nickname }} is being blocked"
+                   class="input input-xs flex-1" />
+            <button type="submit" class="btn btn-xs btn-error btn-outline font-semibold">
+              Block
+            </button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="5" class="text-center text-sm text-base-content/45 py-6">
+          {% if q %}
+          Nobody matches “{{ q }}”.
+          {% else %}
+          Nobody has signed in yet.
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{# `administrator` is keyed on an address, not on an account, precisely so it
+   can name somebody who has never signed in - including the person just
+   appointed by the form above. Without this list that click would look like it
+   did nothing. #}
+{% if users.pending_administrators %}
+<div class="mt-8">
+  <h2 class="font-bold text-lg">Appointed, never signed in</h2>
+  <p class="text-[13px] text-base-content/55 mb-3">
+    Administrators who have no account yet. One appears the first time they sign
+    in with Google.
+  </p>
+  <div class="flex flex-col gap-2">
+    {% for pending in users.pending_administrators %}
+    <div class="rounded-xl border border-base-300 bg-base-100 px-4 py-3 flex items-center gap-2">
+      <span class="badge badge-primary badge-sm font-mono">admin</span>
+      <span class="font-mono text-sm">{{ pending.email }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}

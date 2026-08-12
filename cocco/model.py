@@ -76,6 +76,17 @@ User = Table(
     Column("nickname", String, nullable=False),
     Column("image", LargeBinary, nullable=False),
     Column("image_mime", String, nullable=False),
+    # Shut out of the site entirely, and why. Columns on the row rather than a
+    # table of their own - the opposite of `Administrator`, and for the opposite
+    # reason: that one has to be able to name someone who has never signed in,
+    # while a block always names someone who already did something, so the
+    # account exists. Putting it here means `get_user` - which already reads
+    # this row on every single request - asks the question for free, and a block
+    # takes effect on the blocked person's very next click.
+    Column("blocked_at", DateTime, nullable=True),
+    # Written by an administrator and shown to the blocked person, so it is the
+    # sentence they read rather than a note for a log.
+    Column("blocked_reason", String, nullable=True),
 )
 
 

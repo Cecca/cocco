@@ -1,0 +1,44 @@
+{# What a blocked account sees, on every request it makes. Rendered by
+   `handle_blocked`.
+
+   Context: `reason`, the sentence an administrator wrote for them, and `user`,
+   which is always None here - the navbar's avatar is behind `CurrentUser` and
+   would 403 into a broken image on this very page. `base.jinja` guards on it.
+
+   The sign-out form is the one control that still works for them, and the way
+   to stop an open tab from polling into 403s. #}
+{% extends "base.jinja" %}
+{% block title %}{{ title }}{% endblock %}
+
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+  <div class="card bg-base-100 border border-base-300 shadow-sm">
+    <div class="card-body p-8">
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+        Account blocked
+      </p>
+      <h1 class="font-serif text-4xl font-semibold tracking-tight mt-1 mb-3">
+        You are shut out
+      </h1>
+      <p class="text-base-content/70">
+        An administrator has blocked this account, so nothing on this server is
+        open to you.
+      </p>
+      <div role="alert" class="alert alert-error py-2 text-sm mt-4">
+        <span>{{ reason }}</span>
+      </div>
+      <p class="text-[13px] text-base-content/55 mt-4">
+        If you think this is a mistake, take it up with whoever runs this server.
+      </p>
+      <div class="mt-6">
+        <form action="{{ url_for('post_logout') }}" method="post">
+          <button type="submit"
+                  class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+            Sign out
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+</main>
+{% endblock %}

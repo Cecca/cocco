@@ -21,6 +21,7 @@ from cocco.model import (
 from cocco.model import LeaderboardRanking, UserRole
 from cocco.auth import get_or_create_user
 from cocco.repository import (
+    block_user,
     challenge_in_course,
     count_running_submissions,
     count_testcase_outcomes,
@@ -48,12 +49,16 @@ from cocco.repository import (
     query_sample_testcase,
     query_submission,
     query_submission_outcomes,
+    query_user,
     query_user_by_email,
     query_user_role,
     query_user_submissions,
+    query_users,
     regrade_challenge,
     reorder_challenges,
+    unblock_user,
 )
+from cocco import schema
 from cocco.schema import SubmissionRunData
 
 
@@ -69,12 +74,12 @@ def _make_example_database(db_url="sqlite:///:memory:"):
 
     with engine.begin() as conn:
         users = [
-            ("root@example.com", "root"),
-            ("alice@example.com", "alice"),
-            ("bob@example.com", "bob"),
-            ("carol@example.com", "carol"),
-            ("dave@example.com", "dave"),
-            ("erin@example.com", "erin"),
+            ("root@unipd.it", "root"),
+            ("alice@unipd.it", "alice"),
+            ("bob@unipd.it", "bob"),
+            ("carol@unipd.it", "carol"),
+            ("dave@unipd.it", "dave"),
+            ("erin@unipd.it", "erin"),
         ]
         user_ids = {}
         for email, nickname in users:
@@ -244,7 +249,7 @@ async def test_get_queued_submission_returns_oldest_queued():
         user_id = conn.execute(
             insert(User)
             .values(
-                email="me@example.com",
+                email="me@unipd.it",
                 nickname="the-admin",
                 image=image,
                 image_mime=image_mime,
@@ -318,7 +323,7 @@ async def test_queued_submission_carries_the_challenge_evaluator():
         user_id = conn.execute(
             insert(User)
             .values(
-                email="me@example.com",
+                email="me@unipd.it",
                 nickname="the-admin",
                 image=image,
                 image_mime=image_mime,
@@ -363,7 +368,7 @@ async def test_queued_submission_skips_retired_testcases():
         user_id = conn.execute(
             insert(User)
             .values(
-                email="me@example.com",
+                email="me@unipd.it",
                 nickname="the-admin",
                 image=image,
                 image_mime=image_mime,
@@ -810,6 +815,82 @@ async def test_bootstrapping_administrators_is_idempotent():
     await engine.dispose()
 
 
+async def test_blocking_never_touches_an_administrator():
+    """The rule lives in `block_user`'s WHERE clause, not in a check before it.
+
+    Appointing is one-way through the app, so a blocked administrator would be
+    a lockout with no way back - and a check and a write that are two
+    statements can be told apart by an appointment landing between them.
+    """
+    engine = await _async_database()
+    async with engine.connect() as conn:
+        admin = await insert_user(conn, "matteo@unipd.it", "matteo", b"", "image/svg+xml")
+        student = await insert_user(conn, "bob@unipd.it", "bob", b"", "image/svg+xml")
+        await insert_administrators(conn, ["matteo@unipd.it"])
+        await conn.commit()
+
+        assert not await block_user(conn, admin, "abusive")
+        assert (await query_user(conn, admin)).blocked_at is None
+
+        assert await block_user(conn, student, "spamming the judge")
+        await conn.commit()
+        row = await query_user(conn, student)
+        assert row.blocked_at is not None
+        assert row.blocked_reason == "spamming the judge"
+    await engine.dispose()
+
+
+async def test_blocking_an_absent_user_changes_nothing():
+    """False for an id that is not there, exactly as for an administrator: the
+    route says the same thing about both, because in both cases nothing
+    happened."""
+    engine = await _async_database()
+    async with engine.connect() as conn:
+        assert not await block_user(conn, 404, "who?")
+        assert not await unblock_user(conn, 404)
+    await engine.dispose()
+
+
+async def test_unblocking_forgets_the_reason():
+    """The reason exists to be shown to the person it shut out, so it has no
+    life after they are let back in."""
+    engine = await _async_database()
+    async with engine.connect() as conn:
+        student = await insert_user(conn, "bob@unipd.it", "bob", b"", "image/svg+xml")
+        await conn.commit()
+
+        assert await block_user(conn, student, "spamming the judge")
+        assert await unblock_user(conn, student)
+        await conn.commit()
+
+        row = await query_user(conn, student)
+        assert row.blocked_at is None
+        assert row.blocked_reason is None
+    await engine.dispose()
+
+
+async def test_a_block_reaches_both_user_lookups():
+    """`get_user` reads nothing but these two, so a trimmed column list in
+    either one would fail open - the block would simply not be there to see."""
+    engine = await _async_database()
+    async with engine.connect() as conn:
+        student = await insert_user(conn, "bob@unipd.it", "bob", b"", "image/svg+xml")
+        await block_user(conn, student, "spamming the judge")
+        await conn.commit()
+
+        by_id = await query_user(conn, student)
+        by_email = await query_user_by_email(conn, "bob@unipd.it")
+        for row in (by_id, by_email):
+            assert row is not None
+            assert row.blocked_at is not None
+            assert row.blocked_reason == "spamming the judge"
+
+        # And the model built from either of them carries it, which is what
+        # `get_user` actually refuses on.
+        assert schema.User.model_validate(by_id).blocked_at is not None
+    await engine.dispose()
+
+
 async def test_insert_challenge_and_its_course():
     engine = await _async_database()
     async with engine.connect() as conn:
@@ -876,7 +957,7 @@ async def test_course_page_query_survives_an_empty_course():
         ).scalar_one()
         await conn.commit()
 
-        carol = (await query_user_by_email(conn, "carol@example.com")).id
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
 
         populated = await query_course_info(conn, 1, user_id=carol)
         assert populated is not None
@@ -901,8 +982,8 @@ async def test_the_course_page_says_who_has_submitted():
 
     engine = create_async_engine(url)
     async with engine.connect() as conn:
-        carol = (await query_user_by_email(conn, "carol@example.com")).id
-        erin = (await query_user_by_email(conn, "erin@example.com")).id
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
+        erin = (await query_user_by_email(conn, "erin@unipd.it")).id
 
         # Carol submitted twice to Hello and once to Sum; dave submitted to
         # Hello as well, so that one has two distinct submitters.
@@ -934,7 +1015,7 @@ async def test_challenges_are_listed_in_their_stored_order():
 
     engine = create_async_engine(url)
     async with engine.connect() as conn:
-        alice = (await query_user_by_email(conn, "alice@example.com")).id
+        alice = (await query_user_by_email(conn, "alice@unipd.it")).id
 
         # Seeded without touching `position`, so every row sits at the default
         # and the ids alone decide. This is also the case a plain swap cannot
@@ -973,7 +1054,7 @@ async def test_courses_page_query():
 
     engine = create_async_engine(url)
     async with engine.connect() as conn:
-        carol = (await query_user_by_email(conn, "carol@example.com")).id
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
 
         # carol is a student on two of the three courses. Both halves come back
         # sorted by title, and the enrolled rows carry the role the card prints.
@@ -987,7 +1068,7 @@ async def test_courses_page_query():
 
         # Somebody with no enrollments at all gets an empty list, not a null:
         # that is what the `coalesce` in the query is for.
-        root = (await query_user_by_email(conn, "root@example.com")).id
+        root = (await query_user_by_email(conn, "root@unipd.it")).id
         as_root = await query_courses(conn, user_id=root)
         assert as_root["enrolled"] == []
         assert len(as_root["non_enrolled"]) == 3
@@ -1021,6 +1102,78 @@ async def test_courses_page_query():
 
 
 @pytest.mark.integration
+async def test_users_page_query():
+    """The admin page's list: everyone with an account, plus the appointed
+    addresses that have none yet."""
+    url = _postgres_url()
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        await insert_administrators(conn, ["alice@unipd.it", "nobody@unipd.it"])
+        bob = (await query_user_by_email(conn, "bob@unipd.it")).id
+        await block_user(conn, bob, "spamming the judge")
+        await conn.commit()
+
+        users = await query_users(conn)
+        by_nickname = {u["nickname"]: u for u in users["accounts"]}
+
+        # Sorted by nickname, and everyone with an account is here - including
+        # root, who is on no course and has submitted nothing.
+        assert [u["nickname"] for u in users["accounts"]] == [
+            "alice", "bob", "carol", "dave", "erin", "root",
+        ]
+
+        # The badge comes from `administrator`, which is not a role on a course:
+        # alice teaches two courses and bob teaches one, and only alice is here.
+        assert by_nickname["alice"]["is_admin"]
+        assert not by_nickname["bob"]["is_admin"]
+
+        assert by_nickname["bob"]["is_blocked"]
+        assert by_nickname["bob"]["blocked_reason"] == "spamming the judge"
+        assert by_nickname["bob"]["blocked_at"] is not None
+        assert not by_nickname["carol"]["is_blocked"]
+        assert by_nickname["carol"]["blocked_reason"] is None
+
+        # The two counts, against the seeded enrollments and submissions.
+        assert (by_nickname["carol"]["n_courses"], by_nickname["carol"]["n_submissions"]) == (2, 4)
+        assert (by_nickname["dave"]["n_courses"], by_nickname["dave"]["n_submissions"]) == (2, 3)
+        # Zero and not null: a left join over somebody who has done neither.
+        assert (by_nickname["root"]["n_courses"], by_nickname["root"]["n_submissions"]) == (0, 0)
+        assert by_nickname["root"]["last_submitted"] is None
+        assert by_nickname["carol"]["last_submitted"] is not None
+
+        # Appointed and never signed in: the whole reason this list exists,
+        # since `administrator` is keyed on an address and `user` on an account.
+        assert [p["email"] for p in users["pending_administrators"]] == ["nobody@unipd.it"]
+
+        # The filter matches the nickname...
+        assert [u["nickname"] for u in (await query_users(conn, q="CAro"))["accounts"]] == ["carol"]
+        # ...and the address, which is the half that matters when somebody is
+        # looking up a person they only know by their institutional address.
+        found = await query_users(conn, q="dave@example")
+        assert [u["nickname"] for u in found["accounts"]] == ["dave"]
+        # It reaches the appointed addresses too, so a filtered page does not
+        # quietly drop half of what it is for.
+        pending = await query_users(conn, q="nobody")
+        assert pending["accounts"] == []
+        assert [p["email"] for p in pending["pending_administrators"]] == ["nobody@unipd.it"]
+
+        # A substring test, not a pattern: the characters LIKE would read as
+        # wildcards match themselves and nothing else.
+        for pattern in ("100%", "_", "%"):
+            wild = await query_users(conn, q=pattern)
+            assert wild["accounts"] == []
+            assert wild["pending_administrators"] == []
+
+        # An empty filter is no filter, i.e. the unfiltered call above
+        assert await query_users(conn, q="") == users
+    await engine.dispose()
+
+
+@pytest.mark.integration
 async def test_self_enrollment():
     """The home page's `Enroll!` button: it makes students, only students, and
     never unmakes anything. Postgres-only - it rests on ON CONFLICT."""
@@ -1031,7 +1184,7 @@ async def test_self_enrollment():
 
     engine = create_async_engine(url)
     async with engine.connect() as conn:
-        carol = (await query_user_by_email(conn, "carol@example.com")).id
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         systems = (await query_courses(conn, user_id=carol))["non_enrolled"][0]
         assert systems["title"] == "Systems Programming"
 
@@ -1062,7 +1215,7 @@ async def test_self_enrollment():
 
         # The guarantee that matters: an existing role is never overwritten, so
         # this can neither promote anyone nor demote the course's own teacher.
-        bob = (await query_user_by_email(conn, "bob@example.com")).id
+        bob = (await query_user_by_email(conn, "bob@unipd.it")).id
         await insert_self_enrollment(conn, user_id=bob, course_id=systems["id"])
         await conn.commit()
         assert (
@@ -1082,7 +1235,7 @@ async def test_the_enrollment_key_is_reported_but_never_returned():
 
     engine = create_async_engine(url)
     async with engine.connect() as conn:
-        carol = (await query_user_by_email(conn, "carol@example.com")).id
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         # carol is a student on Algorithms 101 and not on Systems Programming,
         # so one of each half of the home page gets a key
         await conn.execute(

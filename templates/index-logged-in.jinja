@@ -15,13 +15,22 @@
         <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
           Coding Challenges Companion
         </p>
-        {# Only an administrator is offered this; `require_admin` behind the route is
-           what actually stops everyone else. #}
+        {# Only an administrator is offered these; `require_admin` behind both
+           routes is what actually stops everyone else. The admin page is
+           reached from here rather than from the navbar because this context is
+           the only one that already knows the answer - putting the link in
+           `base.jinja` would mean threading `is_admin` through every page. #}
         {% if is_admin %}
-        <a href="{{ url_for('get_course_new') }}"
-           class="btn btn-sm btn-ghost border border-base-300 font-semibold -mt-1">
-          New course
-        </a>
+        <div class="flex items-center gap-2 -mt-1">
+          <a href="{{ url_for('get_admin') }}"
+             class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+            Administration
+          </a>
+          <a href="{{ url_for('get_course_new') }}"
+             class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+            New course
+          </a>
+        </div>
         {% endif %}
       </div>
       <h1 class="font-serif text-4xl font-semibold tracking-tight mt-1 mb-4">Courses</h1>

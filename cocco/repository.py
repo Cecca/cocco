@@ -5,8 +5,19 @@ or their combinations
 """
 
 from collections.abc import Iterable
+from datetime import datetime
 
-from sqlalchemy import Connection, and_, delete, func, insert, select, text, update
+from sqlalchemy import (
+    Connection,
+    and_,
+    delete,
+    exists,
+    func,
+    insert,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -696,20 +707,73 @@ async def challenge_in_course(
     return (await conn.execute(stmt)).first() is not None
 
 
+"""The columns behind a `schema.User`.
+
+Spelled once, because the block is asked about on every request and both
+lookups below feed the same model: a list that carried `blocked_at` in one of
+them and not the other would let a blocked person in through whichever door
+forgot. `image` is deliberately absent - the avatar has a route of its own.
+"""
+_USER_COLUMNS = (
+    User.c.id,
+    User.c.email,
+    User.c.nickname,
+    User.c.blocked_at,
+    User.c.blocked_reason,
+)
+
+
 async def query_user_by_email(conn: AsyncConnection, email: str):
     """The sibling of `query_user`, keyed on the address Google proved."""
-    stmt = select(User.c.id, User.c.email, User.c.nickname).where(
-        User.c.email == email
-    )
+    stmt = select(*_USER_COLUMNS).where(User.c.email == email)
     return (await conn.execute(stmt)).first()
 
 
 async def query_user(conn: AsyncConnection, user_id: int):
     """A user's public identity, without the avatar blob."""
-    stmt = select(User.c.id, User.c.email, User.c.nickname).where(
-        User.c.id == user_id
-    )
+    stmt = select(*_USER_COLUMNS).where(User.c.id == user_id)
     return (await conn.execute(stmt)).first()
+
+
+async def block_user(
+    conn: AsyncConnection, user_id: int, reason: str | None
+) -> bool:
+    """Shut an account out of the site. Does not commit. True if it did.
+
+    That an administrator is never blocked lives in the WHERE clause rather than
+    in a check preceding it, for two reasons. There is no way to revoke an
+    administrator through the app, so a blocked one would be a lockout with no
+    way back; and a check and a write that are two statements can be told apart
+    by an appointment landing between them.
+
+    False means the row belonged to an administrator or was not there at all.
+    The route reports both the same way, because both mean nothing happened.
+    """
+    stmt = (
+        update(User)
+        .where(
+            User.c.id == user_id,
+            ~exists().where(Administrator.c.email == User.c.email),
+        )
+        .values(blocked_at=datetime.now(), blocked_reason=reason)
+        .returning(User.c.id)
+    )
+    return (await conn.execute(stmt)).first() is not None
+
+
+async def unblock_user(conn: AsyncConnection, user_id: int) -> bool:
+    """Let an account back in. Does not commit. True if it did.
+
+    Clears the reason with the block: it exists to be shown to the person it
+    shut out, so it has no life after they are let back in.
+    """
+    stmt = (
+        update(User)
+        .where(User.c.id == user_id)
+        .values(blocked_at=None, blocked_reason=None)
+        .returning(User.c.id)
+    )
+    return (await conn.execute(stmt)).first() is not None
 
 
 async def query_challenge_testcases(conn: AsyncConnection, challenge_id: int):
@@ -1055,6 +1119,92 @@ async def query_courses(conn: AsyncConnection, user_id: int, q: str = ""):
     SELECT row_to_json(u) FROM u;
     """)
     res = await conn.execute(query, dict(user_id=user_id, q=q))
+    return res.scalar()
+
+
+async def query_users(conn: AsyncConnection, q: str = ""):
+    """Everyone the site knows about, for the admin page.
+
+    Two lists, because `administrator` is keyed on an address and `user` on an
+    account, and those are not the same set. `accounts` is everyone who has
+    signed in at least once; `pending_administrators` is the addresses that have
+    been appointed and have no account yet. Without the second, an
+    administrator appointed before their first sign-in appears nowhere on this
+    page - including the one just appointed by the form at the top of it, which
+    would look like the click did nothing.
+
+    `q` is a substring test on the address or the nickname, with `position()`
+    rather than `ILIKE '%'||:q||'%'` for the reason `query_courses` gives: an
+    address typed with a `%` or a `_` in it is matched literally and there is no
+    escaping to get wrong. An empty `q` is no filter at all.
+
+    The two counts are aggregated over the whole table and joined in, rather
+    than asked per row: this page is the whole site and is opened rarely, so it
+    is one round trip either way and this way it is one query.
+    """
+    query = text("""
+    WITH
+    enrolled AS (
+        SELECT user_id, count(*) AS n_courses FROM enrollment GROUP BY user_id
+    ),
+    submitted AS (
+        SELECT user_id,
+               count(*) AS n_submissions,
+               max(enqueued) AS last_submitted
+        FROM submission GROUP BY user_id
+    ),
+    accounts AS (
+        SELECT
+            u.id,
+            u.email,
+            u.nickname,
+            -- EXISTS rather than a join: `administrator` is keyed on the
+            -- address and may name somebody with no account at all, so it is
+            -- not a table every row of `user` is guaranteed to meet. That same
+            -- fact is what `appointed` below exists for.
+            EXISTS (
+                SELECT 1 FROM administrator a WHERE a.email = u.email
+            ) AS is_admin,
+            u.blocked_at IS NOT NULL AS is_blocked,
+            u.blocked_at,
+            u.blocked_reason,
+            coalesce(enrolled.n_courses, 0) AS n_courses,
+            coalesce(submitted.n_submissions, 0) AS n_submissions,
+            submitted.last_submitted
+        FROM "user" u
+        LEFT JOIN enrolled ON enrolled.user_id = u.id
+        LEFT JOIN submitted ON submitted.user_id = u.id
+        WHERE :q = ''
+           OR position(lower(:q) in lower(u.email)) > 0
+           OR position(lower(:q) in lower(u.nickname)) > 0
+    ),
+    -- coalesce, as in `query_courses`: json_agg over no rows is NULL, and a
+    -- filter that matches nobody would otherwise hand the template a null.
+    listed AS (
+        SELECT coalesce(
+            json_agg(accounts ORDER BY accounts.nickname, accounts.id),
+            '[]'::json
+        ) AS accounts
+        FROM accounts
+    ),
+    appointed AS (
+        SELECT administrator.email
+        FROM administrator
+        LEFT JOIN "user" ON "user".email = administrator.email
+        WHERE "user".id IS NULL
+          AND (:q = '' OR position(lower(:q) in lower(administrator.email)) > 0)
+    ),
+    pending AS (
+        SELECT coalesce(json_agg(appointed ORDER BY appointed.email), '[]'::json)
+               AS pending_administrators
+        FROM appointed
+    ),
+    d AS (
+        SELECT * FROM listed, pending
+    )
+    SELECT row_to_json(d) FROM d;
+    """)
+    res = await conn.execute(query, dict(q=q))
     return res.scalar()
 
 

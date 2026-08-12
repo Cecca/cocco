@@ -34,6 +34,7 @@ from cocco.model import (
     metadata,
 )
 from cocco.repository import (
+    block_user,
     query_course_role,
     query_enrollment_key,
     query_user_by_email,
@@ -410,6 +411,128 @@ async def test_a_session_pointing_at_nobody_is_discarded(client, google, app_eng
     response = client.get(BEHIND_THE_WALL, follow_redirects=False)
     assert response.status_code == 303
     assert "/login" in response.headers["location"]
+
+
+########################################################################
+# blocked accounts
+#
+# The block is on `user`, checked in `get_user` on the row it already reads, so
+# it is re-asked on every request rather than only at the door. What these pin
+# is the difference from the two refusals either side of it: it is not
+# `NotAuthenticated` (which redirects to a login page that could not explain
+# this) and it does not end with the session.
+
+
+async def _block(app_engine, email: str, reason: str = "spamming the judge"):
+    async with app_engine.connect() as conn:
+        row = await query_user_by_email(conn, email)
+        assert row is not None
+        assert await block_user(conn, row.id, reason)
+        await conn.commit()
+
+
+async def test_a_block_takes_effect_on_the_next_request(client, google, app_engine):
+    """Signed in a moment ago, shut out now - without touching their cookie."""
+    google(claims=VERIFIED)
+    client.get("/auth/google/callback?code=x", follow_redirects=False)
+    assert client.get(BEHIND_THE_WALL, follow_redirects=False).status_code == 200
+
+    await _block(app_engine, "dave@unipd.it")
+
+    response = client.get(BEHIND_THE_WALL, follow_redirects=False)
+    assert response.status_code == 403
+    assert "spamming the judge" in response.text
+
+
+async def test_a_block_is_not_a_logout(client, google, app_engine):
+    """The session is left alone: clearing it would send them to a login page
+    that explains nothing, while the block page explains everything."""
+    import cocco.main as main
+
+    google(claims=VERIFIED)
+    client.get("/auth/google/callback?code=x", follow_redirects=False)
+    await _block(app_engine, "dave@unipd.it")
+
+    for _ in range(2):
+        assert client.get(BEHIND_THE_WALL, follow_redirects=False).status_code == 403
+    assert client.cookies.get(main.CONFIG.session.cookie_name)
+
+
+async def test_a_blocked_htmx_request_is_not_sent_to_the_login_page(
+    client, google, app_engine
+):
+    """The mistake this code is one line away from: `handle_not_authenticated`
+    answers htmx with 204 + HX-Redirect, and doing that here would conflate
+    being blocked with being signed out."""
+    google(claims=VERIFIED)
+    client.get("/auth/google/callback?code=x", follow_redirects=False)
+    await _block(app_engine, "dave@unipd.it")
+
+    response = client.get(
+        BEHIND_THE_WALL, headers={"HX-Request": "true"}, follow_redirects=False
+    )
+    assert response.status_code == 403
+    assert "HX-Redirect" not in response.headers
+
+
+async def test_a_blocked_user_cannot_sign_in(client, google, app_engine):
+    """Refused at the callback too, so the sentence arrives on the page they
+    are already looking at rather than after a sign-in that dies on the first
+    click."""
+    import cocco.main as main
+
+    google(claims=VERIFIED)
+    client.get("/auth/google/callback?code=x", follow_redirects=False)
+    await _block(app_engine, "dave@unipd.it")
+    client.cookies.clear()
+
+    response = client.get("/auth/google/callback?code=x", follow_redirects=False)
+    assert response.status_code == 403
+    assert "spamming the judge" in response.text
+    # And no session came out of it.
+    assert not client.cookies.get(main.CONFIG.session.cookie_name)
+    assert client.get(BEHIND_THE_WALL, follow_redirects=False).status_code == 303
+
+
+async def test_a_blocked_user_can_still_sign_out(client, google, app_engine):
+    """The one control the block page offers them, and the way to stop an open
+    tab from polling into 403s."""
+    google(claims=VERIFIED)
+    client.get("/auth/google/callback?code=x", follow_redirects=False)
+    await _block(app_engine, "dave@unipd.it")
+
+    response = client.post("/logout", follow_redirects=False)
+    assert response.status_code == 303
+
+
+async def test_a_block_with_no_reason_still_says_something(
+    client, google, app_engine
+):
+    """The reason is optional, so the page has to have a sentence of its own."""
+    google(claims=VERIFIED)
+    client.get("/auth/google/callback?code=x", follow_redirects=False)
+
+    async with app_engine.connect() as conn:
+        row = await query_user_by_email(conn, "dave@unipd.it")
+        await block_user(conn, row.id, None)
+        await conn.commit()
+
+    response = client.get(BEHIND_THE_WALL, follow_redirects=False)
+    assert response.status_code == 403
+    assert "No reason was recorded" in response.text
+
+
+async def test_dummy_auth_is_blocked_too(client, monkeypatch, app_engine, no_google):
+    """The check is on both branches of `get_user`: otherwise dummy auth would
+    be the one configuration in which the block does not exist, which is the
+    configuration it gets developed in."""
+    _set_dummy_auth(monkeypatch, True, "alice@unipd.it")
+    client.cookies.clear()
+    # The first request creates the account.
+    assert client.get(BEHIND_THE_WALL, follow_redirects=False).status_code == 200
+
+    await _block(app_engine, "alice@unipd.it")
+    assert client.get(BEHIND_THE_WALL, follow_redirects=False).status_code == 403
 
 
 ########################################################################

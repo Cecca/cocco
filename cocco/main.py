@@ -61,6 +61,7 @@ import logging
 import os
 
 from cocco.repository import (
+    block_user,
     challenge_in_course,
     count_running_submissions,
     count_testcase_outcomes,
@@ -93,11 +94,14 @@ from cocco.repository import (
     query_submission_outcomes,
     query_testcase,
     query_user,
+    query_user_by_email,
     query_user_role,
     query_user_submissions,
+    query_users,
     regrade_challenge,
     reorder_challenges,
     swap_testcase_order,
+    unblock_user,
     update_challenge,
     update_course,
     update_testcase,
@@ -549,7 +553,7 @@ async def _populate_dummy_data(conn: AsyncConnection):
         ("ferrari", "route.py", 0.199),
         ("romano", "planner.py", 0.402),
     ]:
-        classmate_id = await _seed_user(conn, f"{nickname}@example.com", nickname)
+        classmate_id = await _seed_user(conn, f"{nickname}@studenti.unipd.it", nickname)
         await _seed_submission(
             classmate_id, filename, OutcomeEnum.success, 1.0, elapsed_s
         )
@@ -576,16 +580,28 @@ class NotAuthenticated(Exception):
         self.next_path = next_path
 
 
-async def get_user(request: Request, db: DBDep) -> schema.User:
-    """The signed-in user, or `NotAuthenticated`.
+def _refuse_if_blocked(user: schema.User) -> None:
+    """The site-wide gate, asked of the row `get_user` has already read.
 
-    The cookie holds nothing but the user id, so a renamed - or deleted -
-    account takes effect on the very next request.
+    Free, which is why the block lives on `user` rather than in a table of its
+    own, and asked again on every request, so it takes effect on the blocked
+    person's very next click - exactly as a deleted account does.
+    """
+    if user.blocked_at is not None:
+        raise Blocked(user.blocked_reason)
+
+
+async def get_user(request: Request, db: DBDep) -> schema.User:
+    """The signed-in user, or `NotAuthenticated` - or `Blocked`.
+
+    The cookie holds nothing but the user id, so a renamed - or deleted, or
+    blocked - account takes effect on the very next request.
 
     The user is also stashed on `request.state`, for the one caller that cannot
     ask for a dependency: `handle_forbidden` renders a whole page, navbar
     included, and this has always run by the time an authorization dependency
-    can refuse.
+    can refuse. The block is checked *before* the stash, deliberately - see
+    `handle_blocked`, which wants no viewer at all.
     """
     if DUMMY_AUTH:
         # Development only: there is no sign-in step at all. The address is
@@ -595,6 +611,10 @@ async def get_user(request: Request, db: DBDep) -> schema.User:
         # real sign-in gets.
         user = await get_or_create_user(db, DUMMY_USER)
         await db.commit()
+        # Checked on this branch too: otherwise dummy auth would be the one
+        # configuration in which the block does not exist, which is the
+        # configuration it gets developed in.
+        _refuse_if_blocked(user)
         request.state.user = user
         return user
 
@@ -603,6 +623,7 @@ async def get_user(request: Request, db: DBDep) -> schema.User:
         row = await query_user(db, user_id)
         if row is not None:
             user = schema.User.model_validate(row)
+            _refuse_if_blocked(user)
             request.state.user = user
             return user
         # A session pointing at nobody: in development, typically the other
@@ -674,6 +695,59 @@ async def handle_forbidden(request: Request, exc: Forbidden):
             # Stashed by `get_user`; absent only if something refused before
             # anyone was identified, and `base.jinja` guards the navbar anyway.
             "user": getattr(request.state, "user", None),
+        },
+    )
+
+
+class Blocked(Forbidden):
+    """An account an administrator has shut out of the site.
+
+    A subclass of `Forbidden` rather than a fresh `HTTPException`: it is still
+    "a 403 that renders as a page", and Starlette resolves a handler along the
+    exception's MRO, so deleting the handler below would degrade this to
+    `403.jinja` rather than to raw JSON.
+
+    Its own class all the same, because it is not a refusal about the URL that
+    was asked for - nothing on the site is open to them - and the page has to
+    say so and carry the sentence somebody wrote for them.
+    """
+
+    DEFAULT_REASON = "No reason was recorded."
+
+    def __init__(self, reason: str | None):
+        self.reason = reason or self.DEFAULT_REASON
+        super().__init__(f"This account is blocked. {self.reason}")
+
+
+@app.exception_handler(Blocked)
+async def handle_blocked(request: Request, exc: Blocked):
+    """The refusal a blocked account gets, on every request it makes.
+
+    Rendered with no viewer, and that is not modesty: the navbar's avatar is
+    `/users/{id}/avatar`, itself behind `CurrentUser`, so it would 403 into a
+    broken image on the very page explaining the block. `get_user` raises
+    before it stashes `request.state.user`, which is what makes that possible.
+
+    The session is left alone. Clearing it would turn every later request into
+    `NotAuthenticated` and send them to a login page that explains nothing,
+    while this page explains everything - and the cookie holds only an id,
+    which is re-checked here on every request anyway. `get_user` still clears a
+    session pointing at *nobody*: that one is stale, this one is not.
+
+    Polled fragments are left to freeze, as they do for a student unenrolled
+    mid-session: htmx does not swap the body of an error response. Deliberately
+    not the `HX-Redirect` `handle_not_authenticated` sends, which would conflate
+    being blocked with being signed out and land them on the one page that
+    cannot tell them what happened.
+    """
+    return templates.TemplateResponse(
+        request=request,
+        name="blocked.jinja",
+        status_code=403,
+        context={
+            "title": "Account blocked",
+            "reason": exc.reason,
+            "user": None,
         },
     )
 
@@ -873,6 +947,21 @@ async def get_auth_google_callback(request: Request, db: DBDep):
 
     user = await get_or_create_user(db, email)
     await db.commit()
+
+    if user.blocked_at is not None:
+        # Refused here as well as in `get_user`, and after the domain check so
+        # that the permanent reason keeps precedence. Without this the sign-in
+        # succeeds and dies on the first click, on a page they did not ask for;
+        # this way the sentence arrives on the page they are already looking at.
+        # `get_or_create_user` created nothing above - a blocked account exists.
+        logger.info("refused a sign-in from a blocked account: %s", email)
+        return _login_page(
+            request,
+            next_path=next_path,
+            error=f"This account is blocked. {user.blocked_reason or ''}".strip(),
+            status_code=403,
+        )
+
     return _sign_in(request, user, next_path)
 
 
@@ -888,17 +977,22 @@ async def post_logout(request: Request):
 
 
 async def require_admin(db: DBDep, user: CurrentUser) -> schema.User:
-    """Authorize creating a course, or raise 403.
+    """Authorize a site administrator, or raise 403.
 
-    The only permission in the app that names no course, because the course does
-    not exist yet - which is exactly why it is not a `UserRole`: it is a row in
-    `administrator`, keyed on the address, put there by `cocco.toml` or by hand.
+    The only permission in the app that names no course - which is exactly why
+    it is not a `UserRole`: it is a row in `administrator`, keyed on the
+    address, put there by `cocco.toml`, by the admin page or by hand. It guards
+    creating a course, where the course does not exist yet to have a role on,
+    and the admin page, which is about the site rather than about any course.
+
+    The sentence names the permission rather than either of those two, so a
+    third one does not find the wrong refusal waiting for it.
 
     Returns the user, so a route that needs the creator does not ask twice.
     Hiding the button on the home page is an affordance, not this check.
     """
     if not await is_administrator(db, user.email):
-        raise Forbidden("Only an administrator can create a course.")
+        raise Forbidden("Only a site administrator can do that.")
     return user
 
 
@@ -1213,6 +1307,184 @@ async def post_course_new(
                 request.url_for("get_course_edit", course_id=course_id)
             )
         },
+    )
+
+
+########################################################################
+# Administering the site. Administrators only, through `Admin` - the second
+# thing that dependency guards, and the reason its sentence names the
+# permission rather than creating a course.
+#
+# Unlike its neighbour above, the position of this block is not load-bearing:
+# `/admin` is a literal segment that collides with no path parameter.
+#
+# Every mutation here answers with the user list, alert included, rather than
+# with an alert alone: it is `post_course_enroll` answering with the courses
+# list it changed, with `f-enroll.jinja`'s rule folded in - what you are
+# looking at after a refusal is the thing you acted on. One swap target means
+# the sentence and the new state arrive together instead of being kept in step.
+
+
+async def _render_users(
+    request: Request,
+    db: AsyncConnection,
+    user: schema.User,
+    q: str,
+    message: str | None = None,
+    ok: bool = False,
+):
+    """The user list, as every route on the admin page answers with it."""
+    users = await query_users(db, q=q)
+    return templates.TemplateResponse(
+        request=request,
+        name="f-users.jinja",
+        context={
+            "users": users,
+            "q": q,
+            "user": user,
+            "message": message,
+            "ok": ok,
+        },
+    )
+
+
+@app.get("/admin")
+async def get_admin(request: Request, db: DBDep, user: Admin, q: str = ""):
+    """The admin page: everyone the site knows about, and the way to appoint
+    another administrator."""
+    users = await query_users(db, q=q)
+    return templates.TemplateResponse(
+        request=request,
+        name="admin.jinja",
+        context={
+            "users": users,
+            "q": q,
+            "title": "Administration",
+            "user": user,
+            "message": None,
+            "ok": False,
+        },
+    )
+
+
+@app.get("/f/users")
+async def get_fragment_users(request: Request, db: DBDep, user: Admin, q: str = ""):
+    """The user list, re-rendered as the filter box is typed in. The page
+    inlines this same fragment on first paint."""
+    return await _render_users(request, db, user, q)
+
+
+@app.post("/admin/administrators")
+async def post_administrator(
+    request: Request,
+    db: DBDep,
+    user: Admin,
+    # Defaulted rather than required, so an empty box becomes the alert below
+    # instead of a 422 - which htmx would drop on the floor, leaving the person
+    # who submitted it looking at nothing at all.
+    email: Annotated[str, Form()] = "",
+    q: Annotated[str, Form()] = "",
+):
+    """Appoint a site administrator, by address.
+
+    By address and not by user id, because that is what `administrator` holds:
+    the point of the table is that it can name someone before they have ever
+    signed in, and this form is the ordinary way that happens - a colleague is
+    appointed, and their account appears on their first sign-in.
+
+    This is the only place in the app where a human types an address, so it is
+    the only place that has to normalize one. It also refuses an address outside
+    `allowed_domains`, which `_load_auth_config` merely warns about: a bad line
+    in `cocco.toml` must not stop the app from booting, but a form has somebody
+    in front of it who can fix the typo.
+    """
+    try:
+        email = normalize_email(email)
+    except ValueError as err:
+        return await _render_users(request, db, user, q, message=str(err))
+
+    if not is_allowed_email(email, CONFIG.auth.allowed_domains):
+        domains = ", ".join("@" + d for d in CONFIG.auth.allowed_domains)
+        return await _render_users(
+            request,
+            db,
+            user,
+            q,
+            message=(
+                f"{email} could never sign in: administrators must have "
+                f"an address at {domains}."
+            ),
+        )
+
+    row = await query_user_by_email(db, email)
+    if row is not None and row.blocked_at is not None:
+        # The other half of "an administrator is never blocked". Appointing is
+        # one-way through the app, so without this an administrator could be
+        # made who cannot sign in and cannot be unmade.
+        return await _render_users(
+            request,
+            db,
+            user,
+            q,
+            message=f"{email} is blocked. Unblock them first.",
+        )
+
+    # ON CONFLICT DO NOTHING, so appointing someone twice is a no-op rather
+    # than an error - and the message below is true either way.
+    await insert_administrators(db, [email])
+    await db.commit()
+    return await _render_users(
+        request, db, user, q, message=f"{email} is now an administrator.", ok=True
+    )
+
+
+@app.post("/admin/users/{user_id}/block")
+async def post_user_block(
+    request: Request,
+    db: DBDep,
+    user: Admin,
+    user_id: int,
+    reason: Annotated[str, Form()] = "",
+    q: Annotated[str, Form()] = "",
+):
+    """Shut an account out of the site.
+
+    Refusing on an administrator is `block_user`'s job, not this route's, so
+    that the rule and the write are one statement - see it for why. `False`
+    comes back for an administrator and for an id that is not there, and both
+    get the same sentence, because in both cases nothing happened.
+    """
+    reason = reason.strip()
+    if not await block_user(db, user_id, reason or None):
+        return await _render_users(
+            request,
+            db,
+            user,
+            q,
+            message="Nobody was blocked: an administrator cannot be.",
+        )
+    await db.commit()
+    return await _render_users(
+        request, db, user, q, message="That account is now blocked.", ok=True
+    )
+
+
+@app.post("/admin/users/{user_id}/unblock")
+async def post_user_unblock(
+    request: Request,
+    db: DBDep,
+    user: Admin,
+    user_id: int,
+    q: Annotated[str, Form()] = "",
+):
+    """Let an account back in."""
+    if not await unblock_user(db, user_id):
+        return await _render_users(
+            request, db, user, q, message="There is no such account."
+        )
+    await db.commit()
+    return await _render_users(
+        request, db, user, q, message="That account is welcome again.", ok=True
     )
 
 

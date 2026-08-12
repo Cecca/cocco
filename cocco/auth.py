@@ -320,4 +320,12 @@ async def get_or_create_user(conn: AsyncConnection, email: str) -> schema.User:
         if row is None:
             raise
         return schema.User.model_validate(row)
-    return schema.User(id=user_id, email=email, nickname=nickname)
+    # Not blocked, and that is the truth rather than a default: the row was
+    # inserted a line ago, and nothing has had the chance to shut it out.
+    return schema.User(
+        id=user_id,
+        email=email,
+        nickname=nickname,
+        blocked_at=None,
+        blocked_reason=None,
+    )

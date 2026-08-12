@@ -19,6 +19,11 @@ class User(Base):
     id: int
     email: str
     nickname: str
+    # Nullable but deliberately *not defaulted*: `get_user` refuses on these, so
+    # a query that selected a trimmed column list and forgot them has to fail
+    # loudly here rather than quietly report everybody as welcome.
+    blocked_at: datetime | None
+    blocked_reason: str | None
 
 
 class Course(Base):
