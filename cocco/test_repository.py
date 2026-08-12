@@ -1164,7 +1164,7 @@ async def test_users_page_query():
         assert [u["nickname"] for u in (await query_users(conn, q="CAro"))["accounts"]] == ["carol"]
         # ...and the address, which is the half that matters when somebody is
         # looking up a person they only know by their institutional address.
-        found = await query_users(conn, q="dave@example")
+        found = await query_users(conn, q="dave@unipd")
         assert [u["nickname"] for u in found["accounts"]] == ["dave"]
         # It reaches the appointed addresses too, so a filtered page does not
         # quietly drop half of what it is for.
