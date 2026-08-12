@@ -30,7 +30,7 @@ The web app and the judge are **separate processes** that must agree on three th
 
 `COCCO_RESET_DB=1` drops every table and reseeds dummy data on startup. Leave it unset in normal development: `fastapi dev` reloads on every file change, and each reload would wipe the data. There is no migration tool, so a schema change reaches an existing database only through one such reset.
 
-Runtime configuration lives in `cocco.toml` (path overridable with `COCCO_CONFIG`), read by `load_config` in the same shape `load_languages` reads `languages.toml`. It is gitignored — it holds the Google client secret and the session signing key — and `cocco.example.toml` is the commented template. **A missing file is not an error**: with no `[auth]` credentials the app boots and the login page says Google sign-in is unconfigured. `COCCO_DUMMY_AUTH=1` is what makes a fresh checkout usable at all — it needs no credentials and no click, and `just dev` sets it by default.
+Runtime configuration lives in `cocco.toml` (path overridable with `COCCO_CONFIG`), read by `load_config` in the same shape `load_languages` reads `languages.toml`. It is gitignored — it holds the Google client secret and the session signing key — and `cocco.example.toml` is the commented template. **A missing file is not an error**: with no `[auth]` credentials the app boots and the login page says Google sign-in is unconfigured. It is also where a deployment's first administrators are listed (`[auth] administrators`, a bootstrap — see "Authorization"). `COCCO_DUMMY_AUTH=1` is what makes a fresh checkout usable at all — it needs no credentials and no click, and `just dev` sets it by default.
 
 ## Architecture
 
@@ -67,7 +67,7 @@ The evaluator's sandbox budget is fixed in `judge.py` (`EVALUATOR_TIME_LIMIT_S`,
 
 ### Data model (`cocco/model.py`)
 
-SQLAlchemy Core `Table`s on a shared `MetaData` form the domain: `User` (with `UserRole` via `Enrollment`), `Course` → `Challenge` → `TestCase` (inputs/expected outputs referenced by filesystem path, not stored in the DB — see `DESIGN.md` "Test case inputs"; `is_sample` marks the ones students may download, `is_active` the ones new submissions are graded on), `Submission` → `TestOutcome`. There is no queue table: a submission is queued when its `status` is `SubmissionStatus.queued`. `Challenge.ranking` (a `LeaderboardRanking`) is presentation-only — it picks the leaderboard the challenge page shows and the judge never reads it.
+SQLAlchemy Core `Table`s on a shared `MetaData` form the domain: `User` (with `UserRole` via `Enrollment`, and `Administrator` beside it — every `UserRole` is a *per-course* thing, so the site-wide power to create a course is its own table, keyed on the email so it can name someone who has never signed in), `Course` → `Challenge` → `TestCase` (inputs/expected outputs referenced by filesystem path, not stored in the DB — see `DESIGN.md` "Test case inputs"; `is_sample` marks the ones students may download, `is_active` the ones new submissions are graded on), `Submission` → `TestOutcome`. There is no queue table: a submission is queued when its `status` is `SubmissionStatus.queued`. `Challenge.ranking` (a `LeaderboardRanking`) is presentation-only — it picks the leaderboard the challenge page shows and the judge never reads it.
 
 `cocco/schema.py` holds the Pydantic mirrors used for validation and for the judge's `SubmissionRunData`.
 
@@ -179,14 +179,19 @@ seed's administrator, so a fresh checkout can create a course) with no cookie, n
 click and no credentials — creating the account if it is missing, so it works against an empty
 database. `/login` and `/auth/google` merely redirect, and `/logout` is a no-op. Setting it on a
 public deployment is equivalent to publishing the admin password. The seeded cast is
-`matteo.ceccarello@unipd.it` (`admin` on every course) and `alice@unipd.it` (`teacher` on every
-course) and `bob@unipd.it` and `charlie@unipd.it` (students). Alice is there to be signed in as
-when checking what course staff *without* `admin` may do.
+`matteo.ceccarello@unipd.it` and `alice@unipd.it` (`teacher` on every course) and `bob@unipd.it`
+and `charlie@unipd.it` (students). Matteo and Alice differ in one thing only: he is a **site
+administrator**, a row in `administrator` rather than a role anywhere, which is why a fresh
+checkout can create a course. `create_db_and_tables` seeds him whenever `COCCO_DUMMY_AUTH=1` — a
+development checkout has no `cocco.toml` to list him in — and deliberately seeds `DUMMY_ADMIN`
+rather than `DUMMY_USER`, so `COCCO_DUMMY_USER=alice@unipd.it` still shows what plain course staff
+may do instead of quietly promoting her.
 
 ### Authorization
 
 `role` lives on `enrollment`, so permissions are **per course**, not site-wide. `EDITOR_ROLES`
-(teacher, admin, collaborator) is course staff; students may read the course and submit to it.
+(teacher, collaborator) is course staff; students may read the course and submit to it. The one
+site-wide thing is the **administrator**, and it is deliberately not a `UserRole` — see below.
 
 **Enrollment is the gate on a course's contents, not a label on them.** The unenrolled are not
 read-only, they are shut out: `require_course_member` 403s anyone with no role on the course in the
@@ -214,12 +219,30 @@ navbar and an exception handler cannot ask for a dependency, so `get_user` stash
 response.
 
 The one exception is **creating a course**, the only permission that names no course, because the
-course does not exist yet. There is still no site-wide administrator in this schema, so the check
-is the closest thing it can express: `user_is_admin` asks whether the person holds `admin` on
-*any* enrollment, and `require_admin` (the `Admin` dependency) 403s everyone else — deliberately
-narrower than `EDITOR_ROLES`, since a teacher runs a course they were given and an admin brings
-new ones into being. That is the only thing `admin` means today. The creator is enrolled on the
-new course as `teacher`, otherwise they could not open the editor they are redirected to.
+course does not exist yet — which is exactly why it is not a role. A **site administrator** is a
+row in the `administrator` table, keyed on the *email*: `cocco.toml` names the first set of them,
+and an address has to be nameable before its owner has ever signed in, since the account only
+appears on the first accepted callback. `is_administrator` is the single read of that table and
+`require_admin` (the `Admin` dependency) 403s everyone else. The creator is still enrolled on the
+new course as `teacher`, which is what course staff *means* there and what the editor they are
+redirected to checks.
+
+`[auth] administrators` is a **bootstrap, not the truth**: `create_db_and_tables` replays it into
+the table on every boot with `ON CONFLICT DO NOTHING`, because a brand new deployment has nobody
+to appoint its first administrator. It only ever adds — deleting the line demotes nobody, and
+removing an administrator is a `DELETE` on the table.
+
+**An administrator is course staff on every course**, enrolled or not. That lives in exactly one
+place: `effective_course_role` (and `effective_challenge_role`, for the routes whose URL carries
+only a challenge) returns the enrollment's role, or `teacher` when the asker is an administrator —
+`teacher` because that is already this app's spelling of full staff on a course, the very row
+`post_course_new` writes. Every dependency resolves the role through it, so `EDITOR_ROLES` stays
+the *per-course* notion and never has to learn about administrators, and every `role in
+EDITOR_ROLES` downstream keeps working untouched. The lookup only runs when the enrollment did not
+already answer the question, so course staff pay nothing for it. Two consequences worth knowing:
+`get_course` gives an administrator the course itself rather than the enroll preview, and
+`get_challenge` takes `can_edit` from the dependency rather than from `query_challenge`'s
+`viewer_role`, which is a `LEFT JOIN` on `enrollment` and would be NULL for them.
 
 Nothing is reachable without a session: every route depends on `CurrentUser`, directly or through
 `require_challenge_editor`, and the only ways in are `/login`, `/auth/google`,

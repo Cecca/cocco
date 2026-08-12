@@ -25,7 +25,14 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from cocco.auth import GoogleConfig, get_or_create_user
-from cocco.model import Challenge, Course, Enrollment, UserRole, metadata
+from cocco.model import (
+    Administrator,
+    Challenge,
+    Course,
+    Enrollment,
+    UserRole,
+    metadata,
+)
 from cocco.repository import (
     query_course_role,
     query_enrollment_key,
@@ -575,6 +582,38 @@ async def test_the_gate_admits_every_role(app_engine, a_course):
             await require_course_member(ours["course_id"], conn, stranger)
         with pytest.raises(Forbidden):
             await require_challenge_member(ours["challenge_id"], conn, stranger)
+
+
+async def test_an_administrator_is_inside_every_gate(app_engine, a_course):
+    """A site administrator has no enrollment at all and still passes, because
+    `effective_course_role` answers `teacher` for them - they are course staff
+    everywhere. Called directly, for the reason at the top of this file: the far
+    side of the gate is a page query only Postgres can run.
+    """
+    from cocco.main import (
+        require_challenge_member,
+        require_course_editor,
+        require_course_member,
+    )
+
+    ours, _ = a_course
+    async with app_engine.begin() as conn:
+        admin = await get_or_create_user(conn, "root@unipd.it")
+        await conn.execute(insert(Administrator).values(email=admin.email))
+
+    async with app_engine.connect() as conn:
+        assert (
+            await require_course_member(ours["course_id"], conn, admin)
+            == UserRole.teacher
+        )
+        assert (
+            await require_course_editor(ours["course_id"], conn, admin)
+            == UserRole.teacher
+        )
+        assert (
+            await require_challenge_member(ours["challenge_id"], conn, admin)
+            == UserRole.teacher
+        )
 
 
 async def test_the_course_page_previews_for_a_non_member(

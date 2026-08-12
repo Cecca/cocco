@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 import cocco.model as cm
 from cocco.avatar import generate_identicon
 from cocco.model import (
+    Administrator,
     Challenge,
     Course,
     Enrollment,
@@ -24,11 +25,13 @@ from cocco.repository import (
     count_running_submissions,
     count_testcase_outcomes,
     course_exists,
+    insert_administrators,
     insert_challenge,
     insert_course,
     insert_enrollment,
     insert_self_enrollment,
     insert_user,
+    is_administrator,
     pull_queued_submission,
     query_challenge,
     query_challenge_leaderboard,
@@ -50,7 +53,6 @@ from cocco.repository import (
     query_user_submissions,
     regrade_challenge,
     reorder_challenges,
-    user_is_admin,
 )
 from cocco.schema import SubmissionRunData
 
@@ -758,27 +760,53 @@ async def test_course_role_is_the_editors_check():
     await engine.dispose()
 
 
-async def test_admin_is_not_just_another_editor():
-    """The check behind "may create a course": holding `admin` *somewhere*.
+async def test_an_administrator_is_not_a_role_on_a_course():
+    """The check behind "may create a course": a row in `administrator`.
 
-    A teacher is course staff everywhere it matters and still fails it - that
-    distinction is the whole point of the flag, and the schema has nowhere else
-    to put it, since `role` lives on `enrollment`.
+    A teacher is course staff on the course they teach and still fails it -
+    that distinction is the whole point, and it is why the answer does not come
+    from `enrollment` at all.
     """
     engine = await _async_database()
     async with engine.connect() as conn:
         course_id = await insert_course(conn, title="Algorithms 101", description="intro")
-        admin = await insert_user(conn, "matteo@unipd.it", "matteo", b"", "image/svg+xml")
         teacher = await insert_user(conn, "alice@unipd.it", "alice", b"", "image/svg+xml")
-        stranger = await insert_user(conn, "bob@unipd.it", "bob", b"", "image/svg+xml")
-        await insert_enrollment(conn, admin, course_id, UserRole.admin)
         await insert_enrollment(conn, teacher, course_id, UserRole.teacher)
+        await insert_administrators(conn, ["matteo@unipd.it"])
         await conn.commit()
 
-        assert await user_is_admin(conn, admin)
-        assert not await user_is_admin(conn, teacher)
-        # Enrolled nowhere at all
-        assert not await user_is_admin(conn, stranger)
+        assert await is_administrator(conn, "matteo@unipd.it")
+        assert not await is_administrator(conn, "alice@unipd.it")
+        # An address with no account behind it at all is still not one
+        assert not await is_administrator(conn, "bob@unipd.it")
+    await engine.dispose()
+
+
+async def test_an_administrator_needs_no_account_yet():
+    """The table is keyed on the address precisely so that `cocco.toml` can name
+    someone who has never signed in - the account only appears on the first
+    accepted callback from Google."""
+    engine = await _async_database()
+    async with engine.connect() as conn:
+        await insert_administrators(conn, ["nobody@unipd.it"])
+        await conn.commit()
+        assert await is_administrator(conn, "nobody@unipd.it")
+    await engine.dispose()
+
+
+async def test_bootstrapping_administrators_is_idempotent():
+    """The configured list is replayed on every boot, so inserting it twice has
+    to be a no-op rather than a primary key violation."""
+    engine = await _async_database()
+    async with engine.connect() as conn:
+        await insert_administrators(conn, ["matteo@unipd.it", "alice@unipd.it"])
+        await insert_administrators(conn, ["matteo@unipd.it", "bob@unipd.it"])
+        # An empty list is a no-op too, not an empty INSERT
+        await insert_administrators(conn, [])
+        await conn.commit()
+
+        rows = (await conn.execute(select(Administrator.c.email))).scalars().all()
+        assert sorted(rows) == ["alice@unipd.it", "bob@unipd.it", "matteo@unipd.it"]
     await engine.dispose()
 
 

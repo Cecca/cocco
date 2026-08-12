@@ -4,6 +4,8 @@ Functions in this module return models from `cocco.models`,
 or their combinations
 """
 
+from collections.abc import Iterable
+
 from sqlalchemy import Connection, and_, delete, func, insert, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -11,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from cocco import schema
 from cocco.schema import SubmissionRunData
 from cocco.model import (
+    Administrator,
     Challenge,
     Course,
     Enrollment,
@@ -648,28 +651,33 @@ async def query_course_role(
     return (await conn.execute(stmt)).scalar_one_or_none()
 
 
-async def user_is_admin(conn: AsyncConnection, user_id: int) -> bool:
-    """Whether this person is an administrator of any course.
+async def is_administrator(conn: AsyncConnection, email: str) -> bool:
+    """Whether this address administers the site.
 
-    `role` lives on `enrollment`, so the schema has no site-wide administrator
-    to ask about: holding `admin` somewhere is the closest thing it can express,
-    and it is what "may create a course" is keyed on - the one permission that
-    names no course, because the course does not exist yet.
-
-    Deliberately narrower than `EDITOR_ROLES`: a teacher runs a course they were
-    given, an admin brings new ones into being.
+    Keyed on the address rather than on a user id because that is what
+    `administrator` holds - see the table, which has to be able to name someone
+    who has never signed in. `user.email` is stored in the same normalized form
+    the rows are, so this is a plain equality and needs no join.
     """
-    stmt = (
-        select(Enrollment.c.user_id)
-        .where(
-            and_(
-                Enrollment.c.user_id == user_id,
-                Enrollment.c.role == UserRole.admin,
-            )
-        )
-        .limit(1)
-    )
+    stmt = select(Administrator.c.email).where(Administrator.c.email == email)
     return (await conn.execute(stmt)).first() is not None
+
+
+async def insert_administrators(conn: AsyncConnection, emails: Iterable[str]) -> None:
+    """Add administrators, leaving the ones already there alone. Does not commit.
+
+    `ON CONFLICT DO NOTHING` is what makes the configured list a *bootstrap*:
+    it is replayed on every boot, so it has to be idempotent, and it must never
+    trample a row that came from somewhere else. Nothing here removes anybody -
+    dropping a line from `cocco.toml` does not demote its owner.
+    """
+    rows = [{"email": email} for email in emails]
+    if not rows:
+        return
+    await conn.execute(
+        pg_insert(Administrator).on_conflict_do_nothing(index_elements=["email"]),
+        rows,
+    )
 
 
 async def challenge_in_course(

@@ -4,7 +4,9 @@
 
    Context: `course` (a row of `query_courses`, i.e. the course columns plus
    the viewer's enrollment columns - `role` is NULL for a course they are not
-   on). `EDITOR_ROLE_NAMES` is a Jinja global.
+   on) and `is_admin`, since a site administrator is staff on every course
+   whether or not they are enrolled on it. `EDITOR_ROLE_NAMES` is a Jinja
+   global.
 #}
 <div class="card bg-base-100 border border-base-300 shadow-sm transition-colors hover:border-primary/40">
   <div class="card-body flex-row items-center gap-4 p-5">
@@ -27,7 +29,7 @@
     </div>
 
     <div class="flex items-center gap-2">
-      {% if course.role in EDITOR_ROLE_NAMES %}
+      {% if course.role in EDITOR_ROLE_NAMES or is_admin %}
       <a href="{{ url_for('get_course_edit', course_id=course.id) }}"
          class="btn btn-sm btn-ghost gap-1.5 font-semibold border border-base-300">
         <span class="text-primary">✎</span> Edit

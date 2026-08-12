@@ -125,6 +125,9 @@ def test_load_config_without_a_file(tmp_path):
     assert config.auth.allowed_domains == DEFAULT_ALLOWED_DOMAINS
     assert config.base_url is None
     assert config.session.secret_key
+    # No administrators is the ordinary case, not a hole: an existing database
+    # already has its own, and the bootstrap only ever adds.
+    assert config.auth.administrators == ()
 
 
 def test_load_config_reads_the_auth_table(tmp_path, monkeypatch):
@@ -189,6 +192,45 @@ def test_an_empty_allowed_domains_list_is_honoured(tmp_path):
     path = tmp_path / "cocco.toml"
     path.write_text("[auth]\nallowed_domains = []\n")
     assert load_config(path).auth.allowed_domains == ()
+
+
+def test_the_administrators_are_normalized_and_deduped(tmp_path):
+    """They land in `administrator`, whose rows are compared against
+    `user.email` - so they have to arrive in the same form that column holds."""
+    path = tmp_path / "cocco.toml"
+    path.write_text(
+        '[auth]\nadministrators = [" Matteo@UNIPD.it ", "alice@unipd.it", '
+        '"MATTEO@unipd.it"]\n'
+    )
+    assert load_config(path).auth.administrators == (
+        "matteo@unipd.it",
+        "alice@unipd.it",
+    )
+
+
+def test_one_bad_administrator_does_not_take_the_others_down(tmp_path, caplog):
+    """A line that is not an address at all is dropped with a warning: the app
+    must still boot, and the administrators around it are perfectly good."""
+    path = tmp_path / "cocco.toml"
+    path.write_text('[auth]\nadministrators = ["not-an-email", "alice@unipd.it"]\n')
+    with caplog.at_level("WARNING", logger="cocco.auth"):
+        config = load_config(path)
+    assert config.auth.administrators == ("alice@unipd.it",)
+    assert "not-an-email" in caplog.text
+
+
+def test_an_administrator_who_could_never_sign_in_is_flagged(tmp_path, caplog):
+    """Kept, because the table is the truth and the allowlist may be what is
+    wrong - but said out loud, because it is almost always a typo."""
+    path = tmp_path / "cocco.toml"
+    path.write_text(
+        '[auth]\nallowed_domains = ["unipd.it"]\n'
+        'administrators = ["someone@example.org"]\n'
+    )
+    with caplog.at_level("WARNING", logger="cocco.auth"):
+        config = load_config(path)
+    assert config.auth.administrators == ("someone@example.org",)
+    assert "allowed_domains" in caplog.text
 
 
 def test_environment_beats_the_file_for_the_secret(tmp_path, monkeypatch):

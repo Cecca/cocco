@@ -17,7 +17,7 @@
         </p>
         {# Only an administrator is offered this; `require_admin` behind the route is
            what actually stops everyone else. #}
-        {% if can_create_course %}
+        {% if is_admin %}
         <a href="{{ url_for('get_course_new') }}"
            class="btn btn-sm btn-ghost border border-base-300 font-semibold -mt-1">
           New course

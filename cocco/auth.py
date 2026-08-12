@@ -75,6 +75,11 @@ class AuthConfig:
     # None means Google sign-in is unconfigured, which is not an error: the app
     # boots and the login page says so. COCCO_DUMMY_AUTH=1 needs no credentials.
     google: GoogleConfig | None = None
+    # The site's first administrators, normalized. A *bootstrap*, not the
+    # truth: they are inserted into `administrator` on every boot and the table
+    # is what is asked afterwards, so this list can only ever add. An empty one
+    # is the ordinary case for a database that already has its administrators.
+    administrators: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -146,6 +151,18 @@ def _load_auth_config(section: dict) -> AuthConfig:
         "google_client_secret"
     )
 
+    administrators = normalize_administrators(section.get("administrators") or ())
+    for email in administrators:
+        if not is_allowed_email(email, domains):
+            # Not fatal, and not filtered out either - the table is the truth
+            # and someone may be fixing the allowlist next. But an
+            # administrator who cannot sign in is a typo worth naming.
+            logger.warning(
+                "[auth] administrator %s is outside `allowed_domains`, "
+                "so they could never sign in",
+                email,
+            )
+
     google = None
     if client_id and client_secret:
         google = GoogleConfig(
@@ -164,7 +181,9 @@ def _load_auth_config(section: dict) -> AuthConfig:
             "(or COCCO_GOOGLE_CLIENT_ID / COCCO_GOOGLE_CLIENT_SECRET); "
             "Google sign-in is disabled"
         )
-    return AuthConfig(allowed_domains=domains, google=google)
+    return AuthConfig(
+        allowed_domains=domains, google=google, administrators=administrators
+    )
 
 
 ########################################################################
@@ -176,6 +195,23 @@ def normalize_domains(raw: Iterable[str]) -> tuple[str, ...]:
     or trailing dot. Done once at load so the predicate has nothing to clean."""
     cleaned = (d.strip().lower().strip(".") for d in raw if d)
     return tuple(d for d in cleaned if d)
+
+
+def normalize_administrators(raw: Iterable[str]) -> tuple[str, ...]:
+    """The configured administrators, canonicalized to what `administrator`
+    stores: `normalize_email` on each, in the order given, without duplicates.
+
+    An entry that is not an address at all is dropped with a warning rather
+    than raising: one bad line in the list must not stop the app from booting,
+    and the ones around it are still perfectly good administrators.
+    """
+    seen: dict[str, None] = {}
+    for entry in raw:
+        try:
+            seen.setdefault(normalize_email(entry), None)
+        except ValueError as exc:
+            logger.warning("[auth] ignoring administrator %r: %s", entry, exc)
+    return tuple(seen)
 
 
 def email_domain(email: str) -> str:

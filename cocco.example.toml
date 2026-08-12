@@ -26,6 +26,22 @@ max_age = 1209600
 # admits nobody: a misconfiguration should lock the door, not open it.
 allowed_domains = ["unipd.it"]
 
+# The site's administrators: the people who may create a course. Unlike
+# `teacher` or `student`, this is not a role on any enrollment - a course being
+# created does not exist yet - so it lives in its own table, and these addresses
+# are inserted into it on every startup.
+#
+# A *bootstrap*, not the truth. It is how a brand new deployment gets its first
+# administrator, since there is nobody there to appoint one; afterwards the
+# table is what is asked. So it only ever adds: deleting a line from here
+# demotes nobody, and the way to remove an administrator is
+#   DELETE FROM administrator WHERE email = '...';
+#
+# An address is listed before its owner has ever signed in - the account is
+# created on the first accepted callback from Google - so it must be one
+# `allowed_domains` admits, or they will never be able to use it.
+# administrators = ["you@unipd.it"]
+
 # The OAuth client, from the Google Cloud console: APIs & Services >
 # Credentials > Create credentials > OAuth client ID > Web application. On the
 # consent screen ask for the `openid` and `email` scopes only - both are

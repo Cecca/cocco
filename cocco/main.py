@@ -66,6 +66,7 @@ from cocco.repository import (
     count_testcase_outcomes,
     course_exists,
     delete_testcase,
+    insert_administrators,
     insert_challenge,
     insert_course,
     insert_enrollment,
@@ -73,6 +74,7 @@ from cocco.repository import (
     insert_submission,
     insert_testcase,
     insert_user,
+    is_administrator,
     query_challenge,
     query_challenge_leaderboard,
     query_challenge_ranking,
@@ -99,7 +101,6 @@ from cocco.repository import (
     update_challenge,
     update_course,
     update_testcase,
-    user_is_admin,
 )
 
 
@@ -111,9 +112,10 @@ logger = logging.getLogger(__name__)
 CONFIG = load_config(Path(os.environ.get("COCCO_CONFIG", "cocco.toml")))
 
 # The development cast, up here because DUMMY_USER defaults to the admin.
-# Matteo is the administrator, Alice a plain teacher - the two are course staff
-# alike, and the difference only shows on "New course", which `require_admin`
-# gates. Bob and Charlie are students.
+# Matteo and Alice both teach every seeded course; what separates them is that
+# Matteo is a site administrator - a row in `administrator`, not a role on any
+# enrollment - so he may create courses and is staff on courses nobody enrolled
+# him on. Bob and Charlie are students.
 DUMMY_ADMIN = "matteo.ceccarello@unipd.it"
 DUMMY_TEACHERS = ["alice@unipd.it"]
 DUMMY_STAFF = [DUMMY_ADMIN, *DUMMY_TEACHERS]
@@ -208,7 +210,9 @@ MAX_TESTCASE_BYTES = 32 << 20
 
 # Course staff. `role` lives on `enrollment`, so these are per-course, not
 # site-wide. Everyone else - i.e. students and the unenrolled - is read-only.
-EDITOR_ROLES = {UserRole.teacher, UserRole.admin, UserRole.collaborator}
+# A site administrator is staff on every course without appearing here: that is
+# resolved in `effective_course_role`, not by widening this set.
+EDITOR_ROLES = {UserRole.teacher, UserRole.collaborator}
 # The same set as it comes back from `row_to_json`, i.e. plain strings
 EDITOR_ROLE_NAMES = {role.value for role in EDITOR_ROLES}
 
@@ -273,6 +277,19 @@ async def create_db_and_tables(dummy=False):
         await conn.run_sync(metadata.create_all)
         if dummy:
             await _populate_dummy_data(conn)
+        # The configured administrators, replayed on every boot: this is how a
+        # brand new deployment gets its first one, since there is no
+        # administrator to appoint another. It only ever adds - see
+        # `insert_administrators` - so a database that has moved on is left
+        # alone, and deleting a line from `cocco.toml` demotes nobody.
+        await insert_administrators(conn, CONFIG.auth.administrators)
+        if DUMMY_AUTH:
+            # A development checkout has no `cocco.toml` at all, and the
+            # promise of dummy auth is that it is usable as it stands. Seeds
+            # DUMMY_ADMIN and deliberately not DUMMY_USER, so
+            # `COCCO_DUMMY_USER=alice@unipd.it` still shows what a plain
+            # teacher sees rather than quietly promoting her.
+            await insert_administrators(conn, [DUMMY_ADMIN])
 
 
 async def _seed_user(conn: AsyncConnection, email: str, nickname: str) -> int:
@@ -335,12 +352,12 @@ async def _populate_dummy_data(conn: AsyncConnection):
                 .returning(Course.c.id)
             )
         ).scalar_one()
-        # Matteo administers everything and Alice teaches it; Bob and Charlie
-        # are students. `role` is per course, so this is one row per person per
-        # course - and Matteo's `admin` rows are the only thing in the seed that
-        # makes "New course" reachable at all.
+        # Matteo and Alice both teach; Bob and Charlie are students. `role` is
+        # per course, so this is one row per person per course. What makes
+        # Matteo an administrator is not written here but in `administrator`,
+        # by the bootstrap in `create_db_and_tables`.
         await insert_enrollment(
-            conn, user_ids[DUMMY_ADMIN], course_id, UserRole.admin
+            conn, user_ids[DUMMY_ADMIN], course_id, UserRole.teacher
         )
         for email in DUMMY_TEACHERS:
             await insert_enrollment(
@@ -874,20 +891,55 @@ async def require_admin(db: DBDep, user: CurrentUser) -> schema.User:
     """Authorize creating a course, or raise 403.
 
     The only permission in the app that names no course, because the course does
-    not exist yet: `role` lives on `enrollment`, so the closest the schema comes
-    to a site-wide administrator is holding `admin` somewhere, and that is what
-    `user_is_admin` asks. Deliberately narrower than `require_course_editor` - a
-    teacher runs a course they were given, an admin brings new ones into being.
+    not exist yet - which is exactly why it is not a `UserRole`: it is a row in
+    `administrator`, keyed on the address, put there by `cocco.toml` or by hand.
 
     Returns the user, so a route that needs the creator does not ask twice.
     Hiding the button on the home page is an affordance, not this check.
     """
-    if not await user_is_admin(db, user.id):
+    if not await is_administrator(db, user.email):
         raise Forbidden("Only an administrator can create a course.")
     return user
 
 
 Admin = Annotated[schema.User, Depends(require_admin)]
+
+
+async def effective_course_role(
+    db: AsyncConnection, user: schema.User, course_id: int
+) -> UserRole | None:
+    """The role every check on a course is made against: the enrollment's, or
+    `teacher` for a site administrator, who is course staff everywhere.
+
+    Substituting `teacher` is not a fiction bolted on here - it is already this
+    app's spelling of full staff on a course, and the very row `post_course_new`
+    writes for the administrator who creates one. Saying it in one place is what
+    keeps every `role in EDITOR_ROLES` downstream, in Python and in the
+    templates, true without being touched.
+
+    The administrator lookup only runs when the enrollment did not already
+    answer the question, so course staff pay nothing for it.
+    """
+    role = await query_course_role(db, user_id=user.id, course_id=course_id)
+    if role in EDITOR_ROLES:
+        return role
+    if await is_administrator(db, user.email):
+        return UserRole.teacher
+    return role
+
+
+async def effective_challenge_role(
+    db: AsyncConnection, user: schema.User, challenge_id: int
+) -> UserRole | None:
+    """`effective_course_role` for the routes whose URL carries only a
+    challenge, resolving the course through it exactly as `query_user_role`
+    does."""
+    role = await query_user_role(db, user_id=user.id, challenge_id=challenge_id)
+    if role in EDITOR_ROLES:
+        return role
+    if await is_administrator(db, user.email):
+        return UserRole.teacher
+    return role
 
 
 async def require_course_editor(
@@ -899,7 +951,7 @@ async def require_course_editor(
     question a challenge cannot: whether this person may create one here.
     Hiding a button in the template is a UI affordance, not access control.
     """
-    role = await query_course_role(db, user_id=user.id, course_id=course_id)
+    role = await effective_course_role(db, user, course_id)
     if role is None or role not in EDITOR_ROLES:
         raise Forbidden("Only this course's staff can do that.")
     return role
@@ -915,15 +967,16 @@ async def require_course_member(
 
     This is the gate on a course's contents. `EDITOR_ROLES` is a subset of
     "enrolled", so staff pass it without a second check, and it is deliberately
-    the same `query_course_role` `require_course_editor` uses: the role is per
-    course, so the course in the path is the key.
+    the same `effective_course_role` `require_course_editor` uses: the role is
+    per course, so the course in the path is the key - and a site administrator
+    is staff on every course, so they are inside every gate.
 
     What it does *not* guard is the course page itself - `get_course` shows a
     non-member the title, the description and the way in - nor the home page,
     which has to go on listing every course or nobody could find one to enroll
     on, nor `post_course_enroll`, which is that way in.
     """
-    role = await query_course_role(db, user_id=user.id, course_id=course_id)
+    role = await effective_course_role(db, user, course_id)
     if role is None:
         raise Forbidden("You are not enrolled on this course.")
     return role
@@ -963,8 +1016,13 @@ async def require_challenge_member(
     is in the path too, and staff of one course naming it in front of another's
     challenge is a real attack. With one id there is no second key to disagree
     with, and the challenge determines its course.
+
+    A site administrator passes this without an enrollment, and so also passes
+    it for a challenge id that does not exist at all - the route's own query
+    then finds nothing, which is the empty fragment it would have rendered for
+    a challenge whose contents are gone anyway.
     """
-    role = await query_user_role(db, user_id=user.id, challenge_id=challenge_id)
+    role = await effective_challenge_role(db, user, challenge_id)
     if role is None:
         raise Forbidden("You are not enrolled on the course this challenge belongs to.")
     return role
@@ -1001,9 +1059,7 @@ async def authorize_submission(
     submission row first and because a student *is* allowed here: the rule is
     that you may read your own work, and course staff may read anyone's.
     """
-    role = await query_user_role(
-        db, user_id=user.id, challenge_id=submission["challenge_id"]
-    )
+    role = await effective_challenge_role(db, user, submission["challenge_id"])
     is_staff = role in EDITOR_ROLES
     if not is_staff and submission["user_id"] != user.id:
         raise Forbidden("That submission is not yours.")
@@ -1056,9 +1112,11 @@ async def index(request: Request, db: DBDep, user: CurrentUser, q: str = ""):
             "title": "COCCO: Coding Challenges Companion",
             "user": user,
             "nav": "courses",
-            # Only an administrator is offered "New course". The route behind
-            # the button checks for itself - see `require_admin`.
-            "can_create_course": await user_is_admin(db, user.id),
+            # Two affordances off one answer: "New course", and the Edit button
+            # on the card of a course an administrator is not enrolled on. The
+            # routes behind both check for themselves - see `require_admin` and
+            # `effective_course_role`.
+            "is_admin": await is_administrator(db, user.email),
         },
     )
 
@@ -1073,7 +1131,16 @@ async def _render_courses(
     return templates.TemplateResponse(
         request=request,
         name="f-courses.jinja",
-        context={"courses": courses, "q": q, "user": user},
+        context={
+            "courses": courses,
+            "q": q,
+            "user": user,
+            # `_course-card.jinja` reads this: an administrator is staff on
+            # every course, so offering them `Enroll!` on one would be odd.
+            # `query_courses` still splits the two halves on enrollment alone -
+            # they really are not enrolled, and the split should keep saying so.
+            "is_admin": await is_administrator(db, user.email),
+        },
     )
 
 
@@ -1184,8 +1251,11 @@ async def get_course(course_id: int, request: Request, db: DBDep, user: CurrentU
     title and the description, which the home page's card already shows
     truncated, and nothing else. The challenge list is not merely hidden in the
     template - `query_course_info` is never run for them.
+
+    "Non-member" is `effective_course_role`'s answer, so a site administrator
+    gets the course itself rather than an invitation to join it.
     """
-    role = await query_course_role(db, user_id=user.id, course_id=course_id)
+    role = await effective_course_role(db, user, course_id)
     if role is None:
         course = await query_course(db, course_id)
         if course is None:
@@ -1436,7 +1506,10 @@ async def get_challenge(
     challenge = await query_challenge(db, user_id=user.id, challenge_id=challenge_id)
     if challenge is None:
         raise HTTPException(status_code=404)
-    can_edit = challenge["viewer_role"] in EDITOR_ROLE_NAMES
+    # The dependency's role rather than the query's `viewer_role`: that one is a
+    # LEFT JOIN on `enrollment` and is NULL for a site administrator who is not
+    # enrolled, which would hand them the student page and a submit form.
+    can_edit = role in EDITOR_ROLES
     staff_view = can_edit and as_ != "student"
     return templates.TemplateResponse(
         request=request,

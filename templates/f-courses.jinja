@@ -3,9 +3,10 @@
    every keystroke in the filter box) and inlined by `index-logged-in.jinja` on
    first paint, so the filtered list and the initial one cannot drift apart.
 
-   Context: `courses` (`{enrolled, non_enrolled}` from `query_courses`) and
-   `q`, the filter as it was typed - the empty states say different things
-   depending on whether one is in force. #}
+   Context: `courses` (`{enrolled, non_enrolled}` from `query_courses`), `q`,
+   the filter as it was typed - the empty states say different things depending
+   on whether one is in force - and `is_admin`, which is not read here but is
+   inherited by the cards. #}
 
 <div class="flex items-baseline justify-between gap-4 mb-3">
   <div>

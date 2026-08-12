@@ -4,7 +4,7 @@ database.
 Same harness as `test_auth_routes.py`, and for the same reason: `get_db` is
 overridden with SQLite, which works because everything these routes touch -
 `query_course`, `query_course_role`, `challenge_in_course`, `insert_challenge`,
-`user_is_admin`, `insert_course` - is plain Core. The course page itself is not
+`is_administrator`, `insert_course` - is plain Core. The course page itself is not
 tested here, nor is the home page carrying the "New course" button: both run the
 `json_agg` query only Postgres has.
 """
@@ -15,12 +15,21 @@ from sqlalchemy import insert, select
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from cocco.model import Challenge, Course, Enrollment, User, UserRole, metadata
+from cocco.model import (
+    Administrator,
+    Challenge,
+    Course,
+    Enrollment,
+    User,
+    UserRole,
+    metadata,
+)
 
 TEACHER = "alice@unipd.it"
 STUDENT = "bob@unipd.it"
-# Staff too, but with `admin` rather than `teacher`: the one difference between
-# them is that an admin may create a course.
+# A `teacher` on the first course, exactly like Alice. What separates them is a
+# row in `administrator`: it is what lets him create a course, and what makes
+# him staff on the second one, which nobody enrolled him on.
 ADMIN = "matteo.ceccarello@unipd.it"
 
 # A valid form, so a test only has to say what it wants to be wrong about.
@@ -48,8 +57,8 @@ async def world(app_engine):
     """Two courses: alice teaches the first, bob studies it, nobody the second.
 
     The second course is what a teacher of the first must not be able to reach
-    through, and its challenge is what they must not be able to edit. Matteo
-    administers the first, which is what makes him an admin anywhere.
+    through, and its challenge is what they must not be able to edit - while
+    matteo, who administers the site, must be able to reach both.
     """
     async with app_engine.connect() as conn:
         ids = {}
@@ -81,9 +90,10 @@ async def world(app_engine):
         )
         await conn.execute(
             insert(Enrollment).values(
-                user_id=ids["matteo"], course_id=ids["course"], role=UserRole.admin
+                user_id=ids["matteo"], course_id=ids["course"], role=UserRole.teacher
             )
         )
+        await conn.execute(insert(Administrator).values(email=ADMIN))
         ids["other_challenge"] = (
             await conn.execute(
                 insert(Challenge)
@@ -348,3 +358,30 @@ async def test_the_course_in_the_url_has_to_own_the_challenge(client, world):
     assert client.get(f"/courses/{mine}/{challenge}/edit").status_code == 404
     # Not a way in through the real owner either: alice does not teach it.
     assert client.get(f"/courses/{theirs}/{challenge}/edit").status_code == 403
+
+
+async def test_an_administrator_is_staff_on_every_course(client, world, monkeypatch):
+    """A site administrator is course staff everywhere, enrolled or not.
+
+    Matteo has no enrollment at all on the second course, and `EDITOR_ROLES` is
+    unchanged by his being an administrator - `effective_course_role` is what
+    lets him in, so the difference has to show at the routes rather than only on
+    "New course".
+    """
+    theirs, challenge = world["other"], world["other_challenge"]
+    # The staff-only form, rather than the editors: those render the `json_agg`
+    # queries only Postgres has, and a 403 would prove nothing about a 200.
+    url = f"/courses/{theirs}/challenges/new"
+
+    _sign_in_as(monkeypatch, ADMIN)
+    assert client.get(url).status_code == 200
+    # 204 + HX-Redirect is the success path: he did not merely see the form, he
+    # created a challenge on a course nobody enrolled him on.
+    assert client.post(url, data=FORM).status_code == 204
+    # The cross-check still applies to him: a challenge that is not under the
+    # course he named is a 404, not something an administrator may reach anyway.
+    assert client.get(f"/courses/{world['course']}/{challenge}/edit").status_code == 404
+
+    # And the power did not leak into `EDITOR_ROLES` on the way past.
+    _sign_in_as(monkeypatch, TEACHER)
+    assert client.get(url).status_code == 403

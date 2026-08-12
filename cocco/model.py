@@ -18,7 +18,10 @@ from sqlalchemy import (
 
 
 class UserRole(str, Enum):
-    admin = "admin"
+    """What someone is *on a course*. Every value here is a per-course thing:
+    the site-wide power to bring a course into being lives in `Administrator`,
+    which names no course because a course being created does not exist yet."""
+
     teacher = "teacher"
     collaborator = "collaborator"
     student = "student"
@@ -73,6 +76,22 @@ User = Table(
     Column("nickname", String, nullable=False),
     Column("image", LargeBinary, nullable=False),
     Column("image_mime", String, nullable=False),
+)
+
+
+Administrator = Table(
+    "administrator",
+    metadata,
+    # Keyed by the address rather than by `user.id`, because an administrator is
+    # designated *before* they have ever signed in: `cocco.toml` names the first
+    # set of them and the account only appears on the first accepted callback
+    # from Google. An address is what Google proves and what `user.email` is
+    # unique on, so it identifies a person here just as well as an id would.
+    #
+    # Stored normalized - lowercased and trimmed, the form `normalize_email`
+    # produces and the form `user.email` already holds - so the lookup is a
+    # plain equality.
+    Column("email", String, primary_key=True),
 )
 
 
