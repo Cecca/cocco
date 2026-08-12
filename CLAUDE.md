@@ -160,6 +160,36 @@ replaces it, and N dialogs with N unique ids would be rebuilt on every keystroke
 
 The course has an editor of its own at `/courses/{course_id}/edit` — the course's title and description (the same markdown textarea and `post_markdown_preview` the challenge form uses) plus the challenge list, reorderable with ↑/↓. It is **declared above `get_challenge`**, and that is load-bearing: `/courses/{course_id}/{challenge_id}` matches any single segment, so a `/courses/1/edit` declared after it would route there and be rejected as an unparseable id. The cards themselves are `_challenge-card.jinja`, shared by the course page and by `f-course-challenges.jinja` — the fragment every move swaps in — so the student's list and the editor's cannot drift apart.
 
+Beside it, `/courses/{course_id}/people` (`course-people.jinja`) is the class list: who is
+enrolled, in what role, how much they have submitted *here*, and the three ways staff change it.
+It is `/admin` reshaped for one course and keeps that page's rules — one swap target, `#people`;
+every route answering with `f-course-people.jinja`, alert folded in; every mutation carrying `q`;
+both the enrol form and the filter box **outside** the target. It is **declared above
+`get_challenge`** for the same load-bearing reason the editor is. Course staff only, through
+`CourseEditor` — including its *reads*, because a roster is a list of real people who are on one
+course and not another.
+
+Enrolling takes an **address**, not a user id, and this is the second (and last) place a human
+types one: a teacher writes out a roster before term starts, so most of those people have not
+signed in. Unlike `administrator`, `enrollment` is keyed on `user.id` and cannot name an address
+with no account, so the account is **created** here, through the same `get_or_create_user` the
+Google callback uses. Two consequences worth knowing. A pre-enrolled person gets a real `user`
+row, so `/admin`'s `accounts` list shows them indistinguishably from somebody who has actually
+signed in — there is no `pending_*` half here, because there is nothing pending. And a *blocked*
+account is deliberately **not** refused, the opposite of appointing an administrator: that is
+one-way through the app and so has to refuse, while this is undone by the button in the row it
+creates, and a block stops a person without retracting that they are on the course.
+
+Two rules the page will not break, and they sit where they cannot be raced. **You cannot remove
+yourself** — checked in the route, because it is not a race and deserves its own sentence: it
+would shut the door on the page you are standing on. **A course never loses its last teacher** —
+checked inside `set_enrollment_role`'s `ON CONFLICT` clause and `delete_enrollment`'s `WHERE`, the
+way `block_user` refuses an administrator, and only sound because every mutation takes
+`lock_course` first: `FOR UPDATE` on the course row serializes them, and under READ COMMITTED two
+concurrent statements would otherwise each see the other's teacher and both succeed. `Remove` on
+somebody who has submitted asks for an `hx-confirm` first — not the `<dialog>` a regrade opens,
+because nothing here is destroyed and N dialogs would be rebuilt on every keystroke in the filter.
+
 ### Authentication (`cocco/auth.py`)
 
 Login is **Google OIDC**, and nothing else. `GET /login` offers one button; `GET /auth/google`
@@ -224,6 +254,13 @@ one id in the path there is no second key to disagree with. `EDITOR_ROLES` is a 
 "enrolled", so staff pass the membership check without a second one — but staff of *one* course are
 strangers on every other.
 
+There are therefore **two doors into a course**, and they are not variations on one route.
+`post_course_enroll` is the one a student walks through themselves, which is why the role is fixed
+inside `insert_self_enrollment` and no form field can spell `teacher`. The people page is the one
+course staff open for somebody else, and being behind `CourseEditor` is exactly what lets it name
+any role — including `teacher` — and take an enrollment away again. `set_enrollment_role` is the
+only write that does both; `insert_enrollment` survives for `post_course_new`'s single row.
+
 Four things are deliberately outside the gate, and each would break something if it were not: the
 home page and `/f/courses`, which must list every course or nobody could find one to enroll on;
 `post_course_enroll`, the way in; and `get_course`, which for a non-member renders a **preview** —
@@ -256,11 +293,12 @@ removing an administrator is a `DELETE` on the table.
 permission ("Only a site administrator can do that.") rather than either of the two places it is
 used. The page lists everyone, appoints administrators and blocks accounts. Appointing takes an
 **address**, not a user id — that is what the table holds, and naming somebody before their first
-sign-in is the point of it — and it is the only place in the app where a human types an address,
-so it is the only one that calls `normalize_email` and refuses an address outside
-`allowed_domains`. `_load_auth_config` merely *warns* about the same thing, because a bad line in
-`cocco.toml` must not stop the app from booting; a form has somebody in front of it who can fix
-the typo. **There is no revoke**: removing an administrator is still a `DELETE`.
+sign-in is the point of it. It is one of the **two** places in the app where a human types an
+address (the other is the course's people page, below), so it is one of the two that call
+`normalize_email` and refuse an address outside `allowed_domains`. `_load_auth_config` merely
+*warns* about the same thing, because a bad line in `cocco.toml` must not stop the app from
+booting; a form has somebody in front of it who can fix the typo. **There is no revoke**: removing
+an administrator is still a `DELETE`.
 
 That absence is load-bearing, and two guards follow from it. **An administrator is never blocked**
 — enforced inside `block_user`'s `WHERE` clause, not by a check before the write, so an
@@ -322,7 +360,7 @@ was enrolled when they submitted, because `post_submission` is behind the gate t
 - **An isolate box is one flat directory.** `isolate_run` copies every path argument in under its *basename*, so unrelated paths collapse into one namespace, and the copy order — `box_files`, then `args`, then `additional_files` — decides who wins a collision. `box_files` is the explicit form and the only safe one when more than one file is involved: the evaluator gets its three arguments as `.actual_output`, `.expected_output` and `.test_input`, names nothing can collide with because `safe_filename` strips leading dots from every upload. Without it, a checker uploaded as `expected_output.c` compiles to a binary named `expected_output` that lands on top of the expected output it was meant to read.
 - **Scores are per test case, in `[0, 1]`.** A submission's headline score is the mean of its outcomes' scores, shown out of 100. This aggregation assumes higher-is-better, so it is wrong for a challenge whose evaluator uses another scale — nothing enforces the range, and an evaluator is free to return any finite float.
 - **The leaderboard's criterion is per challenge.** `challenge.ranking` is set by course staff in the editor and drives `query_challenge_leaderboard`, whose three variants live in `_LEADERBOARD_CRITERIA` as literal SQL keyed by the enum — the criterion is never taken from a request as text. `running_time` is the strict board: a submission is on it only if it passed *every* test, ranked by the sum of the per-test times. `total_score` and `average_score` rank by score, descending, and deliberately admit partially correct submissions, because a partial-credit evaluator is the case where nobody passes everything; both assume higher-is-better and so are wrong for an evaluator that is not, same as the headline score. Whichever the criterion, a student appears once, represented by their best submission, and every row carries all three metrics plus `n_tests` so the fragment can render the one that applies.
-- **A block stops a person, it does not retract their work.** The judge grades a blocked student's queued submissions — `pull_queued_submission` does not know who submitted and should not learn: skipping those rows would strand them as `queued` forever, showing as pending in every teacher's standings and muddying the `count_running_submissions` check that guards a regrade. Standings and leaderboards go on listing them for the same reason: they are the record of what happened on a course, and it did happen. Nothing blocked is seeded either — a blocked `COCCO_DUMMY_USER` would lock a developer out of their own fresh checkout, which is exactly the trap "an administrator is never blocked" exists to avoid.
+- **A block stops a person, it does not retract their work.** The judge grades a blocked student's queued submissions — `pull_queued_submission` does not know who submitted and should not learn: skipping those rows would strand them as `queued` forever, showing as pending in every teacher's standings and muddying the `count_running_submissions` check that guards a regrade. Standings and leaderboards go on listing them for the same reason: they are the record of what happened on a course, and it did happen. Nothing blocked is seeded either — a blocked `COCCO_DUMMY_USER` would lock a developer out of their own fresh checkout, which is exactly the trap "an administrator is never blocked" exists to avoid. **Removing an enrollment draws the same line**: `delete_enrollment` takes one row and nothing else, so the person loses access to the course and drops out of its standings, while every submission, outcome and leaderboard entry stays exactly where it was — `submission.user_id` has no `ON DELETE` tie to `enrollment`, and `query_challenge_standings`'s cohort is already a union with everyone who submitted. The confirmation on the people page says so in as many words.
 - **A hidden test case gives away nothing but its verdict.** `visible_outcomes` in `main.py` blanks an outcome's `message`, `stdout` and `stderr` unless the test case is a public sample or the viewer is course staff: `stdout`/`stderr` are the submitted program's own output — the obvious way to print a hidden input back out — and `message` is now written by a *teacher's script that has just read the hidden input and the expected output*, which makes the rule matter more, not less — `diff.py` puts the expected output in it verbatim. The verdict, the score and the resource usage are always shown. Compiler output is exempt, and has its own block on the submission page: it does not depend on any test input. Redact in that function, not in the template, so the rule stays unit testable.
 - **An anonymous htmx request gets `HX-Redirect`, not a 302.** `get_user` raises `NotAuthenticated` rather than returning a redirect — a dependency cannot return a `Response` — and the handler branches on the `HX-Request` header. This matters because most of the app is `f-*` fragments polled every few seconds: htmx follows a redirect inside the XHR, so a 302 would splice the whole login page into whatever div was polling, over and over. A 204 with `HX-Redirect` navigates the browser instead.
 - **A secret never has a fixed default.** With neither `COCCO_SECRET_KEY` nor `[session].secret_key` set, `load_config` generates a random key per process and logs a warning: an unconfigured deployment then logs everybody out on every restart and no two workers agree, which is loud. A constant in the source tree would be a signing key that ships with the code, which is silent.

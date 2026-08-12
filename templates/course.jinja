@@ -15,10 +15,16 @@
         </p>
         {# Course staff only. The real check is on the edit routes themselves. #}
         {% if can_edit %}
-        <a href="{{ url_for('get_course_edit', course_id=course.id) }}"
-           class="btn btn-sm btn-ghost gap-1.5 font-semibold border border-base-300 -mt-1">
-          <span class="text-primary">✎</span> Edit course
-        </a>
+        <div class="flex items-center gap-2 -mt-1">
+          <a href="{{ url_for('get_course_people', course_id=course.id) }}"
+             class="btn btn-sm btn-ghost gap-1.5 font-semibold border border-base-300">
+            <span class="text-primary">☺</span> People
+          </a>
+          <a href="{{ url_for('get_course_edit', course_id=course.id) }}"
+             class="btn btn-sm btn-ghost gap-1.5 font-semibold border border-base-300">
+            <span class="text-primary">✎</span> Edit course
+          </a>
+        </div>
         {% endif %}
       </div>
       <h1 class="font-serif text-4xl font-semibold tracking-tight mt-1 mb-4">{{ course.title }}</h1>

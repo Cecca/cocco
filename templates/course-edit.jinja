@@ -15,10 +15,16 @@
       </p>
       <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ course.title }}</h1>
     </div>
-    <a href="{{ url_for('get_course', course_id=course.id) }}"
-       class="btn btn-sm btn-ghost border border-base-300 font-semibold">
-      ← Back to course
-    </a>
+    <div class="flex items-center gap-2">
+      <a href="{{ url_for('get_course_people', course_id=course.id) }}"
+         class="btn btn-sm btn-ghost gap-1.5 border border-base-300 font-semibold">
+        <span class="text-primary">☺</span> People
+      </a>
+      <a href="{{ url_for('get_course', course_id=course.id) }}"
+         class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+        ← Back to course
+      </a>
+    </div>
   </div>
 
   <!-- ══ TITLE + DESCRIPTION ═════════════════════════════════════════ -->

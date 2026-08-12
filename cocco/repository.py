@@ -14,6 +14,7 @@ from sqlalchemy import (
     exists,
     func,
     insert,
+    or_,
     select,
     text,
     update,
@@ -146,6 +147,105 @@ async def insert_self_enrollment(conn: AsyncConnection, user_id: int, course_id:
         .on_conflict_do_nothing(index_elements=["user_id", "course_id"])
     )
     await conn.execute(stmt)
+
+
+def _teacher_count(course_id: int):
+    """How many teachers a course has, as a subquery.
+
+    A subquery and not a separate `SELECT` because it is only ever asked as part
+    of the statement that would change the answer - see `set_enrollment_role`
+    and `delete_enrollment`, which both refuse to take the last one away.
+    """
+    return (
+        select(func.count())
+        .select_from(Enrollment)
+        .where(
+            Enrollment.c.course_id == course_id,
+            Enrollment.c.role == UserRole.teacher,
+        )
+        .scalar_subquery()
+    )
+
+
+async def lock_course(conn: AsyncConnection, course_id: int) -> bool:
+    """Take the course's row for update, so its membership changes serialize.
+    False if there is no such course. Does not commit.
+
+    Every mutation on the people page calls this first, and that is what makes
+    "a course never loses its last teacher" true rather than merely usually
+    true: `_teacher_count` runs inside the statement that acts on it, but under
+    READ COMMITTED two concurrent statements would each still see the other's
+    teacher and both succeed. Locking one row per course serializes them, and
+    `get_db` hands out a connection whose transaction ends at the route's
+    `commit`, so the lock is held for exactly the right span.
+    """
+    stmt = select(Course.c.id).where(Course.c.id == course_id).with_for_update()
+    return (await conn.execute(stmt)).first() is not None
+
+
+async def set_enrollment_role(
+    conn: AsyncConnection, course_id: int, user_id: int, role: UserRole
+) -> bool:
+    """Put someone on a course in a given role, or change the role they are
+    already in. Does not commit. True if a row was written.
+
+    One upsert behind both halves of the people page - the enroll form and the
+    per-row selector - because they are the same write: `enrollment` is keyed on
+    (user_id, course_id), so "enroll them as a teacher" and "make them a
+    teacher" name one row either way. Enrolling somebody twice is therefore not
+    an `IntegrityError`, which is what `insert_enrollment` would raise.
+
+    False means the update was refused: it would have taken `teacher` away from
+    the last one a course has. That guard rides in the `ON CONFLICT` clause's
+    WHERE rather than in a check preceding it, for the reason `block_user`
+    gives - the rule and the write are then one statement. Promoting *to*
+    teacher can never trip it, so it is not even attached in that case.
+    """
+    stmt = pg_insert(Enrollment).values(
+        user_id=user_id, course_id=course_id, role=role
+    )
+    where = None
+    if role is not UserRole.teacher:
+        where = or_(
+            Enrollment.c.role != UserRole.teacher, _teacher_count(course_id) > 1
+        )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["user_id", "course_id"],
+        set_={"role": role},
+        where=where,
+    ).returning(Enrollment.c.user_id)
+    return (await conn.execute(stmt)).first() is not None
+
+
+async def delete_enrollment(
+    conn: AsyncConnection, course_id: int, user_id: int
+) -> bool:
+    """Take somebody off a course. Does not commit. True if it did.
+
+    Nothing of theirs goes with it. `submission.user_id` has no tie to
+    `enrollment`, and `query_challenge_standings` builds its cohort as the union
+    of the enrolled and everyone who submitted, so their attempts stay in the
+    record of the course - a person is removed, their work is not retracted, the
+    same distinction a block draws.
+
+    False means the row belonged to the course's last teacher or was not there
+    at all. The route reports both the same way, because in both cases nothing
+    happened. Refusing on the last teacher lives in the WHERE clause for
+    `block_user`'s reason, and is only sound under `lock_course`.
+    """
+    stmt = (
+        delete(Enrollment)
+        .where(
+            Enrollment.c.course_id == course_id,
+            Enrollment.c.user_id == user_id,
+            or_(
+                Enrollment.c.role != UserRole.teacher,
+                _teacher_count(course_id) > 1,
+            ),
+        )
+        .returning(Enrollment.c.user_id)
+    )
+    return (await conn.execute(stmt)).first() is not None
 
 
 async def course_exists(conn: AsyncConnection, course_id: int) -> bool:
@@ -1205,6 +1305,85 @@ async def query_users(conn: AsyncConnection, q: str = ""):
     SELECT row_to_json(d) FROM d;
     """)
     res = await conn.execute(query, dict(q=q))
+    return res.scalar()
+
+
+async def query_course_people(conn: AsyncConnection, course_id: int, q: str = ""):
+    """Everyone enrolled on a course, for the people page. Course staff only.
+
+    `query_users` for one course instead of the whole site, and the differences
+    are what a roster is: the row carries the person's `role` here, and the
+    submission counts are over *this course* rather than over everything they
+    have ever submitted - a teacher looking at their class wants to know who has
+    started, not who is busy elsewhere.
+
+    Strictly the enrolled, unlike `query_challenge_standings`, whose cohort is
+    deliberately a union with everyone who submitted: this is the class list,
+    and somebody who was removed is off it even though their attempts remain.
+    A site administrator is staff on every course without an enrollment, so they
+    do not appear here either - `effective_course_role` is where that is true,
+    not this table.
+
+    `n_teachers` rides along so the fragment can hide `Remove` on the last one.
+    It is counted **outside** the `q` predicate on purpose: a filter that hides
+    the other teachers must not make the visible one look like the last, which
+    would put a refusal behind a button that is offered.
+
+    `q` is the substring test the rest of the app uses - `position()` rather
+    than `ILIKE '%'||:q||'%'`, so an address typed with a `%` or a `_` in it is
+    matched literally and there is no escaping to get wrong.
+    """
+    query = text("""
+    WITH
+    submitted AS (
+        SELECT submission.user_id,
+               count(*) AS n_submissions,
+               max(submission.enqueued) AS last_submitted
+        FROM submission
+        JOIN challenge ON challenge.id = submission.challenge_id
+        WHERE challenge.course_id = :course_id
+        GROUP BY submission.user_id
+    ),
+    members AS (
+        SELECT
+            u.id,
+            u.email,
+            u.nickname,
+            e.role,
+            u.blocked_at IS NOT NULL AS is_blocked,
+            coalesce(submitted.n_submissions, 0) AS n_submissions,
+            submitted.last_submitted
+        FROM enrollment e
+        JOIN "user" u ON u.id = e.user_id
+        LEFT JOIN submitted ON submitted.user_id = u.id
+        WHERE e.course_id = :course_id
+          AND (:q = ''
+               OR position(lower(:q) in lower(u.email)) > 0
+               OR position(lower(:q) in lower(u.nickname)) > 0)
+    ),
+    -- coalesce, as in `query_users`: json_agg over no rows is NULL, and a
+    -- filter that matches nobody would otherwise hand the template a null.
+    -- Staff first, then by name: the people who run the course sit at the top.
+    listed AS (
+        SELECT coalesce(
+            json_agg(members ORDER BY members.role, members.nickname, members.id),
+            '[]'::json
+        ) AS people
+        FROM members
+    ),
+    -- Unfiltered, and the string literal is how `SAEnum(UserRole)` stores it -
+    -- the spelling `query_challenge_standings` uses for `'student'`.
+    staff AS (
+        SELECT count(*) AS n_teachers
+        FROM enrollment
+        WHERE course_id = :course_id AND role = 'teacher'
+    ),
+    d AS (
+        SELECT * FROM listed, staff
+    )
+    SELECT row_to_json(d) FROM d;
+    """)
+    res = await conn.execute(query, dict(course_id=course_id, q=q))
     return res.scalar()
 
 

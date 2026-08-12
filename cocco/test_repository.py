@@ -26,6 +26,7 @@ from cocco.repository import (
     count_running_submissions,
     count_testcase_outcomes,
     course_exists,
+    delete_enrollment,
     insert_administrators,
     insert_challenge,
     insert_course,
@@ -41,6 +42,7 @@ from cocco.repository import (
     query_challenge_testcases,
     query_course_challenges,
     query_course_info,
+    query_course_people,
     query_course_role,
     query_course,
     query_courses,
@@ -56,10 +58,19 @@ from cocco.repository import (
     query_users,
     regrade_challenge,
     reorder_challenges,
+    set_enrollment_role,
     unblock_user,
 )
 from cocco import schema
 from cocco.schema import SubmissionRunData
+
+
+async def _course_id(conn, title):
+    """The seeded course with this title. `_make_example_database` builds them
+    from a list, so the ids are not known to the test that wants one."""
+    return (
+        await conn.execute(select(Course.c.id).where(Course.c.title == title))
+    ).scalar_one()
 
 
 def _make_engine(db_url="sqlite:///:memory:"):
@@ -1221,6 +1232,125 @@ async def test_self_enrollment():
         assert (
             await query_course_role(conn, user_id=bob, course_id=systems["id"])
         ) == UserRole.teacher
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_the_roster_is_the_enrolled_and_counts_this_course_only():
+    """`query_course_people` is the class list, not the scoreboard's cohort:
+    strictly the enrolled, and the submission counts stop at this course."""
+    url = _postgres_url()
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        algorithms = await _course_id(conn, "Algorithms 101")
+        roster = await query_course_people(conn, algorithms)
+
+        # Staff first, then by name - the people who run the course on top.
+        assert [p["nickname"] for p in roster["people"]] == ["alice", "carol", "dave"]
+        assert roster["n_teachers"] == 1
+        by_name = {p["nickname"]: p for p in roster["people"]}
+        assert by_name["alice"]["role"] == "teacher"
+        assert by_name["carol"]["role"] == "student"
+        # Bob teaches Systems Programming and is nothing here.
+        assert "bob" not in by_name
+
+        # The counts are over this course, not over everything they have ever
+        # submitted - a teacher looking at their class wants to know who has
+        # started here.
+        everywhere = {
+            u["nickname"]: u["n_submissions"]
+            for u in (await query_users(conn))["accounts"]
+        }
+        for nickname, person in by_name.items():
+            assert person["n_submissions"] <= everywhere[nickname]
+
+        # The filter is a substring test on either field, and empty is no filter
+        assert [
+            p["nickname"] for p in (await query_course_people(conn, algorithms, q="car"))["people"]
+        ] == ["carol"]
+        assert await query_course_people(conn, algorithms, q="") == roster
+
+        # Counted outside the filter: hiding the other teachers must not make
+        # the visible one look like the last.
+        assert (await query_course_people(conn, algorithms, q="dave"))["n_teachers"] == 1
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_a_course_never_loses_its_last_teacher():
+    """The guard both writes carry, from underneath the routes: it lives in the
+    WHERE clause, so the rule and the write are one statement."""
+    url = _postgres_url()
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        algorithms = await _course_id(conn, "Algorithms 101")
+        alice = (await query_user_by_email(conn, "alice@unipd.it")).id
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
+
+        # Alice is the only teacher, so neither way of taking that away works
+        assert not await delete_enrollment(conn, algorithms, alice)
+        assert not await set_enrollment_role(
+            conn, algorithms, alice, UserRole.student
+        )
+        await conn.commit()
+        assert (
+            await query_course_role(conn, user_id=alice, course_id=algorithms)
+        ) == UserRole.teacher
+
+        # Promoting *to* teacher can never trip the guard
+        assert await set_enrollment_role(conn, algorithms, carol, UserRole.teacher)
+        await conn.commit()
+        # ...and with a second one there is nothing left to protect
+        assert await delete_enrollment(conn, algorithms, alice)
+        await conn.commit()
+        assert (
+            await query_course_role(conn, user_id=alice, course_id=algorithms)
+        ) is None
+
+        # A row that is not there is False too, and the route says the same
+        # thing about both, because in both cases nothing happened.
+        assert not await delete_enrollment(conn, algorithms, alice)
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_setting_a_role_is_one_upsert():
+    """"Enrol them as a teacher" and "make them a teacher" name one row:
+    `enrollment` is keyed on (user_id, course_id)."""
+    url = _postgres_url()
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        systems = await _course_id(conn, "Systems Programming")
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
+
+        # Not on the course at all: an insert
+        assert (
+            await query_course_role(conn, user_id=carol, course_id=systems)
+        ) is None
+        assert await set_enrollment_role(conn, systems, carol, UserRole.collaborator)
+        await conn.commit()
+        assert (
+            await query_course_role(conn, user_id=carol, course_id=systems)
+        ) == UserRole.collaborator
+
+        # On it already: an update, not an IntegrityError
+        assert await set_enrollment_role(conn, systems, carol, UserRole.student)
+        await conn.commit()
+        assert (
+            await query_course_role(conn, user_id=carol, course_id=systems)
+        ) == UserRole.student
     await engine.dispose()
 
 

@@ -1,0 +1,140 @@
+{# Everyone enrolled on one course. Rendered standalone by every route on the
+   people page - the filter box's GET and all three mutations - and inlined by
+   `course-people.jinja` on first paint, so the list a click leaves behind is
+   the one the box would have produced. `f-users.jinja` for one course instead
+   of the whole site, and it keeps that fragment's rules.
+
+   Context: `people` (`{people, n_teachers}` from `query_course_people`),
+   `course_id`, `q` - the filter as it was typed, so the empty state can say
+   different things depending on whether one is in force - `user`, the viewer,
+   whose own row offers no Remove, and `message`/`ok`, the alert every mutation
+   answers with. The alert lives *inside* the swap rather than in a div of its
+   own: one target means the sentence and the new state arrive together instead
+   of having to be kept in step. #}
+
+{% if message %}
+<div class="mb-4">
+  {% include "f-edit-result.jinja" %}
+</div>
+{% endif %}
+
+<div class="overflow-x-auto">
+  <table class="table">
+    <thead>
+      <tr class="text-xs uppercase tracking-wider text-base-content/45 font-mono">
+        <th>Person</th>
+        <th class="w-52">Role</th>
+        <th class="w-32 text-right">Submissions</th>
+        <th class="w-44">Last submitted</th>
+        <th class="w-28"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for person in people.people %}
+      {# The last teacher is neither demoted nor removed - `set_enrollment_role`
+         and `delete_enrollment` refuse in their WHERE clauses, and these two
+         say so in the interface rather than letting a click find out.
+         `n_teachers` is counted unfiltered, so typing in the box above cannot
+         make somebody look like the last one. #}
+      {% set is_last_teacher = person.role == "teacher" and people.n_teachers <= 1 %}
+      {% set is_self = person.id == user.id %}
+      <tr class="hover">
+        <td>
+          <div class="flex items-center gap-2.5">
+            <img src="{{ url_for('user_avatar', user_id=person.id) }}"
+                 alt="{{ person.nickname }}'s avatar"
+                 class="w-7 h-7 rounded-full bg-base-200 object-cover" />
+            <div>
+              <div class="flex items-center gap-2">
+                <span class="font-semibold">{{ person.nickname }}</span>
+                {% if is_self %}
+                <span class="badge badge-ghost badge-sm font-mono">you</span>
+                {% endif %}
+                {% if person.is_blocked %}
+                {# A block is site-wide and shuts them out of everything; it does
+                   not take them off a course, so the row stays and says so. #}
+                <span class="badge badge-error badge-sm font-mono">blocked</span>
+                {% endif %}
+              </div>
+              <div class="text-[13px] text-base-content/55 font-mono">{{ person.email }}</div>
+            </div>
+          </div>
+        </td>
+        <td>
+          {% if is_last_teacher %}
+          <div class="flex items-center gap-2">
+            <span class="badge badge-primary badge-sm font-mono">teacher</span>
+            <span class="text-[13px] text-base-content/45 whitespace-nowrap">the last one</span>
+          </div>
+          {% else %}
+          {# Its own form - the Remove button below is another, and nesting them
+             would be invalid HTML. It submits on change rather than behind a
+             Save: one field, one write. #}
+          <form hx-post="{{ url_for('post_course_person_role', course_id=course_id, user_id=person.id) }}"
+                hx-target="#people"
+                hx-swap="innerHTML"
+                hx-trigger="change"
+                hx-disabled-elt="find select">
+            <input type="hidden" name="q" value="{{ q }}" />
+            <select name="new_role"
+                    aria-label="{{ person.nickname }}'s role on this course"
+                    class="select select-sm select-bordered font-mono">
+              {% for role_name in USER_ROLE_NAMES %}
+              <option value="{{ role_name }}"
+                      {% if role_name == person.role %}selected{% endif %}>
+                {{ role_name }}
+              </option>
+              {% endfor %}
+            </select>
+          </form>
+          {% endif %}
+        </td>
+        <td class="text-right font-mono text-sm text-base-content/60">
+          {{ person.n_submissions }}
+        </td>
+        <td class="text-sm text-base-content/60">
+          {{ person.last_submitted | datetime if person.last_submitted else "—" }}
+        </td>
+        <td>
+          {% if is_self %}
+          {# `post_course_person_remove` refuses this before it reaches the
+             database: it would shut the door on the page you are standing on. #}
+          <span class="text-[13px] text-base-content/45">—</span>
+          {% elif is_last_teacher %}
+          <span class="text-[13px] text-base-content/45">—</span>
+          {% else %}
+          <form hx-post="{{ url_for('post_course_person_remove', course_id=course_id, user_id=person.id) }}"
+                hx-target="#people"
+                hx-swap="innerHTML"
+                hx-disabled-elt="find button"
+                {% if person.n_submissions %}
+                {# `hx-confirm` and not the `<dialog class="modal">`
+                   `challenge-staff.jinja` opens for a regrade: that precedent is
+                   for outcomes being destroyed, and nothing here is - their work
+                   stays. A dialog per row would also carry a unique id and be
+                   rebuilt on every keystroke in the filter box above. #}
+                hx-confirm="{{ person.nickname }} has {{ person.n_submissions }} submission(s) on this course. Their work stays in the database, but they lose access to the course and drop out of its standings."
+                {% endif %}>
+            <input type="hidden" name="q" value="{{ q }}" />
+            <button type="submit" class="btn btn-xs btn-error btn-outline font-semibold">
+              Remove
+            </button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="5" class="text-center text-sm text-base-content/45 py-6">
+          {% if q %}
+          Nobody on this course matches “{{ q }}”.
+          {% else %}
+          Nobody is enrolled yet. Add them above, or give the class the
+          enrollment key from the course editor.
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
