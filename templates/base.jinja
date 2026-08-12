@@ -28,16 +28,11 @@
     {# The login page renders with no user, so everything below is guarded. #}
     {% if user %}
     <div class="dropdown dropdown-end">
-      <div tabindex="0" role="button" class="flex items-center gap-3 cursor-pointer">
-        <div class="hidden sm:flex flex-col items-end leading-tight">
-          <span class="font-semibold text-sm">{{ user.nickname }}</span>
-          <span class="text-xs opacity-60">{{ user.email }}</span>
-        </div>
-        <img src="{{ url_for('user_avatar', user_id=user.id) }}"
-             alt="{{ user.nickname }}'s avatar"
-             class="w-8 h-8 rounded-full bg-base-200 object-cover" />
-      </div>
+      {% with oob = false %}{% include "_navbar-identity.jinja" %}{% endwith %}
       <ul tabindex="0" class="dropdown-content menu bg-base-100 rounded-box z-10 mt-2 w-44 p-2 shadow border border-base-300">
+        <li>
+          <a href="{{ url_for('get_profile', user_id=user.id) }}">Profile</a>
+        </li>
         <li>
           {# A plain form, so signing out works without JS, and a POST, so it
              cannot be triggered by a link someone else planted. #}

@@ -190,6 +190,38 @@ concurrent statements would otherwise each see the other's teacher and both succ
 somebody who has submitted asks for an `hx-confirm` first — not the `<dialog>` a regrade opens,
 because nothing here is destroyed and N dialogs would be rebuilt on every keystroke in the filter.
 
+`/users/{user_id}` (`profile.jinja`) is the account itself, and it is **one URL, two pages** the
+way the challenge is: the owner gets forms, a site administrator gets the same facts as text.
+There are two dependencies rather than one, and the asymmetry is the point.
+`require_profile_reader` allows the owner or an administrator and **returns `can_edit`**, so the
+route asks once and the template does not work it out again — the trick `authorize_submission`
+plays with `is_staff`. `require_profile_owner` has no administrator branch at all: reading a
+profile is oversight, renaming somebody is impersonation, and `/admin`'s business is what an
+account may *do* — appoint it, block it — not what it is called. Course staff are strangers here
+even to their own students, because the page spans every course rather than the one in a URL.
+The address is nobody's to edit, including its owner's: it is the login identifier Google proves.
+`update_user` is the write, deliberately not the path a block takes — `block_user` has a rule in
+its `WHERE` clause that going through the kwargs helper would lose.
+
+Everything a mutation can change is one swap target, `#identity`, alert included, which is
+`/admin`'s rule again; the address, the badges and the course list sit outside it because no
+button touches them, and dragging them in would drag the Postgres-only `query_user_profile` in
+behind — the mutations answer from `query_user`, which is plain Core. The navbar shows the same
+name and face, so a rename swaps a fresh `_navbar-identity.jinja` **out of band**: the partial
+exists so those two copies cannot drift, and right after a rename is exactly when a drift would be
+noticed. There are two ways in, the dropdown's `Profile` and the nickname in `f-users.jinja`.
+
+**The avatar is `user.image`, a blob on the row, and `sniff_image_mime` decides its type.** Never
+the upload's own `content_type`, which is written by whoever is uploading: `user_avatar` serves
+those bytes straight back from this origin, so believing that header would be believing a stranger
+about what the browser should run. SVG is refused for the same reason even though the identicon
+*is* one — we generate identicons, we do not generate uploads — and the route answers with
+`nosniff` and a `default-src 'none'` CSP as the second lock. It also sets `Cache-Control:
+no-cache`, because the URL does not change when the picture does. `Generate from my name` reseeds
+`generate_identicon` on the nickname **as it is now**, which is how a face catches up with a
+rename: a rename never silently redraws one, since once somebody has uploaded a picture it is
+theirs.
+
 ### Authentication (`cocco/auth.py`)
 
 Login is **Google OIDC**, and nothing else. `GET /login` offers one button; `GET /auth/google`

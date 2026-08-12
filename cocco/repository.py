@@ -835,6 +835,21 @@ async def query_user(conn: AsyncConnection, user_id: int):
     return (await conn.execute(stmt)).first()
 
 
+async def update_user(conn: AsyncConnection, user_id: int, **fields) -> None:
+    """Change a user's own details. Does not commit.
+
+    The kwargs shape `update_course` and `update_challenge` use, and for the
+    same reason: the caller knows which half of the form it is saving. It is
+    deliberately *not* how a block is written - `block_user` has a WHERE clause
+    carrying a rule, and going through here would lose it. Nothing that touches
+    `email` should come through here either: that is the login identifier
+    Google proves, not a field.
+    """
+    if not fields:
+        return
+    await conn.execute(update(User).where(User.c.id == user_id).values(**fields))
+
+
 async def block_user(
     conn: AsyncConnection, user_id: int, reason: str | None
 ) -> bool:
@@ -1305,6 +1320,86 @@ async def query_users(conn: AsyncConnection, q: str = ""):
     SELECT row_to_json(d) FROM d;
     """)
     res = await conn.execute(query, dict(q=q))
+    return res.scalar()
+
+
+async def query_user_profile(conn: AsyncConnection, user_id: int):
+    """Everything one profile page shows, or None if there is no such account.
+
+    `query_users` narrowed to one person and widened with the courses they are
+    on - which is the thing a profile says that a row in a list cannot. The
+    courses carry the role and the submissions made *there*, the way
+    `query_course_people` counts per course rather than site-wide: on a profile
+    the interesting number is per course, and the site-wide total rides along
+    beside it as `n_submissions`.
+
+    `person` is keyed on the id and nothing else, so a missing account makes
+    every cross join below empty and `row_to_json` returns nothing at all -
+    the route turns that into a 404 rather than rendering a blank page.
+
+    `image` stays out, as it does in `_USER_COLUMNS`: the avatar has a route of
+    its own and does not belong in a JSON document.
+    """
+    query = text("""
+    WITH
+    -- Site-wide, and beside the per-course counts rather than their sum: a
+    -- submission to a course the person has since been removed from is still
+    -- theirs, and would go missing from a total added up over `enrollment`.
+    totals AS (
+        SELECT count(*) AS n_submissions, max(enqueued) AS last_submitted
+        FROM submission WHERE user_id = :user_id
+    ),
+    per_course AS (
+        SELECT challenge.course_id, count(*) AS n_submissions
+        FROM submission
+        JOIN challenge ON challenge.id = submission.challenge_id
+        WHERE submission.user_id = :user_id
+        GROUP BY challenge.course_id
+    ),
+    memberships AS (
+        SELECT
+            c.id,
+            c.title,
+            e.role,
+            coalesce(per_course.n_submissions, 0) AS n_submissions
+        FROM enrollment e
+        JOIN course c ON c.id = e.course_id
+        LEFT JOIN per_course ON per_course.course_id = c.id
+        WHERE e.user_id = :user_id
+    ),
+    -- coalesce, as everywhere else: json_agg over no rows is NULL, and
+    -- somebody enrolled on nothing at all would hand the template a null to
+    -- iterate. Staff first, then by title, as on the people page.
+    listed AS (
+        SELECT coalesce(
+            json_agg(memberships ORDER BY memberships.role, memberships.title),
+            '[]'::json
+        ) AS courses
+        FROM memberships
+    ),
+    person AS (
+        SELECT
+            u.id,
+            u.email,
+            u.nickname,
+            -- EXISTS rather than a join, for `query_users`' reason:
+            -- `administrator` is keyed on the address and need not have a row
+            -- of `user` to meet.
+            EXISTS (
+                SELECT 1 FROM administrator a WHERE a.email = u.email
+            ) AS is_admin,
+            u.blocked_at IS NOT NULL AS is_blocked,
+            u.blocked_at,
+            u.blocked_reason
+        FROM "user" u
+        WHERE u.id = :user_id
+    ),
+    d AS (
+        SELECT * FROM person, listed, totals
+    )
+    SELECT row_to_json(d) FROM d;
+    """)
+    res = await conn.execute(query, dict(user_id=user_id))
     return res.scalar()
 
 

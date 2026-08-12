@@ -1,0 +1,94 @@
+{# The name and the face: everything on a profile that its owner may change.
+
+   Rendered standalone by all three mutations and inlined by `profile.jinja` on
+   first paint, so what a click leaves behind is what the page would have shown
+   anyway. Deliberately narrower than the page: the address, the badges and the
+   course list sit outside `#identity`, because no button here touches them.
+
+   Context: `profile` — a `query_user` row after a mutation, the whole document
+   on first paint, and only `id`/`nickname`/`email` are read, which both carry;
+   `can_edit`, true only for the owner; and `message`/`ok`, the alert every
+   mutation answers with, inside the swap so the sentence and the new state
+   arrive together. #}
+
+{% if message %}
+<div class="mb-4">
+  {% include "f-edit-result.jinja" %}
+</div>
+{% endif %}
+
+{# The navbar shows the same name and the same picture. Swapping a fresh copy
+   of it out of band is what keeps the two from disagreeing until a reload —
+   right after a rename is exactly when that would be noticed. #}
+{% if ok %}
+{% with oob = true, user = profile %}{% include "_navbar-identity.jinja" %}{% endwith %}
+{% endif %}
+
+<div class="flex flex-wrap items-start gap-6">
+  <div class="flex flex-col items-center gap-2">
+    <img src="{{ url_for('user_avatar', user_id=profile.id) }}"
+         alt="{{ profile.nickname }}'s avatar"
+         class="w-24 h-24 rounded-full bg-base-200 object-cover border border-base-300" />
+    {% if can_edit %}
+    <form hx-post="{{ url_for('post_avatar', user_id=profile.id) }}"
+          hx-target="#identity"
+          hx-swap="innerHTML"
+          hx-encoding="multipart/form-data"
+          enctype="multipart/form-data"
+          {# `change` bubbles from the file input up to the form, so picking a
+             picture is the whole interaction — a Save button beside a picker
+             would be a second click that says nothing. #}
+          hx-trigger="change"
+          hx-disabled-elt="find input"
+          class="flex flex-col items-center gap-1">
+      <label class="btn btn-xs btn-ghost border border-base-300 font-semibold">
+        <span class="submit-label">Change picture</span>
+        <span class="htmx-indicator loading loading-spinner loading-xs"></span>
+        <input type="file" name="avatar_file" accept="image/png,image/jpeg,image/gif,image/webp"
+               aria-label="Upload a new avatar" class="hidden" />
+      </label>
+      <span class="text-[11px] text-base-content/45">PNG, JPEG, GIF or WebP</span>
+    </form>
+    <form hx-post="{{ url_for('post_avatar_reset', user_id=profile.id) }}"
+          hx-target="#identity"
+          hx-swap="innerHTML"
+          hx-disabled-elt="find button">
+      <button type="submit" class="btn btn-xs btn-ghost text-base-content/55 font-semibold">
+        Generate from my name
+      </button>
+    </form>
+    {% endif %}
+  </div>
+
+  <div class="flex-1 min-w-64">
+    {% if can_edit %}
+    <form hx-post="{{ url_for('post_profile', user_id=profile.id) }}"
+          hx-target="#identity"
+          hx-swap="innerHTML"
+          hx-disabled-elt="find button"
+          class="flex flex-wrap items-end gap-2">
+      <label class="flex-1 min-w-56">
+        <span class="block text-[13px] font-semibold mb-1.5">Display name</span>
+        <input type="text" name="nickname" required autocomplete="off"
+               value="{{ profile.nickname }}"
+               class="input w-full" />
+      </label>
+      <button type="submit" class="btn btn-primary shadow-md shadow-primary/30">
+        <span class="submit-label">Save</span>
+        <span class="htmx-indicator loading loading-spinner loading-sm"></span>
+      </button>
+    </form>
+    <p class="text-[13px] text-base-content/45 mt-2">
+      This is the name on your submissions, on the standings and on every
+      leaderboard.
+    </p>
+    {% else %}
+    <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+      Display name
+    </p>
+    <p class="font-serif text-3xl font-semibold tracking-tight mt-1">
+      {{ profile.nickname }}
+    </p>
+    {% endif %}
+  </div>
+</div>

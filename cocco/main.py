@@ -7,7 +7,7 @@ from pygments.formatters import HtmlFormatter
 from pygments.lexers import TextLexer, get_lexer_by_name
 from pygments.util import ClassNotFound
 from sqlalchemy import insert, select
-from cocco.avatar import generate_identicon
+from cocco.avatar import MAX_AVATAR_BYTES, generate_identicon, sniff_image_mime
 from cocco.evaluators import BUNDLED, DEFAULT_EVALUATOR, bundled_path
 from cocco.judge import extension_to_language, load_languages
 from cocco.storage import Storage, safe_filename
@@ -98,6 +98,7 @@ from cocco.repository import (
     query_testcase,
     query_user,
     query_user_by_email,
+    query_user_profile,
     query_user_role,
     query_user_submissions,
     query_users,
@@ -109,6 +110,7 @@ from cocco.repository import (
     update_challenge,
     update_course,
     update_testcase,
+    update_user,
 )
 
 
@@ -3152,6 +3154,219 @@ async def post_testcase_move(
     return await _render_testcases(request, db, course_id, challenge_id)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# The profile
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# One URL and two pages, the way `get_challenge` is: `/users/{id}` is the
+# profile, and who is asking decides whether the fields are text or a form.
+# The owner may change everything but the address; a site administrator reads
+# the same page and cannot touch it.
+#
+# That asymmetry is the point, and it is why there are two dependencies rather
+# than one. `/admin` is about what an account may *do* - appoint it, block it -
+# and those are powers over somebody. What they are called and what their face
+# looks like is not a power, it is theirs; an administrator who needs to change
+# it can look at the page and ask. The address is nobody's to edit: it is the
+# login identifier Google proves, and `user.email` is unique on it.
+#
+# None of these routes collide with a path parameter elsewhere, so their
+# position in this file is not load-bearing the way `/courses/new`'s is.
+
+
+async def require_profile_reader(user_id: int, db: DBDep, user: CurrentUser) -> bool:
+    """Authorize a look at a profile, and answer whose it is.
+
+    Returns `can_edit`, so the route asks once and the template does not have
+    to work it out again - the same trick `authorize_submission` plays with
+    `is_staff`. A profile is one real person's name, face and class list, so
+    the two who may see it are that person and a site administrator; being
+    course staff somewhere they happen to be enrolled is not enough, because
+    the page spans every course rather than the one in a URL.
+    """
+    if user.id == user_id:
+        return True
+    if await is_administrator(db, user.email):
+        return False
+    raise Forbidden("You can only look at your own profile.")
+
+
+ProfileReader = Annotated[bool, Depends(require_profile_reader)]
+
+
+async def require_profile_owner(user_id: int, user: CurrentUser) -> schema.User:
+    """Authorize a change to a profile: only ever your own.
+
+    Deliberately without the administrator branch `require_profile_reader` has.
+    Reading somebody's profile is oversight; renaming them is impersonation,
+    and there is no button on any page that asks for it.
+    """
+    if user.id != user_id:
+        raise Forbidden("You can only edit your own profile.")
+    return user
+
+
+ProfileOwner = Annotated[schema.User, Depends(require_profile_owner)]
+
+# The longest nickname the navbar can show without wrapping, and the same
+# ceiling `nickname_from_email` truncates to when it derives one.
+MAX_NICKNAME_CHARS = 64
+
+
+async def _render_profile_identity(
+    request: Request,
+    db: AsyncConnection,
+    user_id: int,
+    message: str | None = None,
+    ok: bool = False,
+):
+    """The name and the face, as every mutation on the profile answers with it.
+
+    One swap target, alert included, for the reason `/admin` has one: the
+    sentence and the new state arrive together instead of being kept in step.
+    It covers exactly what a mutation here can change - deliberately not the
+    address, the badges or the courses, none of which any button on this page
+    touches, and all of which would drag `query_user_profile` in behind it.
+    """
+    row = await query_user(db, user_id)
+    if row is None:
+        raise HTTPException(status_code=404)
+    return templates.TemplateResponse(
+        request=request,
+        name="f-profile-identity.jinja",
+        context={
+            "profile": row,
+            # Every route that renders this fragment is behind `ProfileOwner`.
+            "can_edit": True,
+            "message": message,
+            "ok": ok,
+        },
+    )
+
+
+@app.get("/users/{user_id}")
+async def get_profile(
+    user_id: int, request: Request, db: DBDep, user: CurrentUser, can_edit: ProfileReader
+):
+    """What the site knows about one person: their address, their name, their
+    face and the courses they are on."""
+    profile = await query_user_profile(db, user_id)
+    if profile is None:
+        raise HTTPException(status_code=404)
+    return templates.TemplateResponse(
+        request=request,
+        name="profile.jinja",
+        context={
+            "profile": profile,
+            "can_edit": can_edit,
+            "title": profile["nickname"],
+            "user": user,
+            "message": None,
+            "ok": False,
+        },
+    )
+
+
+@app.post("/users/{user_id}/profile")
+async def post_profile(
+    user_id: int,
+    request: Request,
+    db: DBDep,
+    owner: ProfileOwner,
+    # Defaulted rather than required, as on `/admin`: a missing field is a 422,
+    # and htmx drops the body of an error response, so the person who cleared
+    # the box would see nothing at all instead of the sentence below.
+    nickname: Annotated[str, Form()] = "",
+):
+    """Save the display name.
+
+    The avatar is not regenerated to match. It is seeded on the nickname when
+    the account is created, but once somebody has a face it is theirs and a
+    rename must not silently redraw it - the button below is how it changes.
+    """
+    nickname = nickname.strip()
+    if not nickname:
+        return await _render_profile_identity(
+            request, db, user_id, message="A profile needs a name."
+        )
+    if len(nickname) > MAX_NICKNAME_CHARS:
+        return await _render_profile_identity(
+            request,
+            db,
+            user_id,
+            message=f"That name is longer than {MAX_NICKNAME_CHARS} characters.",
+        )
+
+    await update_user(db, user_id, nickname=nickname)
+    await db.commit()
+    return await _render_profile_identity(request, db, user_id, "Saved.", ok=True)
+
+
+@app.post("/users/{user_id}/avatar")
+async def post_avatar(
+    user_id: int,
+    request: Request,
+    db: DBDep,
+    owner: ProfileOwner,
+    avatar_file: Annotated[UploadFile, File()],
+):
+    """Replace the avatar with an uploaded picture.
+
+    The mime stored beside the bytes is `sniff_image_mime`'s answer and never
+    the upload's own `content_type` header, which is written by whoever is
+    uploading: `user_avatar` below serves those bytes back under that mime from
+    this origin, so believing the header would be believing a stranger about
+    what the browser should execute.
+    """
+
+    async def refuse(message: str):
+        return await _render_profile_identity(request, db, user_id, message=message)
+
+    def too_big(size: int) -> str:
+        return (
+            f"That picture is {size / 1024:.0f} KB — the limit is "
+            f"{MAX_AVATAR_BYTES // 1024} KB."
+        )
+
+    # Checked before the read, so a huge upload is refused rather than
+    # buffered. `size` may be absent, hence the second check below.
+    if avatar_file.size is not None and avatar_file.size > MAX_AVATAR_BYTES:
+        return await refuse(too_big(avatar_file.size))
+
+    contents = await avatar_file.read()
+    if len(contents) > MAX_AVATAR_BYTES:
+        return await refuse(too_big(len(contents)))
+    if not contents:
+        return await refuse("That file is empty.")
+
+    mime = sniff_image_mime(contents)
+    if mime is None:
+        return await refuse("That is not a PNG, JPEG, GIF or WebP picture.")
+
+    await update_user(db, user_id, image=contents, image_mime=mime)
+    await db.commit()
+    return await _render_profile_identity(
+        request, db, user_id, "That is your avatar now.", ok=True
+    )
+
+
+@app.post("/users/{user_id}/avatar/reset")
+async def post_avatar_reset(
+    user_id: int, request: Request, db: DBDep, owner: ProfileOwner
+):
+    """Go back to the generated identicon.
+
+    Seeded on the nickname as it is *now*, not as it was when the account was
+    created, so this doubles as the way to make the face follow a rename.
+    """
+    image, image_mime = generate_identicon(owner.nickname)
+    await update_user(db, user_id, image=image, image_mime=image_mime)
+    await db.commit()
+    return await _render_profile_identity(
+        request, db, user_id, "Your avatar is generated from your name again.", ok=True
+    )
+
+
 @app.get("/users/{user_id}/avatar")
 async def user_avatar(user_id: int, db: DBDep, user: CurrentUser):
     row = (
@@ -3161,5 +3376,20 @@ async def user_avatar(user_id: int, db: DBDep, user: CurrentUser):
     ).first()
     if row is None:
         raise HTTPException(status_code=404)
-    return Response(content=row.image, media_type=row.image_mime)
+    return Response(
+        content=row.image,
+        media_type=row.image_mime,
+        headers={
+            # These bytes were uploaded by a user and are served from the same
+            # origin as the app, so the browser is told not to guess at their
+            # type and not to let them reach anything. `sniff_image_mime`
+            # already refuses everything but the four raster formats; this is
+            # the second lock on the same door.
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            # The URL does not change when the picture does, so without this a
+            # new avatar would keep showing as the old one until a hard reload.
+            "Cache-Control": "no-cache",
+        },
+    )
 
