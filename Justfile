@@ -4,15 +4,15 @@ set dotenv-load
 
 log_dir := ".logs"
 
-# Storage root shared by the web app and the judge; they must agree on it.
-export COCCO_STORAGE := env_var_or_default("COCCO_STORAGE", "/tmp/cocco-storage")
-
-# Development runs with authentication bypassed, so `just dev` needs no Google
-# credentials. COCCO_DUMMY_AUTH=0 exercises the real flow; COCCO_DUMMY_USER
-# picks who you are signed in as - the seed's administrator by default, since
-# alice@unipd.it is a plain teacher and cannot create a course.
-export COCCO_DUMMY_AUTH := env_var_or_default("COCCO_DUMMY_AUTH", "1")
-export COCCO_DUMMY_USER := env_var_or_default("COCCO_DUMMY_USER", "matteo.ceccarello@unipd.it")
+# Which configuration file both processes read: the database, the storage root
+# and the development shortcuts all come out of it, so this one variable is
+# what makes the web app and the judge agree. `cocco.dev.toml` is in git and
+# bypasses authentication, so `just dev` needs no Google credentials.
+#
+# To run against your own settings - the real sign-in flow, another database -
+# write a `cocco.toml`, which is gitignored, and start with
+#   COCCO_CONFIG=cocco.toml just dev
+export COCCO_CONFIG := env_var_or_default("COCCO_CONFIG", "cocco.dev.toml")
 
 # Start PostgreSQL, the web app and the judge; logs land in .logs/
 default: dev
@@ -22,6 +22,8 @@ dev:
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # These start the cluster - and, since cocco.dev.toml's database URL is
+    # empty, they are also what libpq resolves it from.
     : "${PGDATA:?PGDATA not set — enter the dev shell first}"
     : "${PGHOST:?PGHOST not set — enter the dev shell first}"
     : "${PGUSER:?PGUSER not set — enter the dev shell first}"
@@ -71,10 +73,10 @@ dev:
     uv run fastapi dev cocco/main.py >{{log_dir}}/app.log 2>&1 &
     pids+=($!)
 
+    # No flags: the judge reads $COCCO_CONFIG, the same file the app just did,
+    # so there is no way to hand the two of them different databases.
     echo "judge:    running             -> {{log_dir}}/judge.log"
-    uv run python -m cocco.judge \
-        --database "postgresql+psycopg://$PGUSER@/$PGDATABASE?host=$PGHOST" \
-        --storage "$COCCO_STORAGE" >{{log_dir}}/judge.log 2>&1 &
+    uv run python -m cocco.judge >{{log_dir}}/judge.log 2>&1 &
     pids+=($!)
 
     echo

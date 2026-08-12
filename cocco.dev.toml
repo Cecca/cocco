@@ -1,0 +1,49 @@
+# The development setup, and it is in git.
+#
+# Everything here is a setting and there is deliberately no secret in it: the
+# session signing key and the Google client come from COCCO_SECRET_KEY,
+# COCCO_GOOGLE_CLIENT_ID and COCCO_GOOGLE_CLIENT_SECRET, and have no file
+# spelling at all. That is what makes a shared, committed configuration file
+# possible in the first place.
+#
+# `just dev` points COCCO_CONFIG at this file. To run against your own
+# settings instead - the real Google flow, another database - write them in
+# `cocco.toml`, which is gitignored, and start with
+#
+#   COCCO_CONFIG=cocco.toml just dev
+
+[database]
+# Empty on purpose, and not a placeholder: libpq fills the user, database and
+# host in from PGUSER, PGDATABASE and PGHOST, which the Nix devShell exports.
+# PGHOST there is "$PWD/.pg/sock" - an absolute path that differs per checkout,
+# and so the one setting a file in git cannot write down. This is not the
+# environment configuring cocco; it is psycopg reading its own standard
+# variables, the same ones `pg-start`, `create-db` and `pg_isready` already use.
+url = "postgresql+psycopg://"
+
+[storage]
+# Test case inputs and expected outputs. The web app and the judge must resolve
+# a path to the same bytes, and they agree by both reading this line.
+root = "/tmp/cocco-storage"
+
+[dev]
+# No Google, no click, no credentials: every request is signed in. This is what
+# makes a fresh checkout usable at all, and on anything public it is equivalent
+# to publishing the admin password.
+dummy_auth = true
+
+# Who you are. Unset means the seed's site administrator, so a fresh checkout
+# can create a course; alice@unipd.it is a plain teacher on every seeded
+# course, which is the way to see what course staff see.
+# dummy_user = "alice@unipd.it"
+
+# Drops every table and reseeds the dummy data on startup. False, and it has to
+# be: `fastapi dev` reloads on every file change, and each reload would wipe
+# every submission made while testing. Turn it on for one boot after a schema
+# change - there is no migration tool - and turn it off again.
+reset_db = false
+
+# There is no [auth] table on purpose. `allowed_domains` defaults to unipd.it,
+# and dummy auth seeds its own administrator, so there is nothing here to
+# configure - and a file every checkout shares should not name one person as
+# the administrator of all of them.

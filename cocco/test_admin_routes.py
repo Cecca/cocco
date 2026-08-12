@@ -12,7 +12,6 @@ user list. Those are marked `integration` and talk to the real server, which
 they **drop every table of** - the same bargain `test_repository.py` makes.
 """
 
-import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -152,15 +151,8 @@ async def test_the_refusal_names_the_permission_not_a_course(
 # with it - including the ones that refuse a badly typed address.
 
 
-def _postgres_url():
-    return (
-        f"postgresql+psycopg://{os.environ['PGUSER']}@/"
-        f"{os.environ['PGDATABASE']}?host={os.environ['PGHOST']}"
-    )
-
-
 @pytest.fixture
-async def pg_client(monkeypatch):
+async def pg_client(monkeypatch, postgres_url):
     """The admin page over a live Postgres, signed in as an administrator.
 
     Drops every table in `$PGDATABASE` first, as the repository integration
@@ -168,8 +160,7 @@ async def pg_client(monkeypatch):
     """
     import cocco.main as main
 
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
     metadata.create_all(sync_engine)
     with sync_engine.begin() as conn:
@@ -184,7 +175,7 @@ async def pg_client(monkeypatch):
             )
         conn.execute(insert(Administrator).values(email=ADMIN))
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
 
     async def _get_db():
         async with engine.connect() as conn:

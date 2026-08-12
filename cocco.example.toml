@@ -1,24 +1,56 @@
-# Copy this to `cocco.toml` and edit it. Nothing here is required: without an
-# [auth] table cocco cannot sign anybody in with Google, which is fine in
-# development — set COCCO_DUMMY_AUTH=1 and there is no sign-in step at all.
+# Copy this to `cocco.toml` and edit it. Nothing here is required: cocco boots
+# with no file at all, and the login page then says Google sign-in is
+# unconfigured. For development you want none of this - `cocco.dev.toml` is in
+# git and `just dev` reads it.
 #
 # The path is `cocco.toml` in the working directory, overridable with
-# COCCO_CONFIG. `cocco.toml` is gitignored: it holds the Google client secret
-# and the session signing key.
+# COCCO_CONFIG. `cocco.toml` is gitignored.
+#
+# THE FILE IS SETTINGS; THE ENVIRONMENT IS SECRETS. The three secrets have no
+# file spelling at all - writing them here does nothing but earn a warning:
+#
+#   COCCO_SECRET_KEY              the session cookie's signing key
+#   COCCO_GOOGLE_CLIENT_ID        the OAuth client
+#   COCCO_GOOGLE_CLIENT_SECRET
+#
+# One source each, so there is no precedence to reason about and nothing secret
+# in a file that gets copied, diffed and pasted into a bug report. COCCO_CONFIG
+# is the exception that proves the rule: it names the file, so it is the one
+# setting that cannot be written in one.
+#
+# The judge reads this same file and takes no --database or --storage of its
+# own, so the two processes cannot be pointed at different ones.
+
+[database]
+# The SQLAlchemy URL, and it must name a driver with both a sync and an async
+# face - `postgresql+psycopg` is the one this project uses: the web app builds
+# an async engine from this string and the judge a sync one. (asyncpg has no
+# sync side; psycopg2 has no async one.)
+#
+# Leave the password out and let libpq supply it from PGPASSWORD or ~/.pgpass:
+# that keeps the credential out of the file, and an empty URL goes further -
+# libpq then resolves the user, database and host from PGUSER, PGDATABASE and
+# PGHOST too, which is what `cocco.dev.toml` does.
+url = "postgresql+psycopg://cocco@localhost/cocco"
+
+[storage]
+# Where test case inputs and expected outputs live - they are referenced by
+# path from the database, not stored in it (see DESIGN.md). The web app and the
+# judge must resolve a path to the same bytes; they agree by both reading this.
+root = "/var/lib/cocco/storage"
 
 [session]
-# The signing key for the session cookie. Prefer the COCCO_SECRET_KEY
-# environment variable in production. If neither is set, cocco generates a
-# random key at startup and warns: sessions then die on every restart and no
-# two workers agree, which is loud - unlike a fixed secret in the source tree.
-#   python -c 'import secrets; print(secrets.token_urlsafe(32))'
-# secret_key = "..."
-
 # Set to true behind TLS, so the cookie is never sent in clear.
-https_only = false
+https_only = true
 
 # How long a session lasts, in seconds. Two weeks.
 max_age = 1209600
+
+# The signing key is COCCO_SECRET_KEY and only that. With it unset, cocco
+# generates a random one per process and warns: sessions then die on every
+# restart and no two workers agree, which is loud - unlike a fixed secret in
+# the source tree, and unlike one written in a file somebody may commit.
+#   python -c 'import secrets; print(secrets.token_urlsafe(32))'
 
 [auth]
 # Who may sign in. A domain admits itself and every subdomain of it, so
@@ -59,11 +91,10 @@ allowed_domains = ["unipd.it"]
 # Google matches the full string, so http://127.0.0.1:8000/... is a *different*
 # entry and a trailing slash is a mismatch. Register every origin you browse to.
 #
-# Prefer the COCCO_GOOGLE_CLIENT_ID / COCCO_GOOGLE_CLIENT_SECRET environment
-# variables in production; they win over what is written here. With neither set,
-# cocco still boots and the login page says Google sign-in is unconfigured.
-# google_client_id = "....apps.googleusercontent.com"
-# google_client_secret = "..."
+# The two halves themselves are COCCO_GOOGLE_CLIENT_ID and
+# COCCO_GOOGLE_CLIENT_SECRET in the environment, and there is no file setting
+# for them. Half a credential is a typo, not a decision: cocco says so and
+# carries on with Google sign-in disabled rather than refusing to boot.
 
 # A hint for Google's account chooser, not an access check: it pre-selects the
 # Workspace domain, while `allowed_domains` is what actually decides. Leave it
@@ -77,3 +108,8 @@ allowed_domains = ["unipd.it"]
 # cocco builds and what the console has registered could disagree - a proxy that
 # terminates TLS makes the request say `http`, and Google refuses the mismatch.
 # base_url = "https://cocco.example.org"
+
+# There is deliberately no [dev] table here. It carries `dummy_auth`, which
+# bypasses authentication entirely, `dummy_user`, and `reset_db`, which drops
+# every table on startup - so they live together under one name a deployment's
+# config file can be read for the *absence* of. See `cocco.dev.toml`.

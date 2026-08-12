@@ -11,7 +11,6 @@ route here, including every refusal, answers with the roster. Those are marked
 the same bargain `test_repository.py` makes.
 """
 
-import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -177,15 +176,8 @@ async def test_the_refusal_names_the_course_not_the_site(client, world, monkeypa
 # answers with it - including the ones that refuse.
 
 
-def _postgres_url():
-    return (
-        f"postgresql+psycopg://{os.environ['PGUSER']}@/"
-        f"{os.environ['PGDATABASE']}?host={os.environ['PGHOST']}"
-    )
-
-
 @pytest.fixture
-async def pg_client(monkeypatch):
+async def pg_client(monkeypatch, postgres_url):
     """The people page over a live Postgres, signed in as the course's teacher.
 
     Drops every table in `$PGDATABASE` first, as the repository integration
@@ -194,8 +186,7 @@ async def pg_client(monkeypatch):
     """
     import cocco.main as main
 
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
     metadata.create_all(sync_engine)
     ids = {}
@@ -256,7 +247,7 @@ async def pg_client(monkeypatch):
             .returning(Submission.c.id)
         ).scalar_one()
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
 
     async def _get_db():
         async with engine.connect() as conn:

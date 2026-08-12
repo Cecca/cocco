@@ -1,18 +1,16 @@
-"""Google sign-in: configuration, the domain allowlist and the account behind
-a confirmed address.
+"""Google sign-in: the domain allowlist and the account behind a confirmed
+address.
 
 Nothing here talks to Google. The OAuth client and the routes live in
 `main.py`, where the request is; what is left is pure and unit-testable, except
 `get_or_create_user`, which is the one place the flow touches the schema.
+
+The configuration is not here either - it is `cocco/config.py`, because the
+judge reads it too and a database URL is none of sign-in's business.
 """
 
 import logging
-import os
-import secrets
-import tomllib
 from collections.abc import Iterable
-from dataclasses import dataclass
-from pathlib import Path
 from urllib.parse import urlparse
 
 from sqlalchemy.exc import IntegrityError
@@ -24,12 +22,6 @@ from cocco.repository import insert_user, query_user_by_email
 
 logger = logging.getLogger(__name__)
 
-# The institution, and the default allowlist. A domain admits its subdomains,
-# so this one entry already covers @studenti.unipd.it and @phd.unipd.it.
-DEFAULT_ALLOWED_DOMAINS = ("unipd.it",)
-
-GOOGLE_METADATA_URL = "https://accounts.google.com/.well-known/openid-configuration"
-
 # Where Google sends the browser back. A constant because it must match, byte
 # for byte, an "Authorized redirect URI" registered in the Google Cloud
 # console - it is not something a route can invent per request.
@@ -38,152 +30,6 @@ GOOGLE_CALLBACK_PATH = "/auth/google/callback"
 # RFC 5321's ceiling. Checked before the address is looked at any further, so a
 # preposterous claim costs nothing.
 MAX_EMAIL_LENGTH = 254
-
-
-########################################################################
-# configuration
-
-
-@dataclass(frozen=True)
-class SessionConfig:
-    secret_key: str
-    https_only: bool = False
-    max_age: int = 14 * 24 * 3600
-    cookie_name: str = "cocco_session"
-
-
-@dataclass(frozen=True)
-class GoogleConfig:
-    """The registered OAuth client. Both halves are required, so a
-    `GoogleConfig` that exists is one a flow can actually be started with."""
-
-    client_id: str
-    client_secret: str
-    # Google's `hd` hint, passed to the account chooser. Deliberately its own
-    # setting rather than something derived from `allowed_domains`: `hd` takes a
-    # single domain, and a Workspace's secondary domains are not always
-    # reachable through the parent's hint. Never the access check.
-    hd: str | None = None
-    server_metadata_url: str = GOOGLE_METADATA_URL
-
-
-@dataclass(frozen=True)
-class AuthConfig:
-    # Suffix-matched on a dot boundary: "unipd.it" admits unipd.it and every
-    # subdomain of it. See `is_allowed_email`.
-    allowed_domains: tuple[str, ...] = DEFAULT_ALLOWED_DOMAINS
-    # None means Google sign-in is unconfigured, which is not an error: the app
-    # boots and the login page says so. COCCO_DUMMY_AUTH=1 needs no credentials.
-    google: GoogleConfig | None = None
-    # The site's first administrators, normalized. A *bootstrap*, not the
-    # truth: they are inserted into `administrator` on every boot and the table
-    # is what is asked afterwards, so this list can only ever add. An empty one
-    # is the ordinary case for a database that already has its administrators.
-    administrators: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class AppConfig:
-    session: SessionConfig
-    auth: AuthConfig
-    # Absolute base for the OAuth redirect URI. None derives it from the
-    # incoming request, which is only right behind a proxy that sets
-    # X-Forwarded-* and a uvicorn running with --proxy-headers.
-    base_url: str | None = None
-
-
-def load_config(path: Path) -> AppConfig:
-    """Read `cocco.toml`, in the shape `load_languages` reads `languages.toml`.
-
-    A missing file is not an error - a development checkout has none and must
-    still boot. Neither is an `[auth]` table with no credentials in it: the app
-    comes up and the login page says Google sign-in is unconfigured.
-    """
-    data: dict = {}
-    if path.is_file():
-        with open(path, "rb") as fp:
-            data = tomllib.load(fp)
-    else:
-        logger.info("no configuration file at %s; using defaults", path)
-
-    return AppConfig(
-        session=_load_session_config(data.get("session", {})),
-        auth=_load_auth_config(data.get("auth", {})),
-        base_url=data.get("site", {}).get("base_url"),
-    )
-
-
-def _load_session_config(section: dict) -> SessionConfig:
-    secret_key = os.environ.get("COCCO_SECRET_KEY") or section.get("secret_key")
-    if not secret_key:
-        # Deliberately not a constant: a fixed fallback secret is a signing key
-        # that ships in the source tree. A fresh random one per process fails
-        # loudly instead - everyone is logged out on restart, and workers do
-        # not agree - which is noticeable long before it is dangerous.
-        secret_key = secrets.token_urlsafe(32)
-        logger.warning(
-            "no session secret configured (COCCO_SECRET_KEY or [session].secret_key); "
-            "generated an ephemeral one, so every restart logs everybody out"
-        )
-    return SessionConfig(
-        secret_key=secret_key,
-        https_only=bool(section.get("https_only", False)),
-        max_age=int(section.get("max_age", SessionConfig.max_age)),
-        cookie_name=section.get("cookie_name", SessionConfig.cookie_name),
-    )
-
-
-def _load_auth_config(section: dict) -> AuthConfig:
-    """The `[auth]` table, with the same precedence `_load_session_config`
-    uses: the environment wins over the file, and an absent setting is a
-    default rather than an error."""
-    raw_domains = section.get("allowed_domains")
-    domains = (
-        normalize_domains(raw_domains)
-        if raw_domains is not None
-        else DEFAULT_ALLOWED_DOMAINS
-    )
-
-    client_id = os.environ.get("COCCO_GOOGLE_CLIENT_ID") or section.get(
-        "google_client_id"
-    )
-    client_secret = os.environ.get("COCCO_GOOGLE_CLIENT_SECRET") or section.get(
-        "google_client_secret"
-    )
-
-    administrators = normalize_administrators(section.get("administrators") or ())
-    for email in administrators:
-        if not is_allowed_email(email, domains):
-            # Not fatal, and not filtered out either - the table is the truth
-            # and someone may be fixing the allowlist next. But an
-            # administrator who cannot sign in is a typo worth naming.
-            logger.warning(
-                "[auth] administrator %s is outside `allowed_domains`, "
-                "so they could never sign in",
-                email,
-            )
-
-    google = None
-    if client_id and client_secret:
-        google = GoogleConfig(
-            client_id=client_id,
-            client_secret=client_secret,
-            hd=section.get("google_hd"),
-            server_metadata_url=section.get(
-                "google_metadata_url", GOOGLE_METADATA_URL
-            ),
-        )
-    elif client_id or client_secret:
-        # Half a credential is a typo, not a decision: say so, then carry on
-        # unconfigured rather than refusing to boot.
-        logger.warning(
-            "[auth] needs both `google_client_id` and `google_client_secret` "
-            "(or COCCO_GOOGLE_CLIENT_ID / COCCO_GOOGLE_CLIENT_SECRET); "
-            "Google sign-in is disabled"
-        )
-    return AuthConfig(
-        allowed_domains=domains, google=google, administrators=administrators
-    )
 
 
 ########################################################################

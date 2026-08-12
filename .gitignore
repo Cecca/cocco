@@ -4,7 +4,9 @@
 .logs/
 node_modules/
 static/styles.css
-# Holds the Google client secret and the session signing key; see cocco.example.toml
+# A deployment's own settings, and possibly a database password; see
+# cocco.example.toml. Deliberately this file alone - cocco.dev.toml is
+# committed, which it can be because no secret has a spelling in any of them.
 cocco.toml
 # Byte-compiled / optimized / DLL files
 __pycache__/

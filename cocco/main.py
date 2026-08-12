@@ -29,10 +29,10 @@ from cocco.auth import (
     get_or_create_user,
     google_redirect_uri,
     is_allowed_email,
-    load_config,
     normalize_email,
     safe_next_path,
 )
+from cocco.config import config_path, load_config
 from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import (
     Depends,
@@ -116,10 +116,11 @@ from cocco.repository import (
 
 logger = logging.getLogger(__name__)
 
-# The Google client, the allowed domains, the session secret and the public
-# base URL. A missing file is fine: the app boots and the login page says that
+# Everything the app is configured with: the database, the storage root, the
+# allowed domains, the session cookie and the development shortcuts. A missing
+# file is fine - the app boots on the defaults, and the login page says that
 # Google sign-in is unconfigured.
-CONFIG = load_config(Path(os.environ.get("COCCO_CONFIG", "cocco.toml")))
+CONFIG = load_config(config_path())
 
 # The development cast, up here because DUMMY_USER defaults to the admin.
 # Matteo and Alice both teach every seeded course; what separates them is that
@@ -133,11 +134,18 @@ DUMMY_STUDENTS = ["bob@unipd.it", "charlie@unipd.it"]
 
 # Development shortcut: no Google, no click, no credentials. `get_user` is the
 # only place that branches on it, so every route is signed in transparently.
-DUMMY_AUTH = os.environ.get("COCCO_DUMMY_AUTH") == "1"
+#
+# Derived from the config once, here, and thereafter *these two names* are the
+# app's switch: `get_user` and `create_db_and_tables` read them rather than
+# CONFIG.dev, which is what lets a test sign itself in with
+# `monkeypatch.setattr(main, "DUMMY_USER", ...)` - several of them change who
+# is signed in halfway through. A frozen dataclass field has no such seam, so
+# do not "tidy" these away.
+DUMMY_AUTH = CONFIG.dev.dummy_auth
 # The admin rather than any of the staff: a fresh checkout should be able to
-# create a course, and `COCCO_DUMMY_USER=alice@unipd.it` is then the way to see
-# what a teacher sees.
-DUMMY_USER = os.environ.get("COCCO_DUMMY_USER") or DUMMY_ADMIN
+# create a course, and `[dev] dummy_user = "alice@unipd.it"` is then the way to
+# see what a teacher sees.
+DUMMY_USER = CONFIG.dev.dummy_user or DUMMY_ADMIN
 
 # Root of the app
 app = FastAPI(default_response_class=HTMLResponse)
@@ -189,17 +197,17 @@ def google_client():
 # Static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# The database
-url = f"postgresql+psycopg://{os.environ['PGUSER']}@/{os.environ['PGDATABASE']}?host={os.environ['PGHOST']}"
-engine = create_async_engine(url)
+# The database. The judge builds a *sync* engine from this same URL, which is
+# why the driver in it has to be one with both faces - see DEFAULT_DATABASE_URL.
+engine = create_async_engine(CONFIG.database.url)
 
 # The templates directory
 templates = Jinja2Templates(directory="templates")
 
 # Test case inputs and expected outputs live on the filesystem, not in the
-# database (see DESIGN.md). The judge must be pointed at the same root, either
-# through this variable or through its own --storage flag.
-storage = Storage(Path(os.environ.get("COCCO_STORAGE", "/tmp/cocco-storage")))
+# database (see DESIGN.md). The judge resolves the same paths against the same
+# root, and the two agree because they read it out of the same file.
+storage = Storage(CONFIG.storage.root)
 
 # Uploads are mapped to a language by their extension, so the challenge page
 # needs no language picker. `languages.toml` is the same file the judge loads,
@@ -301,11 +309,13 @@ async def create_db_and_tables(dummy=False):
         # alone, and deleting a line from `cocco.toml` demotes nobody.
         await insert_administrators(conn, CONFIG.auth.administrators)
         if DUMMY_AUTH:
-            # A development checkout has no `cocco.toml` at all, and the
-            # promise of dummy auth is that it is usable as it stands. Seeds
-            # DUMMY_ADMIN and deliberately not DUMMY_USER, so
-            # `COCCO_DUMMY_USER=alice@unipd.it` still shows what a plain
-            # teacher sees rather than quietly promoting her.
+            # `cocco.dev.toml` deliberately names no administrator - a file
+            # every checkout shares should not make one person the
+            # administrator of all of them - and the promise of dummy auth is
+            # that the checkout is usable as it stands. Seeds DUMMY_ADMIN and
+            # deliberately not DUMMY_USER, so `dummy_user = "alice@unipd.it"`
+            # still shows what a plain teacher sees rather than quietly
+            # promoting her.
             await insert_administrators(conn, [DUMMY_ADMIN])
 
 
@@ -640,7 +650,7 @@ async def get_user(request: Request, db: DBDep) -> schema.User:
             request.state.user = user
             return user
         # A session pointing at nobody: in development, typically the other
-        # side of a COCCO_RESET_DB.
+        # side of a `[dev] reset_db`.
         request.session.clear()
     raise NotAuthenticated(_return_path(request))
 
@@ -1204,7 +1214,7 @@ async def on_startup():
     # Resetting drops every table and reseeds the dummy data, so it must not
     # happen on an ordinary boot: `fastapi dev` reloads would wipe every
     # submission made while testing.
-    await create_db_and_tables(dummy=os.environ.get("COCCO_RESET_DB") == "1")
+    await create_db_and_tables(dummy=CONFIG.dev.reset_db)
 
 
 @app.get("/")

@@ -435,25 +435,15 @@ async def test_get_queued_submission_returns_none_when_empty():
     assert result is None
 
 
-def _postgres_url():
-    import os
-
-    return (
-        f"postgresql+psycopg://{os.environ['PGUSER']}@/"
-        f"{os.environ['PGDATABASE']}?host={os.environ['PGHOST']}"
-    )
-
-
 # The json_agg / row_to_json queries backing the web pages are Postgres-only,
 # so this needs a live server (see PGUSER/PGDATABASE/PGHOST in the devShell).
 @pytest.mark.integration
-async def test_challenge_page_queries():
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+async def test_challenge_page_queries(postgres_url):
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         # carol (user 4) is a student on Algorithms 101
         challenge = await query_challenge(conn, user_id=4, challenge_id=1)
@@ -620,19 +610,18 @@ async def test_challenge_page_queries():
 
 
 @pytest.mark.integration
-async def test_submission_page_queries():
+async def test_submission_page_queries(postgres_url):
     """The two queries behind the single-submission page.
 
     Submission ids follow the order of the fixture's `submissions` list, so 1
     and 2 are carol's two attempts at "Hello" - the older one (2) being the one
     the fixture's outcome cycle gives a compile failure.
     """
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         newer = await query_submission(conn, 1)
         assert newer is not None
@@ -950,15 +939,14 @@ async def test_insert_challenge_and_its_course():
 
 
 @pytest.mark.integration
-async def test_course_page_query_survives_an_empty_course():
+async def test_course_page_query_survives_an_empty_course(postgres_url):
     """A course with no challenges is a real course - it is the one whose page
     staff open to create the first one - so it must not come back as NULL."""
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         empty_id = (
             await conn.execute(
@@ -983,16 +971,15 @@ async def test_course_page_query_survives_an_empty_course():
 
 
 @pytest.mark.integration
-async def test_the_course_page_says_who_has_submitted():
+async def test_the_course_page_says_who_has_submitted(postgres_url):
     """The badge on a challenge card. `n_mine` is the viewer's own history, so
     it is what a student's "Submitted" means; `n_submitters` is the class, and
     only course staff are shown it."""
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         erin = (await query_user_by_email(conn, "erin@unipd.it")).id
@@ -1016,16 +1003,15 @@ async def test_the_course_page_says_who_has_submitted():
 
 
 @pytest.mark.integration
-async def test_challenges_are_listed_in_their_stored_order():
+async def test_challenges_are_listed_in_their_stored_order(postgres_url):
     """`position` is what the arrows write, and both the page query and the
     fragment order by it - with the id breaking a tie, so challenges nobody has
     reordered keep the order they were created in."""
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         alice = (await query_user_by_email(conn, "alice@unipd.it")).id
 
@@ -1056,15 +1042,14 @@ async def test_challenges_are_listed_in_their_stored_order():
 
 
 @pytest.mark.integration
-async def test_courses_page_query():
+async def test_courses_page_query(postgres_url):
     """The home page's list: every course, split by whether the viewer is on
     it, and filtered by the page's search box."""
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
 
@@ -1114,15 +1099,14 @@ async def test_courses_page_query():
 
 
 @pytest.mark.integration
-async def test_users_page_query():
+async def test_users_page_query(postgres_url):
     """The admin page's list: everyone with an account, plus the appointed
     addresses that have none yet."""
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         await insert_administrators(conn, ["alice@unipd.it", "nobody@unipd.it"])
         bob = (await query_user_by_email(conn, "bob@unipd.it")).id
@@ -1186,14 +1170,13 @@ async def test_users_page_query():
 
 
 @pytest.mark.integration
-async def test_user_profile_query():
+async def test_user_profile_query(postgres_url):
     """One person's page: who they are, and every course they are on."""
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         profile = await query_user_profile(conn, carol)
@@ -1246,15 +1229,14 @@ async def test_user_profile_query():
 
 
 @pytest.mark.integration
-async def test_self_enrollment():
+async def test_self_enrollment(postgres_url):
     """The home page's `Enroll!` button: it makes students, only students, and
     never unmakes anything. Postgres-only - it rests on ON CONFLICT."""
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         systems = (await query_courses(conn, user_id=carol))["non_enrolled"][0]
@@ -1297,15 +1279,14 @@ async def test_self_enrollment():
 
 
 @pytest.mark.integration
-async def test_the_roster_is_the_enrolled_and_counts_this_course_only():
+async def test_the_roster_is_the_enrolled_and_counts_this_course_only(postgres_url):
     """`query_course_people` is the class list, not the scoreboard's cohort:
     strictly the enrolled, and the submission counts stop at this course."""
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         algorithms = await _course_id(conn, "Algorithms 101")
         roster = await query_course_people(conn, algorithms)
@@ -1342,15 +1323,14 @@ async def test_the_roster_is_the_enrolled_and_counts_this_course_only():
 
 
 @pytest.mark.integration
-async def test_a_course_never_loses_its_last_teacher():
+async def test_a_course_never_loses_its_last_teacher(postgres_url):
     """The guard both writes carry, from underneath the routes: it lives in the
     WHERE clause, so the rule and the write are one statement."""
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         algorithms = await _course_id(conn, "Algorithms 101")
         alice = (await query_user_by_email(conn, "alice@unipd.it")).id
@@ -1383,15 +1363,14 @@ async def test_a_course_never_loses_its_last_teacher():
 
 
 @pytest.mark.integration
-async def test_setting_a_role_is_one_upsert():
+async def test_setting_a_role_is_one_upsert(postgres_url):
     """"Enrol them as a teacher" and "make them a teacher" name one row:
     `enrollment` is keyed on (user_id, course_id)."""
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         systems = await _course_id(conn, "Systems Programming")
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
@@ -1416,15 +1395,14 @@ async def test_setting_a_role_is_one_upsert():
 
 
 @pytest.mark.integration
-async def test_the_enrollment_key_is_reported_but_never_returned():
+async def test_the_enrollment_key_is_reported_but_never_returned(postgres_url):
     """Both course queries feed pages served to people who do not know the key,
     so they answer whether one is wanted and never what it is."""
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
-    _make_example_database(url)
+    _make_example_database(postgres_url)
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         # carol is a student on Algorithms 101 and not on Systems Programming,

@@ -14,23 +14,26 @@ Dependencies are managed with `uv` (Python 3.13). A `.envrc` / Nix `devShell` au
 
 - Install deps: `uv sync`
 - Start / stop PostgreSQL: `pg-start`, `pg-stop` (then `create-db cocco-dev` once)
-- Run the API (dev): `COCCO_DUMMY_AUTH=1 uv run fastapi dev cocco/main.py`
-- Reset and reseed the database: `COCCO_RESET_DB=1 uv run fastapi dev cocco/main.py`
-- Configure Google sign-in and the session secret: `cp cocco.example.toml cocco.toml` and edit it
-- Run the judge: `uv run python -m cocco.judge --database "postgresql+psycopg://$PGUSER@/$PGDATABASE?host=$PGHOST"`
+- Run the whole stack (app, judge, Postgres): `just dev`
+- Run the API alone: `COCCO_CONFIG=cocco.dev.toml uv run fastapi dev cocco/main.py`
+- Run the judge alone: `COCCO_CONFIG=cocco.dev.toml uv run python -m cocco.judge`
+- Reset and reseed the database: set `[dev] reset_db = true`, start once, set it back
+- Configure a deployment: `cp cocco.example.toml cocco.toml` and edit it — the three secrets go in the environment, not in it
 - Run all tests: `uv run pytest`
 - Run only unit tests (skip those requiring isolate + nix + postgres): `uv run pytest -m "not integration"`
 - Run a single test: `uv run pytest cocco/test_judge.py::test_language_python`
 - Build a language runtime on its own: `nix build .#python3` (or `.#gcc`, `.#jdk`)
 - Build the CSS: `npm install` once, then `npm run build:css` (or `npm run watch:css`)
 
-Integration tests (`@pytest.mark.integration`) require `isolate` installed with its setuid bit, a working `nix` with flakes, the current user being allowed to run isolate boxes, and — for the repository tests — a running PostgreSQL. On NixOS, isolate is declared via `security.wrappers`; on other distros install it outside Nix. Note that the repository integration test **drops every table** in `$PGDATABASE`.
+Integration tests (`@pytest.mark.integration`) require `isolate` installed with its setuid bit, a working `nix` with flakes, the current user being allowed to run isolate boxes, and — for the repository tests — a running PostgreSQL. On NixOS, isolate is declared via `security.wrappers`; on other distros install it outside Nix. Note that the repository integration test **drops every table** in `$PGDATABASE` — which is why the `postgres_url` fixture in `cocco/conftest.py` builds its URL from the `PG*` variables and deliberately **not** from `load_config`: a deployment's `cocco.toml` names that deployment's database, and `pytest -m integration` must have no way of finding it.
 
-The web app and the judge are **separate processes** that must agree on three things: the database, the storage root for test case files (`COCCO_STORAGE`, or the judge's `--storage`; both default to `/tmp/cocco-storage`), and the checkout itself — `languages.toml` decides what an uploaded extension means at both ends, and the bundled evaluators in `cocco/evaluators/` are code, so a judge running an older checkout silently grades with an older `equality.py` than the editor advertises. Submitting through the web UI only enqueues a row — nothing leaves `queued` unless a judge is running against the same database.
+The web app and the judge are **separate processes** that must agree on three things: the database, the storage root for test case files (`[storage] root`), and the checkout itself — `languages.toml` decides what an uploaded extension means at both ends, and the bundled evaluators in `cocco/evaluators/` are code, so a judge running an older checkout silently grades with an older `equality.py` than the editor advertises. The first two they now agree on by *reading the same file*: the judge takes no `--database` and no `--storage`, only a `--config`, because a flag that can disagree with the file is the same bug as an environment variable that can. Submitting through the web UI only enqueues a row — nothing leaves `queued` unless a judge is running against the same database.
 
-`COCCO_RESET_DB=1` drops every table and reseeds dummy data on startup. Leave it unset in normal development: `fastapi dev` reloads on every file change, and each reload would wipe the data. There is no migration tool, so a schema change reaches an existing database only through one such reset.
+`[dev] reset_db` drops every table and reseeds dummy data on startup. Leave it false in normal development — `cocco.dev.toml` ships it that way — because `fastapi dev` reloads on every file change and each reload would wipe the data. There is no migration tool, so a schema change reaches an existing database only through one such reset.
 
-Runtime configuration lives in `cocco.toml` (path overridable with `COCCO_CONFIG`), read by `load_config` in the same shape `load_languages` reads `languages.toml`. It is gitignored — it holds the Google client secret and the session signing key — and `cocco.example.toml` is the commented template. **A missing file is not an error**: with no `[auth]` credentials the app boots and the login page says Google sign-in is unconfigured. It is also where a deployment's first administrators are listed (`[auth] administrators`, a bootstrap — see "Authorization"). `COCCO_DUMMY_AUTH=1` is what makes a fresh checkout usable at all — it needs no credentials and no click, and `just dev` sets it by default.
+**Configuration is split in two, and the line is one sentence: the file is settings, the environment is secrets.** `cocco/config.py` is where both halves are read — its own module rather than a corner of `auth.py`, because the judge reads it too and a database URL is none of sign-in's business. The file carries `[database] url`, `[storage] root`, `[session]`, `[auth]`, `[site]` and `[dev]`; the three secrets — `COCCO_SECRET_KEY`, `COCCO_GOOGLE_CLIENT_ID`, `COCCO_GOOGLE_CLIENT_SECRET` — have **no file spelling at all**, so there is no precedence to reason about and nothing secret in a file that gets copied, diffed and pasted into a bug report. `COCCO_CONFIG` is the exception that proves the rule: it names the file, so it is the one setting that cannot be written in one.
+
+There are **two files**, and which one you get is `COCCO_CONFIG`. `cocco.dev.toml` is **committed**: it is secret-free by construction, and `just dev` points at it. `cocco.toml` is gitignored and is a deployment's own; `cocco.example.toml` is its commented template. **A missing file is still not an error** — and now says more than it did, because `DEFAULT_DATABASE_URL` is the empty `postgresql+psycopg://`, which libpq resolves from `PGUSER`/`PGDATABASE`/`PGHOST`. That is deliberate and is what lets a file in git avoid naming the devShell's socket, whose path is `$PWD/.pg/sock`. It also means importing `cocco.main` needs no environment and no file at all, so the unit tests run outside the dev shell. A setting left in its old place — a `COCCO_DUMMY_AUTH` in the shell, a `secret_key` in the file — is **warned about, not ignored**: `_warn_about_removed_settings` names the old spelling and the new one, and only warns, because a stale variable must not stop the app from booting. `[dev] dummy_auth` is what makes a fresh checkout usable at all, and `[auth] administrators` is where a deployment's first administrators are listed (a bootstrap — see "Authorization").
 
 ## Architecture
 
@@ -244,10 +247,13 @@ Every failure — a denied consent, a mismatched `state`, an unverified address,
 not ours, missing credentials — renders `login.jinja` with one sentence. The callback is reached
 by a browser coming back from Google, so a traceback there is a dead end.
 
-`cocco/auth.py` never touches the network: it is the config, `is_allowed_email`, `safe_next_path`,
+`cocco/auth.py` never touches the network: it is `is_allowed_email`, `safe_next_path`,
 `nickname_from_email`, `google_redirect_uri` and `get_or_create_user`. Authlib and the routes live
 in `main.py`, which is what keeps the interesting half unit-testable — `test_auth_routes.py`
-replaces the whole of Google with a two-method fake.
+replaces the whole of Google with a two-method fake. The configuration is not here either: it is
+`cocco/config.py`, because the judge reads the same file and a database URL is none of sign-in's
+business. The dependency runs one way — `config.py` imports `is_allowed_email` and
+`normalize_administrators` from here, and nothing here imports `config.py`.
 
 The session is a signed cookie (Starlette's `SessionMiddleware`) holding nothing but `user_id`,
 so a renamed or deleted account takes effect on the next request. `same_site` must stay `"lax"`:
@@ -255,8 +261,8 @@ the return from Google is a top-level cross-site navigation, and under `"strict"
 carrying the `state` would not reach the callback, so every sign-in would fail as a state
 mismatch.
 
-**`COCCO_DUMMY_AUTH=1` bypasses all of it.** `get_user` is the only place that branches on it,
-and it signs every request in as `COCCO_DUMMY_USER` (default `matteo.ceccarello@unipd.it`, the
+**`[dev] dummy_auth` bypasses all of it.** `get_user` is the only place that branches on it,
+and it signs every request in as `[dev] dummy_user` (default `matteo.ceccarello@unipd.it`, the
 seed's administrator, so a fresh checkout can create a course) with no cookie, no
 click and no credentials — creating the account if it is missing, so it works against an empty
 database. `/login` and `/auth/google` merely redirect, and `/logout` is a no-op. Setting it on a
@@ -264,10 +270,17 @@ public deployment is equivalent to publishing the admin password. The seeded cas
 `matteo.ceccarello@unipd.it` and `alice@unipd.it` (`teacher` on every course) and `bob@unipd.it`
 and `charlie@unipd.it` (students). Matteo and Alice differ in one thing only: he is a **site
 administrator**, a row in `administrator` rather than a role anywhere, which is why a fresh
-checkout can create a course. `create_db_and_tables` seeds him whenever `COCCO_DUMMY_AUTH=1` — a
-development checkout has no `cocco.toml` to list him in — and deliberately seeds `DUMMY_ADMIN`
-rather than `DUMMY_USER`, so `COCCO_DUMMY_USER=alice@unipd.it` still shows what plain course staff
-may do instead of quietly promoting her.
+checkout can create a course. `create_db_and_tables` seeds him whenever dummy auth is on — a file
+every checkout shares should not name one person as the administrator of all of them, so
+`cocco.dev.toml` deliberately lists none and this is what keeps the checkout usable — and
+deliberately seeds `DUMMY_ADMIN` rather than `DUMMY_USER`, so `dummy_user = "alice@unipd.it"`
+still shows what plain course staff may do instead of quietly promoting her.
+
+`main.DUMMY_AUTH` and `main.DUMMY_USER` are derived from `CONFIG.dev` **once, at import, and stay
+module-level names** — `get_user` and `create_db_and_tables` read those rather than `CONFIG.dev`,
+because that is the seam five test files sign themselves in through, some of them switching who is
+signed in halfway through a test. A frozen dataclass field has no equivalent, so this is not a
+tidy-up waiting to happen.
 
 ### Authorization
 
@@ -336,7 +349,7 @@ That absence is load-bearing, and two guards follow from it. **An administrator 
 — enforced inside `block_user`'s `WHERE` clause, not by a check before the write, so an
 appointment cannot land between the two — and **a blocked address is never appointed**. Either one
 alone would leave a way to make an administrator who cannot sign in and cannot be unmade. It is
-also what keeps `just dev` safe: `COCCO_DUMMY_USER` defaults to the seeded administrator. The two
+also what keeps `just dev` safe: `[dev] dummy_user` defaults to the seeded administrator. The two
 escape hatches belong side by side: `DELETE FROM administrator WHERE email = '…';` and
 `UPDATE "user" SET blocked_at = NULL WHERE email = '…';`
 
@@ -392,10 +405,10 @@ was enrolled when they submitted, because `post_submission` is behind the gate t
 - **An isolate box is one flat directory.** `isolate_run` copies every path argument in under its *basename*, so unrelated paths collapse into one namespace, and the copy order — `box_files`, then `args`, then `additional_files` — decides who wins a collision. `box_files` is the explicit form and the only safe one when more than one file is involved: the evaluator gets its three arguments as `.actual_output`, `.expected_output` and `.test_input`, names nothing can collide with because `safe_filename` strips leading dots from every upload. Without it, a checker uploaded as `expected_output.c` compiles to a binary named `expected_output` that lands on top of the expected output it was meant to read.
 - **Scores are per test case, in `[0, 1]`.** A submission's headline score is the mean of its outcomes' scores, shown out of 100. This aggregation assumes higher-is-better, so it is wrong for a challenge whose evaluator uses another scale — nothing enforces the range, and an evaluator is free to return any finite float.
 - **The leaderboard's criterion is per challenge.** `challenge.ranking` is set by course staff in the editor and drives `query_challenge_leaderboard`, whose three variants live in `_LEADERBOARD_CRITERIA` as literal SQL keyed by the enum — the criterion is never taken from a request as text. `running_time` is the strict board: a submission is on it only if it passed *every* test, ranked by the sum of the per-test times. `total_score` and `average_score` rank by score, descending, and deliberately admit partially correct submissions, because a partial-credit evaluator is the case where nobody passes everything; both assume higher-is-better and so are wrong for an evaluator that is not, same as the headline score. Whichever the criterion, a student appears once, represented by their best submission, and every row carries all three metrics plus `n_tests` so the fragment can render the one that applies.
-- **A block stops a person, it does not retract their work.** The judge grades a blocked student's queued submissions — `pull_queued_submission` does not know who submitted and should not learn: skipping those rows would strand them as `queued` forever, showing as pending in every teacher's standings and muddying the `count_running_submissions` check that guards a regrade. Standings and leaderboards go on listing them for the same reason: they are the record of what happened on a course, and it did happen. Nothing blocked is seeded either — a blocked `COCCO_DUMMY_USER` would lock a developer out of their own fresh checkout, which is exactly the trap "an administrator is never blocked" exists to avoid. **Removing an enrollment draws the same line**: `delete_enrollment` takes one row and nothing else, so the person loses access to the course and drops out of its standings, while every submission, outcome and leaderboard entry stays exactly where it was — `submission.user_id` has no `ON DELETE` tie to `enrollment`, and `query_challenge_standings`'s cohort is already a union with everyone who submitted. The confirmation on the people page says so in as many words.
+- **A block stops a person, it does not retract their work.** The judge grades a blocked student's queued submissions — `pull_queued_submission` does not know who submitted and should not learn: skipping those rows would strand them as `queued` forever, showing as pending in every teacher's standings and muddying the `count_running_submissions` check that guards a regrade. Standings and leaderboards go on listing them for the same reason: they are the record of what happened on a course, and it did happen. Nothing blocked is seeded either — a blocked `[dev] dummy_user` would lock a developer out of their own fresh checkout, which is exactly the trap "an administrator is never blocked" exists to avoid. **Removing an enrollment draws the same line**: `delete_enrollment` takes one row and nothing else, so the person loses access to the course and drops out of its standings, while every submission, outcome and leaderboard entry stays exactly where it was — `submission.user_id` has no `ON DELETE` tie to `enrollment`, and `query_challenge_standings`'s cohort is already a union with everyone who submitted. The confirmation on the people page says so in as many words.
 - **A hidden test case gives away nothing but its verdict.** `visible_outcomes` in `main.py` blanks an outcome's `message`, `stdout` and `stderr` unless the test case is a public sample or the viewer is course staff: `stdout`/`stderr` are the submitted program's own output — the obvious way to print a hidden input back out — and `message` is now written by a *teacher's script that has just read the hidden input and the expected output*, which makes the rule matter more, not less — `diff.py` puts the expected output in it verbatim. The verdict, the score and the resource usage are always shown. Compiler output is exempt, and has its own block on the submission page: it does not depend on any test input. Redact in that function, not in the template, so the rule stays unit testable.
 - **An anonymous htmx request gets `HX-Redirect`, not a 302.** `get_user` raises `NotAuthenticated` rather than returning a redirect — a dependency cannot return a `Response` — and the handler branches on the `HX-Request` header. This matters because most of the app is `f-*` fragments polled every few seconds: htmx follows a redirect inside the XHR, so a 302 would splice the whole login page into whatever div was polling, over and over. A 204 with `HX-Redirect` navigates the browser instead.
-- **A secret never has a fixed default.** With neither `COCCO_SECRET_KEY` nor `[session].secret_key` set, `load_config` generates a random key per process and logs a warning: an unconfigured deployment then logs everybody out on every restart and no two workers agree, which is loud. A constant in the source tree would be a signing key that ships with the code, which is silent.
+- **A secret has one source, and never a fixed default.** The source is the environment — `COCCO_SECRET_KEY`, `COCCO_GOOGLE_CLIENT_ID`, `COCCO_GOOGLE_CLIENT_SECRET` — and there is no file spelling for any of them, so there is no precedence to get wrong and nothing secret in a file that gets copied, diffed and committed by mistake. It is also what makes `cocco.dev.toml` committable at all. With `COCCO_SECRET_KEY` unset, `load_config` generates a random key per process and logs a warning: an unconfigured deployment then logs everybody out on every restart and no two workers agree, which is loud. A constant in the source tree would be a signing key that ships with the code, which is silent.
 - **A `next` destination is filtered, never trusted.** `safe_next_path` keeps only a path on this site — one leading `/`, no scheme, no authority — so neither the `?next=` on the login page nor the one stashed in the session can be turned into an open redirect. It is applied at both ends: before the destination is stashed, and again after it is read back. The OAuth redirect URI deliberately carries no destination at all — Google matches that URI character for character against the console registration, so `next` travels in the session instead, and a callback arriving without one lands on the root.
 - **CSRF rests on `same_site="lax"`, app-wide.** `POST /logout` is a form rather than a link so a planted `<img>` cannot fire it, and `lax` means the session cookie is not sent on a cross-site POST at all. That is the whole defence, and it is the same one every other mutating route in the app relies on — there is no CSRF token anywhere. A deliberate position, not an oversight: changing `same_site` would silently remove it.
 - **Source is highlighted server-side.** `render_source` (the `highlight` Jinja filter) runs Pygments over a submission's source, using `submission.language` — every name in `languages.toml` happens to be a Pygments alias too — and falls back to plain text otherwise. The token colours are hand-written under `.cocco-code` in `assets/styles.css`, not a generated Pygments theme.

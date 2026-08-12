@@ -11,7 +11,6 @@ dependencies: a site administrator *reads* somebody's profile and cannot touch
 it. Oversight is not impersonation.
 """
 
-import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -300,23 +299,15 @@ def test_only_the_four_raster_formats_are_pictures():
 # Postgres, because `query_user_profile` is `json_agg`.
 
 
-def _postgres_url():
-    return (
-        f"postgresql+psycopg://{os.environ['PGUSER']}@/"
-        f"{os.environ['PGDATABASE']}?host={os.environ['PGHOST']}"
-    )
-
-
 @pytest.fixture
-async def pg_client(monkeypatch):
+async def pg_client(monkeypatch, postgres_url):
     """The profile page over a live Postgres, signed in as Alice.
 
     Drops every table in `$PGDATABASE` first, as the other integration tests do.
     """
     import cocco.main as main
 
-    url = _postgres_url()
-    sync_engine = create_engine(url)
+    sync_engine = create_engine(postgres_url)
     metadata.drop_all(sync_engine)
     metadata.create_all(sync_engine)
     ids = {}
@@ -345,7 +336,7 @@ async def pg_client(monkeypatch):
         )
         conn.execute(insert(Administrator).values(email=ADMIN))
 
-    engine = create_async_engine(url)
+    engine = create_async_engine(postgres_url)
 
     async def _get_db():
         async with engine.connect() as conn:

@@ -1,9 +1,10 @@
 """End-to-end tests of the auth *and* authorization routes, over an in-memory
 database.
 
-Importing `cocco.main` reads PGUSER/PGDATABASE/PGHOST and mounts `static/`, so
-these run from the repository root inside the devShell - but they never connect
-to Postgres: `get_db` is overridden with a SQLite connection, which is enough
+Importing `cocco.main` mounts `static/` and reads `languages.toml`, both
+relative to the working directory, so these run from the repository root - but
+they need no database and never connect to one: building an engine does not
+connect, and `get_db` is overridden with a SQLite connection, which is enough
 because the auth routes use plain Core only. Google is replaced wholesale by
 `_FakeGoogleClient`, so nothing here reaches the network either.
 
@@ -24,7 +25,8 @@ from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from cocco.auth import GoogleConfig, get_or_create_user
+from cocco.auth import get_or_create_user
+from cocco.config import GoogleConfig
 from cocco.model import (
     Administrator,
     Challenge,
@@ -395,7 +397,7 @@ async def test_logout_clears_the_session(client, google):
 
 
 async def test_a_session_pointing_at_nobody_is_discarded(client, google, app_engine):
-    """The cookie holds only a user id, so a COCCO_RESET_DB under a live tab
+    """The cookie holds only a user id, so a `[dev] reset_db` under a live tab
     logs that tab out rather than blowing up."""
     from sqlalchemy import delete
 
@@ -536,7 +538,7 @@ async def test_dummy_auth_is_blocked_too(client, monkeypatch, app_engine, no_goo
 
 
 ########################################################################
-# COCCO_DUMMY_AUTH
+# dummy auth
 
 
 async def test_dummy_auth_signs_in_with_no_click(

@@ -15,6 +15,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
 from cocco import repository as repo
+from cocco.config import config_path, load_config
 from cocco.evaluators import DEFAULT_EVALUATOR, bundled_path
 from cocco.schema import (
     Challenge,
@@ -784,7 +785,12 @@ async def run_from_queue(engine: Engine, storage: Storage) -> bool:
 
     outcomes: List[TestOutcome] = []
     try:
-        # TODO: make the path to languages.toml configurable
+        # `languages.toml` is deliberately not configurable, unlike the
+        # database and the storage root: a language entry names a runtime
+        # `flake.nix` must expose, and `resolve_runtime` builds it out of *this*
+        # checkout, so a file pointed elsewhere would advertise a freedom that
+        # does not exist - and be one more way for the two processes to
+        # disagree in silence.
         outcomes = await run_submission(storage, run_data)
     except Exception as e:
         logger.exception(
@@ -829,18 +835,19 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser(
             description="Run the cocco judge loop, picking up queued submissions."
         )
+        # The database and the storage root are not flags. They are the two
+        # things this process must agree with the web app about, and a flag
+        # that can disagree with the file is the same bug as an environment
+        # variable that can - so there is one way to say them, and it is the
+        # file they both read.
         parser.add_argument(
-            "--database",
-            default="sqlite:///dev.db",
-            help="SQLAlchemy database URL (default: sqlite:///dev.db)",
-        )
-        parser.add_argument(
-            "--storage",
+            "--config",
             type=Path,
-            default=Path(os.environ.get("COCCO_STORAGE", "/tmp/cocco-storage")),
+            default=config_path(),
             help=(
-                "Path to the storage root for test inputs/outputs. Must match the "
-                "web app's COCCO_STORAGE (default: $COCCO_STORAGE or /tmp/cocco-storage)"
+                "Path to the configuration file, which is where the database "
+                "and the storage root come from (default: $COCCO_CONFIG, else "
+                "cocco.toml)"
             ),
         )
         parser.add_argument(
@@ -856,8 +863,13 @@ if __name__ == "__main__":
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         )
 
-        storage = Storage(args.storage)
-        engine = create_engine(args.database)
+        # Read after `basicConfig`, so that what `load_config` has to say -
+        # a missing file, a setting in its old place, no session secret -
+        # actually lands in the judge's log rather than nowhere.
+        config = load_config(args.config)
+
+        storage = Storage(config.storage.root)
+        engine = create_engine(config.database.url)
         metadata.create_all(engine)
         await run_loop(engine, storage)
 
