@@ -37,7 +37,12 @@
                  class="w-7 h-7 rounded-full bg-base-200 object-cover" />
             <div>
               <div class="flex items-center gap-2">
-                <span class="font-semibold">{{ u.nickname }}</span>
+                {# The way to the profile. A plain link and not an hx-get: it
+                   leaves this page rather than swapping into it, and the row
+                   is what an administrator has to look at to know whose
+                   profile it is. #}
+                <a href="{{ url_for('get_profile', user_id=u.id) }}"
+                   class="font-semibold hover:text-primary hover:underline">{{ u.nickname }}</a>
                 {% if u.is_admin %}
                 <span class="badge badge-primary badge-sm font-mono">admin</span>
                 {% endif %}

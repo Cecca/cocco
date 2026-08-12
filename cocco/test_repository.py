@@ -53,6 +53,7 @@ from cocco.repository import (
     query_submission_outcomes,
     query_user,
     query_user_by_email,
+    query_user_profile,
     query_user_role,
     query_user_submissions,
     query_users,
@@ -1181,6 +1182,66 @@ async def test_users_page_query():
 
         # An empty filter is no filter, i.e. the unfiltered call above
         assert await query_users(conn, q="") == users
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_user_profile_query():
+    """One person's page: who they are, and every course they are on."""
+    url = _postgres_url()
+    sync_engine = create_engine(url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(url)
+
+    engine = create_async_engine(url)
+    async with engine.connect() as conn:
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
+        profile = await query_user_profile(conn, carol)
+
+        assert (profile["email"], profile["nickname"]) == ("carol@unipd.it", "carol")
+        assert not profile["is_admin"]
+        assert not profile["is_blocked"]
+        assert profile["blocked_at"] is None
+        # The avatar has a route of its own and never rides along in the JSON.
+        assert "image" not in profile
+
+        # Site-wide, and beside the per-course counts rather than their sum.
+        assert profile["n_submissions"] == 4
+        assert profile["last_submitted"] is not None
+
+        # Staff first, then by title - and the counts are per course, which is
+        # the number a profile is actually asked for.
+        assert [(c["title"], c["role"], c["n_submissions"]) for c in profile["courses"]] == [
+            ("Algorithms 101", "student", 3),
+            ("Data Structures", "student", 1),
+        ]
+
+        # Somebody on nothing at all gets an empty list, not a null to iterate.
+        root = (await query_user_by_email(conn, "root@unipd.it")).id
+        empty = await query_user_profile(conn, root)
+        assert empty["courses"] == []
+        assert (empty["n_submissions"], empty["last_submitted"]) == (0, None)
+
+        # `administrator` is keyed on the address, and this is the one place a
+        # profile asks about it.
+        await insert_administrators(conn, ["alice@unipd.it"])
+        bob = (await query_user_by_email(conn, "bob@unipd.it")).id
+        await block_user(conn, bob, "spamming the judge")
+        await conn.commit()
+
+        alice = (await query_user_by_email(conn, "alice@unipd.it")).id
+        staff = await query_user_profile(conn, alice)
+        assert staff["is_admin"]
+        # She teaches, so her courses carry the role that says so.
+        assert {c["role"] for c in staff["courses"]} == {"teacher"}
+
+        blocked = await query_user_profile(conn, bob)
+        assert blocked["is_blocked"]
+        assert blocked["blocked_reason"] == "spamming the judge"
+
+        # No such account is no document at all, which the route turns into a
+        # 404 rather than rendering a page about nobody.
+        assert await query_user_profile(conn, 99999) is None
     await engine.dispose()
 
 

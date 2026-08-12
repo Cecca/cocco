@@ -1,0 +1,19 @@
+{# The viewer's own name and face in the navbar, and the dropdown's trigger.
+
+   Its own partial because the profile page swaps a fresh copy of it out of
+   band after a rename or a new avatar: two copies of this markup would drift,
+   and the copy you would notice drifting is the one sitting at the top of the
+   page you just changed.
+
+   Context: `user`, and `oob` — false where the navbar is drawn, true for the
+   copy `f-profile-identity.jinja` sends back after a successful change. #}
+<div id="navbar-identity" {% if oob %}hx-swap-oob="true"{% endif %}
+     tabindex="0" role="button" class="flex items-center gap-3 cursor-pointer">
+  <div class="hidden sm:flex flex-col items-end leading-tight">
+    <span class="font-semibold text-sm">{{ user.nickname }}</span>
+    <span class="text-xs opacity-60">{{ user.email }}</span>
+  </div>
+  <img src="{{ url_for('user_avatar', user_id=user.id) }}"
+       alt="{{ user.nickname }}'s avatar"
+       class="w-8 h-8 rounded-full bg-base-200 object-cover" />
+</div>
