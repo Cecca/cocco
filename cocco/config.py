@@ -51,6 +51,11 @@ DEFAULT_DATABASE_URL = "postgresql+psycopg://"
 
 DEFAULT_STORAGE_ROOT = Path("/tmp/cocco-storage")
 
+# The flake `nix build` builds a language runtime out of. "." is the working
+# directory, which is what this was before it could be written down at all -
+# so the default changes nothing for a judge started from a checkout.
+DEFAULT_FLAKE_REF = "."
+
 
 @dataclass(frozen=True)
 class SessionConfig:
@@ -108,6 +113,27 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class JudgeConfig:
+    """The one thing only the judge reads, and the only reason it is a setting
+    at all: a language entry in `languages.toml` names a runtime that some
+    flake has to expose, and `resolve_runtime` shells out to `nix build` to get
+    it.
+
+    That used to be spelled `.#python3` - the flake in the *working directory*
+    - which is a coupling the judge could not state and a deployment could not
+    satisfy: an installed `cocco-judge` on PATH has no checkout to be started
+    from. So the ref is written down instead, and "." is what it always was.
+
+    Deliberately not the same kind of setting as `[storage] root`: that one
+    exists so the two processes agree, and this one the web app never reads.
+    """
+
+    # A path (relative or absolute) or any flake reference `nix` accepts, e.g.
+    # "/opt/cocco" or "github:you/cocco".
+    flake: str = DEFAULT_FLAKE_REF
+
+
+@dataclass(frozen=True)
 class DevConfig:
     """The development shortcuts, and every one of them is a hazard on a real
     deployment - which is why they are one table. A production `cocco.toml` can
@@ -137,6 +163,7 @@ class AppConfig:
     auth: AuthConfig
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    judge: JudgeConfig = field(default_factory=JudgeConfig)
     dev: DevConfig = field(default_factory=DevConfig)
     # Absolute base for the OAuth redirect URI. None derives it from the
     # incoming request, which is only right behind a proxy that sets
@@ -176,6 +203,7 @@ def load_config(path: Path) -> AppConfig:
         auth=_load_auth_config(data.get("auth", {})),
         database=_load_database_config(data.get("database", {})),
         storage=_load_storage_config(data.get("storage", {})),
+        judge=_load_judge_config(data.get("judge", {})),
         dev=_load_dev_config(data.get("dev", {})),
         base_url=data.get("site", {}).get("base_url"),
     )
@@ -260,6 +288,12 @@ def _load_database_config(section: dict) -> DatabaseConfig:
 def _load_storage_config(section: dict) -> StorageConfig:
     root = section.get("root")
     return StorageConfig(root=Path(root) if root else DEFAULT_STORAGE_ROOT)
+
+
+def _load_judge_config(section: dict) -> JudgeConfig:
+    # `or`, like the database URL: an explicit `flake = ""` is a typo, not a
+    # request for `nix build #python3`.
+    return JudgeConfig(flake=section.get("flake") or DEFAULT_FLAKE_REF)
 
 
 def _load_dev_config(section: dict) -> DevConfig:

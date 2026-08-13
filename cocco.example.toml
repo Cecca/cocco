@@ -39,6 +39,25 @@ url = "postgresql+psycopg://cocco@localhost/cocco"
 # judge must resolve a path to the same bytes; they agree by both reading this.
 root = "/var/lib/cocco/storage"
 
+[judge]
+# The only setting the web app never reads, and the one an installed judge
+# cannot do without. A language in `languages.toml` names a runtime - python3,
+# gcc, jdk - that some flake has to expose, and the judge runs `nix build` to
+# get it. This says which flake.
+#
+# The default is ".", the flake in the working directory, which is what it was
+# implicitly before it could be written down: right for `just dev`, and wrong
+# for a `cocco-judge` on PATH, which has no checkout to be started from. Give
+# it an absolute path to a checkout, or a flake reference nix accepts:
+#
+#   flake = "/opt/cocco"
+#   flake = "github:you/cocco"
+#
+# Whatever it names must expose the runtimes `languages.toml` asks for, so it
+# is the same repository - pinned by its own `flake.lock`, which is what makes
+# a compiler version a property of the deployment and not of the machine.
+flake = "/opt/cocco"
+
 [session]
 # Set to true behind TLS, so the cookie is never sent in clear.
 https_only = true

@@ -70,13 +70,15 @@ dev:
     create-db "$PGDATABASE" >>{{log_dir}}/postgres.log 2>&1
 
     echo "app:      http://127.0.0.1:8000 -> {{log_dir}}/app.log"
-    uv run fastapi dev cocco/main.py >{{log_dir}}/app.log 2>&1 &
+    uv run cocco-web --reload >{{log_dir}}/app.log 2>&1 &
     pids+=($!)
 
-    # No flags: the judge reads $COCCO_CONFIG, the same file the app just did,
-    # so there is no way to hand the two of them different databases.
+    # No --config on either: both read $COCCO_CONFIG, the same file, so there
+    # is no way to hand the two of them different databases. And both are the
+    # installed console scripts rather than `fastapi dev` and `python -m`, so
+    # what a day's development exercises is what a deployment runs.
     echo "judge:    running             -> {{log_dir}}/judge.log"
-    uv run python -m cocco.judge >{{log_dir}}/judge.log 2>&1 &
+    uv run cocco-judge >{{log_dir}}/judge.log 2>&1 &
     pids+=($!)
 
     echo
@@ -90,3 +92,15 @@ dev:
 # Follow the logs of every process
 logs:
     tail -n 20 -F {{log_dir}}/postgres.log {{log_dir}}/app.log {{log_dir}}/judge.log
+
+# Build the stylesheet from assets/styles.css into the package
+build-css:
+    npm run build:css
+
+# Build the wheel and the sdist into dist/
+#
+# The stylesheet first, and not as a convenience: `cocco/static/styles.css` is
+# gitignored, so it exists only once tailwind has written it, and a wheel built
+# without it is one that installs and serves an unstyled site.
+build: build-css
+    uv build

@@ -1,7 +1,7 @@
 [project]
 name = "cocco"
 version = "0.1.0"
-description = "Add your description here"
+description = "A self-hosted judge for programming challenges"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -21,10 +21,35 @@ dependencies = [
     "python-multipart>=0.0.22",
     "sqlalchemy[asyncio]>=2.0",
     "toml>=0.10.2",
+    # `cocco/server.py` imports it, so it is declared here rather than left to
+    # `fastapi[standard]` to drag in.
+    "uvicorn[standard]>=0.34",
 ]
 
+# The three processes cocco is. `cocco` talks to the transfer API over HTTP and
+# needs nothing else installed; the other two are the deployment.
 [project.scripts]
 cocco = "cocco.cli:main"
+cocco-web = "cocco.server:main"
+cocco-judge = "cocco.judge:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cocco"]
+# The tests live inside the package - they are how it is developed, not part of
+# what a deployment installs.
+exclude = ["cocco/test_*.py", "cocco/conftest.py"]
+# `cocco/static/styles.css` is gitignored, and hatchling's file selection is
+# gitignore-aware: without this the wheel ships every template and no
+# stylesheet, which is the failure mode that looks like a working install.
+# It has to exist first - `npm run build:css` before `uv build`.
+artifacts = ["cocco/static/styles.css"]
+
+[tool.hatch.build.targets.sdist]
+artifacts = ["cocco/static/styles.css"]
 
 [tool.fastapi]
 entrypoint = "cocco.main:app"

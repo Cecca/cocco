@@ -13,6 +13,7 @@ import pytest
 from cocco.config import (
     DEFAULT_ALLOWED_DOMAINS,
     DEFAULT_DATABASE_URL,
+    DEFAULT_FLAKE_REF,
     DEFAULT_STORAGE_ROOT,
     config_path,
     load_config,
@@ -51,6 +52,7 @@ def test_load_config_without_a_file(tmp_path):
     assert config.auth.administrators == ()
     assert config.database.url == DEFAULT_DATABASE_URL
     assert config.storage.root == DEFAULT_STORAGE_ROOT
+    assert config.judge.flake == DEFAULT_FLAKE_REF
     assert config.dev.dummy_auth is False
     assert config.dev.dummy_user is None
     assert config.dev.reset_db is False
@@ -171,6 +173,24 @@ def test_the_storage_root_arrives_as_a_path(tmp_path):
     path = tmp_path / "cocco.toml"
     path.write_text('[storage]\nroot = "/srv/cocco"\n')
     assert load_config(path).storage.root == Path("/srv/cocco")
+
+
+def test_the_judge_flake_is_read(tmp_path):
+    """The only setting the web app never looks at: which flake the judge
+    builds its language runtimes out of."""
+    path = tmp_path / "cocco.toml"
+    path.write_text('[judge]\nflake = "/opt/cocco"\n')
+    assert load_config(path).judge.flake == "/opt/cocco"
+
+
+@pytest.mark.parametrize("body", ["", "[judge]\n", '[judge]\nflake = ""\n'])
+def test_the_judge_flake_defaults_to_the_working_directory(tmp_path, body):
+    """"." is what the ref was implicitly before it could be written down, so
+    a file that says nothing about it leaves `just dev` exactly as it was. An
+    explicit empty string is a typo, not a request for `nix build #python3`."""
+    path = tmp_path / "cocco.toml"
+    path.write_text(body)
+    assert load_config(path).judge.flake == DEFAULT_FLAKE_REF
 
 
 def test_the_dev_table_is_read(tmp_path):
@@ -294,8 +314,14 @@ def test_the_committed_dev_config_loads():
     """`cocco.dev.toml` is tracked and `just dev` depends on it, so it is
     parsed by a test rather than left to rot - and the assertion that it
     configures no Google client is the guard on what makes committing it
-    possible at all: there is no secret in it."""
-    config = load_config(Path("cocco.dev.toml"))
+    possible at all: there is no secret in it.
+
+    Located from this file rather than from the working directory: it is one
+    of the few things that really does live in the checkout and not in the
+    package, and `load_config` treats a missing file as "use the defaults" -
+    so a relative path would not fail here, it would quietly assert about
+    something else."""
+    config = load_config(Path(__file__).resolve().parent.parent / "cocco.dev.toml")
     assert config.dev.dummy_auth is True
     assert config.dev.reset_db is False
     assert config.auth.google is None

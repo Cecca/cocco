@@ -1,9 +1,10 @@
 """End-to-end tests of the auth *and* authorization routes, over an in-memory
 database.
 
-Importing `cocco.main` mounts `static/`, which is relative to the working
-directory, so these run from the repository root - but they need no database
-and never connect to one: building an engine does not
+Importing `cocco.main` mounts `cocco/static/` and reads `cocco/templates/`,
+both resolved against the package rather than the working directory, so these
+run from anywhere - and they need no database and never connect to one:
+building an engine does not
 connect, and `get_db` is overridden with a SQLite connection, which is enough
 because the auth routes use plain Core only. Google is replaced wholesale by
 `_FakeGoogleClient`, so nothing here reaches the network either.

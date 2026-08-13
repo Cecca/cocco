@@ -3,7 +3,7 @@
 .pg/
 .logs/
 node_modules/
-static/styles.css
+cocco/static/styles.css
 # A deployment's own settings, and possibly a database password; see
 # cocco.example.toml. Deliberately this file alone - cocco.dev.toml is
 # committed, which it can be because no secret has a spelling in any of them.

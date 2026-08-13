@@ -93,7 +93,7 @@ def test_static_url_carries_a_version():
 
 
 def test_static_url_falls_back_when_the_file_is_missing():
-    """`static/styles.css` is a build artifact and is simply absent until the
+    """`cocco/static/styles.css` is a build artifact and is simply absent until the
     first `npm run build:css`; an unversioned URL still has to work."""
     assert static_url("no-such-file.png") == "/static/no-such-file.png"
 

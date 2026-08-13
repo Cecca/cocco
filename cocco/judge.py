@@ -15,7 +15,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
 from cocco import repository as repo
-from cocco.config import config_path, load_config
+from cocco.config import DEFAULT_FLAKE_REF, config_path, load_config
 from cocco.evaluators import DEFAULT_EVALUATOR, bundled_path
 from cocco.schema import (
     Challenge,
@@ -68,16 +68,32 @@ _IDS_POOL = BoxPool()
 # output cannot change while the process lives, so remember it.
 _RUNTIME_CACHE: Dict[tuple[str, str], Path] = {}
 
+# Which flake the runtimes are built out of - `[judge] flake`, see `JudgeConfig`.
+# A module-level name rather than an argument threaded through `Language.run`,
+# `run_submission` and `run_loop`, for the reason `main.DUMMY_AUTH` is one:
+# `Language` is a frozen dataclass built straight from `languages.toml` and has
+# nowhere to carry it, and this is one value set once at startup and read from
+# the bottom of the call stack. `main()` assigns it; tests monkeypatch it.
+#
+# `_RUNTIME_CACHE` is not keyed on it, and need not be: it is fixed for the
+# life of the process.
+FLAKE_REF = DEFAULT_FLAKE_REF
+
 
 async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
     cached = _RUNTIME_CACHE.get((runtime_name, bin_name))
     if cached is not None:
         return cached
     logger.debug("resolving runtime %s for binary %s", runtime_name, bin_name)
-    p = await asyncio.create_subprocess_shell(
-        " ".join(
-            ["nix", "build", f".#{runtime_name}", "--no-link", "--print-out-paths"]
-        ),
+    # `exec`, not `shell`: the flake ref comes out of a configuration file now
+    # rather than being a literal here, and joining it into a command line is
+    # the one way that becomes interesting.
+    p = await asyncio.create_subprocess_exec(
+        "nix",
+        "build",
+        f"{FLAKE_REF}#{runtime_name}",
+        "--no-link",
+        "--print-out-paths",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -397,12 +413,13 @@ class Language:
         )
 
 
-# `languages.toml` is part of the checkout rather than a runtime setting - see
+# `languages.toml` is part of the package rather than a runtime setting - see
 # the comment in `run_from_queue` on why it is deliberately not configurable -
 # so it is resolved relative to this module and never to the working directory,
-# the same rule `cocco/evaluators/` states for the bundled scripts. Without it,
-# `python -m cocco.judge` works from the repository root and nowhere else.
-LANGUAGES_PATH = Path(__file__).resolve().parent.parent / "languages.toml"
+# the same rule `cocco/evaluators/` states for the bundled scripts. It lives
+# *inside* `cocco/` rather than beside it, which is what lets an installed
+# `cocco-judge` find it: a wheel has a package directory and no checkout.
+LANGUAGES_PATH = Path(__file__).resolve().parent / "languages.toml"
 
 
 def load_languages(path: Path = LANGUAGES_PATH) -> Dict[str, Language]:
@@ -794,11 +811,12 @@ async def run_from_queue(engine: Engine, storage: Storage) -> bool:
     outcomes: List[TestOutcome] = []
     try:
         # `languages.toml` is deliberately not configurable, unlike the
-        # database and the storage root: a language entry names a runtime
-        # `flake.nix` must expose, and `resolve_runtime` builds it out of *this*
-        # checkout, so a file pointed elsewhere would advertise a freedom that
-        # does not exist - and be one more way for the two processes to
-        # disagree in silence.
+        # database and the storage root: it is shipped inside the package and
+        # read from there by both processes, so a file pointed elsewhere would
+        # be one more way for the two of them to disagree in silence. What
+        # *is* configurable is the flake those runtimes are built out of
+        # (`[judge] flake`) - a language entry names an output some flake has
+        # to expose, and an installed judge has no checkout to assume.
         outcomes = await run_submission(storage, run_data)
     except Exception as e:
         logger.exception(
@@ -838,47 +856,65 @@ async def run_loop(engine: Engine, storage: Storage, wait_time=5):
             await asyncio.sleep(wait_time)
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="cocco-judge",
+        description="Run the cocco judge loop, picking up queued submissions.",
+    )
+    # The database and the storage root are not flags. They are the two
+    # things this process must agree with the web app about, and a flag
+    # that can disagree with the file is the same bug as an environment
+    # variable that can - so there is one way to say them, and it is the
+    # file they both read.
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=config_path(),
+        help=(
+            "Path to the configuration file, which is where the database "
+            "and the storage root come from (default: $COCCO_CONFIG, else "
+            "cocco.toml)"
+        ),
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Logging verbosity (default: INFO)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """The `cocco-judge` console script.
+
+    Module level, and sync, so that it is *importable*: this used to be an
+    async function defined inside the `__main__` guard, which works for
+    `python -m cocco.judge` and cannot be named by an entry point at all.
+    Only `run_loop` is awaited - the engine, the storage root and the flake
+    ref are settled before the event loop starts.
+    """
+    args = build_parser().parse_args(argv)
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    # Read after `basicConfig`, so that what `load_config` has to say -
+    # a missing file, a setting in its old place, no session secret -
+    # actually lands in the judge's log rather than nowhere.
+    config = load_config(args.config)
+
+    global FLAKE_REF
+    FLAKE_REF = config.judge.flake
+    logger.info("building language runtimes from flake %s", FLAKE_REF)
+
+    storage = Storage(config.storage.root)
+    engine = create_engine(config.database.url)
+    metadata.create_all(engine)
+    asyncio.run(run_loop(engine, storage))
+
+
 if __name__ == "__main__":
-    async def main():
-        parser = argparse.ArgumentParser(
-            description="Run the cocco judge loop, picking up queued submissions."
-        )
-        # The database and the storage root are not flags. They are the two
-        # things this process must agree with the web app about, and a flag
-        # that can disagree with the file is the same bug as an environment
-        # variable that can - so there is one way to say them, and it is the
-        # file they both read.
-        parser.add_argument(
-            "--config",
-            type=Path,
-            default=config_path(),
-            help=(
-                "Path to the configuration file, which is where the database "
-                "and the storage root come from (default: $COCCO_CONFIG, else "
-                "cocco.toml)"
-            ),
-        )
-        parser.add_argument(
-            "--log-level",
-            default="INFO",
-            choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-            help="Logging verbosity (default: INFO)",
-        )
-        args = parser.parse_args()
-
-        logging.basicConfig(
-            level=getattr(logging, args.log_level),
-            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        )
-
-        # Read after `basicConfig`, so that what `load_config` has to say -
-        # a missing file, a setting in its old place, no session secret -
-        # actually lands in the judge's log rather than nowhere.
-        config = load_config(args.config)
-
-        storage = Storage(config.storage.root)
-        engine = create_engine(config.database.url)
-        metadata.create_all(engine)
-        await run_loop(engine, storage)
-
-    asyncio.run(main())
+    main()

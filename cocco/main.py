@@ -222,9 +222,16 @@ def google_client():
     """
     return oauth.create_client("google")
 
-# Static files. Resolved against the checkout rather than the working directory,
-# the rule `load_languages` already follows for `languages.toml`.
-STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+# Static files. Resolved against the package rather than the working directory,
+# the rule `load_languages` already follows for `languages.toml` - and inside
+# `cocco/` rather than beside it, so an installed `cocco-web` has them too.
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# The templates, by the same rule. Both of these used to be bare relative
+# strings handed to Starlette and Jinja, which meant the app ran from the
+# repository root and nowhere else - and, worse for `static`, meant the mount
+# and `static_url` below could name two different directories.
+TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 
 class VersionedStaticFiles(StaticFiles):
@@ -255,14 +262,13 @@ class VersionedStaticFiles(StaticFiles):
         return response
 
 
-app.mount("/static", VersionedStaticFiles(directory="static"), name="static")
+app.mount("/static", VersionedStaticFiles(directory=STATIC_DIR), name="static")
 
 # The database. The judge builds a *sync* engine from this same URL, which is
 # why the driver in it has to be one with both faces - see DEFAULT_DATABASE_URL.
 engine = create_async_engine(CONFIG.database.url)
 
-# The templates directory
-templates = Jinja2Templates(directory="templates")
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 # Test case inputs and expected outputs live on the filesystem, not in the
 # database (see DESIGN.md). The judge resolves the same paths against the same
@@ -368,13 +374,13 @@ def static_url(path: str) -> str:
     into `VersionedStaticFiles`' year of `immutable`.
 
     The `stat` happens per render rather than once at import, and that is
-    load-bearing: `npm run watch:css` rewrites `static/styles.css` without
+    load-bearing: `npm run watch:css` rewrites `cocco/static/styles.css` without
     touching a `.py`, so a version fixed at import would pin a year-long
     `max-age` to a file that has since changed, with nothing left to invalidate
     it. Three files and one `stat` each is not worth caching around.
 
-    A missing file falls back to the bare path - `static/styles.css` is a build
-    artifact and is simply absent until the first `npm run build:css`.
+    A missing file falls back to the bare path - `cocco/static/styles.css` is
+    a build artifact and is simply absent until the first `npm run build:css`.
 
     The URL is built by hand rather than through `url_for`, matching what the
     templates already did, and so ignores `root_path`. It takes literals from
