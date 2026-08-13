@@ -2,7 +2,15 @@
 {% block title %}{{ challenge.title }}{% endblock %}
 
 {% block nav_extra %}
-<li><a class="text-base-content font-bold border-b-2 border-primary pb-0.5">This challenge</a></li>
+<li>
+  <a href="{{ url_for('get_course', course_id=course_id) }}"
+     class="max-w-[14rem] truncate hover:text-base-content"
+     title="{{ challenge.course_title }}">{{ challenge.course_title }}</a>
+</li>
+<li>
+  <a class="max-w-[16rem] truncate text-base-content font-bold"
+     title="{{ challenge.title }}">{{ challenge.title }}</a>
+</li>
 {% endblock %}
 
 {% block body %}

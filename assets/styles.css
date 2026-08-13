@@ -72,6 +72,24 @@ body {
   background: color-mix(in oklch, var(--color-primary) 6%, transparent);
 }
 
+/* The navbar's breadcrumb trail. daisyUI's `breadcrumbs` draws its separator as
+   a rotated border the size of the text; this one is a bracket spanning the
+   whole bar, so it is written out here. */
+.cocco-crumbs > li {
+  display: flex;
+  align-items: center;
+}
+.cocco-crumbs > li + li::before {
+  content: "";
+  align-self: stretch; /* the height of the navbar row ... */
+  margin-block: -0.5rem; /* ... plus the navbar's own y padding */
+  width: 0.62rem;
+  margin-inline-end: 0.9rem;
+  background-color: var(--color-primary);
+  /* a thin V: down the leading edge, out to the point, back again */
+  clip-path: polygon(0 0, 2px 0, 100% 50%, 2px 100%, 0 100%, calc(100% - 2px) 50%);
+}
+
 /* Syntax highlighting for a submission's source.
 
    Pygments emits its own short class names (.k for a keyword, .s2 for a double

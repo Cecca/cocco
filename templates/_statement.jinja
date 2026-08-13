@@ -1,4 +1,4 @@
-{# The problem statement card: breadcrumb, title, sandbox limits, description
+{# The problem statement card: caption, title, sandbox limits, description
    and the public sample files. Included by both challenge.jinja (the student
    view) and challenge-staff.jinja, so the two cannot drift apart. Never served
    from a route, hence no `f-` prefix.
@@ -9,10 +9,7 @@
   <div class="card-body p-8">
     <div class="flex items-start justify-between gap-4">
       <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
-        <a href="{{ url_for('get_course', course_id=course_id) }}" class="hover:text-primary">
-          {{ challenge.course_title }}
-        </a>
-        · Challenge {{ "%02d" | format(challenge.number) }}
+        Challenge {{ "%02d" | format(challenge.number) }}
       </p>
       {# Course staff only. The real check is on the edit routes themselves. #}
       {% if can_edit %}
