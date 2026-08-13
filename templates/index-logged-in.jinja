@@ -1,4 +1,7 @@
 {% extends "base.jinja" %}
+
+{# The trail's root, and the page it points at: no href, because this is it. #}
+{% set crumbs = [{"label": "Courses"}] %}
 {% block title %}
 {{ title }}
 {% endblock %}

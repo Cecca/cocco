@@ -1,20 +1,22 @@
 {% extends "base.jinja" %}
 {% block title %}Editing {{ challenge.title }}{% endblock %}
 
-{% block nav_extra %}
-<li><a class="text-base-content font-bold border-b-2 border-primary pb-0.5">Editing</a></li>
-{% endblock %}
+{% set crumbs = [
+  {"label": "Courses", "href": url_for('index')},
+  {"label": challenge.course_title, "href": url_for('get_course', course_id=course_id)},
+  {"label": challenge.title,
+   "href": url_for('get_challenge', course_id=course_id, challenge_id=challenge.id)},
+  {"label": "Editing"},
+] %}
 
 {% block body %}
 <main class="mx-auto max-w-6xl px-6 py-8">
 
   <div class="flex items-start justify-between gap-4 mb-6">
     <div>
+      {# What the trail does not say, the way `_statement.jinja` prints it. #}
       <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
-        <a href="{{ url_for('get_course', course_id=course_id) }}" class="hover:text-primary">
-          {{ challenge.course_title }}
-        </a>
-        · Challenge {{ "%02d" | format(challenge.number) }}
+        Challenge {{ "%02d" | format(challenge.number) }}
       </p>
       <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ challenge.title }}</h1>
     </div>

@@ -1,9 +1,22 @@
 {% extends "base.jinja" %}
 {% block title %}#{{ submission.attempt }} · {{ submission.challenge_title }}{% endblock %}
 
-{% block nav_extra %}
-<li><a class="text-base-content font-bold border-b-2 border-primary pb-0.5">This challenge</a></li>
-{% endblock %}
+{# The ids are on the document: this route's URL carries only the submission.
+   The author crumb is for whoever is not the author - it leads to the page
+   this one was reached from, and the author already knows whose work it is. #}
+{% set crumbs = [
+  {"label": "Courses", "href": url_for('index')},
+  {"label": submission.course_title, "href": url_for('get_course', course_id=submission.course_id)},
+  {"label": submission.challenge_title,
+   "href": url_for('get_challenge', course_id=submission.course_id,
+                   challenge_id=submission.challenge_id)},
+] + ([] if viewer_is_author else [
+  {"label": submission.author_nickname,
+   "href": url_for('get_challenge_student', course_id=submission.course_id,
+                   challenge_id=submission.challenge_id, student_id=submission.user_id)},
+]) + [
+  {"label": "Attempt #" ~ submission.attempt},
+] %}
 
 {# One submission: what was handed in, and what the judge made of it. Reached
    from the submission table on the student's own challenge page and on the
@@ -15,20 +28,7 @@
 
   <div class="flex items-start justify-between gap-4 mb-6">
     <div>
-      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
-        <a href="{{ url_for('get_course', course_id=submission.course_id) }}" class="hover:text-primary">
-          {{ submission.course_title }}
-        </a>
-        ·
-        <a href="{{ url_for('get_challenge', course_id=submission.course_id, challenge_id=submission.challenge_id) }}"
-           class="hover:text-primary">{{ submission.challenge_title }}</a>
-        {% if not viewer_is_author %}
-        ·
-        <a href="{{ url_for('get_challenge_student', course_id=submission.course_id, challenge_id=submission.challenge_id, student_id=submission.user_id) }}"
-           class="hover:text-primary">{{ submission.author_nickname }}</a>
-        {% endif %}
-      </p>
-      <h1 class="font-serif text-3xl font-semibold tracking-tight leading-tight mt-1">
+      <h1 class="font-serif text-3xl font-semibold tracking-tight leading-tight">
         Attempt #{{ submission.attempt }}
       </h1>
       <div class="flex flex-wrap items-center gap-2.5 mt-2">

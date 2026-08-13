@@ -17,12 +17,29 @@
         <span class="grid h-8 w-8 place-items-center rounded-lg bg-primary text-primary-content font-extrabold text-lg">C</span>
         <span class="text-lg font-extrabold tracking-wide">COCCO</span>
       </a>
-      <ul class="cocco-crumbs hidden md:flex items-stretch gap-4 text-sm font-medium text-base-content/60">
+      {# The breadcrumb trail. A page declares it as data - a top-level
+         `{% set crumbs = [...] %}`, which runs before this template does - and
+         owns none of the markup, so every trail truncates and highlights the
+         same way. A crumb with an `href` is a link; the one without is the page
+         you are on, which is why no page has to say which of them is current.
+
+         The trail is the whole of it: a page that is not under a course starts
+         its own, and `/admin` therefore reads "Administration" rather than
+         hanging off "Courses". A page that declares nothing - the login page,
+         the blocked page - renders no trail at all. #}
+      <ul class="cocco-crumbs hidden md:flex items-stretch gap-4 text-sm font-medium text-base-content/60"
+          aria-label="Breadcrumb">
+        {% for crumb in crumbs | default([]) %}
         <li>
-          <a href="{{ url_for('index') }}"
-             class="{% if nav == 'courses' %}text-base-content font-bold border-b-2 border-primary pb-0.5{% endif %}">Courses</a>
+          {% if crumb.href %}
+          <a href="{{ crumb.href }}" class="max-w-[14rem] truncate hover:text-base-content"
+             title="{{ crumb.label }}">{{ crumb.label }}</a>
+          {% else %}
+          <span class="max-w-[16rem] truncate text-base-content font-bold"
+                aria-current="page" title="{{ crumb.label }}">{{ crumb.label }}</span>
+          {% endif %}
         </li>
-        {% block nav_extra %}{% endblock %}
+        {% endfor %}
       </ul>
     </div>
     {# The login page renders with no user, so everything below is guarded. #}

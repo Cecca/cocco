@@ -1,6 +1,9 @@
 {% extends "base.jinja" %}
 {% block title %}{{ title }}{% endblock %}
 
+{# An account spans every course, so it hangs off no one of them. #}
+{% set crumbs = [{"label": profile.nickname}] %}
+
 {# One URL, two pages, the way the challenge has: the owner gets forms, a site
    administrator gets the same facts as text. `can_edit` comes from
    `require_profile_reader`, never from comparing ids here — hiding a control

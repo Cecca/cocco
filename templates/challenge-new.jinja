@@ -1,21 +1,20 @@
 {% extends "base.jinja" %}
 {% block title %}New challenge{% endblock %}
 
-{% block nav_extra %}
-<li><a class="text-base-content font-bold border-b-2 border-primary pb-0.5">New challenge</a></li>
-{% endblock %}
+{# `challenge` here is NEW_CHALLENGE_DEFAULTS, which has no id and no
+   course_title, so the course comes from `course` rather than from it. #}
+{% set crumbs = [
+  {"label": "Courses", "href": url_for('index')},
+  {"label": course.title, "href": url_for('get_course', course_id=course_id)},
+  {"label": "New challenge"},
+] %}
 
 {% block body %}
 <main class="mx-auto max-w-6xl px-6 py-8">
 
   <div class="flex items-start justify-between gap-4 mb-6">
     <div>
-      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
-        <a href="{{ url_for('get_course', course_id=course_id) }}" class="hover:text-primary">
-          {{ course.title }}
-        </a>
-      </p>
-      <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">New challenge</h1>
+      <h1 class="font-serif text-3xl font-semibold tracking-tight">New challenge</h1>
       <p class="text-[13px] text-base-content/55 mt-1">
         The evaluator and the test cases are set up on the editor, which is where
         this form lands once the challenge exists.

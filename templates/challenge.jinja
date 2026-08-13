@@ -1,17 +1,11 @@
 {% extends "base.jinja" %}
 {% block title %}{{ challenge.title }}{% endblock %}
 
-{% block nav_extra %}
-<li>
-  <a href="{{ url_for('get_course', course_id=course_id) }}"
-     class="max-w-[14rem] truncate hover:text-base-content"
-     title="{{ challenge.course_title }}">{{ challenge.course_title }}</a>
-</li>
-<li>
-  <a class="max-w-[16rem] truncate text-base-content font-bold"
-     title="{{ challenge.title }}">{{ challenge.title }}</a>
-</li>
-{% endblock %}
+{% set crumbs = [
+  {"label": "Courses", "href": url_for('index')},
+  {"label": challenge.course_title, "href": url_for('get_course', course_id=course_id)},
+  {"label": challenge.title},
+] %}
 
 {% block body %}
 <main class="mx-auto max-w-6xl px-6 py-8">

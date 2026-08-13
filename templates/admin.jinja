@@ -1,12 +1,9 @@
 {% extends "base.jinja" %}
 {% block title %}{{ title }}{% endblock %}
 
-{% block nav_extra %}
-<li>
-  <a href="{{ url_for('get_admin') }}"
-     class="text-base-content font-bold border-b-2 border-primary pb-0.5">Administration</a>
-</li>
-{% endblock %}
+{# Not under a course, so the trail starts here rather than hanging off
+   "Courses" - the same reason the profile's does. #}
+{% set crumbs = [{"label": "Administration"}] %}
 
 {% block body %}
 <main class="mx-auto max-w-6xl px-6 py-8">

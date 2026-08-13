@@ -6,6 +6,11 @@
 {% extends "base.jinja" %}
 {% block title %}{{ title }}{% endblock %}
 
+{# This page stands for any URL at all, so it can name no course or challenge -
+   and `blocked.jinja` and `login.jinja` declare no trail whatsoever, having
+   nobody to show one to. #}
+{% set crumbs = [{"label": "Not allowed"}] %}
+
 {% block body %}
 <main class="mx-auto max-w-6xl px-6 py-8">
   <div class="card bg-base-100 border border-base-300 shadow-sm">

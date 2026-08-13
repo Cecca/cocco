@@ -1228,7 +1228,6 @@ async def index(request: Request, db: DBDep, user: CurrentUser, q: str = ""):
             "q": q,
             "title": "COCCO: Coding Challenges Companion",
             "user": user,
-            "nav": "courses",
             # Two affordances off one answer: "New course", and the Edit button
             # on the card of a course an administrator is not enrolled on. The
             # routes behind both check for themselves - see `require_admin` and

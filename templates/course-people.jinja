@@ -1,11 +1,11 @@
 {% extends "base.jinja" %}
 {% block title %}{{ title }}{% endblock %}
 
-{% block nav_extra %}
-<li>
-  <a class="text-base-content font-bold border-b-2 border-primary pb-0.5">People</a>
-</li>
-{% endblock %}
+{% set crumbs = [
+  {"label": "Courses", "href": url_for('index')},
+  {"label": course.title, "href": url_for('get_course', course_id=course.id)},
+  {"label": "People"},
+] %}
 
 {% block body %}
 <main class="mx-auto max-w-6xl px-6 py-8">
@@ -13,19 +13,13 @@
   <!-- ══ THE CLASS ═══════════════════════════════════════════════════ -->
   <div class="card bg-base-100 border border-base-300 shadow-sm">
     <div class="card-body p-8">
-      <div class="flex items-start justify-between gap-4">
-        <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
-          <a href="{{ url_for('index') }}" class="hover:text-primary">Courses</a>
-          <span class="text-base-content/30">/</span>
-          <a href="{{ url_for('get_course', course_id=course.id) }}"
-             class="hover:text-primary">{{ course.title }}</a>
-        </p>
+      <div class="flex items-center justify-end">
         <a href="{{ url_for('get_course', course_id=course.id) }}"
-           class="btn btn-sm btn-ghost border border-base-300 font-semibold -mt-1">
+           class="btn btn-sm btn-ghost border border-base-300 font-semibold">
           ← Back to course
         </a>
       </div>
-      <h1 class="font-serif text-4xl font-semibold tracking-tight mt-1 mb-1">People</h1>
+      <h1 class="font-serif text-4xl font-semibold tracking-tight mb-1">People</h1>
       <p class="text-[13px] text-base-content/55 mb-5">
         Everyone enrolled on {{ course.title }}. Teachers and collaborators are
         course staff — they see the standings and may edit the challenges.
