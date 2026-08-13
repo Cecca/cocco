@@ -1,11 +1,18 @@
-<!DOCTYPE html>
+{# Bound once and used twice, below and in the navbar. A preload whose href
+   differs from the `src` by a single byte fetches the image twice, which is
+   exactly the mistake a `?v=` invites. #}
+{% set logo_url = static_url('icon-small.png') %}<!DOCTYPE html>
 <html lang="en" data-theme="cocco">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Cocco - {% block title %}{% endblock %}</title>
-  <link id="favicon" rel="icon" type="image/x-icon" href="/static/favicon.ico">
-  <link href="{{ url_for('static', path='/styles.css') }}" rel="stylesheet">
+  <link rel="icon" type="image/x-icon" href="{{ static_url('favicon.ico') }}">
+  {# Above the stylesheet on purpose: the preload scanner promotes the mark
+     instead of queueing it behind render-blocking CSS, which is what left the
+     navbar painting an empty box with the logo dropping in a beat later. #}
+  <link rel="preload" as="image" href="{{ logo_url }}" fetchpriority="high">
+  <link href="{{ static_url('styles.css') }}" rel="stylesheet">
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700;800&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600;6..72,700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -15,7 +22,10 @@
   <div class="navbar bg-base-100 border-b border-base-300 px-6 min-h-[3.75rem]">
     <div class="flex-1 flex items-center gap-7">
       <a href="{{ url_for('index') }}" class="flex items-center gap-2.5">
-        <img src="/static/icon-small.png" class="h-8 w-8"></img>
+        {# `alt=""` deliberately: the mark is decorative, and the accessible
+           name of this link is the wordmark beside it. A non-empty alt would
+           have a screen reader announce the link twice. #}
+        <img src="{{ logo_url }}" width="64" height="64" alt="" fetchpriority="high" class="h-8 w-8">
         <span class="text-lg font-extrabold tracking-wide rounded-lg bg-primary text-primary-content px-2">COCCO</span>
       </a>
       {# The breadcrumb trail. A page declares it as data - a top-level

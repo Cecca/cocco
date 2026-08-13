@@ -58,6 +58,8 @@ import hmac
 import io
 import logging
 import os
+from pathlib import Path
+from urllib.parse import parse_qs
 
 from cocco.repository import (
     block_user,
@@ -193,8 +195,40 @@ def google_client():
     """
     return oauth.create_client("google")
 
-# Static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Static files. Resolved against the checkout rather than the working directory,
+# the rule `load_languages` already follows for `languages.toml`.
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+
+class VersionedStaticFiles(StaticFiles):
+    """`StaticFiles` with a `Cache-Control`, chosen by whether the URL carries a
+    `?v=`.
+
+    Starlette sets a `last-modified` and an `etag` and no freshness directive at
+    all, so a browser falls back to heuristic caching - which for a file that
+    was created recently is worth nothing. Every reload therefore revalidated
+    the navbar mark, and the navbar painted an empty box until the 304 came
+    back. That is the flicker.
+
+    A year of `immutable` is only safe on a URL that changes when the file does,
+    which is what `static_url` stamps on; a URL typed by hand has no version to
+    change and so gets `no-cache` - it may be held in cache, but never used
+    without asking. The two halves have to stay together: the header is the
+    point of the version, and the version is what makes the header safe."""
+
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        # The `v` *key*, not the substring "v=", which `?nv=1` also contains.
+        versioned = "v" in parse_qs(scope.get("query_string", b"").decode("latin-1"))
+        # Set after `super()`, so this covers the 304 too: `NotModifiedResponse`
+        # keeps `cache-control` among the few headers it carries over.
+        response.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable" if versioned else "no-cache"
+        )
+        return response
+
+
+app.mount("/static", VersionedStaticFiles(directory="static"), name="static")
 
 # The database. The judge builds a *sync* engine from this same URL, which is
 # why the driver in it has to be one with both faces - see DEFAULT_DATABASE_URL.
@@ -293,6 +327,32 @@ templates.env.globals["EDITOR_ROLE_NAMES"] = EDITOR_ROLE_NAMES
 # from four routes, and the list of roles is not any of their business.
 USER_ROLE_NAMES = [role.value for role in UserRole]
 templates.env.globals["USER_ROLE_NAMES"] = USER_ROLE_NAMES
+
+
+def static_url(path: str) -> str:
+    """`/static/<path>` with the file's mtime as `?v=`, which is what opts it
+    into `VersionedStaticFiles`' year of `immutable`.
+
+    The `stat` happens per render rather than once at import, and that is
+    load-bearing: `npm run watch:css` rewrites `static/styles.css` without
+    touching a `.py`, so a version fixed at import would pin a year-long
+    `max-age` to a file that has since changed, with nothing left to invalidate
+    it. Three files and one `stat` each is not worth caching around.
+
+    A missing file falls back to the bare path - `static/styles.css` is a build
+    artifact and is simply absent until the first `npm run build:css`.
+
+    The URL is built by hand rather than through `url_for`, matching what the
+    templates already did, and so ignores `root_path`. It takes literals from
+    templates and never anything a user typed."""
+    try:
+        version = int((STATIC_DIR / path).stat().st_mtime)
+    except OSError:
+        return f"/static/{path}"
+    return f"/static/{path}?v={version:x}"
+
+
+templates.env.globals["static_url"] = static_url
 
 
 async def create_db_and_tables(dummy=False):

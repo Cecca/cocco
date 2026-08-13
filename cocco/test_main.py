@@ -3,9 +3,10 @@ or a running app - the routes themselves are exercised by hand for now."""
 
 
 import pytest
+from fastapi.testclient import TestClient
 
 from cocco.judge import load_languages
-from cocco.main import render_source, visible_outcomes
+from cocco.main import app, render_source, static_url, visible_outcomes
 
 
 def _outcome(is_sample: bool, **overrides):
@@ -77,3 +78,34 @@ def test_visible_outcomes_redacts_hidden_test_cases_for_students():
 def test_visible_outcomes_shows_everything_to_staff():
     outcomes = [_outcome(is_sample=False), _outcome(is_sample=True)]
     assert visible_outcomes(outcomes, is_staff=True) == outcomes
+
+
+# Deliberately not `with TestClient(...)`: entering the context runs the startup
+# event, which calls `create_db_and_tables` against the real Postgres engine.
+# The static mount needs none of it, and these stay unit tests.
+_client = TestClient(app)
+
+
+def test_static_url_carries_a_version():
+    """The `?v=` is what opts a URL into a year of `immutable`, so a file that
+    changes gets a URL that changes with it."""
+    assert static_url("icon-small.png").startswith("/static/icon-small.png?v=")
+
+
+def test_static_url_falls_back_when_the_file_is_missing():
+    """`static/styles.css` is a build artifact and is simply absent until the
+    first `npm run build:css`; an unversioned URL still has to work."""
+    assert static_url("no-such-file.png") == "/static/no-such-file.png"
+
+
+def test_versioned_static_is_cached_forever():
+    response = _client.get("/static/icon-small.png?v=abc")
+    assert response.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+
+@pytest.mark.parametrize("url", ["/static/icon-small.png", "/static/icon-small.png?nv=1"])
+def test_unversioned_static_is_revalidated(url):
+    """Without a version there is nothing to invalidate a stale copy, so it must
+    be revalidated - and `?nv=1` is the near-miss that a substring test for
+    "v=" would wrongly cache for a year."""
+    assert _client.get(url).headers["cache-control"] == "no-cache"
