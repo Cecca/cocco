@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Cocco - {% block title %}{% endblock %}</title>
+  <link id="favicon" rel="icon" type="image/x-icon" href="/static/favicon.ico">
   <link href="{{ url_for('static', path='/styles.css') }}" rel="stylesheet">
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -14,8 +15,8 @@
   <div class="navbar bg-base-100 border-b border-base-300 px-6 min-h-[3.75rem]">
     <div class="flex-1 flex items-center gap-7">
       <a href="{{ url_for('index') }}" class="flex items-center gap-2.5">
-        <span class="grid h-8 w-8 place-items-center rounded-lg bg-primary text-primary-content font-extrabold text-lg">C</span>
-        <span class="text-lg font-extrabold tracking-wide">COCCO</span>
+        <img src="/static/icon-small.png" class="h-8 w-8"></img>
+        <span class="text-lg font-extrabold tracking-wide rounded-lg bg-primary text-primary-content px-2">COCCO</span>
       </a>
       {# The breadcrumb trail. A page declares it as data - a top-level
          `{% set crumbs = [...] %}`, which runs before this template does - and
