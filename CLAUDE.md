@@ -171,6 +171,46 @@ replaces it, and N dialogs with N unique ids would be rebuilt on every keystroke
 
 The course has an editor of its own at `/courses/{course_id}/edit` — the course's title and description (the same markdown textarea and `post_markdown_preview` the challenge form uses) plus the challenge list, reorderable with ↑/↓. It is **declared above `get_challenge`**, and that is load-bearing: `/courses/{course_id}/{challenge_id}` matches any single segment, so a `/courses/1/edit` declared after it would route there and be rejected as an unparseable id. The cards themselves are `_challenge-card.jinja`, shared by the course page and by `f-course-challenges.jinja` — the fragment every move swaps in — so the student's list and the editor's cannot drift apart.
 
+**Both editors end in a "Danger zone" card**, and it holds the two ends of an object's life:
+archiving it, which is reversible, and deleting it, which is not. The course's is
+administrators only — `Admin`, and deliberately *not* `CourseEditor`, which lets a plain teacher
+on to that page; what the home page lists and what exists at all is the site's business rather
+than one course's, the same line `post_course_new` draws at the other end, and the reason
+`require_admin`'s sentence names the permission rather than any of the three places it is now
+used. `get_course_edit` passes `is_admin` down so the card can be drawn or not; the routes behind
+it check for themselves. The challenge's needs no such flag — the whole page is behind
+`ChallengeEditor`, which already *is* "administrators and course staff", and which keeps the
+`challenge_in_course` cross-check that stops staff of one course naming their own in front of
+somebody else's challenge. The three course routes are **declared above `get_challenge`**, for the
+editor's reason; the challenge's have a third segment and cannot collide. Archive and unarchive
+are two routes rather than one with a flag, mirroring `/admin/users/{id}/block` and `/unblock`,
+and every one of the six answers `204` + `HX-Redirect` — back to the same editor for an archive,
+because the badge, every challenge card and the button's own label all change; to the course
+editor for a deleted challenge, which is the list it has just left; to the home page for a deleted
+course, which has no page left to swap into.
+
+**A delete asks for the thing's own title, typed out.** That is the regrade dialog's precedent one
+turn stricter, because a regrade can be run again and this cannot: `<dialog class="modal">` with a
+text box, and an inline script that only *enables* the button on an exact match.
+`_confirmation_matches` compares the same string again in the route, because a disabled control is
+presentation and never the check — the rule `require_challenge_editor` states for hidden buttons.
+A plain `==` on the trimmed string and not `hmac.compare_digest`, unlike the enrollment key: the
+title is printed on the page the box sits on, so this confirms an intention rather than proving a
+secret. The title reaches the script through **`data-expected`**, through Jinja's attribute
+escaping, never interpolated into a JS string literal where a course called `Dijkstra's` would end
+the string. Both danger zones refuse — 200 with `f-edit-result.jinja`, htmx's rule — on a wrong
+name and while a judge is mid-run; only the success is a 204.
+
+**Archiving is a visibility state, not a lock**, and that is what keeps the whole feature down to
+**two enforcement points**: `post_submission` and `post_course_enroll`. An archived course or
+challenge stays readable for the people already enrolled — statement, their attempts, scores,
+leaderboards — stops taking submissions, leaves everybody else's listing, and admits nobody new.
+Staff go on editing it, and unarchive it from where they archived it; so does `cocco push`, since
+the API is the editor by another route. `[dev] reset_db` is the only way `archived_at` reaches an
+existing database, since there is no migration tool — by hand it is
+`ALTER TABLE course ADD COLUMN archived_at timestamp without time zone;` and the same for
+`challenge`.
+
 Beside it, `/courses/{course_id}/people` (`course-people.jinja`) is the class list: who is
 enrolled, in what role, how much they have submitted *here*, and the three ways staff change it.
 It is `/admin` reshaped for one course and keeps that page's rules — one swap target, `#people`;
@@ -488,6 +528,9 @@ though that zip came from our own server.
 - **`challenge.position` orders, `number` numbers.** The column is the sort key the course editor's arrows write, ordered by `position, id` everywhere so challenges nobody has reordered keep the order they were created in. What a page prints ("Challenge 03") is `number`, the *rank* of that key within the course, computed in `query_challenge` — the two are separate fields because a reorder leaves gaps and skipped numbers would be a bug. Moving one is `reorder_challenges`, a dense renumber of the whole course rather than the sentinel swap `swap_testcase_order` does: `position` defaults to 0, so every row of a course that predates the column starts out tied, and exchanging two zeroes moves nothing.
 - **A test case that has graded something is never deleted, only retired.** `delete_testcase` refuses (via `count_testcase_outcomes` in the route, with the `testoutcome.testcase_id` FK as the backstop) once any outcome points at it: detaching those outcomes would leave scores in the history with nothing to say what produced them. Clearing `is_active` is the supported move — the row, the files and the past outcomes all stay, but the judge stops running it and it stops being downloadable. `is_active` is checked in `pull_queued_submission`, in `query_challenge`'s `samples` CTE and in `query_sample_testcase`; the editor's `query_challenge_testcases` deliberately does not filter it, so a retired case can be reinstated.
 - **Regrading is the one place outcomes are deliberately destroyed.** `regrade_challenge` deletes every outcome of a challenge and puts every submission back to `queued`, so a fixed expected output can be applied without asking students to resubmit. Outcomes scored on *retired* test cases go too and never come back, since the judge only runs active ones — that is the difference between regrading and retiring, and it is why the confirmation dialog spells it out. Afterwards `count_testcase_outcomes` is zero for the challenge's test cases, so they are deletable again; nothing is left for a delete to strand. The route checks `count_running_submissions` first and refuses while a judge is mid-run, whose outcomes would otherwise land after the reset.
+- **Deleting a challenge is the one place a submission is destroyed, and the cascade is hand-written.** No foreign key in `model.py` declares an `ON DELETE`, deliberately — `testoutcome.testcase_id` having none is exactly what makes it the backstop that stops `delete_testcase` from stranding a score — so `delete_challenge` spells the order out once (testoutcome by `submission_id`, then by `testcase_id`, then submission, testcase, challenge) and the database's job is to raise if it is ever got wrong. Both outcome deletes and not one: both FK columns are nullable, so an outcome detached from its submission can still be the only thing holding a test case down. `delete_course` calls it per challenge rather than writing the cascade a second time, wider, then takes enrollments and the course. Every other rule in this app draws the opposite line — a block does not retract work, `delete_enrollment` takes one row, a graded test case is retired — and that line is about a course that still exists; there is nothing left for a score to be the record *of* once the challenge is gone. Files are read **before** the deletes (`query_challenge_file_paths`) and unlinked **after** the commit, `post_testcase_delete`'s order, so a failed commit can leave a file nothing points at but never a row pointing at a file that is gone; the directories then go through `Storage.delete_directory`, which is `rmdir` and never `rmtree`, so anything still in there is left to be looked at.
+- **A delete locks the submissions it is about to destroy; a regrade only counts them.** `post_regrade` is happy with `count_running_submissions` because the race costs one stale score. A delete uses `lock_challenge_submissions` / `lock_course_submissions`, which take the rows `FOR UPDATE` and count in the same statement, because `run_from_queue` writes its outcomes inside `engine.begin()` with **no `except` around it**: a submission deleted mid-run makes `insert_test_outcomes` violate a foreign key and takes the judge *process* down. The locks are taken on `submission` before anything touches `testoutcome`, which is the order the judge takes them in, so the two cannot deadlock.
+- **"Archived" is one `or`, spelled twice and never a third time.** A challenge is archived when it says so *or* when its course does; `_EFFECTIVE_ARCHIVED_SQL` says it for the raw page queries and `_effective_archived_at()` for the plain-Core reads the SQLite route tests reach, both in `repository.py`, each naming the other, with an integration test asserting they agree. Every page query exposes it as **`effective_archived_at`** — a separate name and never `AS archived_at`, which would put two columns of that name in the record and let `row_to_json` decide it last-one-wins — and every template reads that one. The single exception is the challenge editor's danger zone, which compares `challenge.archived_at` against it to say "its course is archived, so this is read-only whatever this button says"; anywhere else, reading the challenge's own column silently un-archives every challenge under an archived course. `query_courses` drops an archived course from the **non-enrolled half only**, since it cannot be joined and listing it would be an invitation to a shut door; `include_archived` is how an administrator, the only person who can unarchive one, still finds it. `pull_queued_submission` deliberately does not learn about any of this: skipping an archived challenge's queued rows would strand them as `queued` forever, exactly as it would for a blocked student's.
 - **Language runtimes are pinned by `flake.lock`.** Changing a compiler version means updating the flake, not the system.
 - **An isolate box is one flat directory.** `isolate_run` copies every path argument in under its *basename*, so unrelated paths collapse into one namespace, and the copy order — `box_files`, then `args`, then `additional_files` — decides who wins a collision. `box_files` is the explicit form and the only safe one when more than one file is involved: the evaluator gets its three arguments as `.actual_output`, `.expected_output` and `.test_input`, names nothing can collide with because `safe_filename` strips leading dots from every upload. Without it, a checker uploaded as `expected_output.c` compiles to a binary named `expected_output` that lands on top of the expected output it was meant to read.
 - **Scores are per test case, in `[0, 1]`.** A submission's headline score is the mean of its outcomes' scores, shown out of 100. This aggregation assumes higher-is-better, so it is wrong for a challenge whose evaluator uses another scale — nothing enforces the range, and an evaluator is free to return any finite float.

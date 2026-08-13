@@ -146,6 +146,13 @@ Course = Table(
     # Only ever *printed* by the course editor, which is staff-only - every
     # other query reports whether it is set, never what it is.
     Column("enrollment_key", String, nullable=True),
+    # When the course was archived, or NULL for a live one. Archiving is a
+    # visibility state and not a lock: the people already enrolled go on
+    # reading it and stop being able to submit, everybody else stops being
+    # shown it, and nobody new can join. A timestamp rather than a flag, for
+    # `blocked_at`'s reason - the moment is worth keeping and NULL is the whole
+    # of "no".
+    Column("archived_at", DateTime, nullable=True),
 )
 
 
@@ -189,6 +196,14 @@ Challenge = Table(
     # course whose challenges all still sit at the default keeps the order they
     # were created in - and the arrows are the only thing that ever writes it.
     Column("position", Integer, nullable=False, default=0, server_default=text("0")),
+    # As on `course`, and the two are always read together: a challenge under
+    # an archived course is archived in effect even with this column NULL. That
+    # `or` is spelled exactly twice, both times in `repository.py`
+    # (`_EFFECTIVE_ARCHIVED_SQL` and `_effective_archived_at`), and never in a
+    # route or a template - the way `effective_course_role` is spelled once.
+    # This column on its own is the challenge's *own* state, which only the
+    # challenge editor's danger zone reads.
+    Column("archived_at", DateTime, nullable=True),
 )
 
 

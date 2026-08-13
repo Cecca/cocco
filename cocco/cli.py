@@ -117,7 +117,11 @@ def cmd_ls(args) -> int:
         if row["course_id"] != course:
             course = row["course_id"]
             print(f"\n{row['course_title']}")
-        print(f"  {row['challenge_id']:>{width}}  {row['title']}")
+        # An archived challenge is still pushable - staff edit one exactly as
+        # before - so this is a note beside the title rather than anything
+        # missing from the list.
+        suffix = "  (archived)" if row.get("archived") else ""
+        print(f"  {row['challenge_id']:>{width}}  {row['title']}{suffix}")
     return 0
 
 

@@ -330,6 +330,59 @@ async def test_the_listing_shows_only_what_you_can_edit(client, world):
     }
 
 
+async def test_the_listing_marks_archived_challenges(client, world, app_engine):
+    """The *effective* state, so a challenge whose course was archived is
+    marked as well as one archived on its own. It is a note beside the title
+    for somebody about to push to last year's course, not a gate."""
+    async with app_engine.connect() as conn:
+        await conn.execute(
+            update(Course).where(Course.c.id == world["other"])
+            .values(archived_at=datetime(2026, 1, 1))
+        )
+        await conn.commit()
+
+    rows = {
+        row["challenge_id"]: row
+        for row in client.get("/api/challenges", headers=auth(world, "matteo")).json()
+    }
+    assert rows[world["challenge"]]["archived"] is False
+    assert rows[world["other_challenge"]]["archived"] is True
+
+
+async def test_a_push_to_an_archived_challenge_still_works(
+    client, world, app_engine
+):
+    """Written down so it is not "fixed" later. Archiving is a visibility
+    state, not a lock: staff go on editing an archived challenge in the
+    browser, and the API is the editor by another route. A script the browser
+    accepted and the CLI refused would be a difference nobody could explain.
+
+    The manifest gains no `archived` key either, for the reason `position` has
+    none - so a round trip through a directory cannot silently reopen a
+    challenge that was closed on purpose.
+    """
+    async with app_engine.connect() as conn:
+        await conn.execute(
+            update(Challenge).where(Challenge.c.id == world["challenge"])
+            .values(archived_at=datetime(2026, 1, 1))
+        )
+        await conn.commit()
+
+    _, archive = pull(client, world, "alice", world["challenge"])
+    assert "archived" not in archive.read(MANIFEST_NAME).decode()
+
+    members = {name: archive.read(name) for name in archive.namelist()}
+    members[STATEMENT_NAME] = b"# Fixed a typo\n"
+    assert push(client, world, "alice", world["challenge"], members).status_code == 200
+
+    async with app_engine.connect() as conn:
+        row = (await conn.execute(select(Challenge).where(
+            Challenge.c.id == world["challenge"]))).one()
+    assert row.description == "# Fixed a typo\n"
+    # ...and it is still archived afterwards.
+    assert row.archived_at is not None
+
+
 # ── the export ──────────────────────────────────────────────────────────────
 
 

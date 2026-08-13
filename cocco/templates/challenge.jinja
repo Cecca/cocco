@@ -32,6 +32,22 @@
     <!-- ── RIGHT: submit + leaderboard ──────────────────────────────── -->
     <div class="flex flex-col gap-5">
 
+      {# Archived: readable, but not taking submissions. The form goes rather
+         than being disabled, because there is nothing to fill in - and
+         `post_submission` refuses in any case, which is the actual check.
+         `effective_archived_at`, so archiving the course closes this too. #}
+      {% if challenge.effective_archived_at %}
+      <div class="card bg-base-100 border border-base-300 shadow-sm">
+        <div class="card-body p-5">
+          <h2 class="font-bold text-[15px]">Archived</h2>
+          <p class="text-xs text-base-content/55 -mt-1">
+            This challenge is no longer taking submissions. The statement, your
+            attempts and the leaderboard stay here for reference.
+          </p>
+        </div>
+      </div>
+      {% else %}
+
       <div class="card bg-base-100 border border-base-300 shadow-sm">
         <div class="card-body p-5">
           <h2 class="font-bold text-[15px]">Submit a solution</h2>
@@ -63,6 +79,7 @@
           <div id="submit-result" class="empty:hidden mt-4"></div>
         </div>
       </div>
+      {% endif %}
 
       <div class="card bg-base-100 border border-base-300 shadow-sm">
         <div class="card-body p-5">
@@ -133,6 +150,10 @@
   </div>
 </main>
 
+{# Guarded by the same condition as the form itself: without it
+   `getElementById("file-input")` is null and the first `addEventListener`
+   throws, taking the rest of the page's scripts with it. #}
+{% if not challenge.effective_archived_at %}
 <script>
   // Reflect the chosen file in the dropzone + basic drag styling.
   // (htmx does the actual multipart upload on form submit.)
@@ -154,4 +175,5 @@
     }
   });
 </script>
+{% endif %}
 {% endblock %}

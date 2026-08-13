@@ -139,5 +139,130 @@
       </div>
     </div>
   </div>
+
+  <!-- ══ DANGER ZONE ═════════════════════════════════════════════════ -->
+  {# Site administrators only. `require_course_editor` lets a plain teacher on
+     to this page, so this card asks its own question - `get_course_edit`
+     passes `is_admin` down. The routes behind both buttons are behind `Admin`;
+     this only decides whether they are drawn. Outside the form above, like the
+     challenge list: it has forms of its own. #}
+  {% if is_admin %}
+  <div class="card bg-base-100 border border-error/30 shadow-sm mt-6">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg text-error">Danger zone</h2>
+      <div id="course-danger-result" class="empty:hidden mt-3"></div>
+
+      <div class="flex flex-wrap items-center justify-between gap-4 mt-4 rounded-xl border border-base-300 p-4">
+        <div class="min-w-0 flex-1">
+          <h3 class="font-semibold">
+            {{ "Unarchive this course" if course.archived_at else "Archive this course" }}
+          </h3>
+          <p class="text-[13px] text-base-content/55">
+            {% if course.archived_at %}
+            It is archived: the students already on it read it but cannot
+            submit, nobody else is shown it, and nobody new can join.
+            Unarchiving undoes all three.
+            {% else %}
+            The students already on it keep reading it — statement, their
+            attempts, scores, leaderboards — and stop being able to submit. It
+            leaves everybody else's course list, and nobody new can join. You
+            can still edit it, and you can undo this from here.
+            {% endif %}
+          </p>
+        </div>
+        {# Nothing to swap: the response is a 204 carrying HX-Redirect back to
+           this page, because archiving changes the badge, every challenge card
+           and this button's own label. #}
+        <form hx-post="{{ url_for('post_course_unarchive' if course.archived_at else 'post_course_archive', course_id=course.id) }}"
+              hx-target="#course-danger-result"
+              hx-swap="innerHTML"
+              hx-disabled-elt="find button">
+          <button type="submit" class="btn btn-sm btn-outline btn-warning font-semibold">
+            {{ "Unarchive" if course.archived_at else "Archive" }}
+          </button>
+        </form>
+      </div>
+
+      <div class="flex flex-wrap items-center justify-between gap-4 mt-4 rounded-xl border border-error/30 p-4">
+        <div class="min-w-0 flex-1">
+          <h3 class="font-semibold">Delete this course</h3>
+          <p class="text-[13px] text-base-content/55">
+            Every challenge on it, every test case and evaluator file on disk,
+            every submission and every recorded score, and every enrollment.
+            There is no undo — archive it instead if you only want it out of
+            the way.
+          </p>
+        </div>
+        <button type="button" class="btn btn-sm btn-error font-semibold"
+                onclick="delete_course_modal.showModal()">
+          Delete course…
+        </button>
+      </div>
+    </div>
+  </div>
+  {% endif %}
 </main>
+
+{% if is_admin %}
+{# Deleting is irreversible, so it asks for the course's own title typed out -
+   the regrade dialog in `challenge-staff.jinja` is the precedent, one turn
+   stricter because a regrade can be run again and this cannot. The script
+   below only *enables* the button; `post_course_delete` compares the same
+   string again, because a disabled control is presentation and never the
+   check. #}
+<dialog id="delete_course_modal" class="modal">
+  <div class="modal-box">
+    <h3 class="font-bold text-lg text-error">Delete {{ course.title }}?</h3>
+    <p class="py-3 text-sm text-base-content/70">
+      Every challenge of this course, every test case and evaluator file, every
+      submission and every score are deleted for good, and everybody on it is
+      unenrolled. Nothing about this can be undone.
+    </p>
+    <p class="text-sm text-base-content/70">
+      Type <span class="font-semibold">{{ course.title }}</span> below to confirm.
+    </p>
+    <input type="text" id="course-delete-confirm" name="confirm"
+           autocomplete="off" data-expected="{{ course.title }}"
+           aria-label="Type the course title to confirm"
+           class="input w-full mt-3 font-mono" />
+    <div class="modal-action">
+      <form method="dialog">
+        <button class="btn btn-sm btn-ghost">Cancel</button>
+      </form>
+      <button type="button" id="course-delete-button" disabled
+              class="btn btn-sm btn-error"
+              hx-post="{{ url_for('post_course_delete', course_id=course.id) }}"
+              hx-include="#course-delete-confirm"
+              hx-target="#course-danger-result"
+              hx-swap="innerHTML"
+              onclick="delete_course_modal.close()">
+        Delete for good
+      </button>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<script>
+  // The whole of the JS: enable the button only on an exact match, and clear
+  // the box when the dialog closes so a cancelled attempt does not leave it
+  // armed. Inline and dependency-free, like the dropzone script on the
+  // challenge page - there is no build step here.
+  //
+  // The title travels in `data-expected`, through Jinja's attribute escaping,
+  // rather than being interpolated into a JS string literal: a course called
+  // "Dijkstra's" would end the string.
+  (() => {
+    const field = document.getElementById("course-delete-confirm");
+    const button = document.getElementById("course-delete-button");
+    const check = () => {
+      button.disabled = field.value.trim() !== field.dataset.expected.trim();
+    };
+    field.addEventListener("input", check);
+    document.getElementById("delete_course_modal")
+            .addEventListener("close", () => { field.value = ""; check(); });
+    check();
+  })();
+</script>
+{% endif %}
 {% endblock %}

@@ -2,7 +2,7 @@ import json
 from datetime import datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, insert, select, update
+from sqlalchemy import create_engine, func, insert, select, update
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import cocco.model as cm
@@ -26,6 +26,8 @@ from cocco.repository import (
     count_running_submissions,
     count_testcase_outcomes,
     course_exists,
+    delete_challenge,
+    delete_course,
     delete_enrollment,
     insert_administrators,
     insert_challenge,
@@ -34,8 +36,11 @@ from cocco.repository import (
     insert_self_enrollment,
     insert_user,
     is_administrator,
+    lock_challenge_submissions,
+    lock_course_submissions,
     pull_queued_submission,
     query_challenge,
+    query_challenge_file_paths,
     query_challenge_leaderboard,
     query_challenge_ranking,
     query_challenge_standings,
@@ -43,9 +48,11 @@ from cocco.repository import (
     query_course_challenges,
     query_course_info,
     query_course_people,
+    query_course_archived_at,
     query_course_role,
     query_course,
     query_courses,
+    query_effective_archived_at,
     query_enrollment_key,
     query_ordered_challenge_ids,
     query_sample_testcase,
@@ -59,6 +66,8 @@ from cocco.repository import (
     query_users,
     regrade_challenge,
     reorder_challenges,
+    set_challenge_archived,
+    set_course_archived,
     set_enrollment_role,
     unblock_user,
 )
@@ -1448,4 +1457,255 @@ async def test_a_duplicate_address_is_refused():
         await conn.commit()
         with pytest.raises(IntegrityError):
             await insert_user(conn, "eve@unipd.it", "eve2", b"<svg/>", "image/svg+xml")
+    await engine.dispose()
+
+
+########################################################################
+# Archiving and deleting. Integration tests, and not only because
+# `query_courses` is `json_agg`: SQLite does not enforce foreign keys unless
+# `PRAGMA foreign_keys=ON`, so a cascade written in the wrong order would pass
+# there and prove nothing. These run against a database that would refuse.
+
+
+async def _challenge_id(conn, title):
+    return (
+        await conn.execute(select(Challenge.c.id).where(Challenge.c.title == title))
+    ).scalar_one()
+
+
+@pytest.mark.integration
+async def test_an_archived_course_is_listed_only_to_the_people_on_it(postgres_url):
+    """The offer is withdrawn, not the course: it drops out of the half nobody
+    is enrolled in and stays in the half they are."""
+    sync_engine = create_engine(postgres_url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(postgres_url)
+
+    engine = create_async_engine(postgres_url)
+    async with engine.connect() as conn:
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
+        systems = await _course_id(conn, "Systems Programming")
+        algorithms = await _course_id(conn, "Algorithms 101")
+
+        await set_course_archived(conn, systems, True)
+        await set_course_archived(conn, algorithms, True)
+        await conn.commit()
+
+        courses = await query_courses(conn, user_id=carol)
+        # Carol is on Algorithms 101, so it stays - carrying the timestamp the
+        # card badges itself with.
+        enrolled = {c["title"]: c for c in courses["enrolled"]}
+        assert enrolled["Algorithms 101"]["archived_at"] is not None
+        assert enrolled["Data Structures"]["archived_at"] is None
+        # She is not on Systems Programming, and it cannot be joined, so it is
+        # not offered at all.
+        assert courses["non_enrolled"] == []
+
+        # An administrator asks for all of them: they are the only person who
+        # can unarchive one, so they have to be able to find it.
+        as_admin = await query_courses(conn, user_id=carol, include_archived=True)
+        assert [c["title"] for c in as_admin["non_enrolled"]] == [
+            "Systems Programming"
+        ]
+
+        # And unarchiving clears the column rather than writing a second one.
+        await set_course_archived(conn, systems, False)
+        await conn.commit()
+        assert await query_course_archived_at(conn, systems) is None
+        reopened = await query_courses(conn, user_id=carol)
+        assert [c["title"] for c in reopened["non_enrolled"]] == [
+            "Systems Programming"
+        ]
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_a_challenge_under_an_archived_course_is_archived_in_effect(postgres_url):
+    """The `or` that `_EFFECTIVE_ARCHIVED_SQL` and `_effective_archived_at`
+    spell twice. This is the test that pins the two spellings together: the
+    page queries answer in SQL, `query_effective_archived_at` in Core, and they
+    have to agree."""
+    sync_engine = create_engine(postgres_url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(postgres_url)
+
+    engine = create_async_engine(postgres_url)
+    async with engine.connect() as conn:
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
+        algorithms = await _course_id(conn, "Algorithms 101")
+        hello = await _challenge_id(conn, "Hello")
+        summing = await _challenge_id(conn, "Sum")
+
+        # Nothing archived: every reading of it is None.
+        assert await query_effective_archived_at(conn, hello) is None
+        page = await query_challenge(conn, user_id=carol, challenge_id=hello)
+        assert page["effective_archived_at"] is None
+
+        # One challenge archived on its own.
+        await set_challenge_archived(conn, summing, True)
+        await conn.commit()
+        assert await query_effective_archived_at(conn, summing) is not None
+        assert await query_effective_archived_at(conn, hello) is None
+
+        # Now the course. `Hello`'s own column is still NULL, and every query
+        # has to report it as archived anyway.
+        await set_course_archived(conn, algorithms, True)
+        await conn.commit()
+
+        own = (
+            await conn.execute(
+                select(Challenge.c.archived_at).where(Challenge.c.id == hello)
+            )
+        ).scalar_one()
+        assert own is None
+
+        core = await query_effective_archived_at(conn, hello)
+        assert core is not None
+        page = await query_challenge(conn, user_id=carol, challenge_id=hello)
+        assert page["effective_archived_at"] is not None
+        # The card's list answers the same way, from the shared CTE...
+        cards = await query_course_challenges(conn, algorithms, user_id=carol)
+        assert all(c["effective_archived_at"] is not None for c in cards)
+        # ...and the challenge's own column rides along beside it, untouched,
+        # which is what the challenge editor's danger zone reads.
+        by_title = {c["title"]: c for c in cards}
+        assert by_title["Hello"]["archived_at"] is None
+        assert by_title["Sum"]["archived_at"] is not None
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_deleting_a_challenge_leaves_nothing_behind(postgres_url):
+    """The hand-ordered cascade, against a database that enforces every
+    foreign key it walks past."""
+    sync_engine = create_engine(postgres_url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(postgres_url)
+
+    engine = create_async_engine(postgres_url)
+    async with engine.connect() as conn:
+        hello = await _challenge_id(conn, "Hello")
+        summing = await _challenge_id(conn, "Sum")
+
+        # It has been graded: submissions, outcomes, test cases and two files
+        # per case, which is the whole chain.
+        paths = await query_challenge_file_paths(conn, hello)
+        assert sorted(paths) == [f"Hello/in_{n}.txt" for n in range(3)] + [
+            f"Hello/out_{n}.txt" for n in range(3)
+        ]
+        outcomes_before = (
+            await conn.execute(
+                select(func.count())
+                .select_from(TestOutcome)
+                .join(Submission, Submission.c.id == TestOutcome.c.submission_id)
+                .where(Submission.c.challenge_id == hello)
+            )
+        ).scalar_one()
+        assert outcomes_before > 0
+
+        await delete_challenge(conn, hello)
+        await conn.commit()
+
+        for table, column in (
+            (Challenge, Challenge.c.id),
+            (TestCase, TestCase.c.challenge_id),
+            (Submission, Submission.c.challenge_id),
+        ):
+            assert (
+                await conn.execute(
+                    select(func.count()).select_from(table).where(column == hello)
+                )
+            ).scalar_one() == 0
+
+        # Its sibling on the same course is untouched, outcomes and all.
+        assert (
+            await conn.execute(
+                select(func.count())
+                .select_from(Submission)
+                .where(Submission.c.challenge_id == summing)
+            )
+        ).scalar_one() > 0
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_deleting_a_course_leaves_nothing_behind(postgres_url):
+    sync_engine = create_engine(postgres_url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(postgres_url)
+
+    engine = create_async_engine(postgres_url)
+    async with engine.connect() as conn:
+        algorithms = await _course_id(conn, "Algorithms 101")
+        systems = await _course_id(conn, "Systems Programming")
+        doomed = await query_ordered_challenge_ids(conn, algorithms)
+        assert len(doomed) == 2
+
+        await delete_course(conn, algorithms)
+        await conn.commit()
+
+        assert not await course_exists(conn, algorithms)
+        assert await query_ordered_challenge_ids(conn, algorithms) == []
+        assert (
+            await conn.execute(
+                select(func.count())
+                .select_from(Enrollment)
+                .where(Enrollment.c.course_id == algorithms)
+            )
+        ).scalar_one() == 0
+        assert (
+            await conn.execute(
+                select(func.count())
+                .select_from(Submission)
+                .where(Submission.c.challenge_id.in_(doomed))
+            )
+        ).scalar_one() == 0
+
+        # A sibling course keeps its challenges, its people and their work: a
+        # delete names one course.
+        assert await course_exists(conn, systems)
+        assert len(await query_ordered_challenge_ids(conn, systems)) == 2
+        assert (
+            await conn.execute(
+                select(func.count())
+                .select_from(Enrollment)
+                .where(Enrollment.c.course_id == systems)
+            )
+        ).scalar_one() == 3
+
+        # And nobody lost their account with the course they were on.
+        assert (
+            await conn.execute(select(func.count()).select_from(User))
+        ).scalar_one() == 6
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_the_lock_helpers_count_the_running_submissions(postgres_url):
+    """The count both danger zones refuse on. The *locking* half needs two
+    connections racing each other and is documented on
+    `lock_challenge_submissions` rather than tested here; what is asserted is
+    that the answer is the same one `count_running_submissions` gives, so the
+    stronger helper did not change the question."""
+    sync_engine = create_engine(postgres_url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(postgres_url)
+
+    engine = create_async_engine(postgres_url)
+    async with engine.connect() as conn:
+        systems = await _course_id(conn, "Systems Programming")
+        buffer_copy = await _challenge_id(conn, "Buffer copy")
+        parallel_sum = await _challenge_id(conn, "Parallel sum")
+
+        # dave's "Buffer copy" submission is the seeded `running` one.
+        assert await lock_challenge_submissions(conn, buffer_copy) == 1
+        assert await count_running_submissions(conn, buffer_copy) == 1
+        # Queued is not running: it disappears before a judge ever pulls it.
+        assert await lock_challenge_submissions(conn, parallel_sum) == 0
+
+        # The course-wide one sums its challenges.
+        assert await lock_course_submissions(conn, systems) == 1
+        algorithms = await _course_id(conn, "Algorithms 101")
+        assert await lock_course_submissions(conn, algorithms) == 0
+        await conn.rollback()
     await engine.dispose()

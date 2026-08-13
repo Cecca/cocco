@@ -88,6 +88,8 @@ from cocco.repository import (
     count_testcase_outcomes,
     course_exists,
     delete_api_token,
+    delete_challenge,
+    delete_course,
     delete_enrollment,
     delete_testcase,
     insert_administrators,
@@ -100,22 +102,27 @@ from cocco.repository import (
     insert_testcase,
     insert_user,
     is_administrator,
+    lock_challenge_submissions,
     lock_course,
+    lock_course_submissions,
     query_api_token_user,
     query_api_tokens,
     query_challenge,
     query_challenge_config,
+    query_challenge_file_paths,
     query_challenge_leaderboard,
     query_challenge_ranking,
     query_challenge_standings,
     query_challenge_testcases,
     query_course,
+    query_course_archived_at,
     query_course_challenges,
     query_course_info,
     query_course_people,
     query_course_role,
     query_courses,
     query_editable_challenges,
+    query_effective_archived_at,
     query_enrollment_key,
     query_evaluator_path,
     query_ordered_challenge_ids,
@@ -131,6 +138,8 @@ from cocco.repository import (
     query_users,
     regrade_challenge,
     reorder_challenges,
+    set_challenge_archived,
+    set_course_archived,
     set_enrollment_role,
     swap_testcase_order,
     touch_api_token,
@@ -436,6 +445,7 @@ async def _populate_dummy_data(conn: AsyncConnection):
 
     course_titles = ["Algorithms 101", "Data Structures"]
     first_challenge_id: int | None = None
+    last_challenge_id: int | None = None
     shortest_route = textwrap.dedent("""\
         You are given a weighted, undirected graph of **city connections**.
         Compute the length of the shortest route between a source city and a
@@ -528,8 +538,56 @@ async def _populate_dummy_data(conn: AsyncConnection):
             ).scalar_one()
             if first_challenge_id is None:
                 first_challenge_id = challenge_id
+            last_challenge_id = challenge_id
 
     assert first_challenge_id is not None
+
+    # One archived challenge inside a live course, and one archived course, so
+    # both halves of archiving are visible in a fresh checkout without anybody
+    # having to click. Alice is deliberately *not* enrolled on the archived
+    # course: `[dev] dummy_user = "alice@unipd.it"` is then the view in which
+    # an archived course is simply not listed, while Matteo - an administrator,
+    # and so the only person who can unarchive one - finds it under "Other
+    # courses", and Bob and Charlie see it in "Your courses", greyed and
+    # read-only.
+    from datetime import datetime
+
+    assert last_challenge_id is not None
+    await set_challenge_archived(conn, last_challenge_id, True)
+    archived_course_id = (
+        await conn.execute(
+            insert(Course)
+            .values(
+                title="Algorithms 101 (2024)",
+                description=(
+                    "Last year's edition, kept for the record. Enrolled "
+                    "students can still read it and look back over their "
+                    "submissions."
+                ),
+                archived_at=datetime.now(),
+            )
+            .returning(Course.c.id)
+        )
+    ).scalar_one()
+    await insert_enrollment(
+        conn, user_ids[DUMMY_ADMIN], archived_course_id, UserRole.teacher
+    )
+    for email in DUMMY_STUDENTS:
+        await insert_enrollment(
+            conn, user_ids[email], archived_course_id, UserRole.student
+        )
+    await conn.execute(
+        insert(Challenge).values(
+            title="Shortest Route Planner (2024)",
+            description=shortest_route,
+            course_id=archived_course_id,
+            position=0,
+            max_memory_bytes=256 << 20,
+            max_time_s=5.0,
+            max_threads=1,
+            evaluator_path=None,
+        )
+    )
 
     # The first three are public samples, downloadable from the challenge page;
     # the rest are hidden. The last one is retired, so the editor shows both
@@ -1436,7 +1494,15 @@ async def on_startup():
 
 @app.get("/")
 async def index(request: Request, db: DBDep, user: CurrentUser, q: str = ""):
-    courses = await query_courses(db, user_id=user.id, q=q)
+    # Two affordances off one answer: "New course", and the Edit button on the
+    # card of a course an administrator is not enrolled on. The routes behind
+    # both check for themselves - see `require_admin` and
+    # `effective_course_role`. It is also the third thing here: an archived
+    # course is not listed to somebody who is not on it, and an administrator
+    # is the only person who can unarchive one, so they have to be able to find
+    # it.
+    is_admin = await is_administrator(db, user.email)
+    courses = await query_courses(db, user_id=user.id, q=q, include_archived=is_admin)
     return templates.TemplateResponse(
         request=request,
         name="index-logged-in.jinja",
@@ -1445,11 +1511,7 @@ async def index(request: Request, db: DBDep, user: CurrentUser, q: str = ""):
             "q": q,
             "title": "COCCO: Coding Challenges Companion",
             "user": user,
-            # Two affordances off one answer: "New course", and the Edit button
-            # on the card of a course an administrator is not enrolled on. The
-            # routes behind both check for themselves - see `require_admin` and
-            # `effective_course_role`.
-            "is_admin": await is_administrator(db, user.email),
+            "is_admin": is_admin,
         },
     )
 
@@ -1460,7 +1522,13 @@ async def _render_courses(
     """Both halves of the courses list. Shared by the filter box's GET and by
     `post_course_enroll`, so the list a click leaves behind is the one the box
     would have produced."""
-    courses = await query_courses(db, user_id=user.id, q=q)
+    # `_course-card.jinja` reads this: an administrator is staff on every
+    # course, so offering them `Enroll!` on one would be odd. `query_courses`
+    # still splits the two halves on enrollment alone - they really are not
+    # enrolled, and the split should keep saying so. It also decides whether
+    # the archived courses they are not on are listed at all; see `index`.
+    is_admin = await is_administrator(db, user.email)
+    courses = await query_courses(db, user_id=user.id, q=q, include_archived=is_admin)
     return templates.TemplateResponse(
         request=request,
         name="f-courses.jinja",
@@ -1468,11 +1536,7 @@ async def _render_courses(
             "courses": courses,
             "q": q,
             "user": user,
-            # `_course-card.jinja` reads this: an administrator is staff on
-            # every course, so offering them `Enroll!` on one would be odd.
-            # `query_courses` still splits the two halves on enrollment alone -
-            # they really are not enrolled, and the split should keep saying so.
-            "is_admin": await is_administrator(db, user.email),
+            "is_admin": is_admin,
         },
     )
 
@@ -1848,6 +1912,22 @@ async def post_course_enroll(
     if not await course_exists(db, course_id):
         raise HTTPException(status_code=404)
 
+    # Before the key, because an archived course refuses whether or not the key
+    # is right - it is not taking students at all. The same fragment the key
+    # refusal answers with, for the same reason: what a refused student is
+    # looking at is the panel they clicked in. In practice this is only ever
+    # reached from a stale tab or a typed URL, since `query_courses` does not
+    # offer an archived course to anybody who is not on it - which is exactly
+    # why the route has to say it rather than the listing.
+    if await query_course_archived_at(db, course_id) is not None:
+        return await _render_enroll(
+            request,
+            db,
+            course_id,
+            next,
+            error="This course is archived and is not taking new students.",
+        )
+
     expected = await query_enrollment_key(db, course_id)
     if expected is not None and not hmac.compare_digest(key.strip(), expected):
         # Trimmed, because a key read off a slide is pasted with whitespace,
@@ -1915,6 +1995,11 @@ async def get_course_edit(
             "course_id": course_id,
             "title": f"Editing {course['title']}",
             "user": user,
+            # The danger zone at the foot of this page is administrators only,
+            # and `require_course_editor` lets a plain teacher in here - so the
+            # card has to ask its own question. The routes behind it are behind
+            # `Admin`; this only decides whether it is drawn.
+            "is_admin": await is_administrator(db, user.email),
         },
     )
 
@@ -1995,6 +2080,166 @@ async def post_challenge_move(
     await reorder_challenges(db, ordered)
     await db.commit()
     return await _render_course_challenges(request, db, course_id, user)
+
+
+########################################################################
+# The course's danger zone: archiving it, and ending it. Site administrators
+# only, through `Admin`, and deliberately *not* `CourseEditor` - which
+# `get_course_edit` lets a plain teacher through. What the home page lists, and
+# what exists at all, is the site's business rather than one course's; it is
+# the same line `post_course_new` draws at the other end of a course's life,
+# and the reason `require_admin`'s sentence names the permission rather than
+# either of the places it is used - this is now the third.
+#
+# Declared here, above `get_challenge`, for the reason the editor above is:
+# `/courses/{course_id}/{challenge_id}` matches any single segment. These are
+# POSTs and would survive being declared below it today - a path match with the
+# wrong method is only a partial match, and the router keeps looking - but that
+# is an accident of the method rather than a rule, and the next GET added here
+# would find out the hard way.
+#
+# Archive and unarchive are two routes rather than one with a flag, mirroring
+# `/admin/users/{id}/block` and `/unblock`: the closest analogue in the app, a
+# reversible state an administrator toggles, with each URL meaning one thing.
+# Both answer with `HX-Redirect` back to the same editor rather than a fragment
+# swap, because archiving changes the header badge, every challenge card's
+# greying and the button's own label - the page *is* the one swap target.
+
+
+def _danger_alert(request: Request, message: str, ok: bool = False):
+    """The alert both danger zones swap in. The same fragment every other
+    editor route answers with; it is the sentence that differs."""
+    return templates.TemplateResponse(
+        request=request,
+        name="f-edit-result.jinja",
+        context={"ok": ok, "message": message},
+    )
+
+
+def _judge_busy_message(running: int, what: str) -> str:
+    """`post_regrade`'s refusal, worded for a delete. Spelled once because both
+    danger zones refuse in exactly the same circumstances."""
+    return (
+        f"A judge is running {running} submission{'' if running == 1 else 's'} "
+        f"on this {what} right now. Nothing was deleted — try again in a moment."
+    )
+
+
+def _confirmation_matches(typed: str, title: str) -> bool:
+    """Whether the name typed into a delete dialog is the thing's own.
+
+    Checked on the server and not only in the dialog: the script there merely
+    *enables* the button, and a disabled control is presentation, never the
+    check - the rule `require_challenge_editor` states for hidden buttons.
+
+    A plain `==` and deliberately not `hmac.compare_digest`, unlike the
+    enrollment key: the title is printed on the page the box sits on, so this
+    confirms an intention rather than proving a secret.
+    """
+    return typed.strip() == title.strip()
+
+
+@app.post("/courses/{course_id}/archive")
+async def post_course_archive(course_id: int, request: Request, db: DBDep, user: Admin):
+    """Archive a course: read-only for the people already on it, invisible and
+    unjoinable to everybody else. Staff go on editing it - archiving is a
+    visibility state, not a lock, which is what keeps the whole feature down to
+    two enforcement points (`post_submission` and `post_course_enroll`)."""
+    if not await course_exists(db, course_id):
+        raise HTTPException(status_code=404)
+    await set_course_archived(db, course_id, True)
+    await db.commit()
+    return Response(
+        status_code=204,
+        headers={
+            "HX-Redirect": str(request.url_for("get_course_edit", course_id=course_id))
+        },
+    )
+
+
+@app.post("/courses/{course_id}/unarchive")
+async def post_course_unarchive(
+    course_id: int, request: Request, db: DBDep, user: Admin
+):
+    """Undo the above. Clears the column rather than writing a second one - an
+    archive that is over has no date."""
+    if not await course_exists(db, course_id):
+        raise HTTPException(status_code=404)
+    await set_course_archived(db, course_id, False)
+    await db.commit()
+    return Response(
+        status_code=204,
+        headers={
+            "HX-Redirect": str(request.url_for("get_course_edit", course_id=course_id))
+        },
+    )
+
+
+@app.post("/courses/{course_id}/delete")
+async def post_course_delete(
+    course_id: int,
+    request: Request,
+    db: DBDep,
+    user: Admin,
+    confirm: Annotated[str, Form()] = "",
+):
+    """Delete a course, every challenge on it, every submission ever made to
+    them and every file they own.
+
+    `confirm` is the course's own title, typed into the dialog. It is a
+    **defaulted** form field for `post_administrator`'s reason: a missing field
+    is a 422, htmx drops the body of an error response, and the person who
+    clicked would be left looking at nothing.
+
+    Refusals are 200 with an alert, the success is a 204 carrying
+    `HX-Redirect` - there is no page left to swap a fragment into.
+    """
+    course = await query_course(db, course_id)
+    if course is None:
+        raise HTTPException(status_code=404)
+
+    if not _confirmation_matches(confirm, course.title):
+        return _danger_alert(
+            request,
+            "Type the course's title exactly as it is shown to delete it. "
+            "Nothing was changed.",
+        )
+
+    # Refused while a judge is mid-run, as a regrade is - and for a sharper
+    # reason. See `lock_challenge_submissions`: a submission deleted mid-run
+    # takes the judge *process* down, where the same race against a regrade
+    # only leaves one stale score. The lock is what makes this more than
+    # usually true.
+    running = await lock_course_submissions(db, course_id)
+    if running:
+        return _danger_alert(request, _judge_busy_message(running, "course"))
+
+    # Read before the deletes, unlinked after the commit: the order
+    # `post_testcase_delete` states. A failed commit can leave a file nothing
+    # points at, but never a row pointing at a file that is gone.
+    #
+    # `_testcase_dir` and `_evaluator_dir` are defined further down this file,
+    # with the challenge editor they belong to. That is fine - a name in a
+    # function body is resolved when the body runs - and moving this route down
+    # to be near them would put it below `get_challenge`, which is the one
+    # thing it may not be.
+    challenge_ids = await query_ordered_challenge_ids(db, course_id)
+    paths: list[str] = []
+    for challenge_id in challenge_ids:
+        paths.extend(await query_challenge_file_paths(db, challenge_id))
+
+    await delete_course(db, course_id)
+    await db.commit()
+
+    for path in paths:
+        storage.delete(path)
+    for challenge_id in challenge_ids:
+        storage.delete_directory(_testcase_dir(challenge_id))
+        storage.delete_directory(_evaluator_dir(challenge_id))
+
+    return Response(
+        status_code=204, headers={"HX-Redirect": str(request.url_for("index"))}
+    )
 
 
 ########################################################################
@@ -2367,6 +2612,18 @@ async def post_submission(
             request=request,
             name="f-submit-result.jinja",
             context={"ok": ok, "message": message},
+        )
+
+    # One of the two places archiving is enforced, the other being
+    # `post_course_enroll`. Before the upload is read, so an archived challenge
+    # does not buffer a megabyte only to refuse it, and read through
+    # `query_effective_archived_at` so that archiving the *course* closes this
+    # too - the submit form is already gone from the page, and this is the
+    # check behind it.
+    if await query_effective_archived_at(db, challenge_id) is not None:
+        return alert(
+            "This challenge is archived. You can still read it and look back "
+            "over your attempts, but it is not taking new submissions."
         )
 
     filename = os.path.basename(solution.filename or "")
@@ -2903,6 +3160,111 @@ async def post_challenge_edit(
     await update_challenge(db, challenge_id, **fields)
     await db.commit()
     return alert("Saved.", ok=True)
+
+
+########################################################################
+# The challenge's danger zone. `ChallengeEditor` is exactly "administrators and
+# course staff" and needs nothing added: it depends on `CourseEditor`, which
+# resolves through `effective_course_role`, so an administrator is staff here
+# without an enrollment - and it 404s a challenge that is not under the course
+# in the path, the cross-check that stops staff of one course naming their own
+# in front of somebody else's challenge.
+#
+# No route-ordering question here, unlike the course's: these paths have a
+# third segment, so `get_challenge` cannot swallow them.
+
+
+@app.post("/courses/{course_id}/{challenge_id}/archive")
+async def post_challenge_archive(
+    course_id: int, challenge_id: int, request: Request, db: DBDep, role: ChallengeEditor
+):
+    """Archive one challenge: still readable by the class, no longer accepting
+    submissions. Archiving its *course* does the same to it without touching
+    this column - see `_EFFECTIVE_ARCHIVED_SQL`."""
+    await set_challenge_archived(db, challenge_id, True)
+    await db.commit()
+    return Response(
+        status_code=204,
+        headers={
+            "HX-Redirect": str(
+                request.url_for(
+                    "get_challenge_edit",
+                    course_id=course_id,
+                    challenge_id=challenge_id,
+                )
+            )
+        },
+    )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/unarchive")
+async def post_challenge_unarchive(
+    course_id: int, challenge_id: int, request: Request, db: DBDep, role: ChallengeEditor
+):
+    """Undo the above. If the course itself is archived the challenge stays
+    read-only, which is what the editor's note beside this button says."""
+    await set_challenge_archived(db, challenge_id, False)
+    await db.commit()
+    return Response(
+        status_code=204,
+        headers={
+            "HX-Redirect": str(
+                request.url_for(
+                    "get_challenge_edit",
+                    course_id=course_id,
+                    challenge_id=challenge_id,
+                )
+            )
+        },
+    )
+
+
+@app.post("/courses/{course_id}/{challenge_id}/delete")
+async def post_challenge_delete(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+    confirm: Annotated[str, Form()] = "",
+):
+    """Delete a challenge, its test cases, every submission to it and its
+    files. `post_course_delete`'s body for one challenge; the reasoning behind
+    each step is written out there.
+
+    It lands on the course editor, which is the list the challenge has just
+    left.
+    """
+    challenge = await query_challenge_config(db, challenge_id)
+    if challenge is None:
+        raise HTTPException(status_code=404)
+
+    if not _confirmation_matches(confirm, challenge.title):
+        return _danger_alert(
+            request,
+            "Type the challenge's title exactly as it is shown to delete it. "
+            "Nothing was changed.",
+        )
+
+    running = await lock_challenge_submissions(db, challenge_id)
+    if running:
+        return _danger_alert(request, _judge_busy_message(running, "challenge"))
+
+    paths = await query_challenge_file_paths(db, challenge_id)
+    await delete_challenge(db, challenge_id)
+    await db.commit()
+
+    for path in paths:
+        storage.delete(path)
+    storage.delete_directory(_testcase_dir(challenge_id))
+    storage.delete_directory(_evaluator_dir(challenge_id))
+
+    return Response(
+        status_code=204,
+        headers={
+            "HX-Redirect": str(request.url_for("get_course_edit", course_id=course_id))
+        },
+    )
 
 
 ########################################################################
@@ -3820,6 +4182,12 @@ async def api_list_challenges(db: DBDep, user: ApiUser):
                 "course_title": row.course_title,
                 "challenge_id": row.challenge_id,
                 "title": row.title,
+                # The *effective* state, so a challenge under an archived
+                # course is marked too. A push to either is still accepted -
+                # the API is the editor by another route, and staff go on
+                # editing an archived challenge - so this is a warning to
+                # somebody about to push to last year's course, not a gate.
+                "archived": row.archived_at is not None,
             }
             for row in rows
         ]

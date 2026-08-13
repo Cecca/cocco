@@ -28,7 +28,12 @@
         </a>
       </div>
       {% endif %}
-      <h1 class="font-serif text-4xl font-semibold tracking-tight mb-4">{{ course.title }}</h1>
+      <h1 class="font-serif text-4xl font-semibold tracking-tight mb-4">
+        {{ course.title }}
+        {% if course.archived_at %}
+        <span class="badge badge-warning badge-outline align-middle font-semibold">Archived</span>
+        {% endif %}
+      </h1>
 
       <article class="prose prose-sm max-w-none prose-pre:bg-neutral prose-pre:text-neutral-content prose-pre:rounded-xl">
         {{ course.description | markdown }}

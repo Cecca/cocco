@@ -30,6 +30,12 @@ class Course(Base):
     id: int | None = None
     title: str
     description: str
+    # Defaulted, unlike `User.blocked_at` above, and the difference is the
+    # reason that one is not: `get_user` refuses on the block, so a trimmed
+    # column list has to fail loudly there. Nothing refuses on a `Course` -
+    # `post_course_enroll` reads `query_course_archived_at` directly - so there
+    # is no door here a missing column could be walked through.
+    archived_at: datetime | None = None
 
 
 class Challenge(Base):
@@ -40,6 +46,10 @@ class Challenge(Base):
     description: str
     max_memory_bytes: int
     max_time_s: float
+    # The challenge's own state, not the effective one: a challenge under an
+    # archived course is archived with this still NULL. See `Challenge` in
+    # `model.py` for where that `or` lives.
+    archived_at: datetime | None = None
 
 
 class TestCase(Base):

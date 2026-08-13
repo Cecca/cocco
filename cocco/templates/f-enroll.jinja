@@ -9,7 +9,19 @@
    sentence to show when there is one. #}
 
 <div id="enroll" class="rounded-xl border border-dashed border-base-300 bg-base-200/40 px-6 py-8">
-  {% if course.requires_key %}
+  {# First, because an archived course refuses whether or not the key is right:
+     there is no form to offer, only the reason. `post_course_enroll` checks in
+     the same order. #}
+  {% if course.archived_at %}
+
+  <p class="text-center text-sm text-base-content/60">
+    This course is archived. It is not taking new students.
+  </p>
+  {% if error %}
+  <p role="alert" class="text-error text-[13px] mt-2 text-center">{{ error }}</p>
+  {% endif %}
+
+  {% elif course.requires_key %}
 
   <p class="text-center text-sm text-base-content/60">
     This course needs an enrollment key.

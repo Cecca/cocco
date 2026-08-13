@@ -40,6 +40,26 @@ from cocco.model import (
 )
 
 
+# A challenge is archived when it says so, or when its course does. That `or`
+# is the whole of "archiving a course archives its challenges", and it is
+# written here twice and nowhere else: once as SQL, because the page queries
+# are raw text, and once as a Core expression, because the plain-Core reads are
+# what the route tests reach on SQLite. Both are named, both point at each
+# other, and an integration test asserts they agree.
+#
+# Nothing downstream - no route, no template - may spell it a third time, the
+# way nothing downstream spells `effective_course_role`'s promotion again. A
+# template that reads `challenge.archived_at` for a badge silently un-archives
+# every challenge under an archived course.
+_EFFECTIVE_ARCHIVED_SQL = "coalesce(challenge.archived_at, course.archived_at)"
+
+
+def _effective_archived_at():
+    """`_EFFECTIVE_ARCHIVED_SQL` as a Core expression. Only valid in a
+    statement that has both tables in its FROM."""
+    return func.coalesce(Challenge.c.archived_at, Course.c.archived_at)
+
+
 async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
     """Get a queued submission, along with all the data required to run it.
     Atomically set it to 'running'."""
@@ -454,8 +474,11 @@ async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int
 
     Submissions are deliberately not part of this document: the challenge page
     loads them through `query_user_submissions` and keeps them fresh by polling.
+
+    `effective_archived_at` is what decides whether the page shows a submit
+    form; see `_EFFECTIVE_ARCHIVED_SQL` for why it is not `challenge.archived_at`.
     """
-    query = text("""
+    query = text(f"""
     WITH
     samples AS (
         SELECT challenge_id,
@@ -474,6 +497,7 @@ async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int
     cs AS (
         SELECT challenge.*,
                course.title AS course_title,
+               {_EFFECTIVE_ARCHIVED_SQL} AS effective_archived_at,
                numbers.number AS number,
                enrollment.role AS viewer_role,
                coalesce(samples.samples, '[]'::json) AS samples
@@ -1093,6 +1117,11 @@ async def query_editable_challenges(
     administrator - who is staff everywhere without an enrollment - asks the
     same question. Ordered the way both editors order: `position, id` within a
     course, courses by title.
+
+    `archived_at` here is the *effective* one - `_effective_archived_at`'s
+    second caller, which is what earns it a name - so `cocco ls` marks a
+    challenge whose course was archived as well as one archived on its own. A
+    push to either is still accepted; see `api_import_challenge`.
     """
     joined = Challenge.join(Course, Challenge.c.course_id == Course.c.id)
     stmt = select(
@@ -1100,6 +1129,7 @@ async def query_editable_challenges(
         Course.c.title.label("course_title"),
         Challenge.c.id.label("challenge_id"),
         Challenge.c.title,
+        _effective_archived_at().label("archived_at"),
     )
     if every_course:
         stmt = stmt.select_from(joined)
@@ -1326,7 +1356,222 @@ async def swap_testcase_order(conn: AsyncConnection, a_id: int, b_id: int) -> No
     )
 
 
-async def query_courses(conn: AsyncConnection, user_id: int, q: str = ""):
+# ---------------------------------------------------------------------------
+# Archiving, and the one thing this application does that destroys a
+# submission. Like every other mutation in this module, none of these commit:
+# the caller owns the transaction.
+
+
+async def query_course_archived_at(
+    conn: AsyncConnection, course_id: int
+) -> datetime | None:
+    """When the course was archived, or None if it is live - or if there is no
+    such course at all. `post_course_enroll` has already established that it
+    exists, exactly as `query_enrollment_key` assumes.
+    """
+    stmt = select(Course.c.archived_at).where(Course.c.id == course_id)
+    return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def query_effective_archived_at(
+    conn: AsyncConnection, challenge_id: int
+) -> datetime | None:
+    """When this challenge became read-only: its own `archived_at`, or its
+    course's.
+
+    The single Python-side read of the rule - `post_submission` is its caller,
+    and `query_challenge` answers the same question in SQL for the page. Plain
+    Core, so the route tests reach it on SQLite.
+    """
+    stmt = (
+        select(_effective_archived_at())
+        .select_from(
+            Challenge.outerjoin(Course, Course.c.id == Challenge.c.course_id)
+        )
+        .where(Challenge.c.id == challenge_id)
+    )
+    return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def set_course_archived(
+    conn: AsyncConnection, course_id: int, archived: bool
+) -> None:
+    """Archive or unarchive a course.
+
+    The timestamp is stamped here rather than passed in, exactly as
+    `block_user` stamps `blocked_at`: "now" belongs beside the write.
+    Unarchiving clears the column rather than writing a second one - an archive
+    that is over has no date, the way `unblock_user` clears the reason along
+    with the block.
+
+    Deliberately not the `update_course(**fields)` helper: that shape exists
+    for a caller saving one half of a form, and this is not a form field.
+    """
+    await conn.execute(
+        update(Course)
+        .where(Course.c.id == course_id)
+        .values(archived_at=datetime.now() if archived else None)
+    )
+
+
+async def set_challenge_archived(
+    conn: AsyncConnection, challenge_id: int, archived: bool
+) -> None:
+    """`set_course_archived` for one challenge. Archiving the course it is on
+    makes it read-only whatever this column says; see `_effective_archived_at`.
+    """
+    await conn.execute(
+        update(Challenge)
+        .where(Challenge.c.id == challenge_id)
+        .values(archived_at=datetime.now() if archived else None)
+    )
+
+
+async def query_challenge_file_paths(
+    conn: AsyncConnection, challenge_id: int
+) -> list[str]:
+    """Every file this challenge owns: each test case's two, and the evaluator
+    when it has one of its own rather than the bundled default.
+
+    Read *before* the rows are deleted and unlinked *after* the commit - the
+    order `post_testcase_delete` states, so a failed commit can leave a file
+    nothing points at but never a row pointing at a file that is gone.
+    """
+    paths: list[str] = []
+    rows = await conn.execute(
+        select(TestCase.c.input_path, TestCase.c.expected_output_path).where(
+            TestCase.c.challenge_id == challenge_id
+        )
+    )
+    for row in rows:
+        paths.append(row.input_path)
+        paths.append(row.expected_output_path)
+
+    evaluator_path = (
+        await conn.execute(
+            select(Challenge.c.evaluator_path).where(Challenge.c.id == challenge_id)
+        )
+    ).scalar_one_or_none()
+    if evaluator_path:
+        paths.append(evaluator_path)
+    return paths
+
+
+async def lock_challenge_submissions(
+    conn: AsyncConnection, challenge_id: int
+) -> int:
+    """Take every submission row of a challenge FOR UPDATE, and answer how many
+    of them a judge is running.
+
+    `count_running_submissions` asked before a *delete* would only be usually
+    true, the way "a course never loses its last teacher" was before
+    `lock_course`: under READ COMMITTED a judge can claim a queued submission
+    between the count and the commit. `FOR UPDATE` makes the check and the
+    write one statement - a claim in flight is waited for and therefore
+    counted, and one that has not started yet blocks until this transaction
+    commits, by which time `pull_queued_submission`'s UPDATE matches no row and
+    the judge simply goes back to sleep.
+
+    A delete needs that where a regrade does not, and the difference is sharp.
+    `run_from_queue` writes its outcomes inside `engine.begin()` with no
+    `except` around it, so a submission deleted mid-run makes
+    `insert_test_outcomes` violate a foreign key and takes the judge *process*
+    down - where the same race against a regrade only leaves one stale score.
+
+    The locks are taken on `submission` before anything touches `testoutcome`,
+    which is the order the judge takes them in, so the two cannot deadlock.
+    """
+    stmt = (
+        select(Submission.c.status)
+        .where(Submission.c.challenge_id == challenge_id)
+        .with_for_update()
+    )
+    rows = (await conn.execute(stmt)).scalars().all()
+    return sum(1 for status in rows if status == SubmissionStatus.running)
+
+
+async def lock_course_submissions(conn: AsyncConnection, course_id: int) -> int:
+    """`lock_challenge_submissions` over every challenge of a course.
+
+    A subquery on `challenge` rather than a join, so the `FOR UPDATE` needs no
+    `OF`: it locks `submission` and only `submission`, which is what keeps the
+    lock order the same as the per-challenge version's.
+    """
+    stmt = (
+        select(Submission.c.status)
+        .where(
+            Submission.c.challenge_id.in_(
+                select(Challenge.c.id).where(Challenge.c.course_id == course_id)
+            )
+        )
+        .with_for_update()
+    )
+    rows = (await conn.execute(stmt)).scalars().all()
+    return sum(1 for status in rows if status == SubmissionStatus.running)
+
+
+async def delete_challenge(conn: AsyncConnection, challenge_id: int) -> None:
+    """Delete a challenge and everything that hangs off it.
+
+    Hand-ordered, because no foreign key in `cocco/model.py` declares an
+    `ON DELETE` - and that is deliberate rather than an omission:
+    `testoutcome.testcase_id` having none is exactly what makes it the backstop
+    stopping `delete_testcase` from stranding a score. So the order is written
+    out here, once, and the database's job is to raise if it is ever got wrong.
+
+    Both outcome deletes, and not one: `testoutcome.submission_id` and
+    `testcase_id` are both nullable, so an outcome detached from its submission
+    could still be the only thing holding a test case down.
+
+    This is the one place in the application that destroys a submission.
+    Everything else draws the opposite line - a block stops a person without
+    retracting their work, `delete_enrollment` takes one row and nothing else,
+    a test case that has graded something is retired and never deleted. That
+    line is about a course that still exists; there is nothing left for a score
+    to be the record *of* once the challenge is gone.
+
+    The caller has taken `lock_challenge_submissions` first, and unlinks the
+    files afterwards - `query_challenge_file_paths` says why in that order.
+    """
+    submission_ids = select(Submission.c.id).where(
+        Submission.c.challenge_id == challenge_id
+    )
+    testcase_ids = select(TestCase.c.id).where(
+        TestCase.c.challenge_id == challenge_id
+    )
+    await conn.execute(
+        delete(TestOutcome).where(TestOutcome.c.submission_id.in_(submission_ids))
+    )
+    await conn.execute(
+        delete(TestOutcome).where(TestOutcome.c.testcase_id.in_(testcase_ids))
+    )
+    await conn.execute(
+        delete(Submission).where(Submission.c.challenge_id == challenge_id)
+    )
+    await conn.execute(delete(TestCase).where(TestCase.c.challenge_id == challenge_id))
+    await conn.execute(delete(Challenge).where(Challenge.c.id == challenge_id))
+
+
+async def delete_course(conn: AsyncConnection, course_id: int) -> None:
+    """Delete a course, every challenge on it and every enrollment.
+
+    `delete_challenge` for each one rather than a second cascade written wider:
+    the order is a rule, and a rule spelled twice is a rule that drifts.
+    `query_ordered_challenge_ids` is the list, so this and the route that has
+    to collect the files before it runs walk exactly the same set.
+
+    Nothing else in the schema references `course`: `administrator` is keyed on
+    an address and has no foreign key here at all.
+    """
+    for challenge_id in await query_ordered_challenge_ids(conn, course_id):
+        await delete_challenge(conn, challenge_id)
+    await conn.execute(delete(Enrollment).where(Enrollment.c.course_id == course_id))
+    await conn.execute(delete(Course).where(Course.c.id == course_id))
+
+
+async def query_courses(
+    conn: AsyncConnection, user_id: int, q: str = "", include_archived: bool = False
+):
     """Every course, split into the ones this user is enrolled on and the rest.
 
     `q` filters both halves by title. It is the home page's filter box, so it
@@ -1339,6 +1584,11 @@ async def query_courses(conn: AsyncConnection, user_id: int, q: str = ""):
     secret, and a star would put it in the JSON of every card - including the
     courses the viewer is not on, which are precisely the ones it guards. What
     the card needs is `requires_key`, which is the question and not the answer.
+
+    `include_archived` is how a site administrator asks for all of them. They
+    are the only people who can unarchive a course, so they have to be able to
+    find one they are not enrolled on; everybody else is shown an archived
+    course only in the half they are already on.
     """
     query = text("""
     WITH
@@ -1348,6 +1598,7 @@ async def query_courses(conn: AsyncConnection, user_id: int, q: str = ""):
             c.title,
             c.description,
             c.enrollment_key IS NOT NULL AS requires_key,
+            c.archived_at,
             e.role
         FROM course c
         LEFT JOIN (SELECT * FROM enrollment WHERE user_id = :user_id) e
@@ -1357,19 +1608,27 @@ async def query_courses(conn: AsyncConnection, user_id: int, q: str = ""):
     -- coalesce: json_agg over no rows is NULL, and a user enrolled in every
     -- course (or none) would otherwise hand the template a null to iterate
     enrolled_courses AS (
+        -- The archived ones stay here, badged: the people already on a course
+        -- go on reading it. It is only the offer that is withdrawn.
         SELECT coalesce(json_agg(courses ORDER BY courses.title), '[]'::json) AS enrolled
         FROM courses WHERE role IS NOT null
     ),
     non_enrolled_courses AS (
+        -- An archived course is not offered to somebody who is not on it: it
+        -- cannot be joined, so listing it would be an invitation to a shut
+        -- door.
         SELECT coalesce(json_agg(courses ORDER BY courses.title), '[]'::json) AS non_enrolled
-        FROM courses WHERE role IS null
+        FROM courses
+        WHERE role IS null AND (:include_archived OR archived_at IS null)
     ),
     u AS (
         SELECT * from enrolled_courses, non_enrolled_courses
     )
     SELECT row_to_json(u) FROM u;
     """)
-    res = await conn.execute(query, dict(user_id=user_id, q=q))
+    res = await conn.execute(
+        query, dict(user_id=user_id, q=q, include_archived=include_archived)
+    )
     return res.scalar()
 
 
@@ -1631,12 +1890,17 @@ async def query_course(conn: AsyncConnection, course_id: int):
     `requires_key` and not the key: this feeds a page shown to people who have
     not proved they know it. `query_enrollment_key` is the one that reads the
     value, and it exists to compare it.
+
+    `archived_at` rides along because the enroll preview is one of the two
+    places that has to say the course is not taking new students - the other
+    being `post_course_enroll`, which refuses.
     """
     stmt = select(
         Course.c.id,
         Course.c.title,
         Course.c.description,
         (Course.c.enrollment_key.is_not(None)).label("requires_key"),
+        Course.c.archived_at,
     ).where(Course.c.id == course_id)
     return (await conn.execute(stmt)).first()
 
@@ -1664,7 +1928,7 @@ async def query_enrollment_key(conn: AsyncConnection, course_id: int) -> str | N
 # Takes :course_id and :user_id. The ordering is `position, id`: `position` is
 # what the arrows write, and the id breaks a tie, so challenges that have never
 # been reordered stay in the order they were created in.
-_COURSE_CHALLENGES_CTE = """
+_COURSE_CHALLENGES_CTE = f"""
     submitted AS (
         SELECT submission.challenge_id,
                count(*) FILTER (WHERE submission.user_id = :user_id) AS n_mine,
@@ -1678,9 +1942,19 @@ _COURSE_CHALLENGES_CTE = """
     -- in `submitted` at all, and it is still a challenge the page must list.
     challenges AS (
         SELECT challenge.*,
+               -- The *effective* one, so a card under an archived course greys
+               -- itself without the template having to know that a course can
+               -- archive a challenge. `challenge.archived_at` rides along in
+               -- the star and is the challenge's own state; only the challenge
+               -- editor's danger zone reads that one. A separate name and
+               -- never `AS archived_at`: that would put two columns of the
+               -- same name in the record, `row_to_json` would emit both keys,
+               -- and `json.loads` would resolve it last-one-wins.
+               {_EFFECTIVE_ARCHIVED_SQL} AS effective_archived_at,
                coalesce(submitted.n_mine, 0) AS n_mine,
                coalesce(submitted.n_submitters, 0) AS n_submitters
         FROM challenge
+        LEFT JOIN course ON course.id = challenge.course_id
         LEFT JOIN submitted ON submitted.challenge_id = challenge.id
         WHERE challenge.course_id = :course_id
     )

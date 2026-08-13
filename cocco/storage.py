@@ -82,6 +82,28 @@ class Storage(object):
         deleting a database row whose file may already be gone."""
         self.resolve(path).unlink(missing_ok=True)
 
+    def delete_directory(self, path: Path | str) -> None:
+        """Remove a directory, but only once it is already empty.
+
+        `rmdir` and deliberately never `shutil.rmtree`. The caller has just
+        unlinked the files it had rows for; anything still in there is
+        something this application either did not put there or lost the row
+        for, and destroying it on the way past is exactly the mistake this
+        class exists to prevent. So a non-empty directory is left alone and is
+        a thing to look at rather than a thing to lose, and a missing one is
+        not an error for `delete`'s reason.
+
+        Refusing the root is not paranoia: `resolve("")` *is* the storage root
+        and `resolve` allows it, by its own first branch.
+        """
+        target = self.resolve(path)
+        if target == self.basedir:
+            raise ValueError("refusing to remove the storage root")
+        try:
+            target.rmdir()
+        except OSError:
+            pass
+
     def rename(self, path_from: Path | str, path_to: Path | str) -> None:
         target = self.resolve(path_to)
         if target.exists():

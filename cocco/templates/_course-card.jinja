@@ -8,7 +8,7 @@
    whether or not they are enrolled on it. `EDITOR_ROLE_NAMES` is a Jinja
    global.
 #}
-<div class="card bg-base-100 border border-base-300 shadow-sm transition-colors hover:border-primary/40">
+<div class="card bg-base-100 border border-base-300 shadow-sm transition-colors hover:border-primary/40{% if course.archived_at %} opacity-60{% endif %}">
   <div class="card-body flex-row items-center gap-4 p-5">
 
     <div class="min-w-0 flex-1">
@@ -20,6 +20,12 @@
            class="hover:text-primary">
           {{ course.title }}
         </a>
+        {# Only ever reached by somebody already on the course, or by an
+           administrator: `query_courses` drops an archived course from the
+           half nobody is enrolled in. #}
+        {% if course.archived_at %}
+        <span class="badge badge-sm badge-warning badge-outline align-middle ml-1">Archived</span>
+        {% endif %}
       </h3>
       {# The description is markdown; two lines of its source is a blurb, and
          the rendered body belongs to the course page. #}
@@ -34,13 +40,17 @@
          class="btn btn-sm btn-ghost gap-1.5 font-semibold border border-base-300">
         <span class="text-primary">✎</span> Edit
       </a>
-      {% elif not course.role and course.requires_key %}
+      {# `and not course.archived_at` on both branches is defence in depth: an
+         archived course is not listed to anybody who is not on it, and
+         `post_course_enroll` refuses anyway. An administrator takes the Edit
+         branch above, so nothing is lost by it. #}
+      {% elif not course.role and not course.archived_at and course.requires_key %}
       {# A course with a key cannot be joined from here: the field, and the
          message when the key is wrong, need more room than a list row has. The
          preview is where both live. #}
       <a href="{{ url_for('get_course', course_id=course.id) }}"
          class="btn btn-sm btn-secondary btn-outline">Enroll…</a>
-      {% elif not course.role %}
+      {% elif not course.role and not course.archived_at %}
       {# Joins as a student, and only as a student - `insert_self_enrollment`
          fixes the role, so nothing about this form decides it. The target is
          the whole list, both halves: the course has to move out of "Other

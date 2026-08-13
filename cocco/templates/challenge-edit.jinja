@@ -74,5 +74,115 @@
       </div>
     </div>
   </div>
+
+  <!-- ══ DANGER ZONE ═══════════════════════════════════════════════════ -->
+  {# No `is_admin` guard, unlike the course editor's: the whole page is behind
+     `ChallengeEditor`, which is already "administrators and course staff". #}
+  <div class="card bg-base-100 border border-error/30 shadow-sm mt-6">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg text-error">Danger zone</h2>
+      <div id="challenge-danger-result" class="empty:hidden mt-3"></div>
+
+      <div class="flex flex-wrap items-center justify-between gap-4 mt-4 rounded-xl border border-base-300 p-4">
+        <div class="min-w-0 flex-1">
+          <h3 class="font-semibold">
+            {{ "Unarchive this challenge" if challenge.archived_at else "Archive this challenge" }}
+          </h3>
+          <p class="text-[13px] text-base-content/55">
+            {% if challenge.archived_at %}
+            It is archived: the class still reads it and looks back over their
+            attempts, and it takes no new submissions. Unarchiving reopens it.
+            {% else %}
+            The class keeps reading it — statement, samples, their attempts,
+            the leaderboard — and stops being able to submit. You can still
+            edit it, and you can undo this from here.
+            {% endif %}
+          </p>
+          {# The one place in the app that reads `challenge.archived_at`, the
+             challenge's *own* state, rather than `effective_archived_at`:
+             this is exactly where the difference between the two has to be
+             said out loud. Everywhere else, reading this column instead would
+             silently un-archive every challenge under an archived course. #}
+          {% if challenge.effective_archived_at and not challenge.archived_at %}
+          <p class="text-[13px] text-warning mt-1">
+            Its course is archived, so this challenge is read-only whatever
+            this button says. Unarchive the course to change that.
+          </p>
+          {% endif %}
+        </div>
+        <form hx-post="{{ url_for('post_challenge_unarchive' if challenge.archived_at else 'post_challenge_archive', course_id=course_id, challenge_id=challenge.id) }}"
+              hx-target="#challenge-danger-result"
+              hx-swap="innerHTML"
+              hx-disabled-elt="find button">
+          <button type="submit" class="btn btn-sm btn-outline btn-warning font-semibold">
+            {{ "Unarchive" if challenge.archived_at else "Archive" }}
+          </button>
+        </form>
+      </div>
+
+      <div class="flex flex-wrap items-center justify-between gap-4 mt-4 rounded-xl border border-error/30 p-4">
+        <div class="min-w-0 flex-1">
+          <h3 class="font-semibold">Delete this challenge</h3>
+          <p class="text-[13px] text-base-content/55">
+            Every test case and its files, the evaluator, every submission ever
+            made to it and every recorded score. There is no undo — archive it
+            instead if you only want it closed.
+          </p>
+        </div>
+        <button type="button" class="btn btn-sm btn-error font-semibold"
+                onclick="delete_challenge_modal.showModal()">
+          Delete challenge…
+        </button>
+      </div>
+    </div>
+  </div>
 </main>
+
+{# The course editor's dialog, for a challenge. Both are commented there. #}
+<dialog id="delete_challenge_modal" class="modal">
+  <div class="modal-box">
+    <h3 class="font-bold text-lg text-error">Delete {{ challenge.title }}?</h3>
+    <p class="py-3 text-sm text-base-content/70">
+      Every test case of this challenge and both of its files, the evaluator,
+      every submission ever made to it and every score are deleted for good.
+      Nothing about this can be undone.
+    </p>
+    <p class="text-sm text-base-content/70">
+      Type <span class="font-semibold">{{ challenge.title }}</span> below to confirm.
+    </p>
+    <input type="text" id="challenge-delete-confirm" name="confirm"
+           autocomplete="off" data-expected="{{ challenge.title }}"
+           aria-label="Type the challenge title to confirm"
+           class="input w-full mt-3 font-mono" />
+    <div class="modal-action">
+      <form method="dialog">
+        <button class="btn btn-sm btn-ghost">Cancel</button>
+      </form>
+      <button type="button" id="challenge-delete-button" disabled
+              class="btn btn-sm btn-error"
+              hx-post="{{ url_for('post_challenge_delete', course_id=course_id, challenge_id=challenge.id) }}"
+              hx-include="#challenge-delete-confirm"
+              hx-target="#challenge-danger-result"
+              hx-swap="innerHTML"
+              onclick="delete_challenge_modal.close()">
+        Delete for good
+      </button>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<script>
+  (() => {
+    const field = document.getElementById("challenge-delete-confirm");
+    const button = document.getElementById("challenge-delete-button");
+    const check = () => {
+      button.disabled = field.value.trim() !== field.dataset.expected.trim();
+    };
+    field.addEventListener("input", check);
+    document.getElementById("delete_challenge_modal")
+            .addEventListener("close", () => { field.value = ""; check(); });
+    check();
+  })();
+</script>
 {% endblock %}

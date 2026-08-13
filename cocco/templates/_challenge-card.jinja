@@ -9,7 +9,10 @@
      `can_edit`  add the Edit link, and read the badge as staff do
      `reorder`   add the ↑/↓ column, with `first` / `last` disabling an end
 #}
-<div class="card bg-base-100 border border-base-300 shadow-sm transition-colors hover:border-primary/40">
+{# `effective_archived_at` and never `challenge.archived_at`: the second is the
+   challenge's own state, and a card under an archived course has to grey
+   itself too. See `_EFFECTIVE_ARCHIVED_SQL` in `repository.py`. #}
+<div class="card bg-base-100 border border-base-300 shadow-sm transition-colors hover:border-primary/40{% if challenge.effective_archived_at %} opacity-60{% endif %}">
   <div class="card-body flex-row items-center gap-4 p-5">
 
     {% if reorder %}
@@ -41,6 +44,11 @@
       </h3>
 
       <div class="flex flex-wrap items-center gap-2 mt-2">
+        {% if challenge.effective_archived_at %}
+        <span class="badge badge-warning badge-outline font-semibold"
+              title="Readable, but not taking new submissions">Archived</span>
+        {% endif %}
+
         {# The viewer's own history. A student sees this and nothing else, so
            "Submitted" here always means "by you". #}
         {% if challenge.n_mine %}

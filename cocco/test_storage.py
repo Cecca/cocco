@@ -66,6 +66,35 @@ def test_write_read_rename_delete_round_trip(storage: Storage):
     storage.delete("challenge_1/input.txt")
 
 
+def test_delete_directory_removes_an_empty_one(storage: Storage):
+    storage.write("challenge_1/in_0.txt", "5 6\n")
+    storage.delete("challenge_1/in_0.txt")
+
+    storage.delete_directory("challenge_1")
+    assert not storage.resolve("challenge_1").exists()
+    # ...and doing it again is not an error, for `delete`'s reason
+    storage.delete_directory("challenge_1")
+
+
+def test_delete_directory_leaves_a_non_empty_one_alone(storage: Storage):
+    """`rmdir` and never `rmtree`. Whatever is still in there is something this
+    application either did not put there or lost the row for, and a leftover
+    file is a thing to look at rather than a thing to lose."""
+    storage.write("challenge_1/orphan.txt", "who put this here\n")
+
+    storage.delete_directory("challenge_1")
+    assert storage.read("challenge_1/orphan.txt") == "who put this here\n"
+
+
+@pytest.mark.parametrize("path", ["", ".", "challenge_1/.."])
+def test_delete_directory_refuses_the_root(storage: Storage, path):
+    """`resolve("")` is the storage root and `resolve` allows it, so this has
+    to be refused here rather than left to the traversal check."""
+    with pytest.raises(ValueError):
+        storage.delete_directory(path)
+    assert storage.basedir.is_dir()
+
+
 def test_rename_refuses_to_clobber(storage: Storage):
     storage.write("a.txt", "a")
     storage.write("b.txt", "b")
