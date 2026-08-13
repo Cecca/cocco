@@ -26,6 +26,7 @@ from cocco import schema
 from cocco.schema import SubmissionRunData
 from cocco.model import (
     Administrator,
+    ApiToken,
     Challenge,
     Course,
     Enrollment,
@@ -891,6 +892,85 @@ async def unblock_user(conn: AsyncConnection, user_id: int) -> bool:
     return (await conn.execute(stmt)).first() is not None
 
 
+# ---------------------------------------------------------------------------
+# Personal access tokens. The token itself never reaches this module: what is
+# stored, and what is looked up, is `hash_token`'s output - see `cocco/tokens.py`.
+
+
+async def insert_api_token(
+    conn: AsyncConnection, user_id: int, label: str, token_hash: str
+) -> int:
+    """Record a freshly minted token and return its id. Does not commit."""
+    stmt = (
+        insert(ApiToken)
+        .values(user_id=user_id, label=label, token_hash=token_hash)
+        .returning(ApiToken.c.id)
+    )
+    return (await conn.execute(stmt)).scalar_one()
+
+
+async def query_api_token_user(conn: AsyncConnection, token_hash: str):
+    """Whose token this is, as the same row `query_user` returns.
+
+    `_USER_COLUMNS` rather than a fresh column list, deliberately: that constant
+    exists so that a door which forgot `blocked_at` cannot be the one somebody
+    walks through, and this is the third door.
+    """
+    stmt = (
+        select(*_USER_COLUMNS)
+        .select_from(ApiToken.join(User, ApiToken.c.user_id == User.c.id))
+        .where(ApiToken.c.token_hash == token_hash)
+    )
+    return (await conn.execute(stmt)).first()
+
+
+async def touch_api_token(conn: AsyncConnection, token_hash: str) -> None:
+    """Record that a token was just used. Does not commit."""
+    await conn.execute(
+        update(ApiToken)
+        .where(ApiToken.c.token_hash == token_hash)
+        .values(last_used_at=datetime.now())
+    )
+
+
+async def query_api_tokens(conn: AsyncConnection, user_id: int):
+    """A user's tokens, newest first - never the hash.
+
+    The column list is spelled out rather than `select(ApiToken)` for the reason
+    `query_courses` lists its columns: the one value in this table that must not
+    reach a page is the one a `SELECT *` would carry along.
+    """
+    stmt = (
+        select(
+            ApiToken.c.id,
+            ApiToken.c.label,
+            ApiToken.c.created_at,
+            ApiToken.c.last_used_at,
+        )
+        .where(ApiToken.c.user_id == user_id)
+        .order_by(ApiToken.c.created_at.desc(), ApiToken.c.id.desc())
+    )
+    return (await conn.execute(stmt)).all()
+
+
+async def delete_api_token(
+    conn: AsyncConnection, user_id: int, token_id: int
+) -> bool:
+    """Revoke a token. Does not commit. True if it did.
+
+    Scoped to the owner in the WHERE clause rather than by a lookup first, the
+    way `query_testcase` scopes a test case to its challenge: an id belonging to
+    somebody else's account then names no row here, instead of naming one that a
+    check has to remember to reject.
+    """
+    stmt = (
+        delete(ApiToken)
+        .where(and_(ApiToken.c.id == token_id, ApiToken.c.user_id == user_id))
+        .returning(ApiToken.c.id)
+    )
+    return (await conn.execute(stmt)).first() is not None
+
+
 async def query_challenge_testcases(conn: AsyncConnection, challenge_id: int):
     """Every test case of a challenge, in execution order, with the number of
     outcomes scored against each.
@@ -981,6 +1061,62 @@ async def query_evaluator_path(
         select(Challenge.c.evaluator_path).where(Challenge.c.id == challenge_id)
     )
     return result.scalar_one_or_none()
+
+
+async def query_challenge_config(conn: AsyncConnection, challenge_id: int):
+    """A challenge's own row, plain Core.
+
+    Deliberately not `query_challenge`, which is the *page* query: that one
+    needs a viewer to compute their role, joins five tables and is written in
+    Postgres-only SQL. The transfer format wants the columns and nothing else,
+    and wants them somewhere the route tests can reach on SQLite.
+    """
+    stmt = select(Challenge).where(Challenge.c.id == challenge_id)
+    return (await conn.execute(stmt)).first()
+
+
+async def query_editable_challenges(
+    conn: AsyncConnection,
+    user_id: int,
+    editor_roles: Iterable[UserRole],
+    every_course: bool = False,
+):
+    """Every challenge the caller may edit, with the course it belongs to.
+
+    This is what `cocco ls` prints, and the only thing that makes an id
+    discoverable from a command line. Plain Core rather than the `json_agg`
+    shape the page queries use, deliberately: those are Postgres-only, and the
+    route tests run on SQLite.
+
+    `editor_roles` is passed in rather than spelled here so that `EDITOR_ROLES`
+    stays the one definition of course staff, and `every_course` is how a site
+    administrator - who is staff everywhere without an enrollment - asks the
+    same question. Ordered the way both editors order: `position, id` within a
+    course, courses by title.
+    """
+    joined = Challenge.join(Course, Challenge.c.course_id == Course.c.id)
+    stmt = select(
+        Course.c.id.label("course_id"),
+        Course.c.title.label("course_title"),
+        Challenge.c.id.label("challenge_id"),
+        Challenge.c.title,
+    )
+    if every_course:
+        stmt = stmt.select_from(joined)
+    else:
+        stmt = stmt.select_from(
+            joined.join(
+                Enrollment,
+                and_(
+                    Enrollment.c.course_id == Course.c.id,
+                    Enrollment.c.user_id == user_id,
+                ),
+            )
+        ).where(Enrollment.c.role.in_(list(editor_roles)))
+    stmt = stmt.order_by(
+        Course.c.title, Course.c.id, Challenge.c.position, Challenge.c.id
+    )
+    return (await conn.execute(stmt)).all()
 
 
 async def insert_challenge(

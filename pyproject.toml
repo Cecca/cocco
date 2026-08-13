@@ -9,6 +9,9 @@ dependencies = [
     "babel>=2.18.0",
     "fastapi[standard]>=0.135.3",
     "greenlet>=3.3.2",
+    # The `cocco` CLI talks to the transfer API over HTTP, so httpx is a
+    # runtime dependency and not only the thing TestClient is built on.
+    "httpx>=0.28.1",
     "icecream>=2.2.0",
     "itsdangerous>=2.2.0",
     "jinja2>=3.1.6",
@@ -19,6 +22,9 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0",
     "toml>=0.10.2",
 ]
+
+[project.scripts]
+cocco = "cocco.cli:main"
 
 [tool.fastapi]
 entrypoint = "cocco.main:app"

@@ -1,0 +1,89 @@
+{# The account's API tokens. Every mutation returns this whole fragment, alert
+   included, so the sentence and the new list arrive in one swap — `/admin`'s
+   rule. Rendered both standalone and inlined by profile.jinja.
+
+   Context: profile_id, tokens, message/ok, and `minted` — the one value here
+   that no query can produce, because only the hash is stored. #}
+
+{% if message %}
+<div role="alert" class="alert {{ 'alert-success' if ok else 'alert-error' }} text-sm mb-4">
+  <span>{{ message }}</span>
+</div>
+{% endif %}
+
+{% if minted %}
+{# The only time this string exists anywhere but in the reader's hands. There
+   is no "show again": the row holds a SHA-256 of it and nothing else. #}
+<div class="rounded-xl border-2 border-primary bg-primary/5 p-4 mb-4">
+  <p class="text-xs font-bold uppercase tracking-wider text-primary mb-2">
+    Copy this now — it is not shown again
+  </p>
+  <code class="block font-mono text-sm break-all select-all bg-base-100 rounded-lg border border-base-300 p-3">{{ minted }}</code>
+  <p class="text-[13px] text-base-content/55 mt-2">
+    Use it as <code class="font-mono">COCCO_TOKEN</code>, or send it as
+    <code class="font-mono">Authorization: Bearer &lt;token&gt;</code>.
+  </p>
+</div>
+{% endif %}
+
+<div class="overflow-x-auto">
+  <table class="table">
+    <thead>
+      <tr class="text-xs uppercase tracking-wider text-base-content/45 font-mono">
+        <th>Label</th>
+        <th class="w-40">Created</th>
+        <th class="w-40">Last used</th>
+        <th class="w-24"></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for token in tokens %}
+      <tr>
+        <td class="font-semibold">{{ token.label }}</td>
+        <td class="text-sm text-base-content/60">{{ token.created_at | datetime }}</td>
+        <td class="text-sm text-base-content/60">
+          {{ token.last_used_at | datetime if token.last_used_at else "never" }}
+        </td>
+        <td class="text-right">
+          {# An inline form rather than the <dialog> a regrade opens: revoking
+             destroys nothing but the token, and minting another is one box
+             away. #}
+          <form hx-post="{{ url_for('post_token_delete', user_id=profile_id, token_id=token.id) }}"
+                hx-target="#tokens"
+                hx-swap="innerHTML"
+                hx-confirm="Revoke {{ token.label }}? Anything using it stops working immediately.">
+            <button type="submit" class="btn btn-xs btn-ghost text-error">Revoke</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="4" class="text-center text-sm text-base-content/45 py-6">
+          No tokens yet.
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- ── MINT ONE ─────────────────────────────────────────────────────── -->
+<form hx-post="{{ url_for('post_token', user_id=profile_id) }}"
+      hx-target="#tokens"
+      hx-swap="innerHTML"
+      class="mt-5 rounded-xl border border-base-300 bg-base-200/40 p-4">
+  <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">
+    New token
+  </h3>
+  <div class="flex flex-wrap items-end gap-4">
+    <div class="flex-1 min-w-56">
+      <label class="text-xs text-base-content/55">What is it for?</label>
+      <input type="text" name="label" placeholder="laptop"
+             class="input input-sm w-full mt-1" />
+    </div>
+    <button type="submit" class="btn btn-sm btn-primary">
+      <span class="submit-label">Create</span>
+      <span class="htmx-indicator loading loading-spinner loading-xs"></span>
+    </button>
+  </div>
+</form>

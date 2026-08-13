@@ -90,6 +90,31 @@ User = Table(
 )
 
 
+ApiToken = Table(
+    "api_token",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    # Keyed on `user.id` and not on the address, the opposite of
+    # `Administrator` and for the opposite reason: that table has to be able to
+    # name somebody who has never signed in, while a token is minted on its
+    # owner's own profile page, so the account always exists.
+    Column("user_id", Integer, ForeignKey("user.id"), nullable=False),
+    # What the token is for, in its owner's words. Shown in the list so that
+    # revoking the right one is possible months later.
+    Column("label", String, nullable=False),
+    # The SHA-256 of the token, never the token: the hash is the lookup key, so
+    # a leaked database yields nothing that can be presented to the API. This
+    # is why the value is shown exactly once, when it is minted - there is
+    # nowhere it could be read back from.
+    Column("token_hash", String, nullable=False, unique=True),
+    Column("created_at", DateTime, nullable=False, default=datetime.now),
+    # Written on every accepted call. One UPDATE per API request is nothing
+    # against the work the request itself does, and it is the only thing that
+    # can tell its owner a token is stale before they delete it.
+    Column("last_used_at", DateTime, nullable=True),
+)
+
+
 Administrator = Table(
     "administrator",
     metadata,

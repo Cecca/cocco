@@ -32,6 +32,21 @@ from cocco.auth import (
     safe_next_path,
 )
 from cocco.config import config_path, load_config
+from cocco.tokens import hash_token, mint_token, parse_bearer
+from cocco import transfer
+from cocco.transfer import (
+    EVALUATOR_DIR,
+    MANIFEST_NAME,
+    STATEMENT_NAME,
+    TESTS_DIR,
+    ExistingTestCase,
+    Manifest,
+    ManifestError,
+    ManifestTestCase,
+    dump_manifest,
+    parse_manifest,
+    plan_testcases,
+)
 from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import (
     Depends,
@@ -46,6 +61,7 @@ from fastapi import (
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
+    JSONResponse,
     RedirectResponse,
     Response,
 )
@@ -53,11 +69,15 @@ from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from starlette.background import BackgroundTask
 from starlette.middleware.sessions import SessionMiddleware
 import hmac
 import io
 import logging
 import os
+import re
+import tempfile
+import zipfile
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -67,9 +87,11 @@ from cocco.repository import (
     count_running_submissions,
     count_testcase_outcomes,
     course_exists,
+    delete_api_token,
     delete_enrollment,
     delete_testcase,
     insert_administrators,
+    insert_api_token,
     insert_challenge,
     insert_course,
     insert_enrollment,
@@ -79,7 +101,10 @@ from cocco.repository import (
     insert_user,
     is_administrator,
     lock_course,
+    query_api_token_user,
+    query_api_tokens,
     query_challenge,
+    query_challenge_config,
     query_challenge_leaderboard,
     query_challenge_ranking,
     query_challenge_standings,
@@ -90,6 +115,7 @@ from cocco.repository import (
     query_course_people,
     query_course_role,
     query_courses,
+    query_editable_challenges,
     query_enrollment_key,
     query_evaluator_path,
     query_ordered_challenge_ids,
@@ -107,6 +133,7 @@ from cocco.repository import (
     reorder_challenges,
     set_enrollment_role,
     swap_testcase_order,
+    touch_api_token,
     unblock_user,
     update_challenge,
     update_course,
@@ -259,6 +286,13 @@ MAX_EVALUATOR_BYTES = MAX_UPLOAD_BYTES
 # Test case inputs are routinely far larger than a solution file, so they get
 # their own, much higher ceiling - and are streamed to disk, never buffered.
 MAX_TESTCASE_BYTES = 32 << 20
+
+# A pushed challenge carries every test case at once, so its ceiling is a
+# multiple of one test case's rather than equal to it. Checked twice, on the
+# compressed bytes as they arrive and on the *uncompressed* total declared in
+# the zip's directory before a single member is read: a cap on compressed size
+# alone is not a cap at all, which is what a zip bomb is.
+MAX_TRANSFER_BYTES = 256 << 20
 
 # Course staff. `role` lives on `enrollment`, so these are per-course, not
 # site-wide. Everyone else - i.e. students and the unenrolled - is read-only.
@@ -1225,6 +1259,123 @@ async def require_challenge_editor(
 
 
 ChallengeEditor = Annotated[UserRole, Depends(require_challenge_editor)]
+
+
+########################################################################
+# The API's own two dependencies.
+#
+# Everything above answers a browser: `NotAuthenticated` becomes a 303 to
+# `/login` or an `HX-Redirect`, and `Forbidden` renders `403.jinja` through a
+# template. Both are nonsense to a program - a CLI following that 303 would be
+# handed a login page with a 200 on it - so the API refuses with real status
+# codes and a JSON body, which is what FastAPI's own handler does for a plain
+# `HTTPException`.
+
+
+class ApiNotAuthenticated(HTTPException):
+    """A 401 for a caller that has no browser to send anywhere.
+
+    Deliberately not `NotAuthenticated`, whose handler is the whole reason that
+    class is not an `HTTPException` in the first place: it has to decide between
+    a redirect and a header, and neither is an answer here.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(
+            status_code=401,
+            detail=detail,
+            # The scheme, so a generic HTTP client knows what it was supposed
+            # to send rather than only that it was turned away.
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+async def get_api_user(request: Request, db: DBDep) -> schema.User:
+    """Who is calling the API: a bearer token, or the browser's own session.
+
+    Three ways in, in this order.
+
+    `DUMMY_AUTH` first, and for the reason it is checked first in `get_user`:
+    it is the configuration a fresh checkout runs in, so the CLI has to work
+    against `just dev` without anybody minting anything. The block is enforced
+    on this branch too, or dummy auth would be the one configuration in which
+    the feature does not exist.
+
+    Then `Authorization: Bearer`, which is what a command line actually uses.
+    The token is never stored, so the lookup is by its hash - which means an
+    unknown token and a revoked one are the same miss, as they should be.
+
+    Then the session cookie, so a signed-in browser can follow a plain Download
+    link to an export URL. That fallback is safe on the mutating half for the
+    same reason every other POST in this app is: `same_site="lax"` means the
+    session cookie is not sent on a cross-site POST at all, and that is the
+    whole CSRF defence here as everywhere else.
+    """
+    if DUMMY_AUTH:
+        user = await get_or_create_user(db, DUMMY_USER)
+        await db.commit()
+        _refuse_if_blocked(user)
+        request.state.user = user
+        return user
+
+    presented = parse_bearer(request.headers.get("Authorization"))
+    if presented is not None:
+        token_hash = hash_token(presented)
+        row = await query_api_token_user(db, token_hash)
+        if row is None:
+            raise ApiNotAuthenticated("Unknown or revoked API token.")
+        user = schema.User.model_validate(row)
+        _refuse_if_blocked(user)
+        # One UPDATE per accepted call. It makes a GET write, which is worth
+        # saying out loud, and it is the only thing that can tell a token's
+        # owner it has gone stale before they revoke it.
+        await touch_api_token(db, token_hash)
+        await db.commit()
+        request.state.user = user
+        return user
+
+    user_id = request.session.get("user_id")
+    if user_id is not None:
+        row = await query_user(db, user_id)
+        if row is not None:
+            user = schema.User.model_validate(row)
+            _refuse_if_blocked(user)
+            request.state.user = user
+            return user
+
+    raise ApiNotAuthenticated(
+        "No API token. Mint one on your profile page and send it as "
+        "`Authorization: Bearer <token>`."
+    )
+
+
+ApiUser = Annotated[schema.User, Depends(get_api_user)]
+
+
+async def require_api_challenge_editor(
+    challenge_id: int, db: DBDep, user: ApiUser
+) -> UserRole:
+    """Authorize a pull or a push of `challenge_id`, or raise 403.
+
+    Keyed on the challenge alone, because the API's URL carries nothing else -
+    the same shape as `require_challenge_member`, and safe for the reason its
+    docstring gives: with one id in the path there is no second key to disagree
+    with, so the cross-check `require_challenge_editor` performs has nothing to
+    check. It resolves through `effective_challenge_role`, so a site
+    administrator is staff here exactly as they are everywhere.
+
+    A plain `HTTPException` rather than `Forbidden`, which renders a page.
+    """
+    role = await effective_challenge_role(db, user, challenge_id)
+    if role is None or role not in EDITOR_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail="Only this challenge's course staff can do that.",
+        )
+    return role
+
+
+ApiChallengeEditor = Annotated[UserRole, Depends(require_api_challenge_editor)]
 
 
 async def authorize_submission(
@@ -2802,6 +2953,37 @@ async def _render_evaluator(
     )
 
 
+def _check_evaluator_source(name: str, contents: bytes) -> str | None:
+    """None if these bytes may become a challenge's evaluator, else the reason.
+
+    One rule with two callers - the editor's upload form and the API's push -
+    because a script the browser accepted and the CLI refused (or worse, the
+    other way round) would be a difference nobody could explain. Every check
+    here is about the file itself, so neither caller needs to know the other.
+    """
+    if len(contents) > MAX_EVALUATOR_BYTES:
+        return (
+            f"That file is {len(contents) / 1024:.0f} KB - the limit is "
+            f"{MAX_EVALUATOR_BYTES // 1024} KB. An evaluator is a script, not "
+            "test data."
+        )
+
+    # Load-bearing, not cosmetic: the extension is the only thing that tells
+    # the judge how to compile and run the script, so a name it cannot read is
+    # refused here rather than becoming an evaluator_error on every submission.
+    extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if EXTENSION_TO_LANGUAGE.get(extension) is None:
+        known = ", ".join(sorted("." + e for e in EXTENSION_TO_LANGUAGE))
+        return f"Cannot tell the language of {name!r}. Accepted: {known}."
+
+    try:
+        contents.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"{name} is not valid UTF-8 text."
+
+    return None
+
+
 async def _replace_evaluator(
     db: DBDep, challenge_id: int, new_path: str, contents: bytes
 ) -> None:
@@ -2849,28 +3031,12 @@ async def post_evaluator(
         )
 
     contents = await evaluator_file.read()
-    if len(contents) > MAX_EVALUATOR_BYTES:
-        return await refuse(
-            f"That file is {len(contents) / 1024:.0f} KB — the limit is "
-            f"{MAX_EVALUATOR_BYTES // 1024} KB. An evaluator is a script, not "
-            "test data."
-        )
-
-    # Load-bearing, not cosmetic: the extension is the only thing that tells
-    # the judge how to compile and run the script, so a name it cannot read is
-    # refused here rather than becoming an evaluator_error on every submission.
-    extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-    language = EXTENSION_TO_LANGUAGE.get(extension)
-    if language is None:
-        known = ", ".join(sorted("." + e for e in EXTENSION_TO_LANGUAGE))
-        return await refuse(
-            f"Cannot tell the language of {name!r}. Accepted: {known}."
-        )
-
-    try:
-        contents.decode("utf-8")
-    except UnicodeDecodeError:
-        return await refuse(f"{name} is not valid UTF-8 text.")
+    # Size, extension and encoding, shared with the API's push so the two
+    # cannot disagree about what a usable evaluator is.
+    problem = _check_evaluator_source(name, contents)
+    if problem is not None:
+        return await refuse(problem)
+    language = EXTENSION_TO_LANGUAGE[name.rsplit(".", 1)[-1].lower()]
 
     await _replace_evaluator(
         db, challenge_id, f"{_evaluator_dir(challenge_id)}/{name}", contents
@@ -3322,12 +3488,21 @@ async def get_profile(
     profile = await query_user_profile(db, user_id)
     if profile is None:
         raise HTTPException(status_code=404)
+    # `can_edit` is the owner *or* an administrator; the token section is the
+    # owner alone, which is a narrower question than the page has asked so far
+    # and so needs its own answer. Both are presentation - the routes behind
+    # every form here are guarded by `ProfileOwner` regardless.
+    is_owner = user.id == user_id
     return templates.TemplateResponse(
         request=request,
         name="profile.jinja",
         context={
             "profile": profile,
             "can_edit": can_edit,
+            "is_owner": is_owner,
+            "profile_id": user_id,
+            "tokens": await query_api_tokens(db, user_id) if is_owner else [],
+            "minted": None,
             "title": profile["nickname"],
             "user": user,
             "message": None,
@@ -3436,6 +3611,109 @@ async def post_avatar_reset(
     )
 
 
+########################################################################
+# API tokens, which live on the profile because they are the account's, not the
+# site's. Every route here is behind `ProfileOwner` and deliberately *not*
+# `ProfileReader`, the read half - which is the same line that page already
+# draws, one step further along. Reading a profile is oversight; minting a
+# credential in somebody else's name is impersonation, and even *listing*
+# somebody's tokens is reading the shape of their credentials rather than
+# anything about them. An administrator who needs one of these gone has the
+# same escape hatch the other two have: `DELETE FROM api_token WHERE ...`.
+
+# Long enough to say what a token is for, short enough for the table.
+MAX_TOKEN_LABEL_CHARS = 60
+
+
+async def _render_tokens(
+    request: Request,
+    db: AsyncConnection,
+    user_id: int,
+    message: str | None = None,
+    ok: bool = False,
+    minted: str | None = None,
+):
+    """The token list, as every mutation answers with it.
+
+    One swap target with the alert folded in, which is `/admin`'s rule. `minted`
+    is the one thing this fragment shows that no query can produce: the token
+    itself, on the single response that created it. Only its hash is stored, so
+    there is nowhere it could be read back from - which is the point, and which
+    is why the fragment says so where it prints it.
+    """
+    return templates.TemplateResponse(
+        request=request,
+        name="f-tokens.jinja",
+        context={
+            "profile_id": user_id,
+            "tokens": await query_api_tokens(db, user_id),
+            "message": message,
+            "ok": ok,
+            "minted": minted,
+        },
+    )
+
+
+@app.get("/f/users/{user_id}/tokens")
+async def get_fragment_tokens(
+    user_id: int, request: Request, db: DBDep, owner: ProfileOwner
+):
+    return await _render_tokens(request, db, user_id)
+
+
+@app.post("/users/{user_id}/tokens")
+async def post_token(
+    user_id: int,
+    request: Request,
+    db: DBDep,
+    owner: ProfileOwner,
+    # Defaulted rather than required, as on `/admin` and on the profile form
+    # above: a missing field is a 422, and htmx drops the body of an error
+    # response, so the person who left the box empty would see nothing at all.
+    label: Annotated[str, Form()] = "",
+):
+    """Mint a token, and show it once."""
+    label = label.strip()
+    if not label:
+        return await _render_tokens(
+            request, db, user_id, "Give the token a label, so you know what to "
+            "revoke later.", ok=False,
+        )
+    if len(label) > MAX_TOKEN_LABEL_CHARS:
+        return await _render_tokens(
+            request, db, user_id,
+            f"Labels are at most {MAX_TOKEN_LABEL_CHARS} characters.", ok=False,
+        )
+
+    token = mint_token()
+    await insert_api_token(db, user_id, label, hash_token(token))
+    await db.commit()
+    return await _render_tokens(
+        request, db, user_id,
+        "Token created. Copy it now - it is not shown again.", ok=True,
+        minted=token,
+    )
+
+
+@app.post("/users/{user_id}/tokens/{token_id}/delete")
+async def post_token_delete(
+    user_id: int,
+    token_id: int,
+    request: Request,
+    db: DBDep,
+    owner: ProfileOwner,
+):
+    """Revoke a token. It stops working on the very next call, because the
+    lookup in `get_api_user` is a read of the row this deletes."""
+    removed = await delete_api_token(db, user_id, token_id)
+    await db.commit()
+    return await _render_tokens(
+        request, db, user_id,
+        "Token revoked." if removed else "That token is already gone.",
+        ok=removed,
+    )
+
+
 @app.get("/users/{user_id}/avatar")
 async def user_avatar(user_id: int, db: DBDep, user: CurrentUser):
     row = (
@@ -3462,3 +3740,470 @@ async def user_avatar(user_id: int, db: DBDep, user: CurrentUser):
         },
     )
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# The transfer API
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A challenge is otherwise only reachable one HTTP form at a time: one upload
+# per test case, one arrow-press per reorder, a `<textarea>` for the statement.
+# These four routes are the other way in - pull a challenge as a zip, edit it
+# with an editor, push it back - and `cocco/cli.py` is what drives them.
+#
+# Everything here answers JSON or a zip, and refuses with a real status code
+# rather than the app's "200 with an alert in the body". That convention exists
+# because htmx will not swap the body of an error response; there is no htmx
+# here, and a program that cannot tell a refusal from a success by its status
+# is a program that will overwrite a challenge and report that it worked.
+#
+# The format itself is `cocco/transfer.py`, which touches nothing - so what a
+# challenge looks like as files is testable without a database or a request.
+
+
+def _slug(text: str) -> str:
+    """A file-name-safe stub of a title, for the download's name only.
+
+    Nothing is ever looked up by it: the challenge a push lands on is the one
+    in the URL. It exists so a directory full of pulled challenges can be read.
+    """
+    stub = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return stub[:60] or "challenge"
+
+
+def _existing_testcases(rows) -> list[ExistingTestCase]:
+    """`query_challenge_testcases`' rows, reduced to what a plan needs.
+
+    The narrowing is the point: `plan_testcases` decides the one rule that must
+    not be got wrong - retire what has been graded, delete only what has not -
+    and it does so over plain dataclasses, so it can be tested without either a
+    database or a filesystem.
+    """
+    return [
+        ExistingTestCase(
+            id=row.id,
+            input_name=row.input_path.rsplit("/", 1)[-1],
+            expected_output_name=row.expected_output_path.rsplit("/", 1)[-1],
+            is_sample=row.is_sample,
+            is_active=row.is_active,
+            n_outcomes=row.n_outcomes,
+        )
+        for row in rows
+    ]
+
+
+@app.get("/api/challenges")
+async def api_list_challenges(db: DBDep, user: ApiUser):
+    """Every challenge the caller may edit, so an id can be found from a shell.
+
+    Not behind a course in the path, because the question a CLI asks first is
+    "what can I edit?", which names no course. A site administrator is staff on
+    every course, so they get all of them - `every_course` says that in the
+    query rather than making the route filter afterwards.
+    """
+    rows = await query_editable_challenges(
+        db,
+        user_id=user.id,
+        editor_roles=EDITOR_ROLES,
+        every_course=await is_administrator(db, user.email),
+    )
+    return JSONResponse(
+        [
+            {
+                "course_id": row.course_id,
+                "course_title": row.course_title,
+                "challenge_id": row.challenge_id,
+                "title": row.title,
+            }
+            for row in rows
+        ]
+    )
+
+
+@app.get("/api/challenges/{challenge_id}")
+async def api_export_challenge(
+    challenge_id: int, db: DBDep, role: ApiChallengeEditor
+):
+    """The whole challenge as a zip: manifest, statement, test data, evaluator.
+
+    Retired and hidden test cases are **included**, carrying their flags. This
+    is the staff view - the same reason `query_challenge_testcases` does not
+    filter `is_active` while the challenge page's `samples` CTE does - and a
+    round trip that silently dropped every retired case would lose data on the
+    way back in.
+
+    The zip is built into a temporary file rather than into memory: one test
+    case may be 32 MB and there is no limit on how many there are. The file is
+    unlinked by a background task once the response has been sent.
+    """
+    challenge = await query_challenge_config(db, challenge_id)
+    if challenge is None:
+        raise HTTPException(status_code=404)
+
+    rows = await query_challenge_testcases(db, challenge_id)
+    evaluator_path = await query_evaluator_path(db, challenge_id)
+    evaluator_name = (
+        None if evaluator_path is None else evaluator_path.rsplit("/", 1)[-1]
+    )
+
+    manifest = Manifest(
+        title=challenge.title,
+        ranking=LeaderboardRanking(challenge.ranking),
+        max_time_s=challenge.max_time_s,
+        max_memory_mb=challenge.max_memory_bytes / 1024 / 1024,
+        max_threads=challenge.max_threads,
+        evaluator=(
+            None if evaluator_name is None else f"{EVALUATOR_DIR}/{evaluator_name}"
+        ),
+        testcases=tuple(
+            ManifestTestCase(
+                input=f"{TESTS_DIR}/{row.input_path.rsplit('/', 1)[-1]}",
+                expected_output=(
+                    f"{TESTS_DIR}/{row.expected_output_path.rsplit('/', 1)[-1]}"
+                ),
+                is_sample=row.is_sample,
+                is_active=row.is_active,
+            )
+            for row in rows
+        ),
+    )
+
+    # A row may name a file that is not there - a failed commit after a write,
+    # a storage root that moved, a database restored without its files. Asked
+    # before the zip is opened, so the answer is a sentence naming the file
+    # rather than a traceback halfway through a half-written download.
+    for row in rows:
+        for path in (row.input_path, row.expected_output_path):
+            if not storage.exists(path):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"This challenge cannot be exported: {path} is missing "
+                        "from storage. The test case's row survived its file."
+                    ),
+                )
+    if evaluator_path is not None and not storage.exists(evaluator_path):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This challenge cannot be exported: its evaluator "
+                f"{evaluator_path} is missing from storage."
+            ),
+        )
+
+    handle = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    try:
+        with zipfile.ZipFile(handle, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(
+                MANIFEST_NAME,
+                dump_manifest(
+                    manifest,
+                    transfer.HEADER.format(
+                        challenge_id=challenge_id,
+                        statement=STATEMENT_NAME,
+                        tests=TESTS_DIR,
+                    ),
+                ),
+            )
+            zf.writestr(STATEMENT_NAME, challenge.description or "")
+            for row, entry in zip(rows, manifest.testcases):
+                zf.write(storage.resolve(row.input_path), entry.input)
+                zf.write(
+                    storage.resolve(row.expected_output_path),
+                    entry.expected_output,
+                )
+            if evaluator_path is not None and manifest.evaluator is not None:
+                zf.write(storage.resolve(evaluator_path), manifest.evaluator)
+        handle.close()
+    except (OSError, ValueError):
+        handle.close()
+        os.unlink(handle.name)
+        raise
+
+    return FileResponse(
+        handle.name,
+        media_type="application/zip",
+        filename=f"challenge-{challenge_id}-{_slug(challenge.title)}.zip",
+        background=BackgroundTask(os.unlink, handle.name),
+    )
+
+
+def _read_archive(handle) -> tuple[zipfile.ZipFile, Manifest, str]:
+    """Open a pushed zip and take the manifest and the statement out of it.
+
+    Two caps, and they are not the same cap. The upload's own bytes are counted
+    as they stream in, before this; here the *uncompressed* sizes declared in
+    the zip's directory are summed before a single member is read, because a
+    limit on compressed size alone is not a limit - that is what a zip bomb is.
+    """
+    try:
+        archive = zipfile.ZipFile(handle)
+    except zipfile.BadZipFile as e:
+        raise ManifestError(f"That is not a zip file: {e}") from e
+
+    total = sum(info.file_size for info in archive.infolist())
+    if total > MAX_TRANSFER_BYTES:
+        raise ManifestError(
+            f"The archive unpacks to {total / (1 << 20):.0f} MB - the limit is "
+            f"{MAX_TRANSFER_BYTES >> 20} MB."
+        )
+
+    names = set(archive.namelist())
+    if MANIFEST_NAME not in names:
+        raise ManifestError(f"The archive has no {MANIFEST_NAME}.")
+
+    manifest = parse_manifest(archive.read(MANIFEST_NAME).decode("utf-8"))
+
+    # An absent README is an empty statement rather than a refusal: a challenge
+    # with no description is a challenge the editor lets you save today.
+    statement = (
+        archive.read(STATEMENT_NAME).decode("utf-8")
+        if STATEMENT_NAME in names
+        else ""
+    )
+
+    # Every file the manifest names has to be here...
+    wanted = {tc.input for tc in manifest.testcases}
+    wanted |= {tc.expected_output for tc in manifest.testcases}
+    if manifest.evaluator is not None:
+        wanted.add(manifest.evaluator)
+    missing = sorted(wanted - names)
+    if missing:
+        raise ManifestError(
+            "The archive is missing " + ", ".join(missing) + "."
+        )
+
+    # ...and every file under tests/ has to be named by it. Ignoring a stray
+    # one silently is how somebody loses a test case they thought they added.
+    stray = sorted(
+        name
+        for name in names
+        if name.startswith(f"{TESTS_DIR}/")
+        and not name.endswith("/")
+        and name not in wanted
+    )
+    if stray:
+        raise ManifestError(
+            ", ".join(stray)
+            + f" {'is' if len(stray) == 1 else 'are'} in the archive but not in "
+            f"{MANIFEST_NAME}. Add a [[testcase]] block, or remove the file."
+        )
+
+    return archive, manifest, statement
+
+
+@app.post("/api/challenges/{challenge_id}")
+async def api_import_challenge(
+    challenge_id: int,
+    db: DBDep,
+    role: ApiChallengeEditor,
+    file: Annotated[UploadFile, File()],
+):
+    """Apply a pushed zip to the challenge named in the URL.
+
+    Deliberately an update and never a create: the challenge a push lands on is
+    the one in the path, so a manifest carries no id and a directory copied
+    between checkouts cannot overwrite something it was not pointed at. A new
+    challenge is still made in the web editor, and pushed to once it exists.
+
+    The order of operations is the one the rest of the app uses - files written,
+    the database updated, one commit, and only then the superseded files
+    removed. A failed commit can therefore leave a file nothing points at, but
+    never a row pointing at a file that is gone.
+    """
+
+    def refuse(message: str):
+        return JSONResponse({"detail": message}, status_code=400)
+
+    # Streamed to disk, not read: a push carries every test case at once.
+    upload = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    try:
+        received = 0
+        while chunk := await file.read(1 << 20):
+            received += len(chunk)
+            if received > MAX_TRANSFER_BYTES:
+                return refuse(
+                    f"The upload is larger than {MAX_TRANSFER_BYTES >> 20} MB."
+                )
+            upload.write(chunk)
+        upload.flush()
+        upload.seek(0)
+
+        try:
+            archive, manifest, statement = _read_archive(upload)
+        except ManifestError as e:
+            return refuse(str(e))
+
+        # The limits and the ranking are validated by the same function the
+        # create form and the edit form go through, rather than a second time
+        # here: this is `_challenge_fields`' third caller, not its rival.
+        fields, error = _challenge_fields(
+            statement,
+            manifest.max_time_s,
+            manifest.max_memory_mb,
+            manifest.max_threads,
+            manifest.ranking.value,
+        )
+        if fields is None:
+            return refuse(error or "Invalid challenge.")
+
+        # Read and checked here rather than where it is written, so that every
+        # refusal this push can make happens before a single byte is stored.
+        # An evaluator is capped at 1 MB, so reading it is not the streaming
+        # question a test case is.
+        evaluator_name = manifest.evaluator_name
+        evaluator_source: bytes | None = None
+        if manifest.evaluator is not None and evaluator_name is not None:
+            evaluator_source = archive.read(manifest.evaluator)
+            problem = _check_evaluator_source(evaluator_name, evaluator_source)
+            if problem is not None:
+                return refuse(problem)
+
+        existing = _existing_testcases(
+            await query_challenge_testcases(db, challenge_id)
+        )
+        plan = plan_testcases(existing, manifest)
+
+        # A retired test case keeps its two files, so a name the manifest reuses
+        # would be written on top of them. Checked before anything is written,
+        # because afterwards it is somebody else's data that is gone.
+        kept: dict[str, str] = {}
+        for tc in plan.retired:
+            for name in (tc.input_name, tc.expected_output_name):
+                kept[name] = tc.input_name
+        clash = sorted(
+            {
+                name
+                for entry in manifest.testcases
+                for name in (entry.input_name, entry.expected_output_name)
+                if name in kept
+            }
+        )
+        if clash:
+            return refuse(
+                ", ".join(clash)
+                + " already belongs to a retired test case that this push does "
+                "not name. Retired test cases keep their files - rename yours, "
+                "or keep the [[testcase]] block."
+            )
+
+        with archive:
+            directory = _testcase_dir(challenge_id)
+            written: set[str] = set()
+
+            def store(member: str, name: str) -> str:
+                path = f"{directory}/{name}"
+                with archive.open(member) as source:
+                    storage.save_stream(path, source)
+                written.add(path)
+                return path
+
+            superseded: list[str] = []
+
+            for update in plan.updated:
+                store(update.entry.input, update.entry.input_name)
+                output_path = store(
+                    update.entry.expected_output, update.entry.expected_output_name
+                )
+                if update.existing.expected_output_name != update.entry.expected_output_name:
+                    superseded.append(
+                        f"{directory}/{update.existing.expected_output_name}"
+                    )
+                await update_testcase(
+                    db,
+                    update.existing.id,
+                    expected_output_path=output_path,
+                    is_sample=update.entry.is_sample,
+                    is_active=update.entry.is_active,
+                )
+
+            added_ids: list[int] = []
+            for addition in plan.added:
+                input_path = store(addition.entry.input, addition.entry.input_name)
+                output_path = store(
+                    addition.entry.expected_output,
+                    addition.entry.expected_output_name,
+                )
+                new_id = await insert_testcase(
+                    db,
+                    challenge_id,
+                    input_path,
+                    output_path,
+                    is_sample=addition.entry.is_sample,
+                )
+                # `insert_testcase` can express neither `is_active` nor an
+                # explicit order - it always appends, which is the contract the
+                # editor's Add button depends on - so the rest is a follow-up
+                # rather than a widening of the helper.
+                await update_testcase(db, new_id, is_active=addition.entry.is_active)
+                added_ids.append(new_id)
+
+            for tc in plan.retired:
+                await update_testcase(db, tc.id, is_active=False)
+
+            for tc in plan.deleted:
+                await delete_testcase(db, tc.id)
+
+            # `execution_order` is rewritten densely from the block order, which
+            # is what makes reordering a matter of moving lines in a text file.
+            # Through negative sentinels for `reorder_challenges`' reason: the
+            # column may yet gain a unique constraint per challenge, and then
+            # assigning the final numbers one at a time would collide with the
+            # rows not rewritten yet. Retired cases go after the live ones.
+            ordered: list[int | None] = [None] * len(manifest.testcases)
+            for update in plan.updated:
+                ordered[update.execution_order] = update.existing.id
+            for addition, new_id in zip(plan.added, added_ids):
+                ordered[addition.execution_order] = new_id
+            live = [tid for tid in ordered if tid is not None]
+            live += [tc.id for tc in plan.retired]
+            for index, testcase_id in enumerate(live):
+                await update_testcase(db, testcase_id, execution_order=-(index + 1))
+            for index, testcase_id in enumerate(live):
+                await update_testcase(db, testcase_id, execution_order=index)
+
+            previous_evaluator = await query_evaluator_path(db, challenge_id)
+            if evaluator_source is not None and evaluator_name is not None:
+                new_evaluator = f"{_evaluator_dir(challenge_id)}/{evaluator_name}"
+                storage.save_stream(new_evaluator, io.BytesIO(evaluator_source))
+                await update_challenge(db, challenge_id, evaluator_path=new_evaluator)
+                if previous_evaluator not in (None, new_evaluator):
+                    superseded.append(str(previous_evaluator))
+            else:
+                # No `evaluator` key means the bundled default, exactly as the
+                # editor's "Reset to default" does.
+                await update_challenge(db, challenge_id, evaluator_path=None)
+                if previous_evaluator is not None:
+                    superseded.append(previous_evaluator)
+
+            await update_challenge(
+                db, challenge_id, title=manifest.title, **fields
+            )
+            await db.commit()
+
+        # Only now, and never a path this push just wrote: a new test case is
+        # free to take the name of one being deleted, and deleting afterwards
+        # would then remove the file that replaced it.
+        for tc in plan.deleted:
+            for name in (tc.input_name, tc.expected_output_name):
+                superseded.append(f"{directory}/{name}")
+        for path in superseded:
+            if path not in written:
+                storage.delete(path)
+    finally:
+        upload.close()
+        os.unlink(upload.name)
+
+    return JSONResponse(
+        {
+            "challenge_id": challenge_id,
+            "title": manifest.title,
+            "testcases": {
+                "updated": len(plan.updated),
+                "added": len(plan.added),
+                "retired": [tc.input_name for tc in plan.retired],
+                "deleted": [tc.input_name for tc in plan.deleted],
+            },
+            "evaluator": evaluator_name,
+        }
+    )

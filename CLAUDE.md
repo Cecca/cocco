@@ -24,6 +24,7 @@ Dependencies are managed with `uv` (Python 3.13). A `.envrc` / Nix `devShell` au
 - Run a single test: `uv run pytest cocco/test_judge.py::test_language_python`
 - Build a language runtime on its own: `nix build .#python3` (or `.#gcc`, `.#jdk`)
 - Build the CSS: `npm install` once, then `npm run build:css` (or `npm run watch:css`)
+- Drive a challenge from the command line: `COCCO_URL=http://localhost:8000 uv run python -m cocco.cli ls` (then `pull` / `push` — see "The transfer API")
 
 Integration tests (`@pytest.mark.integration`) require `isolate` installed with its setuid bit, a working `nix` with flakes, the current user being allowed to run isolate boxes, and — for the repository tests — a running PostgreSQL. On NixOS, isolate is declared via `security.wrappers`; on other distros install it outside Nix. Note that the repository integration test **drops every table** in `$PGDATABASE` — which is why the `postgres_url` fixture in `cocco/conftest.py` builds its URL from the `PG*` variables and deliberately **not** from `load_config`: a deployment's `cocco.toml` names that deployment's database, and `pytest -m integration` must have no way of finding it.
 
@@ -94,7 +95,7 @@ One challenge URL, two pages: `get_challenge` renders `challenge-staff.jinja` fo
 
 A submission has its own page, `get_submission` at `/submissions/{id}` — flat, because the id already determines its challenge and course. It shows the source (highlighted by Pygments), the compiler's output when the submission failed to compile, and the per-test outcomes; the last two are the polled fragment `f-submission-results.jinja`, which uses `query_submission_outcomes` rather than the page's `query_submission` so a megabyte of source is not re-sent every two seconds. Both entry points the user reaches it from — the student's own history and the staff view of one student — are the same fragment, `f-submissions.jinja`, so the link is written once.
 
-Uploads carry no language field: `post_submission` maps the file extension to a language through `EXTENSION_TO_LANGUAGE`, built from the same `languages.toml` the judge loads. Upload failures come back as **200 with an error alert**, not a 4xx, because htmx does not swap error responses by default.
+Uploads carry no language field: `post_submission` maps the file extension to a language through `EXTENSION_TO_LANGUAGE`, built from the same `languages.toml` the judge loads. Upload failures come back as **200 with an error alert**, not a 4xx, because htmx does not swap error responses by default. That rule is about htmx and stops where htmx does: the `/api` routes below refuse with a real status code and a JSON body, because a client that cannot tell a refusal from a success by its status is one that overwrites a challenge and reports that it worked.
 
 The home page (`index`, `index-logged-in.jinja`) is the courses list, in two halves: the courses the
 viewer is enrolled on — as staff or as a student, `query_courses` splits on `role IS NULL` — and
@@ -378,9 +379,11 @@ already answer the question, so course staff pay nothing for it. Two consequence
 `get_challenge` takes `can_edit` from the dependency rather than from `query_challenge`'s
 `viewer_role`, which is a `LEFT JOIN` on `enrollment` and would be NULL for them.
 
-Nothing is reachable without a session: every route depends on `CurrentUser`, directly or through
-`require_challenge_editor`, and the only ways in are `/login`, `/auth/google`,
-`/auth/google/callback` and `/static`.
+Nothing is reachable without an identity: every route depends on `CurrentUser` or on `ApiUser`,
+directly or through `require_challenge_editor` / `require_api_challenge_editor`, and the only ways
+in are `/login`, `/auth/google`, `/auth/google/callback` and `/static`. For a browser that identity
+is always the session; **`ApiUser` is the one place a request identifies itself any other way**, and
+it exists because a command line has no browser to run OIDC in — see "The transfer API" below.
 
 The challenge editor's routes all depend on `require_challenge_editor`, which 403s a non-staff user.
 Hiding a control in a template is presentation, never access control — anything that mutates a
@@ -391,6 +394,82 @@ The submission page is the exception to the dependency: a student must be able t
 work, so `get_submission` and its fragment call `authorize_submission` instead, which allows the
 author and otherwise requires `EDITOR_ROLES`. It needs no membership check of its own — the author
 was enrolled when they submitted, because `post_submission` is behind the gate too.
+
+### The transfer API (`/api`, `cocco/transfer.py`, `cocco/cli.py`)
+
+A challenge is otherwise only reachable one HTTP form at a time: an upload per test case, an
+arrow-press per reorder, a `<textarea>` for the statement. **The API makes a challenge a file** —
+`cocco pull 12`, edit, `cocco push 12` — and the ergonomic point is that reordering test cases
+becomes moving two lines in a text editor and the statement becomes a markdown file you can keep in
+git.
+
+The zip is flat and **mirrors what is already on disk**: `challenge.toml`, `README.md` (the
+statement, verbatim), `tests/`, and `evaluator/` when the challenge has an uploaded checker. Test
+files live in one directory per challenge with no per-test subdirectory, which is why input and
+output names are already unique within a challenge — `tests/` keeps exactly that shape, and that is
+why **a test case is identified by its input file name**. The manifest carries no ids on purpose: a
+directory is meant to be edited, copied between checkouts and committed, so renaming an input
+*replaces* the test case rather than renaming it. Three things are deliberately absent from it.
+`position` belongs to the course editor, and a key that silently did nothing would be worse than no
+key; `course_id` and `challenge_id`, because the challenge a push lands on is the one in the URL,
+never a number inside a file somebody may have copied; and `execution_order`, because the block
+order *is* the order.
+
+**`cocco/transfer.py` touches nothing** — no FastAPI, no `AsyncConnection`, no `Storage` — which is
+the seam that makes the format testable by import, the way `auth.py` keeps the interesting half of
+sign-in unit-testable. It owns the shape (`parse_manifest`, `dump_manifest`) and the one rule that
+must not be got wrong (`plan_testcases`); `main.py` owns the I/O. Written with `toml.dumps` and read
+with stdlib `tomllib`: hand-rolled escaping works until somebody names a challenge "Dijkstra's".
+Every path is checked against `safe_filename` and its directory *before anything is opened* — a
+`../`, an absolute path or a nested `tests/a/b.in` is a `ManifestError`, and `Storage.resolve` stays
+the backstop rather than the check.
+
+**A push can never strand a score**, which is the same rule `post_testcase_delete` enforces and the
+reason `plan_testcases` sorts an absent test case into `retired` or `deleted` by `n_outcomes` alone:
+graded means retired (row, files and outcomes all kept, `is_active` cleared), never graded means
+deleted. A retired case *keeps its two files*, so a push that hands one of those names to a
+different test case is refused before anything is written. Every other refusal happens up front too
+— the manifest, the limits, the evaluator's language — so a rejected push leaves the challenge
+exactly as it was. `execution_order` is then rewritten densely from the block order through negative
+sentinels, for the reason `reorder_challenges` uses them.
+
+The two ends share their rules rather than restating them. `_challenge_fields` validates the limits
+and the ranking here as it does for the create and the edit form — this is its third caller, not a
+second opinion — and `_check_evaluator_source` is the size/extension/UTF-8 chain, factored out of
+`post_evaluator`, because a script the browser accepted and the CLI refused would be a difference
+nobody could explain.
+
+**Authentication is `ApiUser`, and it is the one identity in the app that is not a cookie.**
+`get_api_user` tries `DUMMY_AUTH` first (so the CLI works against `just dev` with nothing minted,
+and so the block exists in the configuration the feature gets developed in), then `Authorization:
+Bearer`, then the session — that last so a signed-in browser can follow a plain link to an export
+URL, and safe on the mutating half for the reason every other POST here is, `same_site="lax"`. A
+refusal is `ApiNotAuthenticated`, a plain `HTTPException(401)`, deliberately **not**
+`NotAuthenticated`: that class is not an `HTTPException` precisely so its handler can choose between
+a 303 and an `HX-Redirect`, and a CLI following the 303 would be handed a login page with a 200 on
+it. `require_api_challenge_editor` is keyed on the challenge alone — with one id in the path there
+is no second key to disagree with, `require_challenge_member`'s argument — and resolves through
+`effective_challenge_role`, so an administrator is staff here as everywhere.
+
+**A token is stored only as a hash** (`cocco/tokens.py`: `mint_token`, `hash_token`, `parse_bearer`),
+so it is shown exactly once, when it is minted, because there is nowhere it could be read back from.
+`api_token` is keyed on `user.id` rather than the address — the opposite of `Administrator` and for
+the opposite reason: a token is minted on its owner's own profile page, so the account always
+exists. `query_api_token_user` goes through `_USER_COLUMNS`, because that constant exists so that a
+door which forgot `blocked_at` cannot be the one somebody walks through, and this is the third door.
+The tokens section of `/users/{id}` is behind `ProfileOwner` and **not** `ProfileReader`: that page
+already draws the line between oversight and impersonation, and listing somebody's credentials is on
+the far side of it — an administrator sees no section at all. `last_used_at` is written on every
+accepted call, which makes a GET write, and is the only thing that can tell an owner a token has
+gone stale before they revoke it.
+
+`cocco/cli.py` is `argparse` over `httpx`, run as `uv run python -m cocco.cli` in the checkout (the
+way the judge is) and as `cocco` where the package is installed. `COCCO_URL` and `COCCO_TOKEN` are
+its configuration, and that is a *client's* — nothing to do with `cocco.toml`, which is a
+deployment's. `pull` extracts into a directory by default, because a directory is the thing you can
+edit; `push` zips **only** `challenge.toml`, `README.md`, `tests/` and `evaluator/`, so a `.git` or
+an editor's swap file is never sent, and it checks every member's path on the way out of a zip even
+though that zip came from our own server.
 
 ## Conventions specific to this repo
 

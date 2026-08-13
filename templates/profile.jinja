@@ -122,5 +122,30 @@
       {% endfor %}
     </div>
   </div>
+
+  {# ══ API TOKENS ══════════════════════════════════════════════════ #}
+  {# The owner alone, which is narrower than `can_edit` — that one also admits
+     a site administrator, and a list of somebody's credentials is not theirs
+     to read. Every route behind these forms is guarded by `ProfileOwner`
+     besides; this only decides whether the section is drawn. #}
+  {% if is_owner %}
+  <div class="mt-8">
+    <h2 class="font-bold text-lg">API tokens</h2>
+    <p class="text-[13px] text-base-content/55 mb-3">
+      What the <code class="font-mono">cocco</code> command line signs in with —
+      there is no browser out there to run Google sign-in in. A token acts as
+      you, on everything you can reach, so keep it as you would a password and
+      revoke it the moment you no longer need it.
+    </p>
+
+    <div class="card bg-base-100 border border-base-300 shadow-sm">
+      <div class="card-body p-7">
+        <div id="tokens">
+          {% include "f-tokens.jinja" %}
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
 </main>
 {% endblock %}
