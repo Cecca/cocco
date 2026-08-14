@@ -93,6 +93,13 @@ class SubmissionRunData(Base):
     submission_id: int
     language: str
     source: str
+    # The name the student uploaded, and not decoration: `javac` refuses
+    # `public class Foo` in anything but `Foo.java`, so the judge writes the
+    # source under this name - see `judge.source_filename`. Required, because
+    # `submission.filename` is NOT NULL and a query that dropped the column
+    # should fail here rather than quietly go back to grading every submission
+    # as `source.<ext>`.
+    filename: str
     max_threads: int
     max_memory_bytes: int
     max_time_s: float

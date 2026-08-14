@@ -97,6 +97,7 @@ async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
     return SubmissionRunData(
         submission_id=submission.id,
         source=submission.source,
+        filename=submission.filename,
         language=submission.language,
         max_threads=challenge.max_threads,
         max_memory_bytes=challenge.max_memory_bytes,

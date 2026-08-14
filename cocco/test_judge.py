@@ -8,6 +8,33 @@ import cocco.judge as cj
 from cocco.storage import Storage
 
 
+@pytest.mark.parametrize(
+    "language,uploaded,expected",
+    [
+        # The whole point: javac wants `public class Main` in `Main.java`.
+        ("java", "Main.java", "Main.java"),
+        # The extension is the language's own, not the upload's - javac would
+        # refuse to read a file it does not consider a source file at all.
+        ("java", "Main.JAVA", "Main.java"),
+        # ... and g++ is happy either way, so the canonical one is no loss.
+        ("cpp", "solution.cc", "solution.cpp"),
+        # Sanitised here, because `post_submission` only takes a basename and
+        # rows already in the database carry whatever that let through.
+        ("java", "../../etc/Passwd.java", "Passwd.java"),
+        ("java", "we ird/na:me.java", "na_me.java"),
+        # A dotfile is not rejected, it is de-dotted: `safe_filename` strips
+        # leading dots, so what is left is the stem.
+        ("java", ".java", "java.java"),
+        # Nothing usable left at all: a name, not a crash and not a path.
+        ("java", "", "source.java"),
+        ("python", "...", "source.py"),
+    ],
+)
+def test_source_filename(language: str, uploaded: str, expected: str):
+    languages = cj.load_languages()
+    assert cj.source_filename(uploaded, languages[language]) == expected
+
+
 @pytest.mark.integration
 async def test_python_run():
     python = await cj.resolve_runtime("python3", "python")
@@ -159,12 +186,16 @@ async def test_run_submission():
     ]
 
     def make_run_data(
-        language: str, source: str, evaluator_path: str | None = None
+        language: str,
+        source: str,
+        evaluator_path: str | None = None,
+        filename: str = "solution.py",
     ) -> cs.SubmissionRunData:
         return cs.SubmissionRunData(
             submission_id=1,
             language=language,
             source=source,
+            filename=filename,
             max_threads=1,
             max_memory_bytes=64 * 1024 * 1024,
             max_time_s=1.0,
@@ -199,10 +230,66 @@ async def test_run_submission():
                 return 0;
             }
         """,
+        filename="solution.c",
     )
     res = await cj.run_submission(storage, run_data)
     assert res[0].outcome == cs.OutcomeEnum.compile_failure
     assert res[0].score == 0
+
+
+@pytest.mark.integration
+async def test_run_submission_java_keeps_its_class_name():
+    """A java submission is written under its uploaded name, with every class.
+
+    Two bugs in one test, because in practice they arrive together. Writing the
+    source as `source.java` made javac refuse `public class Main` outright, and
+    copying only the entry point's `.class` into the box left `Main$Helper` -
+    and every other class javac emitted - behind, for a NoClassDefFoundError at
+    the first line that used one.
+    """
+    import cocco.schema as cs
+
+    storage = Storage(Path("/tmp/cocco-storage"))
+    stdin_path = Path("test-run-java/stdin.txt")
+    expected_path = Path("test-run-java/expected.txt")
+    storage.write(stdin_path, "moon")
+    storage.write(expected_path, "hello moon")
+
+    run_data = cs.SubmissionRunData(
+        submission_id=1,
+        language="java",
+        filename="Main.java",
+        source=textwrap.dedent("""\
+        import java.util.Scanner;
+
+        public class Main {
+            public static void main(String[] args) {
+                Scanner scanner = new Scanner(System.in);
+                System.out.println(Greeter.greet(scanner.next()));
+            }
+        }
+
+        class Greeter {
+            static String greet(String who) {
+                return "hello " + who;
+            }
+        }
+        """),
+        max_threads=1,
+        max_memory_bytes=256 * 1024 * 1024,
+        max_time_s=10.0,
+        test_cases=[
+            cs.TestCase(
+                execution_order=0,
+                input_path=str(stdin_path),
+                expected_output_path=str(expected_path),
+            )
+        ],
+    )
+
+    res = await cj.run_submission(storage, run_data)
+    assert res[0].outcome == cs.OutcomeEnum.success, res[0].message
+    assert res[0].score == 1
 
 
 def _write_evaluator(storage: Storage, name: str, source: str) -> str:
@@ -235,6 +322,7 @@ async def test_run_submission_with_uploaded_evaluator():
             submission_id=1,
             language="python",
             source='print("hello", input())',
+            filename="solution.py",
             max_threads=1,
             max_memory_bytes=64 * 1024 * 1024,
             max_time_s=1.0,
@@ -317,6 +405,7 @@ async def test_evaluator_receives_its_three_files():
         submission_id=1,
         language="python",
         source='print("hello", input())',
+        filename="solution.py",
         max_threads=1,
         max_memory_bytes=64 * 1024 * 1024,
         max_time_s=1.0,
@@ -382,6 +471,7 @@ async def test_evaluator_files_do_not_collide_by_name():
         submission_id=1,
         language="python",
         source='print("hello", input())',
+        filename="solution.py",
         max_threads=1,
         max_memory_bytes=64 * 1024 * 1024,
         max_time_s=1.0,
@@ -427,6 +517,7 @@ async def test_broken_evaluator_is_an_evaluator_error(name: str, source: str):
         submission_id=1,
         language="python",
         source='print("hello", input())',
+        filename="solution.py",
         max_threads=1,
         max_memory_bytes=64 * 1024 * 1024,
         max_time_s=1.0,
@@ -456,6 +547,7 @@ async def test_evaluator_that_does_not_compile_fails_every_test():
         submission_id=1,
         language="python",
         source='print("hello", input())',
+        filename="solution.py",
         max_threads=1,
         max_memory_bytes=64 * 1024 * 1024,
         max_time_s=1.0,

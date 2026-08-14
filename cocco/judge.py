@@ -29,7 +29,7 @@ from cocco.migrate import SchemaOutOfDate, check_schema_is_current
 from cocco.model import (
     OutcomeEnum,
 )
-from cocco.storage import Storage
+from cocco.storage import Storage, safe_filename
 
 
 logger = logging.getLogger(__name__)
@@ -369,6 +369,24 @@ class Language:
                 stderr=stderr.decode(),
             )
 
+    def _run_artifacts(self, executable: Path) -> List[Path]:
+        """Everything the run needs in the box beside the entry point.
+
+        `javac` writes one `.class` per class, not one per file: a submission
+        with an inner, an anonymous or a second top-level class compiles to
+        `Main.class` *and* `Main$Helper.class`, and a box holding only the first
+        dies with NoClassDefFoundError the moment it is used. So a compiled + VM
+        language ships its whole output directory; an interpreted one has only
+        the source file it was handed.
+
+        Scoped by directory, which is what keeps it honest: a submission's
+        classes are compiled into the run's temp dir and an evaluator's into
+        `evaluator/` beneath it, so neither picks up the other's.
+        """
+        if self.compiler is None or not self.output_ext:
+            return [executable]
+        return sorted(executable.parent.glob("*" + self.output_ext)) or [executable]
+
     async def run(
         self,
         executable: Path,
@@ -396,7 +414,12 @@ class Language:
                 time_limit=time_limit,
                 mem_limit_kb=mem_limit_kb,
                 processes=processes + self.additional_processes,
-                additional_files=[executable],
+                # Deliberately `additional_files` and not `box_files`: the
+                # caller owns that one - `evaluate` puts the checker's three
+                # arguments in it - and merging the two would be one more thing
+                # to keep in step. They cannot collide either way, since those
+                # three are named with a leading dot.
+                additional_files=self._run_artifacts(executable),
                 box_files=box_files,
             )
         return await isolate_run(
@@ -411,6 +434,35 @@ class Language:
             additional_files=[executable],
             box_files=box_files,
         )
+
+
+# What a submission is called when its uploaded name reduces to nothing.
+DEFAULT_SOURCE_STEM = "source"
+
+
+def source_filename(filename: str, language: Language) -> str:
+    """The name a submission's source is written under before it is compiled.
+
+    The uploaded name and not a generated one, for the reason
+    `prepare_evaluator` states about an uploaded checker: `javac` requires
+    `Foo.java` for `public class Foo`, and `Language.compile` then looks for
+    `Foo.class` because it derives the artifact from the stem. Writing every
+    submission as `source.<ext>` made java the one language nobody could submit.
+
+    The sanitising every other user-supplied path gets happens *here* rather
+    than at upload: `post_submission` only takes a basename, and rows already in
+    the database carry whatever that let through.
+
+    The extension is the language's canonical one rather than the uploaded one.
+    The extension is what tells a compiler what it has been handed: `Main.JAVA`
+    is a java submission that javac would refuse to read, and a `.cc` and a
+    `.cpp` are the same thing to g++.
+    """
+    try:
+        stem = Path(safe_filename(filename)).stem
+    except ValueError:
+        stem = ""
+    return f"{stem or DEFAULT_SOURCE_STEM}.{language.extensions[0]}"
 
 
 # `languages.toml` is part of the package rather than a runtime setting - see
@@ -680,9 +732,8 @@ async def run_submission(
     outcomes = []
     with tempfile.TemporaryDirectory() as temp:
         temp = Path(temp)
-        # The dot matters: a compiler is told what it has been handed by the
-        # extension, and `languages.toml` spells extensions without one.
-        source_fname = temp / ("source." + runtime.extensions[0])
+        # Under the student's own name, sanitised - see `source_filename`.
+        source_fname = temp / source_filename(run_data.filename, runtime)
         with open(source_fname, "w") as fp:
             fp.write(run_data.source)
 
