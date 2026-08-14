@@ -39,10 +39,23 @@ root = "/tmp/cocco-storage"
 # Sign out to change your mind; that is the whole point of the box.
 dummy_auth = true
 
-# Drops every table and reseeds the dummy data on startup. False, and it has to
-# be: `fastapi dev` reloads on every file change, and each reload would wipe
-# every submission made while testing. Turn it on for one boot after a schema
-# change - there is no migration tool - and turn it off again.
+# Drops the schema and reseeds the dummy data on startup. False, and it has to
+# be: `cocco-web --reload` reloads on every file change, and each reload would
+# wipe every submission made while testing.
+#
+# This is *not* how a schema change reaches the database any more - that is a
+# migration. Edit `cocco/model.py`, then
+#
+#   just migration "what changed"     # writes cocco/migrations/versions/...
+#   just migrate                      # applies it
+#
+# and both `cocco-web` and `cocco-judge` will refuse to start until you have.
+# What `reset_db` is for is throwing the *data* away: it drops the whole schema,
+# re-runs every migration and reseeds the cast below, so it ends up exactly
+# where a fresh `just migrate` would, with the dummy data on top. Note that a
+# judge started earlier is left holding a schema that has been dropped and
+# rebuilt underneath it - `just dev` migrates first and starts the judge last,
+# so the ordinary path is fine; restart the stack if you reset under a live one.
 reset_db = false
 
 # There is no [auth] table on purpose. `allowed_domains` defaults to unipd.it,

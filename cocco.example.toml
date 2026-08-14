@@ -31,6 +31,21 @@
 # that keeps the credential out of the file, and an empty URL goes further -
 # libpq then resolves the user, database and host from PGUSER, PGDATABASE and
 # PGHOST too, which is what `cocco.dev.toml` does.
+#
+# THE SCHEMA IS NOT CREATED ON BOOT. It is a sequence of revisions shipped
+# inside the package, and applying them is a step of deploying:
+#
+#   cocco-migrate upgrade head        # reads this same file
+#   systemctl restart cocco-web cocco-judge
+#
+# in that order. Both processes check the database against the revisions they
+# were built with and refuse to start if it is behind, printing that command -
+# so a forgotten migration is a service that will not come up rather than one
+# serving 500s off a missing column. `cocco-migrate current` says where a
+# database stands; `upgrade head --sql` prints the DDL instead of running it,
+# for somebody else to apply. A database that predates all this and whose schema
+# already matches is adopted with `cocco-migrate stamp head`, which records the
+# revision without running it.
 url = "postgresql+psycopg://cocco@localhost/cocco"
 
 [storage]
@@ -130,6 +145,7 @@ allowed_domains = ["unipd.it"]
 
 # There is deliberately no [dev] table here. It carries `dummy_auth`, which
 # puts a box on the login page that signs you in as whatever address you type -
-# no password, no Google, anyone as anyone - and `reset_db`, which drops every
-# table on startup. They live together under one name a deployment's config file
-# can be read for the *absence* of. See `cocco.dev.toml`.
+# no password, no Google, anyone as anyone - and `reset_db`, which drops the
+# whole schema on startup and reseeds dummy data. They live together under one
+# name a deployment's config file can be read for the *absence* of. See
+# `cocco.dev.toml`.

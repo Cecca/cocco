@@ -25,8 +25,8 @@ from cocco.schema import (
     TestCase,
     TestOutcome,
 )
+from cocco.migrate import SchemaOutOfDate, check_schema_is_current
 from cocco.model import (
-    metadata,
     OutcomeEnum,
 )
 from cocco.storage import Storage
@@ -912,7 +912,23 @@ def main(argv: list[str] | None = None) -> None:
 
     storage = Storage(config.storage.root)
     engine = create_engine(config.database.url)
-    metadata.create_all(engine)
+
+    # The judge never builds a schema and never migrates one: it is the process
+    # that must not surprise anybody with DDL, and it used to call
+    # `metadata.create_all` here, which silently papered over a web app and a
+    # judge pointed at different databases. It asks once, at startup, and then
+    # runs forever - so a `[dev] reset_db` boot of `cocco-web` underneath a live
+    # judge leaves that judge on a schema that has been dropped and rebuilt.
+    # `just dev` migrates first and starts the judge last, which is the ordinary
+    # path; anything else is loud rather than wrong, because `run_from_queue`
+    # has no `except` around its transaction.
+    try:
+        with engine.connect() as conn:
+            check_schema_is_current(conn, process="cocco-judge")
+    except SchemaOutOfDate as e:
+        logger.error("%s", e)
+        raise SystemExit(1)
+
     asyncio.run(run_loop(engine, storage))
 
 

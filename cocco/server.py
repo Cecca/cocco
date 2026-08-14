@@ -19,6 +19,7 @@ one file is the thing that keeps them agreeing.
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import uvicorn
@@ -87,6 +88,50 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _check_schema() -> None:
+    """Refuse to serve a database that is not at the revision this code expects.
+
+    This looks like a duplicate of the check in `cocco.main`'s startup, and it
+    is not: uvicorn only turns a failed startup into a non-zero exit when there
+    is one worker and no reloader. Under `--reload` - which is what `just dev`
+    runs - the reload supervisor outlives the dead child, does not restart it
+    (it restarts on file changes, not on a child dying) and eventually exits 0,
+    so `just dev`'s `wait -n` never fires and what you get is a silently absent
+    web app. Under `--workers N` the process manager respawns the failing worker
+    forever. Asking here, before uvicorn exists, is what makes the refusal a
+    plain non-zero exit under every combination of flags; the copy in the app is
+    what covers every other ASGI runner and makes each worker verify for itself.
+
+    Imported inside the function for this module's usual reason - importing
+    `cocco.server` must stay cheap, and `--config` has to be in the environment
+    first. Pointedly not `cocco.main`: this needs the configuration file and the
+    revision scripts, not the app, which is what
+    `test_the_server_does_not_import_the_app` is about.
+    """
+    from sqlalchemy import create_engine
+
+    from cocco.config import config_path, load_config
+    from cocco.migrate import SchemaOutOfDate, check_schema_is_current
+
+    config = load_config(config_path())
+    if config.dev.reset_db:
+        # A reset builds the schema itself, so it is allowed to start behind -
+        # indeed it is normally started against nothing at all.
+        return
+
+    engine = create_engine(config.database.url)
+    try:
+        with engine.connect() as conn:
+            check_schema_is_current(conn, process="cocco-web")
+    except SchemaOutOfDate as e:
+        # No prefix of our own: `check_schema_is_current` was given the process
+        # name and has already put it at the front of the sentence.
+        print(e, file=sys.stderr)
+        raise SystemExit(1)
+    finally:
+        engine.dispose()
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
 
@@ -95,6 +140,8 @@ def main(argv: list[str] | None = None) -> None:
     # says stands, and `config_path()` falls back to `cocco.toml` as always.
     if args.config is not None:
         os.environ["COCCO_CONFIG"] = str(args.config)
+
+    _check_schema()
 
     uvicorn.run(
         "cocco.main:app",

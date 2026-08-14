@@ -21,7 +21,6 @@ from cocco.model import (
     TestOutcome,
     User,
     UserRole,
-    metadata,
 )
 from cocco import schema
 from cocco.auth import (
@@ -32,6 +31,11 @@ from cocco.auth import (
     safe_next_path,
 )
 from cocco.config import config_path, load_config
+from cocco.migrate import (
+    check_schema_is_current,
+    reset_schema,
+    upgrade_to_head,
+)
 from cocco.tokens import hash_token, mint_token, parse_bearer
 from cocco import transfer
 from cocco.transfer import (
@@ -399,12 +403,36 @@ def static_url(path: str) -> str:
 templates.env.globals["static_url"] = static_url
 
 
-async def create_db_and_tables(dummy=False):
+async def prepare_database(reset=False):
+    """Check the schema, and only under `[dev] reset_db` build one.
+
+    The schema is not created on boot any more - `cocco-migrate` owns it, and
+    this refuses to start against a database that is behind, naming the command
+    that fixes it. A server that quietly runs DDL is a server that can migrate a
+    deployment nobody meant to migrate.
+
+    `[dev] reset_db` is the one exception, because a reset is somebody asking
+    for exactly that. It does not use `metadata.drop_all`: that drops the tables
+    and the four ENUM types with them, but `alembic_version` is not in
+    `metadata` and would survive, so the `upgrade head` after it would find a
+    database already claiming to be at head and do nothing - leaving an empty
+    database that *passes* the check below and 500s on the first query. See
+    `reset_schema`.
+    """
+    if reset:
+        async with engine.begin() as conn:
+            await conn.run_sync(reset_schema)
+        # A separate transaction: the drop is committed before alembic starts
+        # its own work on the same connection.
+        async with engine.begin() as conn:
+            await conn.run_sync(upgrade_to_head)
+
     async with engine.begin() as conn:
-        if dummy:
-            await conn.run_sync(metadata.drop_all)
-        await conn.run_sync(metadata.create_all)
-        if dummy:
+        # Before anything is written, so that a database which is behind is
+        # found out rather than inserted into. After a reset too, where it costs
+        # one query and is the only thing proving the reset landed at head.
+        await conn.run_sync(check_schema_is_current, process="cocco-web")
+        if reset:
             await _populate_dummy_data(conn)
         # The configured administrators, replayed on every boot: this is how a
         # brand new deployment gets its first one, since there is no
@@ -486,7 +514,7 @@ async def _populate_dummy_data(conn: AsyncConnection):
         # Matteo and Alice both teach; Bob and Charlie are students. `role` is
         # per course, so this is one row per person per course. What makes
         # Matteo an administrator is not written here but in `administrator`,
-        # by the bootstrap in `create_db_and_tables`.
+        # by the bootstrap in `prepare_database`.
         await insert_enrollment(
             conn, user_ids[DUMMY_ADMIN], course_id, UserRole.teacher
         )
@@ -1523,10 +1551,16 @@ def visible_outcomes(outcomes, is_staff: bool):
 
 @app.on_event("startup")
 async def on_startup():
-    # Resetting drops every table and reseeds the dummy data, so it must not
-    # happen on an ordinary boot: `fastapi dev` reloads would wipe every
-    # submission made while testing.
-    await create_db_and_tables(dummy=CONFIG.dev.reset_db)
+    # An ordinary boot only *checks* the schema; `cocco-migrate` is what builds
+    # it. `cocco/server.py` asks the same question before uvicorn is even
+    # started - see the comment there for why one of the two is not enough -
+    # and this is the copy that covers every other way `cocco.main:app` is
+    # served, and that makes each worker verify for itself.
+    #
+    # Resetting drops the schema and reseeds the dummy data, so it must not
+    # happen on an ordinary boot: `cocco-web --reload` reloads on every file
+    # change and each one would wipe every submission made while testing.
+    await prepare_database(reset=CONFIG.dev.reset_db)
 
 
 @app.get("/")

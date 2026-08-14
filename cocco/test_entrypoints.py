@@ -1,4 +1,4 @@
-"""The three console scripts, checked as what they are: importable names.
+"""The four console scripts, checked as what they are: importable names.
 
 `[project.scripts]` is a string in `pyproject.toml`, so a target that has been
 renamed, moved or - the actual bug this file exists for - defined *inside* a
@@ -25,6 +25,7 @@ ENTRY_POINTS = [
     ("cocco.cli", "main", "cocco"),
     ("cocco.server", "main", "cocco-web"),
     ("cocco.judge", "main", "cocco-judge"),
+    ("cocco.migrate", "main", "cocco-migrate"),
 ]
 
 

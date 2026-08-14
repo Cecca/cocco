@@ -17,6 +17,8 @@ Dependencies are managed with `uv` (Python 3.13). A `.envrc` / Nix `devShell` au
 - Run the whole stack (app, judge, Postgres): `just dev`
 - Run the API alone: `COCCO_CONFIG=cocco.dev.toml uv run cocco-web --reload`
 - Run the judge alone: `COCCO_CONFIG=cocco.dev.toml uv run cocco-judge`
+- Apply a schema change: `just migration "what changed"` then `just migrate` — see "Migrations"
+- Ask where a database stands: `uv run cocco-migrate current` (or `heads`, `history`, `downgrade`)
 - Reset and reseed the database: set `[dev] reset_db = true`, start once, set it back
 - Configure a deployment: `cp cocco.example.toml cocco.toml` and edit it — the three secrets go in the environment, not in it
 - Run all tests: `uv run pytest`
@@ -27,7 +29,7 @@ Dependencies are managed with `uv` (Python 3.13). A `.envrc` / Nix `devShell` au
 - Build the wheel and the sdist: `just build` — which is `npm run build:css` *then* `uv build`, in that order for a reason (see below)
 - Drive a challenge from the command line: `COCCO_URL=http://localhost:8000 uv run cocco ls` (then `pull` / `push` — see "The transfer API")
 
-**cocco is a package, and it is three commands.** `[project.scripts]` declares `cocco` (`cocco/cli.py`, the transfer CLI), `cocco-web` (`cocco/server.py`) and `cocco-judge` (`cocco/judge.py:main`); hatchling builds it and `uv sync` installs it editable into `.venv`, which is what makes those names work in the checkout as well as out of it. That is not just three lines of metadata: everything the two server processes read at runtime — `templates/`, `static/`, `languages.toml`, `cocco/evaluators/` — lives **inside `cocco/`** and is resolved with `Path(__file__).resolve().parent`, never against the working directory, because an installed wheel has no repository root to be relative to. `assets/` is the other half of that line: it is tailwind's *input* plus the design-source icons, is never read by Python, and is not shipped. The one thing that survives as a genuine build step is `cocco/static/styles.css`, which is gitignored and so invisible to hatchling's file selection — `[tool.hatch.build.targets.*] artifacts` names it explicitly, and it has to have been built before `uv build` runs or the wheel installs a site with no stylesheet.
+**cocco is a package, and it is four commands.** `[project.scripts]` declares `cocco` (`cocco/cli.py`, the transfer CLI), `cocco-web` (`cocco/server.py`), `cocco-judge` (`cocco/judge.py:main`) and `cocco-migrate` (`cocco/migrate.py`); hatchling builds it and `uv sync` installs it editable into `.venv`, which is what makes those names work in the checkout as well as out of it. Three processes and the command that prepares the database two of them share — and which those two refuse to start without. That is not just four lines of metadata: everything the server processes read at runtime — `templates/`, `static/`, `languages.toml`, `cocco/evaluators/`, `cocco/migrations/` — lives **inside `cocco/`** and is resolved with `Path(__file__).resolve().parent`, never against the working directory, because an installed wheel has no repository root to be relative to. The migrations are the newest member of that list and the one with a tempting alternative: there is deliberately **no `alembic.ini`**, at the repository root or anywhere else, because an ini file is a working-directory dependency by construction and a stray one would be found by anybody running plain `alembic` from the checkout — who would then migrate whatever database *it* named rather than the one `cocco.toml` does. `assets/` is the other half of that line: it is tailwind's *input* plus the design-source icons, is never read by Python, and is not shipped. The one thing that survives as a genuine build step is `cocco/static/styles.css`, which is gitignored and so invisible to hatchling's file selection — `[tool.hatch.build.targets.*] artifacts` names it explicitly, and it has to have been built before `uv build` runs or the wheel installs a site with no stylesheet.
 
 `cocco-web` is a **thin uvicorn wrapper and its own module**, not a function in `main.py`. `cocco.main` reads its configuration at import — `CONFIG`, the engine, `Storage(...)`, `load_languages()` are all module-level — so a `--config` flag parsed from inside it would arrive after the file it names had been read. `cocco/server.py` puts the path in `COCCO_CONFIG` first and only then hands uvicorn the import string `"cocco.main:app"`, which is also the only form `--reload` and `--workers` accept. `cocco-judge`'s `main` is module-level and sync for the same kind of reason: it used to be an `async def` inside `if __name__ == "__main__"`, which `python -m` can run and an entry point cannot name at all.
 
@@ -35,7 +37,7 @@ Integration tests (`@pytest.mark.integration`) require `isolate` installed with 
 
 The web app and the judge are **separate processes** that must agree on three things: the database, the storage root for test case files (`[storage] root`), and the *installed package* itself — `languages.toml` decides what an uploaded extension means at both ends, and the bundled evaluators in `cocco/evaluators/` are code, so a judge running an older version silently grades with an older `equality.py` than the editor advertises. The first two they agree on by *reading the same file*: the judge takes no `--database` and no `--storage`, only a `--config`, because a flag that can disagree with the file is the same bug as an environment variable that can. The third they agree on by *being the same package*, which is exactly why those files moved inside `cocco/` — a wheel is one version of all of it. Submitting through the web UI only enqueues a row — nothing leaves `queued` unless a judge is running against the same database.
 
-`[dev] reset_db` drops every table and reseeds dummy data on startup. Leave it false in normal development — `cocco.dev.toml` ships it that way — because `cocco-web --reload` reloads on every file change and each reload would wipe the data. There is no migration tool, so a schema change reaches an existing database only through one such reset.
+`[dev] reset_db` drops the schema and reseeds dummy data on startup. Leave it false in normal development — `cocco.dev.toml` ships it that way — because `cocco-web --reload` reloads on every file change and each reload would wipe the data. It is not how a schema change reaches a database: that is a migration (see "Migrations"), and `reset_db` is for throwing the *data* away.
 
 **Configuration is split in two, and the line is one sentence: the file is settings, the environment is secrets.** `cocco/config.py` is where both halves are read — its own module rather than a corner of `auth.py`, because the judge reads it too and a database URL is none of sign-in's business. The file carries `[database] url`, `[storage] root`, `[judge] flake`, `[session]`, `[auth]`, `[site]` and `[dev]`; the three secrets — `COCCO_SECRET_KEY`, `COCCO_GOOGLE_CLIENT_ID`, `COCCO_GOOGLE_CLIENT_SECRET` — have **no file spelling at all**, so there is no precedence to reason about and nothing secret in a file that gets copied, diffed and pasted into a bug report. `COCCO_CONFIG` is the exception that proves the rule: it names the file, so it is the one setting that cannot be written in one.
 
@@ -83,6 +85,55 @@ SQLAlchemy Core `Table`s on a shared `MetaData` form the domain: `User` (with `U
 `User.blocked_at` / `blocked_reason` are the **blacklist**, and they are columns on the row rather than a table of their own — deliberately the opposite of `Administrator`, and for the opposite reason. That table is keyed on an address because it must name people who have never signed in; a block always names someone who already did something, so the account exists. Living on the row means `get_user` — which already reads it on every request — asks the question for free, and a block therefore takes effect on the blocked person's very next click. `_USER_COLUMNS` in `repository.py` is the one column list behind both `query_user` and `query_user_by_email`, spelled once because a list that carried `blocked_at` in one of them and not the other would let a blocked person in through whichever door forgot.
 
 `cocco/schema.py` holds the Pydantic mirrors used for validation and for the judge's `SubmissionRunData`. `schema.User` carries the two block fields **without defaults**: `get_user` refuses on them, so a query that selected a trimmed column list has to fail loudly at validation rather than quietly report everybody as welcome.
+
+### Migrations (`cocco/migrate.py`, `cocco/migrations/`)
+
+**`model.py` is the head of a sequence of revisions, and the schema is not created on boot.** Alembic
+owns it: `cocco/migrations/versions/` holds the revisions, `cocco-migrate` moves a database between
+them, and `cocco-web` and `cocco-judge` *check* and never migrate. Both call
+`check_schema_is_current` before they serve anything and refuse to start against a database that is
+behind, printing the command that fixes it — a server that quietly ran DDL would be one that could
+migrate a deployment nobody meant to migrate, and the old `metadata.create_all` on startup was worse
+than that: it created *missing tables*, never altered an existing one, and so silently papered over
+a web app and a judge pointed at different databases.
+
+That refusal is spelled **twice on the web side**, and the duplication is load-bearing. Uvicorn only
+turns a failed startup into a non-zero exit when there is one worker and no reloader; under
+`cocco-web --reload` the reload supervisor outlives the dead child, does not restart it and exits 0,
+so `just dev`'s `wait -n` would never fire and you would get a silently absent app. So `_check_schema`
+in `cocco/server.py` asks *before uvicorn exists*, which is what makes the refusal a plain non-zero
+exit under every combination of flags, and the copy in the startup hook covers every other ASGI
+runner and makes each worker verify for itself. `cocco/server.py` keeps its lazy-import discipline
+doing it: the check pulls in `cocco.config` and `cocco.migrate`, never `cocco.main`.
+
+`env.py` reads `load_config(config_path())` itself rather than `config.get_main_option("sqlalchemy.url")`,
+so `cocco-migrate` cannot migrate a database the two servers are not talking to. That is also the only
+way cocco's URL survives at all: `alembic.config.Config` is a `ConfigParser` underneath, so a `%` in a
+password would be an interpolation error and the empty `postgresql+psycopg://` has no business being
+written down. `script_location` is the one main option ever set; a URL or a connection travels in
+`config.attributes`, which is a plain dict — that is how `[dev] reset_db` and the drift test run
+migrations on a connection they already hold.
+
+**Three things autogenerate cannot see**, and each is a hand-written revision. A new *value* on an
+existing enum produces no diff whatsoever (`ALTER TYPE outcomeenum ADD VALUE 'x'`, inside
+`op.get_context().autocommit_block()`, because a value added in a transaction cannot be used until it
+commits). A changed **server default** is invisible because `compare_server_default` is off in
+`COMPARE_OPTIONS` — Postgres reads `challenge.ranking`'s back as `'running_time'::leaderboardranking`
+against a model that says `text("'running_time'")`, so leaving it on would be permanent phantom drift;
+there are three such columns in the whole schema. And a **new PG ENUM type** is created implicitly by
+`op.create_table` but never dropped by `op.drop_table`, so every revision that adds one owes its
+`downgrade` an explicit drop — the baseline's `ENUM_TYPES` loop is the worked example, and a
+`downgrade base` followed by an `upgrade head` is what proves it.
+
+`cocco/test_migrations.py` is what stops the revisions and `model.py` drifting apart: it runs
+`upgrade head` on a scratch Postgres and asserts `compare_metadata` finds nothing, on exactly the
+`COMPARE_OPTIONS` `env.py` configures autogenerate with — the two spellings being one constant is why
+it cannot pass on a diff a revision would record. Every other test still builds its schema with
+`metadata.create_all`, deliberately: the revisions are Postgres-only DDL and the SQLite route tests
+could not replay them. `reset_schema` is `DROP SCHEMA public CASCADE`, not `metadata.drop_all`, and
+that is the one trap worth knowing: `drop_all` takes the tables and the four ENUM types but leaves
+`alembic_version` standing, so the `upgrade head` after it finds a database already claiming to be at
+head and does nothing — an empty database that *passes* the check and 500s on the first query.
 
 ### Queries (`cocco/repository.py`)
 
@@ -206,10 +257,8 @@ name and while a judge is mid-run; only the success is a 204.
 challenge stays readable for the people already enrolled — statement, their attempts, scores,
 leaderboards — stops taking submissions, leaves everybody else's listing, and admits nobody new.
 Staff go on editing it, and unarchive it from where they archived it; so does `cocco push`, since
-the API is the editor by another route. `[dev] reset_db` is the only way `archived_at` reaches an
-existing database, since there is no migration tool — by hand it is
-`ALTER TABLE course ADD COLUMN archived_at timestamp without time zone;` and the same for
-`challenge`.
+the API is the editor by another route. `archived_at` is in the baseline revision, so it reaches a
+database the way every column now does — `cocco-migrate upgrade head`.
 
 Beside it, `/courses/{course_id}/people` (`course-people.jinja`) is the class list: who is
 enrolled, in what role, how much they have submitted *here*, and the three ways staff change it.

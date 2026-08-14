@@ -69,6 +69,13 @@ dev:
 
     create-db "$PGDATABASE" >>{{log_dir}}/postgres.log 2>&1
 
+    # Before either process, and not beside them: both refuse to start against a
+    # database that is not at head, so this is what makes a fresh checkout come
+    # up at all. `set -e` means a failed migration takes the whole stack down
+    # through the cleanup trap rather than starting an app that cannot work.
+    echo "schema:   upgrading           -> {{log_dir}}/migrate.log"
+    uv run cocco-migrate upgrade head >{{log_dir}}/migrate.log 2>&1
+
     echo "app:      http://127.0.0.1:8000 -> {{log_dir}}/app.log"
     uv run cocco-web --reload >{{log_dir}}/app.log 2>&1 &
     pids+=($!)
@@ -91,7 +98,20 @@ dev:
 
 # Follow the logs of every process
 logs:
-    tail -n 20 -F {{log_dir}}/postgres.log {{log_dir}}/app.log {{log_dir}}/judge.log
+    tail -n 20 -F {{log_dir}}/postgres.log {{log_dir}}/migrate.log {{log_dir}}/app.log {{log_dir}}/judge.log
+
+# Bring the database up to the schema this checkout expects
+migrate:
+    uv run cocco-migrate upgrade head
+
+# Write a new revision by diffing cocco/model.py against the dev database
+#
+# Two recipes rather than one `migrate *args`, because just's own parsing makes
+# leading `--` flags awkward to pass through. Anything else - `current`,
+# `history`, `downgrade` - is `uv run cocco-migrate ...` directly, which works
+# because COCCO_CONFIG is exported at the top of this file.
+migration message:
+    uv run cocco-migrate revision --autogenerate -m "{{message}}"
 
 # Build the stylesheet from assets/styles.css into the package
 build-css:

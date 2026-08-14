@@ -5,6 +5,10 @@ description = "A self-hosted judge for programming challenges"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    # A runtime dependency, not a development one: `cocco-web` and `cocco-judge`
+    # import `cocco.migrate` to ask whether the database is at the revision they
+    # were written against, and refuse to start if it is not.
+    "alembic>=1.16",
     "authlib>=1.6",
     "babel>=2.18.0",
     "fastapi[standard]>=0.135.3",
@@ -26,12 +30,15 @@ dependencies = [
     "uvicorn[standard]>=0.34",
 ]
 
-# The three processes cocco is. `cocco` talks to the transfer API over HTTP and
-# needs nothing else installed; the other two are the deployment.
+# The three processes cocco is, and the command that prepares the database two
+# of them share. `cocco` talks to the transfer API over HTTP and needs nothing
+# else installed; `cocco-web` and `cocco-judge` are the deployment, and
+# `cocco-migrate` is what they both refuse to start without.
 [project.scripts]
 cocco = "cocco.cli:main"
 cocco-web = "cocco.server:main"
 cocco-judge = "cocco.judge:main"
+cocco-migrate = "cocco.migrate:main"
 
 [build-system]
 requires = ["hatchling"]

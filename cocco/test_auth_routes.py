@@ -81,7 +81,7 @@ async def client(app_engine, monkeypatch):
     monkeypatch.setattr(main, "DUMMY_AUTH", False)
 
     # Deliberately not `with TestClient(...)`: entering the context runs the
-    # startup event, which calls `create_db_and_tables` against the real
+    # startup event, which calls `prepare_database` against the real
     # Postgres engine. Nothing here needs it, and these stay unit tests.
     client = TestClient(main.app)
     yield client

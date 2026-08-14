@@ -81,7 +81,7 @@ def test_visible_outcomes_shows_everything_to_staff():
 
 
 # Deliberately not `with TestClient(...)`: entering the context runs the startup
-# event, which calls `create_db_and_tables` against the real Postgres engine.
+# event, which calls `prepare_database` against the real Postgres engine.
 # The static mount needs none of it, and these stay unit tests.
 _client = TestClient(app)
 
