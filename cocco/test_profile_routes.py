@@ -99,7 +99,11 @@ async def world(app_engine):
 
 
 @pytest.fixture
-def client(app_engine, monkeypatch):
+def client(app_engine, world, monkeypatch):
+    # `world` is a dependency rather than an argument of the tests alone,
+    # because signing in *creates* the account if it is missing: without the
+    # ordering, the fixture would insert alice a moment before the seed does and
+    # the seed would trip over its own unique index.
     import cocco.main as main
 
     async def _get_db():
@@ -108,19 +112,21 @@ def client(app_engine, monkeypatch):
 
     main.app.dependency_overrides[main.get_db] = _get_db
     monkeypatch.setattr(main, "DUMMY_AUTH", True)
-    monkeypatch.setattr(main, "DUMMY_USER", TEACHER)
 
     # Not `with TestClient(...)`: entering the context runs the startup event,
     # which reaches for the real Postgres engine.
     client = TestClient(main.app)
+    _sign_in_as(client, TEACHER)
     yield client
     main.app.dependency_overrides.clear()
 
 
-def _sign_in_as(monkeypatch, email: str):
-    import cocco.main as main
-
-    monkeypatch.setattr(main, "DUMMY_USER", email)
+def _sign_in_as(client, email: str):
+    """Become somebody else. Dummy auth is a real session now, so this is a
+    request rather than a monkeypatch, and `_sign_in` clears the old session
+    before writing the new id - no identity leaks into the next one."""
+    response = client.post("/auth/dummy", data={"email": email}, follow_redirects=False)
+    assert response.status_code == 303, response.text
 
 
 async def _read_user(app_engine, user_id: int):
@@ -132,7 +138,7 @@ async def _read_user(app_engine, user_id: int):
 
 async def test_a_stranger_may_not_read_or_change_a_profile(client, world, monkeypatch):
     """Being on the same course as somebody is not oversight of them."""
-    _sign_in_as(monkeypatch, STUDENT)
+    _sign_in_as(client, STUDENT)
     assert client.get(f"/users/{world['alice']}").status_code == 403
     for url, data in _write_urls(world["alice"]):
         assert client.post(url, data=data).status_code == 403, url
@@ -152,7 +158,7 @@ async def test_an_administrator_may_look_but_not_touch(
     Only the writes are asserted here: the read is `query_user_profile`, which
     is Postgres-only and so is tested in the other half.
     """
-    _sign_in_as(monkeypatch, ADMIN)
+    _sign_in_as(client, ADMIN)
     for url, data in _write_urls(world["alice"]):
         assert client.post(url, data=data).status_code == 403, url
     assert (
@@ -344,9 +350,9 @@ async def pg_client(monkeypatch, postgres_url):
 
     main.app.dependency_overrides[main.get_db] = _get_db
     monkeypatch.setattr(main, "DUMMY_AUTH", True)
-    monkeypatch.setattr(main, "DUMMY_USER", TEACHER)
 
     client = TestClient(main.app)
+    _sign_in_as(client, TEACHER)
     yield client, ids
     main.app.dependency_overrides.clear()
     await engine.dispose()
@@ -367,7 +373,7 @@ async def test_your_own_profile_is_a_form(pg_client):
 @pytest.mark.integration
 async def test_an_administrator_sees_the_same_facts_as_text(pg_client, monkeypatch):
     client, ids = pg_client
-    _sign_in_as(monkeypatch, ADMIN)
+    _sign_in_as(client, ADMIN)
     response = client.get(f"/users/{ids['bob']}")
     assert response.status_code == 200
     # What we know about them: the address, the name, the class list.
@@ -382,14 +388,14 @@ async def test_an_administrator_sees_the_same_facts_as_text(pg_client, monkeypat
 @pytest.mark.integration
 async def test_a_profile_that_is_not_there_is_a_404(pg_client, monkeypatch):
     client, _ = pg_client
-    _sign_in_as(monkeypatch, ADMIN)
+    _sign_in_as(client, ADMIN)
     assert client.get("/users/99999").status_code == 404
 
 
 @pytest.mark.integration
 async def test_a_stranger_gets_a_page_and_not_a_traceback(pg_client, monkeypatch):
     client, ids = pg_client
-    _sign_in_as(monkeypatch, STUDENT)
+    _sign_in_as(client, STUDENT)
     response = client.get(f"/users/{ids['alice']}")
     assert response.status_code == 403
     assert "You can only look at your own profile." in response.text

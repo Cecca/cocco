@@ -157,12 +157,22 @@ def no_google(monkeypatch):
     )
 
 
-def _set_dummy_auth(monkeypatch, enabled: bool, user: str | None = None):
+def _set_dummy_auth(client, monkeypatch, enabled: bool, user: str | None = None):
+    """Turn the development shortcut on, and optionally walk through it.
+
+    Two steps rather than one now, and the split is the feature: `dummy_auth`
+    only puts a box on the login page, and being signed in is a request through
+    it. So the tests below that assert *who* somebody is name a user here, and
+    the ones about the box itself do not.
+    """
     import cocco.main as main
 
     monkeypatch.setattr(main, "DUMMY_AUTH", enabled)
     if user is not None:
-        monkeypatch.setattr(main, "DUMMY_USER", user)
+        response = client.post(
+            "/auth/dummy", data={"email": user}, follow_redirects=False
+        )
+        assert response.status_code == 303, response.text
 
 
 ########################################################################
@@ -526,12 +536,10 @@ async def test_a_block_with_no_reason_still_says_something(
 
 
 async def test_dummy_auth_is_blocked_too(client, monkeypatch, app_engine, no_google):
-    """The check is on both branches of `get_user`: otherwise dummy auth would
-    be the one configuration in which the block does not exist, which is the
-    configuration it gets developed in."""
-    _set_dummy_auth(monkeypatch, True, "alice@unipd.it")
-    client.cookies.clear()
-    # The first request creates the account.
+    """A session minted by the box is a session like any other, so it meets the
+    same `get_user`. There is only one branch there now, and this is what says
+    so from the side dummy auth actually gets developed in."""
+    _set_dummy_auth(client, monkeypatch, True, "alice@unipd.it")
     assert client.get(BEHIND_THE_WALL, follow_redirects=False).status_code == 200
 
     await _block(app_engine, "alice@unipd.it")
@@ -539,44 +547,127 @@ async def test_dummy_auth_is_blocked_too(client, monkeypatch, app_engine, no_goo
 
 
 ########################################################################
-# dummy auth
+# dummy auth: the development sign-in box
 
 
-async def test_dummy_auth_signs_in_with_no_click(
+async def test_the_login_page_offers_the_box_only_under_dummy_auth(
+    client, monkeypatch, no_google
+):
+    import cocco.main as main
+
+    monkeypatch.setattr(main, "DUMMY_AUTH", False)
+    assert "/auth/dummy" not in client.get("/login").text
+
+    monkeypatch.setattr(main, "DUMMY_AUTH", True)
+    response = client.get("/login")
+    assert response.status_code == 200
+    assert "/auth/dummy" in response.text
+    # The cast it names comes from `main`, so it cannot drift from the seed.
+    assert main.DUMMY_ADMIN in response.text
+
+
+async def test_the_box_signs_in_and_creates_the_account(
     client, monkeypatch, app_engine, no_google
 ):
-    """No cookie, no credentials, no login page - and it works against an empty
-    database, creating the account on the way."""
-    _set_dummy_auth(monkeypatch, True, "alice@unipd.it")
-    client.cookies.clear()
+    """It works against an empty database, creating the account on the way -
+    with no enrollments, which is exactly what a first real sign-in gets."""
+    _set_dummy_auth(client, monkeypatch, True)
 
-    assert client.get(BEHIND_THE_WALL, follow_redirects=False).status_code != 303
+    response = client.post(
+        "/auth/dummy", data={"email": "alice@unipd.it"}, follow_redirects=False
+    )
+    assert response.status_code == 303
+    assert client.get(BEHIND_THE_WALL, follow_redirects=False).status_code == 200
+
     async with app_engine.connect() as conn:
         row = await query_user_by_email(conn, "alice@unipd.it")
     assert row is not None and row.nickname == "alice"
 
 
-async def test_dummy_auth_honours_cocco_dummy_user(
-    client, monkeypatch, app_engine, no_google
-):
-    _set_dummy_auth(monkeypatch, True, "bob@unipd.it")
-    client.get(BEHIND_THE_WALL, follow_redirects=False)
+async def test_the_box_is_the_only_identity(client, monkeypatch, app_engine, no_google):
+    """Nobody is signed in until somebody types an address: `dummy_auth` on its
+    own is a form, not a session, which is the whole change."""
+    _set_dummy_auth(client, monkeypatch, True)
+    assert client.get(BEHIND_THE_WALL, follow_redirects=False).status_code == 303
 
+    _set_dummy_auth(client, monkeypatch, True, "bob@unipd.it")
     async with app_engine.connect() as conn:
         assert await query_user_by_email(conn, "bob@unipd.it") is not None
         assert await query_user_by_email(conn, "alice@unipd.it") is None
 
 
-async def test_dummy_auth_skips_the_login_page(client, monkeypatch, no_google):
-    _set_dummy_auth(monkeypatch, True)
-    response = client.get("/login?next=/courses/1/2", follow_redirects=False)
-    assert response.status_code == 303
+async def test_the_box_takes_the_next_destination(client, monkeypatch, no_google):
+    _set_dummy_auth(client, monkeypatch, True)
+    response = client.post(
+        "/auth/dummy",
+        data={"email": "alice@unipd.it", "next": "/courses/1/2"},
+        follow_redirects=False,
+    )
     assert response.headers["location"] == "/courses/1/2"
 
-    # And there is no flow to start either.
-    response = client.get("/auth/google", follow_redirects=False)
-    assert response.status_code == 303
+
+async def test_a_hostile_next_on_the_box_is_filtered(client, monkeypatch, no_google):
+    """`safe_next_path`, like every other destination in the app."""
+    _set_dummy_auth(client, monkeypatch, True)
+    response = client.post(
+        "/auth/dummy",
+        data={"email": "alice@unipd.it", "next": "https://evil.test/phish"},
+        follow_redirects=False,
+    )
     assert response.headers["location"] == "/"
+
+
+async def test_the_box_refuses_an_address_outside_the_allowed_domains(
+    client, monkeypatch, app_engine, no_google
+):
+    """The gate the Google callback applies, applied here too - `dummy_auth`
+    skips proving the address, not the rules about which addresses there are."""
+    _set_dummy_auth(client, monkeypatch, True)
+    response = client.post(
+        "/auth/dummy", data={"email": "someone@example.test"}, follow_redirects=False
+    )
+    assert response.status_code == 403
+    assert "not an institutional address" in response.text
+
+    async with app_engine.connect() as conn:
+        assert await query_user_by_email(conn, "someone@example.test") is None
+
+
+async def test_the_box_refuses_an_empty_address(client, monkeypatch, no_google):
+    """A defaulted `Form` field rather than a required one: a 422 would be a
+    page with nothing on it for the person looking at the box."""
+    _set_dummy_auth(client, monkeypatch, True)
+    response = client.post("/auth/dummy", data={}, follow_redirects=False)
+    assert response.status_code == 400
+    assert "email address is required" in response.text
+
+
+async def test_the_box_refuses_a_blocked_account(
+    client, monkeypatch, app_engine, no_google
+):
+    """Refused at the door rather than on the first click, which is the reason
+    the Google callback checks it too - and now the one reason, once."""
+    _set_dummy_auth(client, monkeypatch, True, "alice@unipd.it")
+    await _block(app_engine, "alice@unipd.it")
+
+    response = client.post(
+        "/auth/dummy", data={"email": "alice@unipd.it"}, follow_redirects=False
+    )
+    assert response.status_code == 403
+    assert "This account is blocked" in response.text
+    assert "spamming the judge" in response.text
+
+
+async def test_the_box_is_not_there_at_all_without_dummy_auth(client, monkeypatch):
+    """A hidden form is presentation and never the check: the route itself
+    refuses, and with a 404, so a deployment does not admit it exists."""
+    import cocco.main as main
+
+    monkeypatch.setattr(main, "DUMMY_AUTH", False)
+    response = client.post(
+        "/auth/dummy", data={"email": "alice@unipd.it"}, follow_redirects=False
+    )
+    assert response.status_code == 404
 
 
 ########################################################################
@@ -645,7 +736,7 @@ async def test_a_non_member_is_refused_a_courses_contents(
     client, monkeypatch, no_google, a_course
 ):
     """The gate itself: signed in is not enough, enrollment is the check."""
-    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "dave@unipd.it")
     ours, _ = a_course
 
     for method, url in _gated_urls(ours["course_id"], ours["challenge_id"]):
@@ -661,7 +752,7 @@ async def test_staff_of_one_course_are_not_staff_of_another(
     stranger everywhere they were not enrolled."""
     ours, theirs = a_course
     await _enroll(app_engine, "alice@unipd.it", ours["course_id"], UserRole.teacher)
-    _set_dummy_auth(monkeypatch, True, "alice@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "alice@unipd.it")
 
     for method, url in _gated_urls(theirs["course_id"], theirs["challenge_id"]):
         assert getattr(client, method)(url).status_code == 403, url
@@ -676,7 +767,7 @@ async def test_a_member_cannot_reach_another_courses_challenge_through_their_own
     is a URL for a challenge that does not exist under that course - 404."""
     ours, theirs = a_course
     await _enroll(app_engine, "dave@unipd.it", ours["course_id"], UserRole.student)
-    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "dave@unipd.it")
 
     smuggled = f"/courses/{ours['course_id']}/{theirs['challenge_id']}"
     assert client.get(smuggled).status_code == 404
@@ -748,7 +839,7 @@ async def test_the_course_page_previews_for_a_non_member(
     """The one deliberate hole in the gate: the course page is where a link
     from the home page lands and where the way in lives, so it shows the title,
     the description and `Enroll!` - and nothing of the contents."""
-    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "dave@unipd.it")
     ours, _ = a_course
 
     response = client.get(f"/courses/{ours['course_id']}")
@@ -767,7 +858,7 @@ async def test_enrolling_from_the_preview_comes_back_to_the_course(
 ):
     """`next` is what turns the preview into the course page, and it is
     filtered like every other destination in the app."""
-    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "dave@unipd.it")
     ours, _ = a_course
     course_url = f"/courses/{ours['course_id']}"
 
@@ -794,7 +885,7 @@ async def test_enrolling_from_the_preview_comes_back_to_the_course(
 async def test_a_hostile_next_on_enrolling_is_filtered(
     client, monkeypatch, no_google, a_course
 ):
-    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "dave@unipd.it")
     ours, _ = a_course
 
     response = client.post(
@@ -809,7 +900,7 @@ async def test_a_refusal_is_a_page_not_json(
 ):
     """These are URLs an ordinary visitor can now reach by clicking, so the
     answer has to be readable."""
-    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "dave@unipd.it")
     ours, _ = a_course
 
     response = client.get(f"/courses/{ours['course_id']}/{ours['challenge_id']}")
@@ -861,7 +952,7 @@ async def test_a_wrong_enrollment_key_enrolls_nobody(
     """Including the empty one, and including a differently cased one: the key
     is a string the teacher chose, so deciding that case does not count is not
     ours to make."""
-    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "dave@unipd.it")
     url = f"/courses/{a_locked_course}/enroll"
 
     response = client.post(url, data={"key": attempt, "next": "/courses/1"})
@@ -873,7 +964,7 @@ async def test_a_wrong_enrollment_key_enrolls_nobody(
 async def test_the_right_enrollment_key_enrolls(
     client, monkeypatch, no_google, a_locked_course, app_engine
 ):
-    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "dave@unipd.it")
     course_url = f"/courses/{a_locked_course}"
 
     response = client.post(
@@ -892,7 +983,7 @@ async def test_a_pasted_enrollment_key_is_trimmed(
 ):
     """A key read off a slide arrives with whitespace around it, and that is
     not the student getting it wrong."""
-    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "dave@unipd.it")
     course_url = f"/courses/{a_locked_course}"
 
     response = client.post(
@@ -911,7 +1002,7 @@ async def test_a_course_without_a_key_asks_for_none(
     """The open path is untouched: no `key` field is sent at all, and nothing
     demands one. Posted with `next`, as the preview does, because the home
     page's answer is the courses fragment and that is a `json_agg` query."""
-    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "dave@unipd.it")
     ours, _ = a_course
     course_url = f"/courses/{ours['course_id']}"
 
@@ -928,7 +1019,7 @@ async def test_the_preview_asks_for_the_key_and_never_shows_it(
 ):
     """The page is served to people who have not proved they know the key, so
     `query_course` reports `requires_key` and nothing more."""
-    _set_dummy_auth(monkeypatch, True, "dave@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "dave@unipd.it")
 
     response = client.get(f"/courses/{a_locked_course}")
     assert response.status_code == 200
@@ -944,7 +1035,7 @@ async def test_the_editor_saves_and_clears_the_key(
     the course rather than setting a key nobody can type."""
     ours, _ = a_course
     await _enroll(app_engine, "alice@unipd.it", ours["course_id"], UserRole.teacher)
-    _set_dummy_auth(monkeypatch, True, "alice@unipd.it")
+    _set_dummy_auth(client, monkeypatch, True, "alice@unipd.it")
     url = f"/courses/{ours['course_id']}/edit"
     saved = {"title": "Algorithms 101", "description": "About it."}
 

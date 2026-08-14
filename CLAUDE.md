@@ -39,7 +39,7 @@ The web app and the judge are **separate processes** that must agree on three th
 
 **Configuration is split in two, and the line is one sentence: the file is settings, the environment is secrets.** `cocco/config.py` is where both halves are read — its own module rather than a corner of `auth.py`, because the judge reads it too and a database URL is none of sign-in's business. The file carries `[database] url`, `[storage] root`, `[judge] flake`, `[session]`, `[auth]`, `[site]` and `[dev]`; the three secrets — `COCCO_SECRET_KEY`, `COCCO_GOOGLE_CLIENT_ID`, `COCCO_GOOGLE_CLIENT_SECRET` — have **no file spelling at all**, so there is no precedence to reason about and nothing secret in a file that gets copied, diffed and pasted into a bug report. `COCCO_CONFIG` is the exception that proves the rule: it names the file, so it is the one setting that cannot be written in one.
 
-There are **two files**, and which one you get is `COCCO_CONFIG`. `cocco.dev.toml` is **committed**: it is secret-free by construction, and `just dev` points at it. `cocco.toml` is gitignored and is a deployment's own; `cocco.example.toml` is its commented template. **A missing file is still not an error** — and now says more than it did, because `DEFAULT_DATABASE_URL` is the empty `postgresql+psycopg://`, which libpq resolves from `PGUSER`/`PGDATABASE`/`PGHOST`. That is deliberate and is what lets a file in git avoid naming the devShell's socket, whose path is `$PWD/.pg/sock`. It also means importing `cocco.main` needs no environment and no file at all, so the unit tests run outside the dev shell. A setting left in its old place — a `COCCO_DUMMY_AUTH` in the shell, a `secret_key` in the file — is **warned about, not ignored**: `_warn_about_removed_settings` names the old spelling and the new one, and only warns, because a stale variable must not stop the app from booting. `[dev] dummy_auth` is what makes a fresh checkout usable at all, and `[auth] administrators` is where a deployment's first administrators are listed (a bootstrap — see "Authorization").
+There are **two files**, and which one you get is `COCCO_CONFIG`. `cocco.dev.toml` is **committed**: it is secret-free by construction, and `just dev` points at it. `cocco.toml` is gitignored and is a deployment's own; `cocco.example.toml` is its commented template. **A missing file is still not an error** — and now says more than it did, because `DEFAULT_DATABASE_URL` is the empty `postgresql+psycopg://`, which libpq resolves from `PGUSER`/`PGDATABASE`/`PGHOST`. That is deliberate and is what lets a file in git avoid naming the devShell's socket, whose path is `$PWD/.pg/sock`. It also means importing `cocco.main` needs no environment and no file at all, so the unit tests run outside the dev shell. A setting left in its old place — a `COCCO_DUMMY_AUTH` in the shell, a `secret_key` in the file — is **warned about, not ignored**: `_warn_about_removed_settings` names the old spelling and the new one, and only warns, because a stale variable must not stop the app from booting. `dummy_user` is the third kind and has its own sentence there: it did not move, it was **deleted**, so there is no "it is X now" to print — the answer is that `/login` asks. `[dev] dummy_auth` is what makes a fresh checkout usable at all, and `[auth] administrators` is where a deployment's first administrators are listed (a bootstrap — see "Authorization").
 
 ## Architecture
 
@@ -309,26 +309,38 @@ the return from Google is a top-level cross-site navigation, and under `"strict"
 carrying the `state` would not reach the callback, so every sign-in would fail as a state
 mismatch.
 
-**`[dev] dummy_auth` bypasses all of it.** `get_user` is the only place that branches on it,
-and it signs every request in as `[dev] dummy_user` (default `matteo.ceccarello@unipd.it`, the
-seed's administrator, so a fresh checkout can create a course) with no cookie, no
-click and no credentials — creating the account if it is missing, so it works against an empty
-database. `/login` and `/auth/google` merely redirect, and `/logout` is a no-op. Setting it on a
-public deployment is equivalent to publishing the admin password. The seeded cast is
-`matteo.ceccarello@unipd.it` and `alice@unipd.it` (`teacher` on every course) and `bob@unipd.it`
-and `charlie@unipd.it` (students). Matteo and Alice differ in one thing only: he is a **site
-administrator**, a row in `administrator` rather than a role anywhere, which is why a fresh
-checkout can create a course. `create_db_and_tables` seeds him whenever dummy auth is on — a file
-every checkout shares should not name one person as the administrator of all of them, so
-`cocco.dev.toml` deliberately lists none and this is what keeps the checkout usable — and
-deliberately seeds `DUMMY_ADMIN` rather than `DUMMY_USER`, so `dummy_user = "alice@unipd.it"`
-still shows what plain course staff may do instead of quietly promoting her.
+**`[dev] dummy_auth` is a sign-in, not a bypass, and that is the whole of its design.** It puts a
+text box on `/login`; `post_auth_dummy` takes the address typed into it and mints an ordinary
+session, so everything downstream — the cookie, `get_user`, the block — is the **one** code path
+Google's callback also lands on. It replaced a shortcut that signed every request in as an address
+named in the file (`[dev] dummy_user`, now removed and warned about in both its spellings), which
+made `get_user` two functions and meant seeing what a student sees was an edit and a restart — on
+an app whose every permission is per course, so hopping between the seeded cast is the commonest
+thing one does while developing it. Setting it on a public deployment is equivalent to publishing
+every account's password.
 
-`main.DUMMY_AUTH` and `main.DUMMY_USER` are derived from `CONFIG.dev` **once, at import, and stay
-module-level names** — `get_user` and `create_db_and_tables` read those rather than `CONFIG.dev`,
-because that is the seam five test files sign themselves in through, some of them switching who is
-signed in halfway through a test. A frozen dataclass field has no equivalent, so this is not a
-tidy-up waiting to happen.
+Three consequences follow. The box **reuses the real rules**: `_complete_sign_in` holds the
+allowlist check, `get_or_create_user` and the blacklist refusal, and the Google callback calls the
+same function — a rule the browser enforced and the box did not would be a difference nobody could
+explain, and the box is the configuration all of this gets developed in. `post_auth_dummy`
+answers **404** when the switch is off, not 403, so a deployment does not admit the route exists;
+hiding the form is presentation and never the check. And `/logout` now goes somewhere: it lands on
+the box, which is how you become somebody else.
+
+The seeded cast is `matteo.ceccarello@unipd.it` and `alice@unipd.it` (`teacher` on every course)
+and `bob@unipd.it` and `charlie@unipd.it` (students); `_login_page` passes those names to the
+template so the box can print them and they cannot drift from `_populate_dummy_data`. Matteo and
+Alice differ in one thing only: he is a **site administrator**, a row in `administrator` rather
+than a role anywhere, which is why a fresh checkout can create a course. `create_db_and_tables`
+seeds him whenever dummy auth is on — a file every checkout shares should not name one person as
+the administrator of all of them, so `cocco.dev.toml` deliberately lists none and this is what
+keeps the checkout usable — and seeds only him, so typing `alice@unipd.it` still shows what plain
+course staff may do instead of quietly promoting her.
+
+`main.DUMMY_AUTH` is derived from `CONFIG.dev` **once, at import, and stays a module-level name** —
+`post_auth_dummy`, `_login_page` and `create_db_and_tables` read it rather than `CONFIG.dev`,
+because that is the seam six test files flip. A frozen dataclass field has no equivalent, so this
+is not a tidy-up waiting to happen.
 
 ### Authorization
 
@@ -397,14 +409,16 @@ That absence is load-bearing, and two guards follow from it. **An administrator 
 — enforced inside `block_user`'s `WHERE` clause, not by a check before the write, so an
 appointment cannot land between the two — and **a blocked address is never appointed**. Either one
 alone would leave a way to make an administrator who cannot sign in and cannot be unmade. It is
-also what keeps `just dev` safe: `[dev] dummy_user` defaults to the seeded administrator. The two
+also what keeps `just dev` safe: the seeded administrator is the address a developer types into the
+sign-in box, and blocking him is how a checkout locks itself out. The two
 escape hatches belong side by side: `DELETE FROM administrator WHERE email = '…';` and
 `UPDATE "user" SET blocked_at = NULL WHERE email = '…';`
 
-**The block is enforced in `get_user`, on both branches** — including the `DUMMY_AUTH` one, or
-dummy auth would be the single configuration in which the feature does not exist, which is the
-configuration it gets developed in — and again in the Google callback, so a blocked person gets a
-sentence on the page they are looking at instead of a session that dies on the first click.
+**The block is enforced in `get_user`** — which has one branch, since dummy auth is a session like
+any other — and again in `_complete_sign_in`, so a blocked person gets a sentence on the page they
+are looking at instead of a session that dies on the first click. That second check is shared by
+both ways in, Google's callback and the development box, which is what stops dummy auth being the
+single configuration in which the feature does not exist — the configuration it gets developed in.
 `Blocked` is a `Forbidden` subclass, so it stays a page and would degrade to `403.jinja` if its
 handler were ever removed; `handle_blocked` renders `blocked.jinja` with **no viewer at all**,
 because the navbar's avatar is itself behind `CurrentUser` and would 403 into a broken image on the
@@ -487,10 +501,13 @@ second opinion — and `_check_evaluator_source` is the size/extension/UTF-8 cha
 nobody could explain.
 
 **Authentication is `ApiUser`, and it is the one identity in the app that is not a cookie.**
-`get_api_user` tries `DUMMY_AUTH` first (so the CLI works against `just dev` with nothing minted,
-and so the block exists in the configuration the feature gets developed in), then `Authorization:
-Bearer`, then the session — that last so a signed-in browser can follow a plain link to an export
-URL, and safe on the mutating half for the reason every other POST here is, `same_site="lax"`. A
+`get_api_user` tries `Authorization: Bearer`, then the session — that last so a signed-in browser
+can follow a plain link to an export URL, and safe on the mutating half for the reason every other
+POST here is, `same_site="lax"`. There is deliberately **no `DUMMY_AUTH` branch**, and there was
+one: it came first and signed every API call in as the configured address, which meant a bearer
+token presented to a `just dev` server was silently *ignored* — the one configuration in which the
+header this function is mostly about did nothing. The cost is that `cocco pull` against `just dev`
+now needs a token like anywhere else: mint one on the profile page and put it in `COCCO_TOKEN`. A
 refusal is `ApiNotAuthenticated`, a plain `HTTPException(401)`, deliberately **not**
 `NotAuthenticated`: that class is not an `HTTPException` precisely so its handler can choose between
 a 303 and an `HX-Redirect`, and a CLI following the 303 would be handed a login page with a 200 on
@@ -535,7 +552,7 @@ though that zip came from our own server.
 - **An isolate box is one flat directory.** `isolate_run` copies every path argument in under its *basename*, so unrelated paths collapse into one namespace, and the copy order — `box_files`, then `args`, then `additional_files` — decides who wins a collision. `box_files` is the explicit form and the only safe one when more than one file is involved: the evaluator gets its three arguments as `.actual_output`, `.expected_output` and `.test_input`, names nothing can collide with because `safe_filename` strips leading dots from every upload. Without it, a checker uploaded as `expected_output.c` compiles to a binary named `expected_output` that lands on top of the expected output it was meant to read.
 - **Scores are per test case, in `[0, 1]`.** A submission's headline score is the mean of its outcomes' scores, shown out of 100. This aggregation assumes higher-is-better, so it is wrong for a challenge whose evaluator uses another scale — nothing enforces the range, and an evaluator is free to return any finite float.
 - **The leaderboard's criterion is per challenge.** `challenge.ranking` is set by course staff in the editor and drives `query_challenge_leaderboard`, whose three variants live in `_LEADERBOARD_CRITERIA` as literal SQL keyed by the enum — the criterion is never taken from a request as text. `running_time` is the strict board: a submission is on it only if it passed *every* test, ranked by the sum of the per-test times. `total_score` and `average_score` rank by score, descending, and deliberately admit partially correct submissions, because a partial-credit evaluator is the case where nobody passes everything; both assume higher-is-better and so are wrong for an evaluator that is not, same as the headline score. Whichever the criterion, a student appears once, represented by their best submission, and every row carries all three metrics plus `n_tests` so the fragment can render the one that applies.
-- **A block stops a person, it does not retract their work.** The judge grades a blocked student's queued submissions — `pull_queued_submission` does not know who submitted and should not learn: skipping those rows would strand them as `queued` forever, showing as pending in every teacher's standings and muddying the `count_running_submissions` check that guards a regrade. Standings and leaderboards go on listing them for the same reason: they are the record of what happened on a course, and it did happen. Nothing blocked is seeded either — a blocked `[dev] dummy_user` would lock a developer out of their own fresh checkout, which is exactly the trap "an administrator is never blocked" exists to avoid. **Removing an enrollment draws the same line**: `delete_enrollment` takes one row and nothing else, so the person loses access to the course and drops out of its standings, while every submission, outcome and leaderboard entry stays exactly where it was — `submission.user_id` has no `ON DELETE` tie to `enrollment`, and `query_challenge_standings`'s cohort is already a union with everyone who submitted. The confirmation on the people page says so in as many words.
+- **A block stops a person, it does not retract their work.** The judge grades a blocked student's queued submissions — `pull_queued_submission` does not know who submitted and should not learn: skipping those rows would strand them as `queued` forever, showing as pending in every teacher's standings and muddying the `count_running_submissions` check that guards a regrade. Standings and leaderboards go on listing them for the same reason: they are the record of what happened on a course, and it did happen. Nothing blocked is seeded either — a blocked seeded administrator would lock a developer out of their own fresh checkout the moment they typed him into the sign-in box, which is exactly the trap "an administrator is never blocked" exists to avoid. **Removing an enrollment draws the same line**: `delete_enrollment` takes one row and nothing else, so the person loses access to the course and drops out of its standings, while every submission, outcome and leaderboard entry stays exactly where it was — `submission.user_id` has no `ON DELETE` tie to `enrollment`, and `query_challenge_standings`'s cohort is already a union with everyone who submitted. The confirmation on the people page says so in as many words.
 - **A hidden test case gives away nothing but its verdict.** `visible_outcomes` in `main.py` blanks an outcome's `message`, `stdout` and `stderr` unless the test case is a public sample or the viewer is course staff: `stdout`/`stderr` are the submitted program's own output — the obvious way to print a hidden input back out — and `message` is now written by a *teacher's script that has just read the hidden input and the expected output*, which makes the rule matter more, not less — `diff.py` puts the expected output in it verbatim. The verdict, the score and the resource usage are always shown. Compiler output is exempt, and has its own block on the submission page: it does not depend on any test input. Redact in that function, not in the template, so the rule stays unit testable.
 - **An anonymous htmx request gets `HX-Redirect`, not a 302.** `get_user` raises `NotAuthenticated` rather than returning a redirect — a dependency cannot return a `Response` — and the handler branches on the `HX-Request` header. This matters because most of the app is `f-*` fragments polled every few seconds: htmx follows a redirect inside the XHR, so a 302 would splice the whole login page into whatever div was polling, over and over. A 204 with `HX-Redirect` navigates the browser instead.
 - **A secret has one source, and never a fixed default.** The source is the environment — `COCCO_SECRET_KEY`, `COCCO_GOOGLE_CLIENT_ID`, `COCCO_GOOGLE_CLIENT_SECRET` — and there is no file spelling for any of them, so there is no precedence to get wrong and nothing secret in a file that gets copied, diffed and committed by mistake. It is also what makes `cocco.dev.toml` committable at all. With `COCCO_SECRET_KEY` unset, `load_config` generates a random key per process and logs a warning: an unconfigured deployment then logs everybody out on every restart and no two workers agree, which is loud. A constant in the source tree would be a signing key that ships with the code, which is silent.

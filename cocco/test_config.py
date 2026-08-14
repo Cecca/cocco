@@ -54,7 +54,6 @@ def test_load_config_without_a_file(tmp_path):
     assert config.storage.root == DEFAULT_STORAGE_ROOT
     assert config.judge.flake == DEFAULT_FLAKE_REF
     assert config.dev.dummy_auth is False
-    assert config.dev.dummy_user is None
     assert config.dev.reset_db is False
 
 
@@ -196,11 +195,10 @@ def test_the_judge_flake_defaults_to_the_working_directory(tmp_path, body):
 def test_the_dev_table_is_read(tmp_path):
     path = tmp_path / "cocco.toml"
     path.write_text(
-        '[dev]\ndummy_auth = true\ndummy_user = "alice@unipd.it"\nreset_db = true\n'
+        "[dev]\ndummy_auth = true\nreset_db = true\n"
     )
     dev = load_config(path).dev
     assert dev.dummy_auth is True
-    assert dev.dummy_user == "alice@unipd.it"
     assert dev.reset_db is True
 
 
@@ -214,7 +212,6 @@ def test_dev_is_off_unless_the_file_says_so(tmp_path):
     )
     dev = load_config(path).dev
     assert dev.dummy_auth is False
-    assert dev.dummy_user is None
     assert dev.reset_db is False
 
 
@@ -277,7 +274,6 @@ def test_an_administrator_who_could_never_sign_in_is_flagged(tmp_path, caplog):
     "variable,replacement",
     [
         ("COCCO_DUMMY_AUTH", "dummy_auth"),
-        ("COCCO_DUMMY_USER", "dummy_user"),
         ("COCCO_RESET_DB", "reset_db"),
         ("COCCO_STORAGE", "root"),
     ],
@@ -293,6 +289,27 @@ def test_a_setting_left_in_the_environment_is_named_out_loud(
         load_config(tmp_path / "absent.toml")
     assert variable in caplog.text
     assert replacement in caplog.text
+
+
+def test_dummy_user_is_named_out_loud_in_both_of_its_spellings(
+    tmp_path, monkeypatch, caplog
+):
+    """The third kind of removed setting: it moved nowhere, it was deleted.
+    Somebody with either spelling left behind is expecting to be signed in as
+    one particular person, and going quiet would let them browse as whoever the
+    box last minted a session for."""
+    path = tmp_path / "cocco.toml"
+    path.write_text('[dev]\ndummy_auth = true\ndummy_user = "alice@unipd.it"\n')
+    monkeypatch.setenv("COCCO_DUMMY_USER", "bob@unipd.it")
+
+    with caplog.at_level("WARNING", logger="cocco.config"):
+        config = load_config(path)
+
+    assert "COCCO_DUMMY_USER" in caplog.text
+    assert "[dev] dummy_user" in caplog.text
+    assert "/login asks" in caplog.text
+    # Warned about, never applied - and the rest of `[dev]` is still read.
+    assert config.dev.dummy_auth is True
 
 
 def test_the_postgres_variables_are_not_warned_about(tmp_path, monkeypatch, caplog):

@@ -98,7 +98,11 @@ async def world(app_engine):
 
 
 @pytest.fixture
-def client(app_engine, monkeypatch):
+def client(app_engine, world, monkeypatch):
+    # `world` is a dependency rather than an argument of the tests alone,
+    # because signing in *creates* the account if it is missing: without the
+    # ordering, the fixture would insert alice a moment before the seed does and
+    # the seed would trip over its own unique index.
     import cocco.main as main
 
     async def _get_db():
@@ -107,24 +111,26 @@ def client(app_engine, monkeypatch):
 
     main.app.dependency_overrides[main.get_db] = _get_db
     monkeypatch.setattr(main, "DUMMY_AUTH", True)
-    monkeypatch.setattr(main, "DUMMY_USER", ADMIN)
 
     # Not `with TestClient(...)`: entering the context runs the startup event,
     # which reaches for the real Postgres engine.
     client = TestClient(main.app)
+    _sign_in_as(client, ADMIN)
     yield client
     main.app.dependency_overrides.clear()
 
 
-def _sign_in_as(monkeypatch, email: str):
-    import cocco.main as main
-
-    monkeypatch.setattr(main, "DUMMY_USER", email)
+def _sign_in_as(client, email: str):
+    """Become somebody else. Dummy auth is a real session now, so this is a
+    request rather than a monkeypatch, and `_sign_in` clears the old session
+    before writing the new id - no identity leaks into the next one."""
+    response = client.post("/auth/dummy", data={"email": email}, follow_redirects=False)
+    assert response.status_code == 303, response.text
 
 
 async def test_the_admin_page_is_administrators_only(client, world, monkeypatch):
     for email in (TEACHER, STUDENT):
-        _sign_in_as(monkeypatch, email)
+        _sign_in_as(client, email)
         for method, url, data in _admin_urls(world["bob"]):
             response = (
                 client.get(url) if method == "get" else client.post(url, data=data)
@@ -137,7 +143,7 @@ async def test_the_refusal_names_the_permission_not_a_course(
 ):
     """`Admin` guards two things now. A sentence about creating a course would
     be the wrong one on half of them, and wronger still on a third."""
-    _sign_in_as(monkeypatch, TEACHER)
+    _sign_in_as(client, TEACHER)
     response = client.get("/admin")
     assert response.status_code == 403
     assert "Only a site administrator can do that." in response.text
@@ -183,9 +189,9 @@ async def pg_client(monkeypatch, postgres_url):
 
     main.app.dependency_overrides[main.get_db] = _get_db
     monkeypatch.setattr(main, "DUMMY_AUTH", True)
-    monkeypatch.setattr(main, "DUMMY_USER", ADMIN)
 
     client = TestClient(main.app)
+    _sign_in_as(client, ADMIN)
     yield client, sync_engine
     main.app.dependency_overrides.clear()
     await engine.dispose()

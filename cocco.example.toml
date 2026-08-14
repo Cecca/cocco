@@ -129,6 +129,7 @@ allowed_domains = ["unipd.it"]
 # base_url = "https://cocco.example.org"
 
 # There is deliberately no [dev] table here. It carries `dummy_auth`, which
-# bypasses authentication entirely, `dummy_user`, and `reset_db`, which drops
-# every table on startup - so they live together under one name a deployment's
-# config file can be read for the *absence* of. See `cocco.dev.toml`.
+# puts a box on the login page that signs you in as whatever address you type -
+# no password, no Google, anyone as anyone - and `reset_db`, which drops every
+# table on startup. They live together under one name a deployment's config file
+# can be read for the *absence* of. See `cocco.dev.toml`.

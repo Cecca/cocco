@@ -27,15 +27,17 @@ url = "postgresql+psycopg://"
 root = "/tmp/cocco-storage"
 
 [dev]
-# No Google, no click, no credentials: every request is signed in. This is what
-# makes a fresh checkout usable at all, and on anything public it is equivalent
-# to publishing the admin password.
+# No Google and no credentials: /login grows a box, and whatever address you
+# type into it is who you are. This is what makes a fresh checkout usable at
+# all, and on anything public it is equivalent to publishing every password.
+#
+# Who to type. The seed gives you matteo.ceccarello@unipd.it, the site
+# administrator, who can create a course; alice@unipd.it, a plain teacher on
+# every seeded course, which is how to see what course staff see; and
+# bob@unipd.it and charlie@unipd.it, students. Anything else in an accepted
+# domain gets a fresh account with no enrollments - a first sign-in, exactly.
+# Sign out to change your mind; that is the whole point of the box.
 dummy_auth = true
-
-# Who you are. Unset means the seed's site administrator, so a fresh checkout
-# can create a course; alice@unipd.it is a plain teacher on every seeded
-# course, which is the way to see what course staff see.
-# dummy_user = "alice@unipd.it"
 
 # Drops every table and reseeds the dummy data on startup. False, and it has to
 # be: `fastapi dev` reloads on every file change, and each reload would wipe

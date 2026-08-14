@@ -13,6 +13,39 @@
       <div class="alert alert-error text-sm">{{ error }}</div>
       {% endif %}
 
+      {# The development sign-in: type an address, be that person. `[dev]
+         dummy_auth` and nothing else puts this here, and `post_auth_dummy`
+         404s without it - a hidden form is presentation, never the check. #}
+      {% if dummy_auth %}
+      <div class="alert alert-warning text-sm flex-col items-start gap-1">
+        <span class="font-semibold">Development sign-in</span>
+        <span>
+          <code>[dev] dummy_auth</code> is on, so anyone may sign in as anyone
+          here, with no password and no Google. Never turn this on in public.
+        </span>
+      </div>
+      <form method="post" action="{{ url_for('post_auth_dummy') }}"
+            class="flex flex-col gap-2">
+        <input type="hidden" name="next" value="{{ next }}">
+        <label class="form-control">
+          <span class="label-text text-sm">Sign in as</span>
+          <input type="email" name="email" autofocus required
+                 class="input input-bordered w-full"
+                 placeholder="{{ dummy_admin }}">
+        </label>
+        <button type="submit" class="btn btn-primary w-full">Sign in</button>
+      </form>
+      <p class="text-xs opacity-60">
+        The seeded cast: <code>{{ dummy_admin }}</code> (site administrator),
+        {% for email in dummy_teachers %}<code>{{ email }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+        (teaches every course), and
+        {% for email in dummy_students %}<code>{{ email }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+        (students). Any other address in an accepted domain creates a fresh
+        account with no enrollments.
+      </p>
+      {% if google_configured %}<div class="divider text-xs">or</div>{% endif %}
+      {% endif %}
+
       {% if google_configured %}
       <p class="text-sm opacity-70">
         Sign in with your institutional Google account. There is no password and
@@ -27,14 +60,19 @@
         {% for domain in allowed_domains %}<code>@{{ domain }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
         and their subdomains.
       </p>
-      {% else %}
+      {% elif not dummy_auth %}
+      {# Only when there is no other way in: under `[dev] dummy_auth` the box
+         above is the way in, and this would be a warning about the absence of
+         a thing nobody is looking for. #}
       <div class="alert alert-warning text-sm flex-col items-start gap-1">
         <span class="font-semibold">Google sign-in is not configured</span>
         <span>
-          Set <code>google_client_id</code> and <code>google_client_secret</code>
-          under <code>[auth]</code> in <code>cocco.toml</code> — see
+          Put <code>COCCO_GOOGLE_CLIENT_ID</code> and
+          <code>COCCO_GOOGLE_CLIENT_SECRET</code> in the environment — they have
+          no spelling in <code>cocco.toml</code>; see
           <code>cocco.example.toml</code>. In development, set
-          <code>COCCO_DUMMY_AUTH=1</code> instead.
+          <code>dummy_auth = true</code> under <code>[dev]</code> instead, as
+          <code>cocco.dev.toml</code> does.
         </span>
       </div>
       {% endif %}

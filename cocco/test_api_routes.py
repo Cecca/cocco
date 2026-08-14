@@ -4,10 +4,12 @@ Same harness as `test_challenge_routes.py` - `get_db` overridden with SQLite -
 which works because everything these routes touch is plain Core: the page
 queries with their `json_agg` are deliberately not on this path.
 
-`DUMMY_AUTH` is **False** here, unlike every other route test in the repo. It
-has to be: the thing under test is the bearer token, and dummy auth is the one
-branch of `get_api_user` that never looks at a header. This is the same reason
-`test_auth_routes.py` turns it off to exercise Google.
+Nothing here touches `DUMMY_AUTH`, and it used to have to: the shortcut was the
+first branch of `get_api_user` and never looked at a header, so a bearer token
+presented to a development server was simply ignored - and the header is the
+whole subject of this file. `get_api_user` has no such branch any more; the
+development sign-in is a session like any other, and the session is already the
+last way in here.
 """
 
 import io
@@ -139,7 +141,7 @@ async def world(app_engine, tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def client(app_engine, monkeypatch):
+def client(app_engine):
     import cocco.main as main
 
     async def _get_db():
@@ -147,9 +149,6 @@ def client(app_engine, monkeypatch):
             yield conn
 
     main.app.dependency_overrides[main.get_db] = _get_db
-    # Off, unlike every other route test here: dummy auth is the one branch of
-    # `get_api_user` that never reads a header, and the header is the subject.
-    monkeypatch.setattr(main, "DUMMY_AUTH", False)
 
     client = TestClient(main.app)
     yield client

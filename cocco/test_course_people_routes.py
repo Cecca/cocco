@@ -116,7 +116,11 @@ async def world(app_engine):
 
 
 @pytest.fixture
-def client(app_engine, monkeypatch):
+def client(app_engine, world, monkeypatch):
+    # `world` is a dependency rather than an argument of the tests alone,
+    # because signing in *creates* the account if it is missing: without the
+    # ordering, the fixture would insert alice a moment before the seed does and
+    # the seed would trip over its own unique index.
     import cocco.main as main
 
     async def _get_db():
@@ -125,19 +129,21 @@ def client(app_engine, monkeypatch):
 
     main.app.dependency_overrides[main.get_db] = _get_db
     monkeypatch.setattr(main, "DUMMY_AUTH", True)
-    monkeypatch.setattr(main, "DUMMY_USER", TEACHER)
 
     # Not `with TestClient(...)`: entering the context runs the startup event,
     # which reaches for the real Postgres engine.
     client = TestClient(main.app)
+    _sign_in_as(client, TEACHER)
     yield client
     main.app.dependency_overrides.clear()
 
 
-def _sign_in_as(monkeypatch, email: str):
-    import cocco.main as main
-
-    monkeypatch.setattr(main, "DUMMY_USER", email)
+def _sign_in_as(client, email: str):
+    """Become somebody else. Dummy auth is a real session now, so this is a
+    request rather than a monkeypatch, and `_sign_in` clears the old session
+    before writing the new id - no identity leaks into the next one."""
+    response = client.post("/auth/dummy", data={"email": email}, follow_redirects=False)
+    assert response.status_code == 303, response.text
 
 
 async def test_the_people_page_is_course_staff_only(client, world, monkeypatch):
@@ -146,7 +152,7 @@ async def test_the_people_page_is_course_staff_only(client, world, monkeypatch):
     course in the path exists for."""
     course_id = world["course"]
     for email in (STUDENT, OUTSIDER):
-        _sign_in_as(monkeypatch, email)
+        _sign_in_as(client, email)
         for method, url, data in _people_urls(course_id, world["bob"]):
             response = (
                 client.get(url) if method == "get" else client.post(url, data=data)
@@ -157,7 +163,7 @@ async def test_the_people_page_is_course_staff_only(client, world, monkeypatch):
 async def test_the_refusal_names_the_course_not_the_site(client, world, monkeypatch):
     """`Admin`'s sentence would be the wrong one here: this is a per-course
     permission, and a site administrator passes it without being one."""
-    _sign_in_as(monkeypatch, STUDENT)
+    _sign_in_as(client, STUDENT)
     response = client.get(f"/courses/{world['course']}/people")
     assert response.status_code == 403
     assert "Only this course's staff can do that." in response.text
@@ -255,9 +261,9 @@ async def pg_client(monkeypatch, postgres_url):
 
     main.app.dependency_overrides[main.get_db] = _get_db
     monkeypatch.setattr(main, "DUMMY_AUTH", True)
-    monkeypatch.setattr(main, "DUMMY_USER", TEACHER)
 
     client = TestClient(main.app)
+    _sign_in_as(client, TEACHER)
     yield client, sync_engine, ids
     main.app.dependency_overrides.clear()
     await engine.dispose()
@@ -297,7 +303,7 @@ async def test_an_administrator_is_staff_on_every_course(pg_client, monkeypatch)
     import cocco.main as main
 
     client, engine, ids = pg_client
-    monkeypatch.setattr(main, "DUMMY_USER", ADMIN)
+    _sign_in_as(client, ADMIN)
 
     assert client.get(f"/courses/{ids['course']}/people").status_code == 200
     response = client.post(
@@ -430,7 +436,7 @@ async def test_a_course_never_loses_its_last_teacher(pg_client, monkeypatch):
     import cocco.main as main
 
     client, engine, ids = pg_client
-    monkeypatch.setattr(main, "DUMMY_USER", ADMIN)
+    _sign_in_as(client, ADMIN)
 
     response = client.post(
         f"/courses/{ids['course']}/people/{ids['alice']}/remove", data={}

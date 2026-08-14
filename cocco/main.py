@@ -159,30 +159,25 @@ logger = logging.getLogger(__name__)
 # Google sign-in is unconfigured.
 CONFIG = load_config(config_path())
 
-# The development cast, up here because DUMMY_USER defaults to the admin.
-# Matteo and Alice both teach every seeded course; what separates them is that
-# Matteo is a site administrator - a row in `administrator`, not a role on any
-# enrollment - so he may create courses and is staff on courses nobody enrolled
-# him on. Bob and Charlie are students.
+# The development cast, and the addresses `post_auth_dummy` is there to be
+# typed. Matteo and Alice both teach every seeded course; what separates them is
+# that Matteo is a site administrator - a row in `administrator`, not a role on
+# any enrollment - so he may create courses and is staff on courses nobody
+# enrolled him on. Bob and Charlie are students.
 DUMMY_ADMIN = "matteo.ceccarello@unipd.it"
 DUMMY_TEACHERS = ["alice@unipd.it"]
 DUMMY_STAFF = [DUMMY_ADMIN, *DUMMY_TEACHERS]
 DUMMY_STUDENTS = ["bob@unipd.it", "charlie@unipd.it"]
 
-# Development shortcut: no Google, no click, no credentials. `get_user` is the
-# only place that branches on it, so every route is signed in transparently.
+# Development shortcut: no Google and no credentials. `/login` grows a box, and
+# whatever address is typed into it is signed in - so it is `post_auth_dummy`
+# that branches on this, and `get_user` no longer does. On anything public it is
+# equivalent to publishing every account's password.
 #
-# Derived from the config once, here, and thereafter *these two names* are the
-# app's switch: `get_user` and `create_db_and_tables` read them rather than
-# CONFIG.dev, which is what lets a test sign itself in with
-# `monkeypatch.setattr(main, "DUMMY_USER", ...)` - several of them change who
-# is signed in halfway through. A frozen dataclass field has no such seam, so
-# do not "tidy" these away.
+# Derived from the config once, here, and thereafter *this name* is the app's
+# switch, read rather than `CONFIG.dev`: it is the seam the route tests flip,
+# and a frozen dataclass field has no equivalent. Do not "tidy" it away.
 DUMMY_AUTH = CONFIG.dev.dummy_auth
-# The admin rather than any of the staff: a fresh checkout should be able to
-# create a course, and `[dev] dummy_user = "alice@unipd.it"` is then the way to
-# see what a teacher sees.
-DUMMY_USER = CONFIG.dev.dummy_user or DUMMY_ADMIN
 
 # Root of the app
 app = FastAPI(default_response_class=HTMLResponse)
@@ -421,10 +416,9 @@ async def create_db_and_tables(dummy=False):
             # `cocco.dev.toml` deliberately names no administrator - a file
             # every checkout shares should not make one person the
             # administrator of all of them - and the promise of dummy auth is
-            # that the checkout is usable as it stands. Seeds DUMMY_ADMIN and
-            # deliberately not DUMMY_USER, so `dummy_user = "alice@unipd.it"`
-            # still shows what a plain teacher sees rather than quietly
-            # promoting her.
+            # that the checkout is usable as it stands. Only DUMMY_ADMIN, so
+            # that typing `alice@unipd.it` into the sign-in box still shows what
+            # plain course staff see rather than quietly promoting her.
             await insert_administrators(conn, [DUMMY_ADMIN])
 
 
@@ -783,22 +777,13 @@ async def get_user(request: Request, db: DBDep) -> schema.User:
     included, and this has always run by the time an authorization dependency
     can refuse. The block is checked *before* the stash, deliberately - see
     `handle_blocked`, which wants no viewer at all.
-    """
-    if DUMMY_AUTH:
-        # Development only: there is no sign-in step at all. The address is
-        # resolved on every request rather than stashed in the session, and the
-        # account is created if it is missing, so this works against an empty
-        # database too - with no enrollments, which is exactly what a first
-        # real sign-in gets.
-        user = await get_or_create_user(db, DUMMY_USER)
-        await db.commit()
-        # Checked on this branch too: otherwise dummy auth would be the one
-        # configuration in which the block does not exist, which is the
-        # configuration it gets developed in.
-        _refuse_if_blocked(user)
-        request.state.user = user
-        return user
 
+    There is **one branch**, and that is the point of `post_auth_dummy` being a
+    sign-in rather than a bypass: development used to resolve an address out of
+    the configuration on every request, which made this function two functions
+    and meant every rule here - the block, the stale session, the redirect - had
+    to be written twice and could be got wrong in the half nobody browses in.
+    """
     user_id = request.session.get("user_id")
     if user_id is not None:
         row = await query_user(db, user_id)
@@ -972,6 +957,14 @@ def _login_page(
             "error": error,
             "google_configured": CONFIG.auth.google is not None,
             "allowed_domains": CONFIG.auth.allowed_domains,
+            # Draws the development sign-in box. See `post_auth_dummy`.
+            "dummy_auth": DUMMY_AUTH,
+            # The seeded cast, so the box can say who there is to be. Passed
+            # from here rather than spelled in the template, which is what stops
+            # it drifting from the addresses `_populate_dummy_data` writes.
+            "dummy_admin": DUMMY_ADMIN,
+            "dummy_teachers": DUMMY_TEACHERS,
+            "dummy_students": DUMMY_STUDENTS,
         },
     )
 
@@ -982,6 +975,57 @@ def _sign_in(request: Request, user: schema.User, next_path: str):
     request.session.clear()
     request.session["user_id"] = user.id
     return RedirectResponse(next_path, status_code=303)
+
+
+async def _complete_sign_in(
+    request: Request, db: AsyncConnection, email: str, next_path: str
+):
+    """Everything between a proved address and a session, for both of the ways
+    an address is proved.
+
+    Google's callback proves one by verifying an ID token; `post_auth_dummy`
+    "proves" one by being development. What has to happen next is the same three
+    rules either way - the domain allowlist, the account, the blacklist - and
+    they are written here once rather than restated at each end, the way
+    `_challenge_fields` is shared by the three forms that build a challenge. A
+    rule the browser enforced and the box did not would be a difference nobody
+    could explain, and the box is the configuration this all gets developed in.
+
+    The address must already be through `normalize_email`: canonicalizing it is
+    each caller's, because the sentence for an unusable one differs - Google
+    returning no address is not the same event as an empty text box.
+    """
+    if not is_allowed_email(email, CONFIG.auth.allowed_domains):
+        logger.info("refused a sign-in from outside the allowed domains: %s", email)
+        domains = ", ".join("@" + d for d in CONFIG.auth.allowed_domains)
+        return _login_page(
+            request,
+            next_path=next_path,
+            error=(
+                f"{email} is not an institutional address. "
+                f"Sign in with your {domains} account."
+            ),
+            status_code=403,
+        )
+
+    user = await get_or_create_user(db, email)
+    await db.commit()
+
+    if user.blocked_at is not None:
+        # Refused here as well as in `get_user`, and after the domain check so
+        # that the permanent reason keeps precedence. Without this the sign-in
+        # succeeds and dies on the first click, on a page they did not ask for;
+        # this way the sentence arrives on the page they are already looking at.
+        # `get_or_create_user` created nothing above - a blocked account exists.
+        logger.info("refused a sign-in from a blocked account: %s", email)
+        return _login_page(
+            request,
+            next_path=next_path,
+            error=f"This account is blocked. {user.blocked_reason or ''}".strip(),
+            status_code=403,
+        )
+
+    return _sign_in(request, user, next_path)
 
 
 def _prune_stale_oauth_state(request: Request) -> None:
@@ -998,11 +1042,47 @@ def _prune_stale_oauth_state(request: Request) -> None:
 
 @app.get("/login")
 async def get_login(request: Request, next: str = "/"):
+    return _login_page(request, next_path=safe_next_path(next))
+
+
+@app.post("/auth/dummy")
+async def post_auth_dummy(
+    request: Request,
+    db: DBDep,
+    email: str = Form(""),
+    next: str = Form("/"),
+):
+    """Sign in as whoever was typed. Development only, and hard-refused
+    otherwise.
+
+    This is the whole of `[dev] dummy_auth`. It replaces a shortcut that signed
+    every request in as one address named in the configuration file, which meant
+    that seeing what a student sees was an edit and a restart - on an app whose
+    every permission is per course, so hopping between the seeded cast is the
+    single most common thing one does while developing it.
+
+    A **404** rather than a 403 when the switch is off: this route signs the
+    caller in as anybody who can be named, so a deployment should not so much as
+    admit that the path exists. Beyond that its defence is the app's only one,
+    `same_site="lax"` - a cross-site POST carries no session, and there is
+    nothing here worth a token that every other mutating route does without.
+
+    Both fields are **defaulted** rather than required, for the reason
+    `post_administrator`'s are: a missing one is a 422 with no page on it, and
+    there is a person in front of this box who deserves a sentence.
+    """
+    if not DUMMY_AUTH:
+        raise HTTPException(status_code=404)
+
     next_path = safe_next_path(next)
-    if DUMMY_AUTH:
-        # There is nothing to click: `get_user` signs every request in.
-        return RedirectResponse(next_path, status_code=303)
-    return _login_page(request, next_path=next_path)
+    try:
+        address = normalize_email(email)
+    except ValueError as err:
+        return _login_page(
+            request, next_path=next_path, error=str(err), status_code=400
+        )
+    logger.warning("dummy sign-in as %s", address)
+    return await _complete_sign_in(request, db, address, next_path)
 
 
 @app.get("/auth/google")
@@ -1013,9 +1093,6 @@ async def get_auth_google(request: Request, next: str = "/"):
     and returns the redirect to the consent screen.
     """
     next_path = safe_next_path(next)
-    if DUMMY_AUTH:
-        return RedirectResponse(next_path, status_code=303)
-
     client = google_client()
     if client is None:
         return _login_page(
@@ -1113,47 +1190,13 @@ async def get_auth_google_callback(request: Request, db: DBDep):
             status_code=403,
         )
 
-    if not is_allowed_email(email, CONFIG.auth.allowed_domains):
-        logger.info("refused a sign-in from outside the allowed domains: %s", email)
-        domains = ", ".join("@" + d for d in CONFIG.auth.allowed_domains)
-        return _login_page(
-            request,
-            next_path=next_path,
-            error=(
-                f"{email} is not an institutional address. "
-                f"Sign in with your {domains} account."
-            ),
-            status_code=403,
-        )
-
-    user = await get_or_create_user(db, email)
-    await db.commit()
-
-    if user.blocked_at is not None:
-        # Refused here as well as in `get_user`, and after the domain check so
-        # that the permanent reason keeps precedence. Without this the sign-in
-        # succeeds and dies on the first click, on a page they did not ask for;
-        # this way the sentence arrives on the page they are already looking at.
-        # `get_or_create_user` created nothing above - a blocked account exists.
-        logger.info("refused a sign-in from a blocked account: %s", email)
-        return _login_page(
-            request,
-            next_path=next_path,
-            error=f"This account is blocked. {user.blocked_reason or ''}".strip(),
-            status_code=403,
-        )
-
-    return _sign_in(request, user, next_path)
+    # The domain, the account and the blacklist, shared with the sign-in box.
+    return await _complete_sign_in(request, db, email, next_path)
 
 
 @app.post("/logout")
 async def post_logout(request: Request):
     request.session.clear()
-    if DUMMY_AUTH:
-        # Nothing to sign out of: `get_user` signs the next request straight
-        # back in. Bounce to the root rather than to a login page that would
-        # only redirect there anyway.
-        return RedirectResponse("/", status_code=303)
     return RedirectResponse("/login", status_code=303)
 
 
@@ -1357,31 +1400,25 @@ class ApiNotAuthenticated(HTTPException):
 async def get_api_user(request: Request, db: DBDep) -> schema.User:
     """Who is calling the API: a bearer token, or the browser's own session.
 
-    Three ways in, in this order.
+    Two ways in, in this order.
 
-    `DUMMY_AUTH` first, and for the reason it is checked first in `get_user`:
-    it is the configuration a fresh checkout runs in, so the CLI has to work
-    against `just dev` without anybody minting anything. The block is enforced
-    on this branch too, or dummy auth would be the one configuration in which
-    the feature does not exist.
-
-    Then `Authorization: Bearer`, which is what a command line actually uses.
-    The token is never stored, so the lookup is by its hash - which means an
-    unknown token and a revoked one are the same miss, as they should be.
+    `Authorization: Bearer`, which is what a command line actually uses. The
+    token is never stored, so the lookup is by its hash - which means an unknown
+    token and a revoked one are the same miss, as they should be.
 
     Then the session cookie, so a signed-in browser can follow a plain Download
     link to an export URL. That fallback is safe on the mutating half for the
     same reason every other POST in this app is: `same_site="lax"` means the
     session cookie is not sent on a cross-site POST at all, and that is the
     whole CSRF defence here as everywhere else.
-    """
-    if DUMMY_AUTH:
-        user = await get_or_create_user(db, DUMMY_USER)
-        await db.commit()
-        _refuse_if_blocked(user)
-        request.state.user = user
-        return user
 
+    There is deliberately no `DUMMY_AUTH` branch, and there used to be: it came
+    first and signed every API call in as the configured address, which meant a
+    bearer token presented to a `just dev` server was *ignored* - the one
+    configuration where the header this function is mostly about did nothing.
+    The cost is that `cocco pull` against `just dev` now needs a token like
+    anywhere else: mint one on the profile page and put it in `COCCO_TOKEN`.
+    """
     presented = parse_bearer(request.headers.get("Authorization"))
     if presented is not None:
         token_hash = hash_token(presented)

@@ -71,9 +71,12 @@ def _client(args) -> httpx.Client:
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    # No token is not an error here: a development server running with
-    # `[dev] dummy_auth` signs every request in, and that is the configuration a
-    # fresh checkout is in. The 401 below is where a missing token is explained.
+    # No token is not an error *here*: whether one is needed is the server's to
+    # say, and a browser session in the cookie jar is another way in. The 401
+    # below is where a missing token is explained - including against a
+    # development server, which used to sign the CLI in on `[dev] dummy_auth`
+    # alone and no longer does: that shortcut is a login box now, and a command
+    # line has no browser to type into it.
     return httpx.Client(
         base_url=url.rstrip("/"), headers=headers, timeout=120.0, follow_redirects=False
     )

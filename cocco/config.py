@@ -146,12 +146,10 @@ class DevConfig:
     here, "no [dev] table" and "all of them off" are the same thing.
     """
 
-    # No Google, no click, no credentials: `get_user` signs every request in.
-    # On anything public this is equivalent to publishing the admin password.
+    # No Google, no credentials: `/login` grows a box you type an address into
+    # and are signed in as, whoever it names. On anything public this is
+    # equivalent to publishing every account's password.
     dummy_auth: bool = False
-    # None rather than the seeded administrator: that cast lives in `main.py`,
-    # beside the seed that writes it, and supplies the fallback.
-    dummy_user: str | None = None
     # Drops every table and reseeds. `fastapi dev` reloads on every file
     # change, and each reload would wipe the data.
     reset_db: bool = False
@@ -299,7 +297,6 @@ def _load_judge_config(section: dict) -> JudgeConfig:
 def _load_dev_config(section: dict) -> DevConfig:
     return DevConfig(
         dummy_auth=bool(section.get("dummy_auth", False)),
-        dummy_user=section.get("dummy_user") or None,
         reset_db=bool(section.get("reset_db", False)),
     )
 
@@ -320,7 +317,6 @@ def _load_dev_config(section: dict) -> DevConfig:
 # moved.
 _REMOVED_ENV = {
     "COCCO_DUMMY_AUTH": "[dev] dummy_auth",
-    "COCCO_DUMMY_USER": "[dev] dummy_user",
     "COCCO_RESET_DB": "[dev] reset_db",
     "COCCO_STORAGE": "[storage] root",
 }
@@ -330,6 +326,17 @@ _REMOVED_KEYS = {
     ("auth", "google_client_id"): "COCCO_GOOGLE_CLIENT_ID",
     ("auth", "google_client_secret"): "COCCO_GOOGLE_CLIENT_SECRET",
 }
+
+# The third kind, and it is neither of the two above: both of those say "that
+# setting moved *there*", and this one moved nowhere at all. `dummy_user` used
+# to name the single address every request was signed in as; with `[dev]
+# dummy_auth` on, `/login` now asks. One sentence, checked against both of its
+# spellings below - the environment's and the file's - because either one left
+# behind means somebody is expecting to be signed in as somebody in particular.
+_GONE_TO_THE_LOGIN_BOX = (
+    "there is no such setting any more: with `[dev] dummy_auth` on, /login asks "
+    "which address to sign in as"
+)
 
 
 def _warn_about_removed_settings(path: Path, data: dict) -> None:
@@ -351,6 +358,14 @@ def _warn_about_removed_settings(path: Path, data: dict) -> None:
                 path,
                 replacement,
             )
+    if "COCCO_DUMMY_USER" in os.environ:
+        logger.warning("COCCO_DUMMY_USER is no longer read; %s", _GONE_TO_THE_LOGIN_BOX)
+    if "dummy_user" in data.get("dev", {}):
+        logger.warning(
+            "[dev] dummy_user in %s is no longer read; %s",
+            path,
+            _GONE_TO_THE_LOGIN_BOX,
+        )
 
 
 # PGUSER/PGDATABASE/PGHOST are deliberately absent from `_REMOVED_ENV`: they

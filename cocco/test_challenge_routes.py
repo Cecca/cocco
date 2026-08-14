@@ -113,7 +113,11 @@ async def world(app_engine):
 
 
 @pytest.fixture
-def client(app_engine, monkeypatch):
+def client(app_engine, world, monkeypatch):
+    # `world` is a dependency rather than an argument of the tests alone,
+    # because signing in *creates* the account if it is missing: without the
+    # ordering, the fixture would insert alice a moment before the seed does and
+    # the seed would trip over its own unique index.
     import cocco.main as main
 
     async def _get_db():
@@ -124,19 +128,21 @@ def client(app_engine, monkeypatch):
     # Signed in without a cookie and without Google. The user rows already
     # exist, so `get_or_create_user` finds them rather than making new ones.
     monkeypatch.setattr(main, "DUMMY_AUTH", True)
-    monkeypatch.setattr(main, "DUMMY_USER", TEACHER)
 
     # Not `with TestClient(...)`: entering the context runs the startup event,
     # which reaches for the real Postgres engine.
     client = TestClient(main.app)
+    _sign_in_as(client, TEACHER)
     yield client
     main.app.dependency_overrides.clear()
 
 
-def _sign_in_as(monkeypatch, email: str):
-    import cocco.main as main
-
-    monkeypatch.setattr(main, "DUMMY_USER", email)
+def _sign_in_as(client, email: str):
+    """Become somebody else. Dummy auth is a real session now, so this is a
+    request rather than a monkeypatch, and `_sign_in` clears the old session
+    before writing the new id - no identity leaks into the next one."""
+    response = client.post("/auth/dummy", data={"email": email}, follow_redirects=False)
+    assert response.status_code == 303, response.text
 
 
 async def test_the_form_is_staff_only(client, world, monkeypatch):
@@ -144,7 +150,7 @@ async def test_the_form_is_staff_only(client, world, monkeypatch):
 
     assert client.get(url).status_code == 200
 
-    _sign_in_as(monkeypatch, STUDENT)
+    _sign_in_as(client, STUDENT)
     assert client.get(url).status_code == 403
     # ...and hiding the button is not what stops them: the POST refuses too.
     assert client.post(url, data=FORM).status_code == 403
@@ -220,7 +226,7 @@ async def test_the_course_editor_is_staff_only(client, world, monkeypatch):
     asserted here - see the module docstring - which is exactly the refusal.
     """
     course_id = world["course"]
-    _sign_in_as(monkeypatch, STUDENT)
+    _sign_in_as(client, STUDENT)
 
     assert client.get(f"/courses/{course_id}/edit").status_code == 403
     assert (
@@ -281,11 +287,11 @@ async def test_creating_a_course_is_admin_only(client, world, monkeypatch):
     Alice is course staff and may do everything else in the editor; this is the
     one thing `EDITOR_ROLES` does not open.
     """
-    _sign_in_as(monkeypatch, ADMIN)
+    _sign_in_as(client, ADMIN)
     assert client.get("/courses/new").status_code == 200
 
     for email in (TEACHER, STUDENT):
-        _sign_in_as(monkeypatch, email)
+        _sign_in_as(client, email)
         assert client.get("/courses/new").status_code == 403
         # ...and hiding the button is not what stops them: the POST refuses too.
         assert client.post("/courses/new", data=COURSE_FORM).status_code == 403
@@ -294,7 +300,7 @@ async def test_creating_a_course_is_admin_only(client, world, monkeypatch):
 async def test_a_created_course_lands_on_its_editor(
     client, world, app_engine, monkeypatch
 ):
-    _sign_in_as(monkeypatch, ADMIN)
+    _sign_in_as(client, ADMIN)
     response = client.post("/courses/new", data=COURSE_FORM)
 
     # 204 + HX-Redirect, not a 302: htmx would splice a whole page into the
@@ -325,7 +331,7 @@ async def test_a_created_course_lands_on_its_editor(
 
 async def test_a_new_course_needs_a_title(client, world, app_engine, monkeypatch):
     """200 with an alert, never a 4xx: htmx does not swap an error response."""
-    _sign_in_as(monkeypatch, ADMIN)
+    _sign_in_as(client, ADMIN)
     response = client.post("/courses/new", data={**COURSE_FORM, "title": "   "})
     assert response.status_code == 200
     assert "A course needs a title." in response.text
@@ -373,7 +379,7 @@ async def test_an_administrator_is_staff_on_every_course(client, world, monkeypa
     # queries only Postgres has, and a 403 would prove nothing about a 200.
     url = f"/courses/{theirs}/challenges/new"
 
-    _sign_in_as(monkeypatch, ADMIN)
+    _sign_in_as(client, ADMIN)
     assert client.get(url).status_code == 200
     # 204 + HX-Redirect is the success path: he did not merely see the form, he
     # created a challenge on a course nobody enrolled him on.
@@ -383,5 +389,5 @@ async def test_an_administrator_is_staff_on_every_course(client, world, monkeypa
     assert client.get(f"/courses/{world['course']}/{challenge}/edit").status_code == 404
 
     # And the power did not leak into `EDITOR_ROLES` on the way past.
-    _sign_in_as(monkeypatch, TEACHER)
+    _sign_in_as(client, TEACHER)
     assert client.get(url).status_code == 403
