@@ -192,6 +192,37 @@ def test_the_judge_flake_defaults_to_the_working_directory(tmp_path, body):
     assert load_config(path).judge.flake == DEFAULT_FLAKE_REF
 
 
+def test_the_judge_gcroots_are_read(tmp_path):
+    """Where the judge writes the symlinks that hold its language runtimes
+    against `nix-store --gc`. A `Path`, because `build_runtime` joins onto it."""
+    path = tmp_path / "cocco.toml"
+    path.write_text('[judge]\ngcroots = "/var/lib/cocco/gcroots"\n')
+    assert load_config(path).judge.gcroots == Path("/var/lib/cocco/gcroots")
+
+
+@pytest.mark.parametrize("body", ["", "[judge]\n", '[judge]\ngcroots = ""\n'])
+def test_the_judge_gcroots_default_under_xdg_state_home(tmp_path, monkeypatch, body):
+    """Nothing to configure for `just dev` or for an ordinary service: the
+    default is durable, per user and per host, which is exactly the scope a GC
+    root has. An explicit empty string is a typo, not a request to scatter
+    symlinks over the filesystem root."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    path = tmp_path / "cocco.toml"
+    path.write_text(body)
+    assert load_config(path).judge.gcroots == tmp_path / "state" / "cocco" / "gcroots"
+
+
+def test_the_judge_gcroots_fall_back_to_the_home_state_directory(tmp_path, monkeypatch):
+    """`$XDG_STATE_HOME` is frequently unset, and the specification's own
+    fallback is what a systemd service with a real user gets."""
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = tmp_path / "cocco.toml"
+    path.write_text("")
+    expected = tmp_path / ".local" / "state" / "cocco" / "gcroots"
+    assert load_config(path).judge.gcroots == expected
+
+
 def test_the_dev_table_is_read(tmp_path):
     path = tmp_path / "cocco.toml"
     path.write_text(

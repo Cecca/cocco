@@ -1,4 +1,5 @@
-"""Fixtures shared by the tests that need a live Postgres.
+"""Fixtures shared by the tests that need something the checkout cannot supply
+on its own - a live Postgres, or the nix-built language runtimes.
 
 These tests **drop every table** in the database they are pointed at, which is
 why the URL here comes from the devShell's PGUSER/PGDATABASE/PGHOST and
@@ -17,6 +18,39 @@ import pytest
 # `pytest -m "not integration"` inside the devShell - and wiping the developer's
 # database on a run that never touched it would be a nasty surprise.
 _postgres_was_used = False
+
+
+# The language runtimes, built and rooted once for the whole session. Every
+# integration test in `test_judge.py` reaches `resolve_runtime` without going
+# through `cocco-judge`'s `main()`, and that function is a pure cache lookup
+# now - so something has to fill the cache, and one fixture here is that
+# something rather than a line repeated at the top of fifteen tests.
+_runtimes_prewarmed = False
+
+
+@pytest.fixture(autouse=True)
+def _language_runtimes(request):
+    """Build and root the runtimes, for the integration tests and nobody else.
+
+    Autouse and function-scoped, but it returns at once unless the test carries
+    the `integration` marker: `pytest -m "not integration"` has to go on running
+    outside the dev shell with no nix and no isolate, and a session-scoped
+    fixture cannot see a per-test marker to decide that.
+
+    The import is deferred for the reason the teardown below defers its own: a
+    run that never asks for any of this should not pay to import it.
+    """
+    if request.node.get_closest_marker("integration") is None:
+        return
+    global _runtimes_prewarmed
+    if _runtimes_prewarmed:
+        return
+    import asyncio
+
+    import cocco.judge as cj
+
+    asyncio.run(cj.prewarm_runtimes(cj.load_languages()))
+    _runtimes_prewarmed = True
 
 
 @pytest.fixture(scope="session")

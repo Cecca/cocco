@@ -55,10 +55,10 @@ url = "postgresql+psycopg://cocco@localhost/cocco"
 root = "/var/lib/cocco/storage"
 
 [judge]
-# The only setting the web app never reads, and the one an installed judge
-# cannot do without. A language in `languages.toml` names a runtime - python3,
-# gcc, jdk - that some flake has to expose, and the judge runs `nix build` to
-# get it. This says which flake.
+# The two settings the web app never reads, and the first is the one an
+# installed judge cannot do without. A language in `languages.toml` names a
+# runtime - python3, gcc, jdk - that some flake has to expose, and the judge
+# runs `nix build` to get it. This says which flake.
 #
 # The default is ".", the flake in the working directory, which is what it was
 # implicitly before it could be written down: right for `just dev`, and wrong
@@ -71,7 +71,31 @@ root = "/var/lib/cocco/storage"
 # Whatever it names must expose the runtimes `languages.toml` asks for, so it
 # is the same repository - pinned by its own `flake.lock`, which is what makes
 # a compiler version a property of the deployment and not of the machine.
+#
+# They are all built once, at startup, before the judge picks up anything: a
+# flake that cannot build one of them is a judge that refuses to start, rather
+# than a submission that fails whenever somebody first uses that language.
 flake = "/opt/cocco"
+
+# Where the judge writes one symlink per runtime. Those symlinks are the point:
+# `nix build --out-link` registers an indirect GC root for the path it built, so
+# a `nix-store --gc` or a `nix-collect-garbage -d` on this host cannot collect an
+# interpreter the judge is still handing to isolate. Without them the store path
+# is held by nothing nix can see, and the failure arrives as submissions dying
+# on a missing file.
+#
+# The default is $XDG_STATE_HOME/cocco/gcroots, falling back to
+# ~/.local/state/cocco/gcroots - durable, per user and per host, which is the
+# scope a GC root has. That is right for `just dev` and for an ordinary systemd
+# unit with a real user; set this when the judge runs with no usable HOME, as
+# under `DynamicUser=yes`, and point it at the unit's own StateDirectory.
+#
+# One directory per judge host *and per deployment*: two judges sharing it while
+# naming different flakes would overwrite each other's links, and a collection
+# in between could take a runtime the other is using. It is deliberately not
+# under `[storage] root` - that is the directory the web app and the judge
+# share, and may be on NFS, while a GC root means nothing off this machine.
+gcroots = "/var/lib/cocco/gcroots"
 
 [session]
 # Set to true behind TLS, so the cookie is never sent in clear.

@@ -15,7 +15,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
 from cocco import repository as repo
-from cocco.config import DEFAULT_FLAKE_REF, config_path, load_config
+from cocco.config import (
+    DEFAULT_FLAKE_REF,
+    config_path,
+    default_gcroots,
+    load_config,
+)
 from cocco.evaluators import DEFAULT_EVALUATOR, bundled_path
 from cocco.schema import (
     Challenge,
@@ -61,11 +66,15 @@ class BoxPool:
 _IDS_POOL = BoxPool()
 
 
-# `nix build` on an already-realised store path still costs tens of
-# milliseconds of process startup and evaluation, and `Language.run` resolves
-# its runtime on *every* invocation - now twice per test case, once for the
-# submission and once for the evaluator. The store path for a given flake
-# output cannot change while the process lives, so remember it.
+# Every runtime `languages.toml` names, resolved once by `prewarm_runtimes`
+# before the judge grades anything and read from here forever after. The store
+# path for a given flake output cannot change while the process lives.
+#
+# It used to fill *lazily*, on the first use of each language, which put a `nix
+# build` in the middle of a graded run: `Language.run` resolves its runtime on
+# every invocation - twice per test case, once for the submission and once for
+# the evaluator - so the first java upload paid for a JDK, and a flake that
+# could not build one said so then rather than at startup.
 _RUNTIME_CACHE: Dict[tuple[str, str], Path] = {}
 
 # Which flake the runtimes are built out of - `[judge] flake`, see `JudgeConfig`.
@@ -79,12 +88,46 @@ _RUNTIME_CACHE: Dict[tuple[str, str], Path] = {}
 # life of the process.
 FLAKE_REF = DEFAULT_FLAKE_REF
 
+# Where the symlinks that root those runtimes are written - `[judge] gcroots`.
+# The same seam as `FLAKE_REF`, assigned beside it by `main()`, and starting at
+# the default rather than at None so that anything resolving a runtime without
+# going through `main()` - the integration tests, notably - still puts its roots
+# somewhere durable instead of failing on a missing directory.
+GCROOTS_DIR = default_gcroots()
 
-async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
-    cached = _RUNTIME_CACHE.get((runtime_name, bin_name))
-    if cached is not None:
-        return cached
-    logger.debug("resolving runtime %s for binary %s", runtime_name, bin_name)
+
+class RuntimeUnavailable(Exception):
+    """The judge cannot get hold of a language runtime.
+
+    One name for both ways that happens, because from the queue's point of view
+    they are the same thing: `nix build` failed, or what it built does not
+    contain the binary a language asks for. It belongs to startup, where it is
+    fatal and names the language at fault - never to the middle of a grading
+    run, where by then the cache has an answer or `languages.toml` disagrees
+    with itself.
+    """
+
+
+async def build_runtime(runtime_name: str) -> List[Path]:
+    """Build one flake output and return its store paths, *rooted*.
+
+    `--out-link` is the whole point of this function. It is what makes nix
+    register an indirect GC root under /nix/var/nix/gcroots/auto for the path it
+    has just built. With the `--no-link` this used to pass, the store path was
+    held by nothing but a `Path` in `_RUNTIME_CACHE` - which nix cannot see - so
+    a `nix-store --gc` on the judge host was free to collect the very
+    interpreter a running judge was about to bind-mount into a box, and the
+    failure landed as submissions dying on a missing file with nothing in the
+    log to say why.
+    """
+    GCROOTS_DIR.mkdir(parents=True, exist_ok=True)
+    # The directory is resolved, and the runtime's name joined on afterwards -
+    # never `(GCROOTS_DIR / runtime_name).resolve()`, which on the second run
+    # would follow the link written by the first and hand `--out-link` a path
+    # inside the store itself. Absolute because nix records an indirect root by
+    # the canonical path of the link, so a relative one roots something that
+    # depends on where the judge happened to be started.
+    out_link = GCROOTS_DIR.resolve() / runtime_name
     # `exec`, not `shell`: the flake ref comes out of a configuration file now
     # rather than being a literal here, and joining it into a command line is
     # the one way that becomes interesting.
@@ -92,28 +135,83 @@ async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
         "nix",
         "build",
         f"{FLAKE_REF}#{runtime_name}",
-        "--no-link",
+        "--out-link",
+        str(out_link),
         "--print-out-paths",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await p.communicate()
     if p.returncode != 0:
-        logger.error(
-            "nix build of %s failed (rc=%s): %s",
-            runtime_name,
-            p.returncode,
-            stderr.decode().strip(),
+        # Raised, where this used to `assert p.returncode == 0`: it is the
+        # startup failure now, and an assertion vanishes under `python -O`.
+        raise RuntimeUnavailable(
+            f"nix build of {FLAKE_REF}#{runtime_name} failed "
+            f"(rc={p.returncode}): {stderr.decode().strip()}"
         )
-    assert p.returncode == 0
-    nix_store_paths: List[str] = stdout.strip().decode().splitlines()
-    for path in nix_store_paths:
-        binary = Path(f"{path}/bin/{bin_name}")
-        if binary.is_file():
-            logger.debug("resolved %s -> %s", bin_name, binary)
-            _RUNTIME_CACHE[(runtime_name, bin_name)] = binary
-            return binary
-    raise ValueError(f"could not find binary {bin_name} in {nix_store_paths}")
+    return [Path(line) for line in stdout.strip().decode().splitlines()]
+
+
+async def prewarm_runtimes(languages: Dict[str, "Language"]) -> None:
+    """Build and root every runtime `languages.toml` names, once, at startup.
+
+    Which is what `main()` has always said it was doing and never did. Three
+    things follow from doing it here rather than on first use: every runtime
+    gets its GC root whether or not anybody submits in that language, a flake
+    that cannot build one is a judge that refuses to start rather than a java
+    submission that fails hours later, and `nix` is never invoked at all while a
+    submission is being graded.
+
+    One build per *runtime*, not per binary: gcc answers for both `gcc` and
+    `g++` and jdk for both `javac` and `java`, and building the same flake
+    output twice would do nothing but write the same symlink again.
+    """
+    wanted: Dict[str, set[str]] = {}
+    for language in languages.values():
+        for bin_name in (language.compiler, language.interpreter):
+            if bin_name is not None:
+                wanted.setdefault(language.runtime, set()).add(bin_name)
+
+    for runtime_name, binaries in sorted(wanted.items()):
+        logger.info("building runtime %s from %s", runtime_name, FLAKE_REF)
+        out_paths = await build_runtime(runtime_name)
+        for bin_name in sorted(binaries):
+            for out in out_paths:
+                binary = out / "bin" / bin_name
+                if binary.is_file():
+                    logger.info("resolved %s -> %s", bin_name, binary)
+                    _RUNTIME_CACHE[(runtime_name, bin_name)] = binary
+                    break
+            else:
+                needed_by = sorted(
+                    language.name
+                    for language in languages.values()
+                    if language.runtime == runtime_name
+                    and bin_name in (language.compiler, language.interpreter)
+                )
+                raise RuntimeUnavailable(
+                    f"{FLAKE_REF}#{runtime_name} exposes no bin/{bin_name}, "
+                    f"which {', '.join(needed_by)} needs"
+                )
+
+
+async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
+    """Where a runtime's binary is. A lookup, and nothing else.
+
+    Still `async`, so `Language.compile` and `Language.run` are untouched, but
+    it no longer builds anything: `prewarm_runtimes` has already filled the
+    cache from the same `languages.toml` these two names come out of. A miss
+    therefore means those two have disagreed, which is a bug to report and not
+    a condition to paper over by building a compiler halfway through grading
+    somebody's submission.
+    """
+    binary = _RUNTIME_CACHE.get((runtime_name, bin_name))
+    if binary is None:
+        raise RuntimeUnavailable(
+            f"runtime {runtime_name} was never resolved for {bin_name}: "
+            "prewarm_runtimes did not cover it"
+        )
+    return binary
 
 
 @dataclass(frozen=True)
@@ -957,9 +1055,9 @@ def main(argv: list[str] | None = None) -> None:
     # actually lands in the judge's log rather than nowhere.
     config = load_config(args.config)
 
-    global FLAKE_REF
+    global FLAKE_REF, GCROOTS_DIR
     FLAKE_REF = config.judge.flake
-    logger.info("building language runtimes from flake %s", FLAKE_REF)
+    GCROOTS_DIR = config.judge.gcroots
 
     storage = Storage(config.storage.root)
     engine = create_engine(config.database.url)
@@ -977,6 +1075,23 @@ def main(argv: list[str] | None = None) -> None:
         with engine.connect() as conn:
             check_schema_is_current(conn, process="cocco-judge")
     except SchemaOutOfDate as e:
+        logger.error("%s", e)
+        raise SystemExit(1)
+
+    # After the schema check, and before the loop. After, because a database
+    # that is behind is the commoner failure and costs nothing to notice -
+    # there is no point pulling a JDK only to then refuse to start. Before,
+    # because this is what puts a GC root on every runtime, and what makes a
+    # flake that cannot build one a judge that does not come up rather than a
+    # submission that fails whenever somebody first uses that language.
+    logger.info(
+        "building language runtimes from flake %s, rooted in %s",
+        FLAKE_REF,
+        GCROOTS_DIR,
+    )
+    try:
+        asyncio.run(prewarm_runtimes(load_languages()))
+    except RuntimeUnavailable as e:
         logger.error("%s", e)
         raise SystemExit(1)
 

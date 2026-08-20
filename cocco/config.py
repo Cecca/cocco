@@ -57,6 +57,25 @@ DEFAULT_STORAGE_ROOT = Path("/tmp/cocco-storage")
 DEFAULT_FLAKE_REF = "."
 
 
+def default_gcroots() -> Path:
+    """Where the judge keeps the symlinks that hold its runtimes against the
+    nix garbage collector.
+
+    A function rather than a `DEFAULT_*` constant like every setting around it,
+    because it reads the environment: a constant would bake `HOME` in at import
+    time, which is untestable and wrong for a process systemd starts with a
+    different one.
+
+    `$XDG_STATE_HOME` and deliberately not `$XDG_CACHE_HOME`: a cache is by
+    definition safe to delete, and deleting these is the exact bug they exist
+    to prevent. `/tmp` would be worse still - systemd-tmpfiles would remove the
+    links and silently un-root the store paths, which is where this started.
+    """
+    state = os.environ.get("XDG_STATE_HOME")
+    base = Path(state) if state else Path.home() / ".local" / "state"
+    return base / "cocco" / "gcroots"
+
+
 @dataclass(frozen=True)
 class SessionConfig:
     secret_key: str
@@ -114,10 +133,10 @@ class StorageConfig:
 
 @dataclass(frozen=True)
 class JudgeConfig:
-    """The one thing only the judge reads, and the only reason it is a setting
-    at all: a language entry in `languages.toml` names a runtime that some
-    flake has to expose, and `resolve_runtime` shells out to `nix build` to get
-    it.
+    """The two things only the judge reads, and the reason the first is a
+    setting at all: a language entry in `languages.toml` names a runtime that
+    some flake has to expose, and `build_runtime` shells out to `nix build` to
+    get it - once for each, at startup, from `prewarm_runtimes`.
 
     That used to be spelled `.#python3` - the flake in the *working directory*
     - which is a coupling the judge could not state and a deployment could not
@@ -131,6 +150,21 @@ class JudgeConfig:
     # A path (relative or absolute) or any flake reference `nix` accepts, e.g.
     # "/opt/cocco" or "github:you/cocco".
     flake: str = DEFAULT_FLAKE_REF
+
+    # Where `nix build --out-link` puts one symlink per runtime, which is what
+    # registers the *indirect GC root* that stops `nix-store --gc` collecting
+    # an interpreter the judge is using. It built with `--no-link` before, so
+    # the store path was held by nothing nix could see and a garbage collection
+    # on the judge host could pull the interpreter out from under a submission.
+    #
+    # Per judge host and per deployment, and that is the one trap: two judges
+    # sharing this directory with different `flake` refs would overwrite each
+    # other's links, and a collection in between could take a live runtime.
+    #
+    # Deliberately not derived from `[storage] root`. That is the one directory
+    # the web app and the judge share and it may well be on NFS; a GC root is
+    # local to the machine whose store it protects, and means nothing on another.
+    gcroots: Path = field(default_factory=default_gcroots)
 
 
 @dataclass(frozen=True)
@@ -290,8 +324,13 @@ def _load_storage_config(section: dict) -> StorageConfig:
 
 def _load_judge_config(section: dict) -> JudgeConfig:
     # `or`, like the database URL: an explicit `flake = ""` is a typo, not a
-    # request for `nix build #python3`.
-    return JudgeConfig(flake=section.get("flake") or DEFAULT_FLAKE_REF)
+    # request for `nix build #python3` - and an empty `gcroots` is a typo, not
+    # a request to scatter symlinks over the filesystem root.
+    gcroots = section.get("gcroots")
+    return JudgeConfig(
+        flake=section.get("flake") or DEFAULT_FLAKE_REF,
+        gcroots=Path(gcroots) if gcroots else default_gcroots(),
+    )
 
 
 def _load_dev_config(section: dict) -> DevConfig:

@@ -19,7 +19,7 @@ isolate --box-id=1 \
   --run -- /nix/store/<hash>-python3-3.11/bin/python3 solution.py
 ```
 
-The exact store path for each runtime is resolved at startup and stored in the database, keeping execution fully reproducible and tied to `flake.lock`.
+The exact store path for each runtime is resolved at startup — every runtime `languages.toml` names, before the judge grades anything — and held for the life of the process, keeping execution fully reproducible and tied to `flake.lock`. Each build is made with `--out-link`, so the store path gets a GC root and cannot be collected out from under a running judge.
 
 ### NixOS setuid note
 

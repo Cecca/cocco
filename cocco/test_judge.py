@@ -35,6 +35,34 @@ def test_source_filename(language: str, uploaded: str, expected: str):
     assert cj.source_filename(uploaded, languages[language]) == expected
 
 
+async def test_resolve_runtime_is_a_lookup(monkeypatch):
+    """A runtime `prewarm_runtimes` never covered is a bug, said so here rather
+    than papered over by starting a `nix build` in the middle of somebody's
+    submission. This is a unit test at all only because resolution stopped
+    shelling out - it needs neither nix nor a flake."""
+    monkeypatch.setattr(cj, "_RUNTIME_CACHE", {})
+    with pytest.raises(cj.RuntimeUnavailable):
+        await cj.resolve_runtime("nosuchruntime", "nosuchbinary")
+
+
+@pytest.mark.integration
+async def test_runtimes_are_rooted_against_the_garbage_collector():
+    """The bug this was written for.
+
+    `nix build --no-link` left the store path held by nothing nix could see, so
+    a `nix-store --gc` on the judge host was free to collect an interpreter a
+    running judge was still handing to isolate. The symlink asserted here is
+    what makes nix register the indirect root that stops it.
+    """
+    link = cj.GCROOTS_DIR / "python3"
+    assert link.is_symlink()
+    assert str(link.resolve()).startswith("/nix/store/")
+    # And it roots the very path the cache hands out, not merely something of
+    # the same name: a link to some *other* build would root the wrong closure.
+    python = await cj.resolve_runtime("python3", "python")
+    assert python.is_relative_to(link.resolve())
+
+
 @pytest.mark.integration
 async def test_python_run():
     python = await cj.resolve_runtime("python3", "python")
