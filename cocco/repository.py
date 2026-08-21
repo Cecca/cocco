@@ -65,7 +65,8 @@ async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
     Atomically set it to 'running'."""
     # Get the submission to run, if any, and atomically sets it to running
     submission = conn.execute(
-        update(Submission).where(
+        update(Submission)
+        .where(
             Submission.c.id
             == (
                 select(Submission.c.id)
@@ -73,7 +74,8 @@ async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
                 .order_by(Submission.c.enqueued)
                 .limit(1)
             ).scalar_subquery()
-        ).values(status = SubmissionStatus.running)
+        )
+        .values(status=SubmissionStatus.running, started_at=func.now())
         .returning(*Submission.c)
     ).first()
     if submission is None:
@@ -111,7 +113,7 @@ def mark_submission_done(conn: Connection, submission_id: int) -> None:
     conn.execute(
         update(Submission)
         .where(Submission.c.id == submission_id)
-        .values(status=SubmissionStatus.done)
+        .values(status=SubmissionStatus.done, finished_at=func.now())
     )
 
 
@@ -233,7 +235,10 @@ async def set_enrollment_role(
         )
     stmt = stmt.on_conflict_do_update(
         index_elements=["user_id", "course_id"],
-        set_={"role": role},
+        # `updated_at` is named here and nowhere else in this module: SQLAlchemy
+        # fires a column's `onupdate` for an UPDATE and not for the DO UPDATE of
+        # an upsert, so this is the one write that has to say it out loud.
+        set_={"role": role, "updated_at": func.now()},
         where=where,
     ).returning(Enrollment.c.user_id)
     return (await conn.execute(stmt)).first() is not None
@@ -876,6 +881,32 @@ async def update_user(conn: AsyncConnection, user_id: int, **fields) -> None:
     await conn.execute(update(User).where(User.c.id == user_id).values(**fields))
 
 
+async def record_sign_in(conn: AsyncConnection, user_id: int) -> None:
+    """Stamp a sign-in. Does not commit.
+
+    One statement, and the `coalesce` is why: `first_login_at` is written by the
+    first sign-in and by no later one, with no read for two tabs to race on.
+
+    It is not `user.created_at`, and the difference is the point of the column.
+    `get_or_create_user` is also how course staff pre-enrol somebody from the
+    people page, so a row can exist for an address whose owner has never been
+    near the login page - NULL here is exactly that person, and `created_at`
+    could not tell you.
+
+    Called from `_complete_sign_in` *after* the blacklist refusal: a sign-in
+    that was turned away is not a sign-in, and putting it there is what keeps
+    that true for both ways in.
+    """
+    await conn.execute(
+        update(User)
+        .where(User.c.id == user_id)
+        .values(
+            first_login_at=func.coalesce(User.c.first_login_at, func.now()),
+            last_login_at=func.now(),
+        )
+    )
+
+
 async def block_user(
     conn: AsyncConnection, user_id: int, reason: str | None
 ) -> bool:
@@ -896,7 +927,7 @@ async def block_user(
             User.c.id == user_id,
             ~exists().where(Administrator.c.email == User.c.email),
         )
-        .values(blocked_at=datetime.now(), blocked_reason=reason)
+        .values(blocked_at=func.now(), blocked_reason=reason)
         .returning(User.c.id)
     )
     return (await conn.execute(stmt)).first() is not None
@@ -954,7 +985,7 @@ async def touch_api_token(conn: AsyncConnection, token_hash: str) -> None:
     await conn.execute(
         update(ApiToken)
         .where(ApiToken.c.token_hash == token_hash)
-        .values(last_used_at=datetime.now())
+        .values(last_used_at=func.now())
     )
 
 
@@ -1068,7 +1099,10 @@ async def regrade_challenge(conn: AsyncConnection, challenge_id: int) -> int:
     result = await conn.execute(
         update(Submission)
         .where(Submission.c.challenge_id == challenge_id)
-        .values(status=SubmissionStatus.queued)
+        # Both timestamps go back to NULL with the status: they describe the run
+        # whose outcomes were just deleted, and leaving them would report a
+        # queued submission as having finished.
+        .values(status=SubmissionStatus.queued, started_at=None, finished_at=None)
     )
     return result.rowcount
 
@@ -1411,7 +1445,7 @@ async def set_course_archived(
     await conn.execute(
         update(Course)
         .where(Course.c.id == course_id)
-        .values(archived_at=datetime.now() if archived else None)
+        .values(archived_at=func.now() if archived else None)
     )
 
 
@@ -1424,7 +1458,7 @@ async def set_challenge_archived(
     await conn.execute(
         update(Challenge)
         .where(Challenge.c.id == challenge_id)
-        .values(archived_at=datetime.now() if archived else None)
+        .values(archived_at=func.now() if archived else None)
     )
 
 

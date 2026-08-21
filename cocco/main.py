@@ -140,6 +140,7 @@ from cocco.repository import (
     query_user_role,
     query_user_submissions,
     query_users,
+    record_sign_in,
     regrade_challenge,
     reorder_challenges,
     set_challenge_archived,
@@ -339,10 +340,23 @@ def render_source(source: str, language: str) -> Markup:
 
 
 def render_datetime(value):
+    """A timestamp as a sentence, in this server's own zone.
+
+    Two shapes arrive here, because the page queries answer in JSON: a real
+    `datetime` from a plain Core read, and an ISO-8601 *string* from `json_agg`
+    / `row_to_json`. Both are now offset-carrying, in whatever zone the Postgres
+    session happens to be set to - which is the host's for the devShell's
+    cluster and UTC for the container in `compose.yaml`. `astimezone()` with no
+    argument pins the reading to the app server's local clock, so the two
+    databases print the same sentence, and it is the same sentence the naive
+    `datetime.now()` this schema used to store already produced.
+    """
     from babel.dates import format_datetime
     from datetime import datetime
     if isinstance(value, str):
         value = datetime.fromisoformat(value)
+    if value.tzinfo is not None:
+        value = value.astimezone()
     return format_datetime(value, locale="en")
 
 def render_score(value) -> str:
@@ -572,7 +586,7 @@ async def _populate_dummy_data(conn: AsyncConnection):
     # and so the only person who can unarchive one - finds it under "Other
     # courses", and Bob and Charlie see it in "Your courses", greyed and
     # read-only.
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     assert last_challenge_id is not None
     await set_challenge_archived(conn, last_challenge_id, True)
@@ -586,7 +600,7 @@ async def _populate_dummy_data(conn: AsyncConnection):
                     "students can still read it and look back over their "
                     "submissions."
                 ),
-                archived_at=datetime.now(),
+                archived_at=datetime.now(timezone.utc),
             )
             .returning(Course.c.id)
         )
@@ -1052,6 +1066,12 @@ async def _complete_sign_in(
             error=f"This account is blocked. {user.blocked_reason or ''}".strip(),
             status_code=403,
         )
+
+    # After the two refusals above and before the session exists: a sign-in
+    # that was turned away is not one, and this function is where both ways in
+    # meet, so neither can be the one that forgets.
+    await record_sign_in(db, user.id)
+    await db.commit()
 
     return _sign_in(request, user, next_path)
 

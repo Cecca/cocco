@@ -3,7 +3,7 @@ This module contains Pydantic schemas for user input validation, or the output
 of complex database queries.
 """
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cocco.model import OutcomeEnum, SubmissionStatus
@@ -67,7 +67,13 @@ class Submission(Base):
     user_id: int | None = None
     challenge_id: int | None = None
     status: SubmissionStatus = SubmissionStatus.queued
-    enqueued: datetime = Field(default_factory=datetime.now)
+    enqueued: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # The other two thirds of the judging lifecycle, NULL until a judge claims
+    # the row and until it lets go. Defaulted, unlike `User.blocked_at` and for
+    # the reason `Course.archived_at` is: nothing refuses on them, so there is
+    # no door here a trimmed column list could be walked through.
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     language: str
     filename: str
     source: str
@@ -140,7 +146,7 @@ class SubmissionWithOutcomes(Base):
 
     submission_id: int | None = None
     status: SubmissionStatus = SubmissionStatus.queued
-    enqueued: datetime = Field(default_factory=datetime.now)
+    enqueued: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     language: str
     source: str
     test_cases: list[tuple[TestCase, TestOutcome | None]]

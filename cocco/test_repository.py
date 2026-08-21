@@ -1,8 +1,8 @@
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine, func, insert, select, update
+from sqlalchemy import create_engine, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import cocco.model as cm
@@ -64,6 +64,7 @@ from cocco.repository import (
     query_user_role,
     query_user_submissions,
     query_users,
+    record_sign_in,
     regrade_challenge,
     reorder_challenges,
     set_challenge_archived,
@@ -91,7 +92,7 @@ def _make_engine(db_url="sqlite:///:memory:"):
 
 def _make_example_database(db_url="sqlite:///:memory:"):
     engine = _make_engine(db_url)
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
 
     with engine.begin() as conn:
         users = [
@@ -263,7 +264,7 @@ def _make_example_database(db_url="sqlite:///:memory:"):
 
 async def test_get_queued_submission_returns_oldest_queued():
     engine = _make_engine()
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
 
     with engine.begin() as conn:
         image, image_mime = generate_identicon("the-admin")
@@ -426,7 +427,7 @@ async def test_queued_submission_skips_retired_testcases():
                 filename="solution.py",
                 source="print('a')",
                 status=cm.SubmissionStatus.queued,
-                enqueued=datetime.now(),
+                enqueued=datetime.now(timezone.utc),
             )
         )
 
@@ -590,10 +591,34 @@ async def test_challenge_page_queries(postgres_url):
         assert await count_running_submissions(conn, 1) == 0
         assert await count_running_submissions(conn, 4) == 1
 
+        # A regrade is also what puts the judging lifecycle back: stamp the
+        # rows first, so that them being NULL afterwards means something.
+        await conn.execute(
+            update(Submission)
+            .where(Submission.c.challenge_id == 1)
+            .values(started_at=func.now(), finished_at=func.now())
+        )
+
         # Rewrites the fixture, so it goes last. The connection is never
         # committed: like the other mutations, this one leaves that to the
         # caller, and the assertions below read it back inside the transaction.
         assert await regrade_challenge(conn, 1) == 3
+
+        # Both timestamps went with the status. Leaving them would report a
+        # queued submission as one that had already finished.
+        assert (
+            await conn.execute(
+                select(func.count())
+                .select_from(Submission)
+                .where(
+                    Submission.c.challenge_id == 1,
+                    or_(
+                        Submission.c.started_at.is_not(None),
+                        Submission.c.finished_at.is_not(None),
+                    ),
+                )
+            )
+        ).scalar_one() == 0
 
         statuses = (
             await conn.execute(
@@ -740,6 +765,51 @@ async def test_get_or_create_user_is_idempotent():
         assert row is not None and row.id == created.id
         # An address that was never seen is simply absent.
         assert await query_user_by_email(conn, "nobody@unipd.it") is None
+    await engine.dispose()
+
+
+async def test_record_sign_in_stamps_the_first_login_once():
+    """`first_login_at` is written by the first sign-in and by no later one.
+
+    It is the column that separates "has never been near the login page" from
+    "was created by a teacher writing out a roster", which `created_at` cannot
+    answer - `get_or_create_user` is the same function on both paths. Each call
+    commits, because `now()` is the *transaction's* clock: two stamps inside one
+    transaction are the same instant by design.
+    """
+    engine = await _async_database()
+
+    async def logins(conn, user_id):
+        # Read straight off the row: `_USER_COLUMNS` deliberately does not carry
+        # these, and nothing should make it - it is the list `schema.User` is
+        # built from, and the reason it is spelled once is `blocked_at`.
+        return (
+            await conn.execute(
+                select(User.c.first_login_at, User.c.last_login_at).where(
+                    User.c.id == user_id
+                )
+            )
+        ).one()
+
+    async with engine.connect() as conn:
+        user = await get_or_create_user(conn, "dave@unipd.it")
+        await conn.commit()
+
+        # Created, never signed in - which is exactly the pre-enrolled roster.
+        before = await logins(conn, user.id)
+        assert before.first_login_at is None and before.last_login_at is None
+
+        await record_sign_in(conn, user.id)
+        await conn.commit()
+        first = await logins(conn, user.id)
+        assert first.first_login_at is not None
+        assert first.last_login_at is not None
+
+        await record_sign_in(conn, user.id)
+        await conn.commit()
+        second = await logins(conn, user.id)
+        assert second.first_login_at == first.first_login_at
+        assert second.last_login_at >= first.last_login_at
     await engine.dispose()
 
 
