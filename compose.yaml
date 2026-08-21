@@ -1,0 +1,54 @@
+# PostgreSQL for development, as an alternative to the devShell's `pg-start`.
+#
+# The two are interchangeable because `cocco.dev.toml` names no database: its
+# URL is the empty `postgresql+psycopg://`, which libpq resolves from PGHOST,
+# PGPORT, PGUSER and PGDATABASE. `pg-start` runs a cluster on a unix socket at
+# $PWD/.pg/sock; this runs one on 127.0.0.1:5432. Point the PG* variables at
+# whichever is up and every part of cocco follows - the web app, the judge,
+# `cocco-migrate`, `psql` and the Postgres tests, none of which are told about
+# this file:
+#
+#   export PGHOST=127.0.0.1
+#   export PGPORT=5432
+#
+# Put those two lines in `.envrc` (gitignored) *after* `use flake` and direnv
+# will keep them in force; the devShell's PGUSER=postgres and
+# PGDATABASE=cocco-dev already match what this container creates.
+#
+#   docker compose up -d          # start it (podman-compose works too)
+#   docker compose logs -f db     # watch it
+#   docker compose down           # stop it, keeping the data
+#   docker compose down -v        # stop it and throw the data away
+services:
+  db:
+    # Pinned to the major version the devShell's client tools are, so a dump
+    # taken from one restores into the other.
+    image: postgres:17
+    environment:
+      # `initdb --auth=trust`, exactly what `pg-start` does - and safe for the
+      # same reason it is there: the port below is bound to the loopback
+      # address only, so nothing off this machine can reach it. Give it a
+      # POSTGRES_PASSWORD and a PGPASSWORD instead if you would rather.
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_USER: postgres
+      # The devShell exports PGDATABASE=cocco-dev, and `just dev`'s `create-db`
+      # would make it anyway; this is just one less thing to happen on a first
+      # start.
+      POSTGRES_DB: cocco-dev
+    ports:
+      # 127.0.0.1 and not 0.0.0.0: with trust authentication the second would
+      # publish an unauthenticated database to the network.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # A named volume rather than a directory under .pg/, because a rootless
+      # podman writes a bind mount as a subordinate uid that your own user then
+      # cannot delete. `docker compose down -v` is the reset.
+      - cocco-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cocco-dev"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  cocco-pgdata:
