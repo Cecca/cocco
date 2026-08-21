@@ -27,6 +27,7 @@ import sys
 import tempfile
 import tomllib
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -121,11 +122,36 @@ def cmd_ls(args) -> int:
             course = row["course_id"]
             print(f"\n{row['course_title']}")
         # An archived challenge is still pushable - staff edit one exactly as
-        # before - so this is a note beside the title rather than anything
-        # missing from the list.
-        suffix = "  (archived)" if row.get("archived") else ""
+        # before - so these are notes beside the title rather than anything
+        # missing from the list. The same goes double for an unpublished one:
+        # not having published it yet is the commonest reason to be pushing to
+        # it, so dropping those would hide the very ids this command exists to
+        # make discoverable.
+        notes = []
+        if row.get("archived"):
+            notes.append("archived")
+        if not row.get("visible", True):
+            notes.append(
+                "hidden" if row.get("visible_from") is None
+                else f"opens {_when(row['visible_from'])}"
+            )
+        suffix = f"  ({', '.join(notes)})" if notes else ""
         print(f"  {row['challenge_id']:>{width}}  {row['title']}{suffix}")
     return 0
+
+
+def _when(iso: str) -> str:
+    """A server timestamp as a local wall clock, to the minute.
+
+    The server sends an offset-carrying ISO string and `astimezone()` re-pins it
+    to whatever clock this terminal is on - which is the same move
+    `render_datetime` makes in the app, one layer down. A value that will not
+    parse is printed as it came rather than crashing a listing over a note.
+    """
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return iso
 
 
 def _extract(archive: zipfile.ZipFile, target: Path) -> None:

@@ -13,6 +13,7 @@ last way in here.
 """
 
 import io
+import re
 import zipfile
 from datetime import datetime
 
@@ -22,6 +23,7 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from cocco.conftest import PUBLISHED
 from cocco.model import (
     Administrator,
     ApiToken,
@@ -109,7 +111,10 @@ async def world(app_engine, tmp_path, monkeypatch):
                     .values(title=title, description="Find them.",
                             course_id=ids[course_key], max_memory_bytes=128 << 20,
                             max_time_s=2.5, max_threads=1,
-                            ranking=LeaderboardRanking.total_score, position=0)
+                            ranking=LeaderboardRanking.total_score, position=0,
+                            # Published: NULL means hidden, and the tests below
+                            # are about the transfer format, not the gate.
+                            visible_from=PUBLISHED)
                     .returning(Challenge.c.id)
                 )
             ).scalar_one()
@@ -380,6 +385,81 @@ async def test_a_push_to_an_archived_challenge_still_works(
     assert row.description == "# Fixed a typo\n"
     # ...and it is still archived afterwards.
     assert row.archived_at is not None
+
+
+async def test_the_listing_marks_what_is_not_published(client, world, app_engine):
+    """Hiding a challenge is the commonest reason to be pushing to it - staff
+    are still writing it - so `cocco ls` has to go on naming its id. A note,
+    never anything missing from the list."""
+    async with app_engine.connect() as conn:
+        await conn.execute(
+            update(Challenge).where(Challenge.c.id == world["other_challenge"])
+            .values(visible_from=None)
+        )
+        await conn.commit()
+
+    rows = {
+        row["challenge_id"]: row
+        for row in client.get("/api/challenges", headers=auth(world, "matteo")).json()
+    }
+    assert rows[world["challenge"]]["visible"] is True
+    assert rows[world["challenge"]]["visible_from"] is not None
+    assert rows[world["other_challenge"]]["visible"] is False
+    assert rows[world["other_challenge"]]["visible_from"] is None
+
+
+async def test_visibility_round_trips_through_a_directory(client, world, app_engine):
+    """Unlike `archived`, this one *is* a manifest key: it is a column a
+    challenge form writes, so a pull, an edit and a push carry it the way they
+    carry the limits.
+
+    Both directions matter. A hidden challenge pulls with no key at all, and
+    pushing that file back leaves it hidden rather than publishing it; a file
+    that names a date sets one.
+    """
+    async with app_engine.connect() as conn:
+        await conn.execute(
+            update(Challenge).where(Challenge.c.id == world["challenge"])
+            .values(visible_from=None)
+        )
+        await conn.commit()
+
+    _, archive = pull(client, world, "alice", world["challenge"])
+    assert "visible_from" not in archive.read(MANIFEST_NAME).decode()
+
+    members = {name: archive.read(name) for name in archive.namelist()}
+    assert push(client, world, "alice", world["challenge"], members).status_code == 200
+
+    async def stored():
+        async with app_engine.connect() as conn:
+            return (await conn.execute(select(Challenge.c.visible_from).where(
+                Challenge.c.id == world["challenge"]))).scalar_one()
+
+    assert await stored() is None
+
+    members[MANIFEST_NAME] = members[MANIFEST_NAME].replace(
+        b"max_threads = 1",
+        b"max_threads = 1\nvisible_from = 2099-09-01T09:00:00+02:00",
+    )
+    assert push(client, world, "alice", world["challenge"], members).status_code == 200
+    opens = await stored()
+    assert opens is not None and opens.year == 2099
+
+
+async def test_a_push_with_an_unreadable_date_is_refused(client, world):
+    """`_challenge_fields` decides, here as for the two forms - so the message a
+    teacher gets from the CLI is the one they would have got from the editor."""
+    _, archive = pull(client, world, "alice", world["challenge"])
+    members = {name: archive.read(name) for name in archive.namelist()}
+    # The challenge is published, so the pulled manifest already carries the
+    # key; this replaces its value rather than adding a second one.
+    members[MANIFEST_NAME] = re.sub(
+        rb"visible_from = .*", b'visible_from = "next Tuesday"',
+        members[MANIFEST_NAME],
+    )
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.status_code == 400
+    assert "date and time" in response.json()["detail"]
 
 
 # ── the export ──────────────────────────────────────────────────────────────

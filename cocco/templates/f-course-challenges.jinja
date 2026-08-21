@@ -8,7 +8,7 @@
 
 <div class="flex flex-col gap-3">
   {% for challenge in challenges %}
-  {% with n = loop.index, can_edit = true, reorder = true,
+  {% with can_edit = true, reorder = true,
           first = loop.first, last = loop.last %}
   {% include "_challenge-card.jinja" %}
   {% endwith %}

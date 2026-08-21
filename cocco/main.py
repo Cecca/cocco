@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Annotated
 import markdown as md
 from markupsafe import Markup
@@ -5,7 +6,7 @@ from pygments import highlight as pygments_highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import TextLexer, get_lexer_by_name
 from pygments.util import ClassNotFound
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select
 from cocco.avatar import MAX_AVATAR_BYTES, generate_identicon, sniff_image_mime
 from cocco.evaluators import BUNDLED, DEFAULT_EVALUATOR, bundled_path
 from cocco.judge import extension_to_language, load_languages
@@ -118,6 +119,7 @@ from cocco.repository import (
     query_challenge_ranking,
     query_challenge_standings,
     query_challenge_testcases,
+    query_challenge_visibility,
     query_course,
     query_course_archived_at,
     query_course_challenges,
@@ -359,6 +361,29 @@ def render_datetime(value):
         value = value.astimezone()
     return format_datetime(value, locale="en")
 
+def render_datetime_local(value) -> str:
+    """A timestamp as an `<input type="datetime-local">` value.
+
+    `render_datetime`'s twin, and it has to be: that filter prints the sentence
+    a badge shows and this one fills the box a teacher types into, so if the two
+    disagreed about which clock they were on, a challenge would open an hour
+    away from where it said it would. Hence the same two shapes accepted - a
+    real `datetime` from a plain Core read, an ISO-8601 string from `row_to_json`
+    - and the same `astimezone()` with no argument, pinning it to the app
+    server's local clock.
+
+    The seconds are dropped because the input's default `step` has no place for
+    them, and an empty string for NULL, which is an empty box.
+    """
+    from datetime import datetime
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    if value.tzinfo is not None:
+        value = value.astimezone()
+    return value.strftime("%Y-%m-%dT%H:%M")
+
 def render_score(value) -> str:
     """Per-test scores are in [0, 1]; the UI shows their mean out of 100."""
     if value is None:
@@ -376,6 +401,7 @@ def render_duration(value) -> str:
 templates.env.filters["markdown"] = render_markdown
 templates.env.filters["highlight"] = render_source
 templates.env.filters["datetime"] = render_datetime
+templates.env.filters["datetime_local"] = render_datetime_local
 templates.env.filters["score"] = render_score
 templates.env.filters["duration"] = render_duration
 
@@ -482,6 +508,7 @@ async def _populate_dummy_data(conn: AsyncConnection):
     course_titles = ["Algorithms 101", "Data Structures"]
     first_challenge_id: int | None = None
     last_challenge_id: int | None = None
+    first_course_id: int | None = None
     shortest_route = textwrap.dedent("""\
         You are given a weighted, undirected graph of **city connections**.
         Compute the length of the shortest route between a source city and a
@@ -525,6 +552,8 @@ async def _populate_dummy_data(conn: AsyncConnection):
                 .returning(Course.c.id)
             )
         ).scalar_one()
+        if first_course_id is None:
+            first_course_id = course_id
         # Matteo and Alice both teach; Bob and Charlie are students. `role` is
         # per course, so this is one row per person per course. What makes
         # Matteo an administrator is not written here but in `administrator`,
@@ -568,6 +597,10 @@ async def _populate_dummy_data(conn: AsyncConnection):
                         # No evaluator of its own: graded by the bundled
                         # default, exact match.
                         evaluator_path=None,
+                        # Published. `insert_challenge` leaves this NULL - a new
+                        # challenge is hidden - so a seed that did not say so
+                        # would hand Bob and Charlie an empty course.
+                        visible_from=func.now(),
                     )
                     .returning(Challenge.c.id)
                 )
@@ -586,9 +619,10 @@ async def _populate_dummy_data(conn: AsyncConnection):
     # and so the only person who can unarchive one - finds it under "Other
     # courses", and Bob and Charlie see it in "Your courses", greyed and
     # read-only.
-    from datetime import datetime, timezone
+    from datetime import timedelta, timezone
 
     assert last_challenge_id is not None
+    assert first_course_id is not None
     await set_challenge_archived(conn, last_challenge_id, True)
     archived_course_id = (
         await conn.execute(
@@ -622,6 +656,39 @@ async def _populate_dummy_data(conn: AsyncConnection):
             max_time_s=5.0,
             max_threads=1,
             evaluator_path=None,
+            visible_from=func.now(),
+        )
+    )
+
+    # The two halves of visibility, on the first course, for archiving's reason:
+    # a fresh checkout should show both without anybody having to click. One
+    # challenge nobody but staff can see, and one that opens next week - which
+    # Bob and Charlie find on their course page as a card with a date on it and
+    # nothing to click.
+    await conn.execute(
+        insert(Challenge).values(
+            title="Maximum Flow (draft)",
+            description="Still being written. Students cannot see this one.",
+            course_id=first_course_id,
+            position=3,
+            max_memory_bytes=256 << 20,
+            max_time_s=5.0,
+            max_threads=1,
+            evaluator_path=None,
+            visible_from=None,
+        )
+    )
+    await conn.execute(
+        insert(Challenge).values(
+            title="Minimum Spanning Tree",
+            description="Opens next week. Until then this is all anybody sees.",
+            course_id=first_course_id,
+            position=4,
+            max_memory_bytes=256 << 20,
+            max_time_s=5.0,
+            max_threads=1,
+            evaluator_path=None,
+            visible_from=datetime.now(timezone.utc) + timedelta(days=7),
         )
     )
 
@@ -1351,6 +1418,38 @@ async def require_course_member(
 CourseMember = Annotated[UserRole, Depends(require_course_member)]
 
 
+async def require_challenge_visible(
+    db: AsyncConnection, challenge_id: int, role: UserRole
+) -> None:
+    """Refuse a challenge the class has not been given yet, or return.
+
+    The whole enforcement of hiding, and it lives here - inside the two gates
+    that already answer "may this person read this challenge" - rather than
+    scattered over the five routes behind them. `post_submission` in particular
+    needs no check of its own: its dependency runs before its body, so a hidden
+    challenge refuses an upload without reading a byte of it. That is the
+    opposite arrangement to archiving, which is a state a route has to consult
+    (`query_effective_archived_at`) because an archived challenge is still one
+    you may open.
+
+    Course staff pass whatever the state is - the editor is where a challenge is
+    written, and it would be a strange hiding place that hid it from them. For
+    everybody else the two refusals are deliberately different. A hidden
+    challenge is a bare 404, which tells the asker nothing, and matches what the
+    course page already showed them: no such thing. A *scheduled* one is a
+    sentence with the date in it, because its card is on their course page
+    saying exactly that, and a 404 there would read as a broken link.
+    """
+    if role in EDITOR_ROLES:
+        return
+    visible_from, visible = await query_challenge_visibility(db, challenge_id)
+    if visible:
+        return
+    if visible_from is None:
+        raise HTTPException(status_code=404)
+    raise Forbidden(f"This challenge opens on {render_datetime(visible_from)}.")
+
+
 async def require_challenge_viewer(
     challenge_id: int, course_id: int, db: DBDep, role: CourseMember
 ) -> UserRole:
@@ -1362,9 +1461,15 @@ async def require_challenge_viewer(
     of one course could name their own course in front of another course's
     challenge and read it. A mismatched pair is a URL for a challenge that does
     not exist under that course, hence 404.
+
+    The visibility check comes after the cross-check and not before it: a
+    student naming somebody else's course is a 404 whatever that challenge's
+    visibility is, and asking the second question first would leak which of two
+    reasons applied.
     """
     if not await challenge_in_course(db, challenge_id, course_id):
         raise HTTPException(status_code=404)
+    await require_challenge_visible(db, challenge_id, role)
     return role
 
 
@@ -1391,6 +1496,7 @@ async def require_challenge_member(
     role = await effective_challenge_role(db, user, challenge_id)
     if role is None:
         raise Forbidden("You are not enrolled on the course this challenge belongs to.")
+    await require_challenge_visible(db, challenge_id, role)
     return role
 
 
@@ -1939,9 +2045,14 @@ async def get_course(course_id: int, request: Request, db: DBDep, user: CurrentU
             },
         )
 
-    # The viewer is part of the query: each challenge card says whether *this*
-    # person has already submitted to it.
-    course = await query_course_info(db, course_id, user_id=user.id)
+    # The viewer is part of the query twice over: each challenge card says
+    # whether *this* person has already submitted to it, and staff are shown
+    # the challenges they have not published yet while the class is not. This
+    # is the only page where the flag is a decision rather than a constant -
+    # `get_course_edit` and the reorder fragment are staff-only by dependency.
+    course = await query_course_info(
+        db, course_id, user_id=user.id, include_hidden=role in EDITOR_ROLES
+    )
     if course is None:
         raise HTTPException(status_code=404)
     return templates.TemplateResponse(
@@ -2054,8 +2165,15 @@ async def _render_course_challenges(
     request: Request, db: DBDep, course_id: int, user: schema.User
 ):
     """The reorderable challenge list. Every move returns this whole fragment,
-    so the cards always sit in the order the database has them."""
-    challenges = await query_course_challenges(db, course_id, user_id=user.id)
+    so the cards always sit in the order the database has them.
+
+    `include_hidden`, unconditionally: this is the course editor's copy of the
+    list and every caller of it is behind `CourseEditor`. Hiding a challenge
+    from the page you publish it on would be a fine joke.
+    """
+    challenges = await query_course_challenges(
+        db, course_id, user_id=user.id, include_hidden=True
+    )
     return templates.TemplateResponse(
         request=request,
         name="f-course-challenges.jinja",
@@ -2075,7 +2193,9 @@ async def get_course_edit(
     user: CurrentUser,
     role: CourseEditor,
 ):
-    course = await query_course_info(db, course_id, user_id=user.id)
+    course = await query_course_info(
+        db, course_id, user_id=user.id, include_hidden=True
+    )
     if course is None:
         raise HTTPException(status_code=404)
     return templates.TemplateResponse(
@@ -3052,6 +3172,10 @@ NEW_CHALLENGE_DEFAULTS = {
     "max_memory_bytes": 256 << 20,
     "max_threads": 1,
     "ranking": LeaderboardRanking.running_time.value,
+    # Hidden, which is what `insert_challenge` writes too. The form's radio
+    # group reads this, so the create page opens on "Hidden" and a challenge is
+    # published deliberately rather than by default.
+    "visible_from": None,
 }
 
 
@@ -3061,12 +3185,22 @@ def _challenge_fields(
     max_memory_mb: float,
     max_threads: int,
     ranking: str,
+    visible_from: str | datetime | None = None,
 ) -> tuple[dict | None, str | None]:
     """The columns a challenge form writes, or the message explaining why not.
 
     The create and the edit form are the same form - `_challenge-form.jinja` -
     so they are validated once, here, and the caller only decides what to do
-    with the result.
+    with the result. `api_import_challenge` is the third caller rather than a
+    second opinion.
+
+    `visible_from` arrives in whichever shape its caller naturally holds: the
+    `"2026-09-01T09:00"` an `<input type="datetime-local">` posts, the real
+    `datetime` `tomllib` parses out of a pushed `challenge.toml`, or None for a
+    challenge that is hidden. Normalizing all three here is what stops the
+    browser and `cocco push` disagreeing about what a date means - and a naive
+    value is read as the app server's local clock, which is the one clock
+    `render_datetime` prints in and `render_datetime_local` fills the box with.
     """
     if max_time_s <= 0 or max_memory_mb <= 0 or max_threads < 1:
         return None, "Limits must be positive."
@@ -3076,13 +3210,75 @@ def _challenge_fields(
     except ValueError:
         return None, "Unknown leaderboard ranking."
 
+    if isinstance(visible_from, str):
+        try:
+            visible_from = datetime.fromisoformat(visible_from)
+        except ValueError:
+            return None, "That is not a date and time."
+    visible_from = _as_aware(visible_from)
+
     return {
         "description": description,
         "max_time_s": max_time_s,
         "max_memory_bytes": int(max_memory_mb * 1024 * 1024),
         "max_threads": max_threads,
         "ranking": criterion,
+        "visible_from": visible_from,
     }, None
+
+
+def _as_aware(value: datetime | None) -> datetime | None:
+    """A datetime with an offset on it, reading a naive one as this server's own
+    clock.
+
+    Naive values reach us from three directions and all three mean the same
+    thing: an `<input type="datetime-local">` posts a wall clock with no offset,
+    a `challenge.toml` may spell a TOML local-datetime, and SQLite - which is
+    what the route tests run on - hands back what Postgres would have made
+    aware. Reading all of them on the server's clock is the same rule
+    `render_datetime` prints in and `render_datetime_local` fills the box with,
+    which is what stops a challenge opening an hour away from where it said.
+    """
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.astimezone()
+
+
+# What the Visibility card's radio group can say. `now` and `scheduled` both end
+# up as a timestamp in the same column - the difference is only which one - and
+# `hidden` is the NULL.
+VISIBILITY_CHOICES = ("hidden", "now", "scheduled")
+
+
+def _visible_from_choice(
+    visibility: str, visible_at: str, current: datetime | None
+) -> tuple[str | datetime | None, str | None]:
+    """Turn the Visibility card's two fields into one value, or say why not.
+
+    A radio and a box rather than a box alone, because "publish this now" is the
+    commonest thing anybody does here and should not require typing a date; and
+    one column behind them, because "hidden", "live" and "opens on Tuesday" are
+    three answers to one question.
+
+    `current` is what the challenge already says, and it exists for one case:
+    re-saving a challenge that is already live must not re-stamp its publication
+    date, or every edit to the statement would move the "visible since" a badge
+    prints. A challenge whose date is still in the future is *not* preserved -
+    picking `now` there is precisely the act of bringing it forward.
+    """
+    if visibility not in VISIBILITY_CHOICES:
+        return None, "Unknown visibility."
+    if visibility == "hidden":
+        return None, None
+    if visibility == "scheduled":
+        if not visible_at.strip():
+            return None, "Pick the date and time the challenge opens."
+        return visible_at.strip(), None
+    now = datetime.now().astimezone()
+    current = _as_aware(current)
+    if current is not None and current <= now:
+        return current, None
+    return now, None
 
 
 @app.get("/courses/{course_id}/challenges/new")
@@ -3122,6 +3318,8 @@ async def post_challenge_new(
     max_memory_mb: Annotated[float, Form()],
     max_threads: Annotated[int, Form()],
     ranking: Annotated[str, Form()],
+    visibility: Annotated[str, Form()] = "hidden",
+    visible_at: Annotated[str, Form()] = "",
 ):
     """Create the challenge and send the browser to its editor."""
 
@@ -3136,8 +3334,14 @@ async def post_challenge_new(
     if not title:
         return alert("A challenge needs a title.")
 
+    # No current value to preserve - there is no challenge yet - so `now` here
+    # always means this moment.
+    visible_from, error = _visible_from_choice(visibility, visible_at, None)
+    if error is not None:
+        return alert(error)
+
     fields, error = _challenge_fields(
-        description, max_time_s, max_memory_mb, max_threads, ranking
+        description, max_time_s, max_memory_mb, max_threads, ranking, visible_from
     )
     if fields is None:
         return alert(error or "Invalid challenge.")
@@ -3232,8 +3436,11 @@ async def post_challenge_edit(
     max_memory_mb: Annotated[float, Form()],
     max_threads: Annotated[int, Form()],
     ranking: Annotated[str, Form()],
+    visibility: Annotated[str, Form()] = "hidden",
+    visible_at: Annotated[str, Form()] = "",
 ):
-    """Save the problem statement, the sandbox limits and the leaderboard."""
+    """Save the problem statement, the sandbox limits, the leaderboard and when
+    the class may see any of it."""
 
     def alert(message: str, ok: bool = False):
         return templates.TemplateResponse(
@@ -3242,8 +3449,15 @@ async def post_challenge_edit(
             context={"ok": ok, "message": message},
         )
 
+    # The current value, so that saving a live challenge with "Visible now"
+    # keeps the date it went live rather than re-stamping it on every edit.
+    current, _ = await query_challenge_visibility(db, challenge_id)
+    visible_from, error = _visible_from_choice(visibility, visible_at, current)
+    if error is not None:
+        return alert(error)
+
     fields, error = _challenge_fields(
-        description, max_time_s, max_memory_mb, max_threads, ranking
+        description, max_time_s, max_memory_mb, max_threads, ranking, visible_from
     )
     if fields is None:
         return alert(error or "Invalid challenge.")
@@ -4279,6 +4493,15 @@ async def api_list_challenges(db: DBDep, user: ApiUser):
                 # editing an archived challenge - so this is a warning to
                 # somebody about to push to last year's course, not a gate.
                 "archived": row.archived_at is not None,
+                # The same kind of note, for the other end of the life cycle.
+                # `visible_from` is null for a hidden challenge, and `visible`
+                # is false for a hidden *or* a scheduled one - the CLI prints
+                # which, and neither is a gate: staff push to a challenge they
+                # have not published precisely because they are still writing it.
+                "visible_from": (
+                    None if row.visible_from is None else row.visible_from.isoformat()
+                ),
+                "visible": bool(row.is_visible),
             }
             for row in rows
         ]
@@ -4320,6 +4543,10 @@ async def api_export_challenge(
         evaluator=(
             None if evaluator_name is None else f"{EVALUATOR_DIR}/{evaluator_name}"
         ),
+        # Absent from the file when the challenge is hidden, which is what
+        # `dump_manifest` does with a None - so pushing a pulled file back keeps
+        # it hidden rather than publishing it.
+        visible_from=challenge.visible_from,
         testcases=tuple(
             ManifestTestCase(
                 input=f"{TESTS_DIR}/{row.input_path.rsplit('/', 1)[-1]}",
@@ -4499,15 +4726,19 @@ async def api_import_challenge(
         except ManifestError as e:
             return refuse(str(e))
 
-        # The limits and the ranking are validated by the same function the
-        # create form and the edit form go through, rather than a second time
-        # here: this is `_challenge_fields`' third caller, not its rival.
+        # The limits, the ranking and the visibility are validated by the same
+        # function the create form and the edit form go through, rather than a
+        # second time here: this is `_challenge_fields`' third caller, not its
+        # rival. `visible_from` arrives as a `datetime` from `tomllib` where the
+        # forms hand it a string, which is exactly the difference that function
+        # exists to absorb.
         fields, error = _challenge_fields(
             statement,
             manifest.max_time_s,
             manifest.max_memory_mb,
             manifest.max_threads,
             manifest.ranking.value,
+            manifest.visible_from,
         )
         if fields is None:
             return refuse(error or "Invalid challenge.")

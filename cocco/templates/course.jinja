@@ -74,9 +74,9 @@
 
   <div class="flex flex-col gap-3">
     {% for challenge in course.challenges %}
-    {% with n = loop.index %}
+    {# No `n`: the card numbers itself from `challenge.number`, which is ranked
+       over the whole course. This list is filtered for a student. #}
     {% include "_challenge-card.jinja" %}
-    {% endwith %}
     {% else %}
     <div class="rounded-xl border border-dashed border-base-300 bg-base-200/40 px-4 py-8 text-center text-sm text-base-content/50">
       No challenges yet.

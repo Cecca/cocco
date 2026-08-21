@@ -38,6 +38,20 @@
       {% if challenge.effective_archived_at %}
       <span class="badge badge-warning badge-outline font-bold">Archived</span>
       {% endif %}
+      {# Only staff ever read these: `require_challenge_viewer` refuses everybody
+         else a challenge that is not visible yet, so a student on this page is
+         on a challenge that is. They are here rather than in `challenge-staff`
+         so that "view as student" shows them too - that view is the one where
+         you check whether the thing is ready to be published. #}
+      {% if not challenge.visible_from %}
+      <span class="badge badge-neutral badge-outline font-bold"
+            title="Only course staff can see this">Hidden</span>
+      {% elif not challenge.is_visible %}
+      <span class="badge badge-info badge-outline font-bold"
+            title="It opens by itself at this time">
+        Opens {{ challenge.visible_from | datetime }}
+      </span>
+      {% endif %}
       <span class="badge badge-warning font-bold border-none"
             style="background:color-mix(in oklch, var(--color-warning) 18%, transparent);color:oklch(45% 0.12 55);">
         {{ challenge.max_time_s }} s limit

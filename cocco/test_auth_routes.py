@@ -26,6 +26,7 @@ from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from cocco.conftest import PUBLISHED
 from cocco.auth import get_or_create_user
 from cocco.config import GoogleConfig
 from cocco.model import (
@@ -702,6 +703,7 @@ async def a_course(app_engine):
                         max_memory_bytes=1 << 20,
                         max_time_s=1.0,
                         max_threads=1,
+                        visible_from=PUBLISHED,
                     )
                     .returning(Challenge.c.id)
                 )

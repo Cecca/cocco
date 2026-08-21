@@ -60,6 +60,37 @@ def _effective_archived_at():
     return func.coalesce(Challenge.c.archived_at, Course.c.archived_at)
 
 
+# Whether a challenge is open to the class yet: `challenge.visible_from` is
+# NULL for a hidden one, a past instant for a live one and a future one for a
+# challenge that opens by itself at that moment.
+#
+# The neighbour of `_EFFECTIVE_ARCHIVED_SQL` above and written under the same
+# discipline: twice and nowhere else, once as SQL because the page queries are
+# raw text and once as a Core expression because the plain-Core reads are what
+# the route tests reach on SQLite. Nothing downstream may spell it a third
+# time.
+#
+# Two differences from its neighbour. It does not cascade from the course - a
+# course has no hidden state to cascade, so this needs only `challenge` in its
+# FROM - and it is a *boolean* rather than a timestamp, because "when" and
+# "whether" come apart here: a page that has to say "opens on the 1st" reads
+# `visible_from` itself, and a gate that has to decide reads this.
+#
+# `now()` and never a Python clock, for the reason `model.py` gives for every
+# timestamp in the schema: the transaction's clock is the one that counts.
+_CHALLENGE_VISIBLE_SQL = (
+    "(challenge.visible_from IS NOT NULL AND challenge.visible_from <= now())"
+)
+
+
+def _challenge_visible():
+    """`_CHALLENGE_VISIBLE_SQL` as a Core expression."""
+    return and_(
+        Challenge.c.visible_from.is_not(None),
+        Challenge.c.visible_from <= func.now(),
+    )
+
+
 async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
     """Get a queued submission, along with all the data required to run it.
     Atomically set it to 'running'."""
@@ -483,6 +514,13 @@ async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int
 
     `effective_archived_at` is what decides whether the page shows a submit
     form; see `_EFFECTIVE_ARCHIVED_SQL` for why it is not `challenge.archived_at`.
+
+    `is_visible` is its neighbour and answers a different question - whether the
+    class may see this at all. Only staff ever read a document whose `is_visible`
+    is false, because `require_challenge_viewer` refuses everybody else before
+    this query runs; it is here so the editor's form and the staff badge can say
+    which of the three states the challenge is in. `visible_from` itself rides
+    along in `challenge.*`.
     """
     query = text(f"""
     WITH
@@ -504,6 +542,7 @@ async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int
         SELECT challenge.*,
                course.title AS course_title,
                {_EFFECTIVE_ARCHIVED_SQL} AS effective_archived_at,
+               {_CHALLENGE_VISIBLE_SQL} AS is_visible,
                numbers.number AS number,
                enrollment.role AS viewer_role,
                coalesce(samples.samples, '[]'::json) AS samples
@@ -1157,6 +1196,13 @@ async def query_editable_challenges(
     second caller, which is what earns it a name - so `cocco ls` marks a
     challenge whose course was archived as well as one archived on its own. A
     push to either is still accepted; see `api_import_challenge`.
+
+    `visible_from` and `is_visible` come back for the same reason and with the
+    same force: a note beside the title, never anything missing from the list.
+    This is a listing of what the caller may *edit*, and hiding a challenge is
+    precisely what staff do while they are still writing it - a `cocco ls` that
+    dropped them would hide the ids of the challenges most likely to be pushed
+    to.
     """
     joined = Challenge.join(Course, Challenge.c.course_id == Course.c.id)
     stmt = select(
@@ -1165,6 +1211,8 @@ async def query_editable_challenges(
         Challenge.c.id.label("challenge_id"),
         Challenge.c.title,
         _effective_archived_at().label("archived_at"),
+        Challenge.c.visible_from,
+        _challenge_visible().label("is_visible"),
     )
     if every_course:
         stmt = stmt.select_from(joined)
@@ -1193,6 +1241,7 @@ async def insert_challenge(
     max_memory_bytes: int,
     max_threads: int,
     ranking: LeaderboardRanking,
+    visible_from: datetime | None = None,
 ) -> int:
     """Create a challenge on a course and return its id.
 
@@ -1202,6 +1251,13 @@ async def insert_challenge(
 
     `evaluator_path` is left NULL on purpose: a brand new challenge has chosen
     no checker, and the judge grades those with the bundled `equality.py`.
+
+    `visible_from` defaults to NULL for the same kind of reason, and it is the
+    one default here that changes what the class sees: a brand new challenge is
+    *hidden*. It has no test cases and no evaluator either, so a course page
+    that listed it the instant it was created was advertising a page that could
+    not be solved. The create form offers the three states all the same, so
+    staff who want it live at once can say so.
     Like the other insert helpers here, this does not commit - the caller owns
     the transaction.
     """
@@ -1224,6 +1280,7 @@ async def insert_challenge(
             ranking=ranking,
             position=next_position,
             evaluator_path=None,
+            visible_from=visible_from,
         )
         .returning(Challenge.c.id)
     )
@@ -1426,6 +1483,31 @@ async def query_effective_archived_at(
         .where(Challenge.c.id == challenge_id)
     )
     return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def query_challenge_visibility(
+    conn: AsyncConnection, challenge_id: int
+) -> tuple[datetime | None, bool]:
+    """When this challenge opens, and whether it has. `_challenge_visible`'s
+    second caller, which is what earns it a name.
+
+    `query_effective_archived_at`'s twin: the single Python-side read of the
+    rule, plain Core so the route tests reach it on SQLite, with
+    `query_challenge` answering the same question in SQL for the page. Both
+    halves come back in one round trip because `require_challenge_visible`
+    needs both - the boolean to decide, and the timestamp to say when to come
+    back.
+
+    A challenge that does not exist answers `(None, False)`, which is what a
+    hidden one answers, and is the right answer to both: the caller 404s.
+    """
+    stmt = select(Challenge.c.visible_from, _challenge_visible()).where(
+        Challenge.c.id == challenge_id
+    )
+    row = (await conn.execute(stmt)).first()
+    if row is None:
+        return None, False
+    return row[0], bool(row[1])
 
 
 async def set_course_archived(
@@ -1963,6 +2045,14 @@ async def query_enrollment_key(conn: AsyncConnection, course_id: int) -> str | N
 # Takes :course_id and :user_id. The ordering is `position, id`: `position` is
 # what the arrows write, and the id breaks a tie, so challenges that have never
 # been reordered stay in the order they were created in.
+#
+# It carries `number` rather than leaving the template to count with
+# `loop.index`, and that is load-bearing now that the list can be filtered: a
+# student is shown neither the hidden challenges nor - in the editor's copy of
+# this list - anything staff have not published, so counting rows on the page
+# would print "Challenge 03" to a student in front of what staff call 04. The
+# window runs over every challenge of the course, inside the CTE, *before* any
+# caller filters it. It is the same rank `query_challenge` computes.
 _COURSE_CHALLENGES_CTE = f"""
     submitted AS (
         SELECT submission.challenge_id,
@@ -1986,6 +2076,13 @@ _COURSE_CHALLENGES_CTE = f"""
                -- same name in the record, `row_to_json` would emit both keys,
                -- and `json.loads` would resolve it last-one-wins.
                {_EFFECTIVE_ARCHIVED_SQL} AS effective_archived_at,
+               -- Whether the class may see it at all, as against whether they
+               -- may still submit to it. A separate name for the same reason
+               -- as above, and `visible_from` itself rides along in the star:
+               -- a scheduled challenge's card has to print *when*.
+               {_CHALLENGE_VISIBLE_SQL} AS is_visible,
+               row_number() OVER (ORDER BY challenge.position, challenge.id)
+                   AS number,
                coalesce(submitted.n_mine, 0) AS n_mine,
                coalesce(submitted.n_submitters, 0) AS n_submitters
         FROM challenge
@@ -1996,13 +2093,30 @@ _COURSE_CHALLENGES_CTE = f"""
 """
 
 
-async def query_course_info(conn: AsyncConnection, course_id: int, user_id: int):
+# Which of the CTE's rows this caller is allowed to be shown. Staff pass
+# `include_hidden` and get the lot, because that is the list they publish from;
+# everybody else gets the visible challenges *and* the scheduled ones, whose
+# card is a teaser with no link - so the class can see what is coming - and
+# never a hidden one, which they are not told exists.
+#
+# Applied outside the CTE rather than in its WHERE, so that `number` is already
+# ranked over the whole course by the time anything is dropped.
+_VISIBLE_TO_CALLER_SQL = "(:include_hidden OR visible_from IS NOT NULL)"
+
+
+async def query_course_info(
+    conn: AsyncConnection, course_id: int, user_id: int, include_hidden: bool = False
+):
     """The course, its description and its challenges as the page lists them.
 
     One document rather than a query per card: see `_COURSE_CHALLENGES_CTE` for
     what each challenge carries. The course editor reads the same thing - it
     shows the same list, plus the arrows - so every reorder re-renders from
     here and cannot drift from what is stored.
+
+    `include_hidden` is what makes the two lists differ, and it defaults to the
+    safe answer: a caller who forgets it shows a student's list, never a
+    teacher's. See `_VISIBLE_TO_CALLER_SQL`.
     """
     query = text(f"""
     WITH
@@ -2017,7 +2131,7 @@ async def query_course_info(conn: AsyncConnection, course_id: int, user_id: int)
             course.*,
             coalesce(
                 (SELECT json_agg(challenges ORDER BY challenges.position, challenges.id)
-                 FROM challenges),
+                 FROM challenges WHERE {_VISIBLE_TO_CALLER_SQL}),
                 '[]'::json
             ) as challenges
         FROM course
@@ -2025,11 +2139,16 @@ async def query_course_info(conn: AsyncConnection, course_id: int, user_id: int)
     )
     SELECT row_to_json(c) FROM c;
     """)
-    res = await conn.execute(query, dict(course_id=course_id, user_id=user_id))
+    res = await conn.execute(
+        query,
+        dict(course_id=course_id, user_id=user_id, include_hidden=include_hidden),
+    )
     return res.scalar()
 
 
-async def query_course_challenges(conn: AsyncConnection, course_id: int, user_id: int):
+async def query_course_challenges(
+    conn: AsyncConnection, course_id: int, user_id: int, include_hidden: bool = False
+):
     """Just the list `query_course_info` nests, for the fragment the reorder
     arrows swap: a move changes the order of the cards and nothing about the
     course itself."""
@@ -2040,8 +2159,11 @@ async def query_course_challenges(conn: AsyncConnection, course_id: int, user_id
         json_agg(challenges ORDER BY challenges.position, challenges.id),
         '[]'::json
     )
-    FROM challenges;
+    FROM challenges WHERE {_VISIBLE_TO_CALLER_SQL};
     """)
-    res = await conn.execute(query, dict(course_id=course_id, user_id=user_id))
+    res = await conn.execute(
+        query,
+        dict(course_id=course_id, user_id=user_id, include_hidden=include_hidden),
+    )
     return res.scalar()
 

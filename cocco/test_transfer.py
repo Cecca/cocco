@@ -6,6 +6,8 @@ that a graded test case is retired and never deleted - be checked here rather
 than only through a round trip against a live server.
 """
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from cocco.model import LeaderboardRanking
@@ -203,3 +205,46 @@ def test_an_empty_manifest_retires_or_deletes_everything():
     )
     assert [tc.input_name for tc in plan.deleted] == ["01.in"]
     assert [tc.input_name for tc in plan.retired] == ["02.in"]
+
+
+########################################################################
+# `visible_from`, which is the one manifest key whose *absence* is a value.
+
+
+def test_visible_from_survives_the_round_trip():
+    """TOML has native datetimes, so this needs no spelling of its own."""
+    when = datetime(2026, 9, 1, 9, 0, tzinfo=timezone(timedelta(hours=2)))
+    text = dump_manifest(a_manifest(visible_from=when))
+    assert parse_manifest(text).visible_from == when
+
+
+def test_a_hidden_challenge_has_no_key_at_all():
+    """Absent means hidden, which is a real value and not a missing one: pulling
+    a challenge staff are still writing and pushing the file back has to leave
+    it hidden, not publish it."""
+    text = dump_manifest(a_manifest(visible_from=None))
+    assert "visible_from" not in text
+    assert parse_manifest(text).visible_from is None
+
+
+def test_a_naive_datetime_is_accepted():
+    """A TOML local-datetime, which is what somebody typing the key by hand
+    writes. `_challenge_fields` reads it on the server's clock - the same rule
+    the editor's box uses - so it is not this module's business to refuse it."""
+    manifest = parse_manifest(
+        dump_manifest(a_manifest()).replace(
+            "max_threads = 1", "max_threads = 1\nvisible_from = 2026-09-01T09:00:00"
+        )
+    )
+    assert manifest.visible_from == datetime(2026, 9, 1, 9, 0)
+
+
+def test_visible_from_has_to_be_a_datetime():
+    """The *type* is checked here even though the value is not: a
+    `visible_from = "soon"` is a perfectly good TOML string and would otherwise
+    reach the database as one."""
+    text = dump_manifest(a_manifest()).replace(
+        "max_threads = 1", 'max_threads = 1\nvisible_from = "soon"'
+    )
+    with pytest.raises(ManifestError, match="date and time"):
+        parse_manifest(text)

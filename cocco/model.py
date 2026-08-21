@@ -280,6 +280,21 @@ Challenge = Table(
     # This column on its own is the challenge's *own* state, which only the
     # challenge editor's danger zone reads.
     Column("archived_at", DateTime(timezone=True), nullable=True),
+    # The other end of the life cycle, and `archived_at` inverted: when this
+    # challenge became - or becomes - visible to the class. NULL is hidden,
+    # a past instant is visible, a future one is a challenge that opens by
+    # itself at that moment, with no one having to be at a keyboard for it.
+    #
+    # Deliberately no `server_default`: a *new* challenge is hidden, because a
+    # challenge with no test cases and no evaluator has no business being on a
+    # student's course page. The migration that adds this column backfills
+    # every existing row from `created_at` for exactly that reason.
+    #
+    # Unlike `archived_at` it does not cascade from the course, which has no
+    # hidden state to cascade. The rule is still spelled exactly twice, both
+    # times in `repository.py` (`_CHALLENGE_VISIBLE_SQL` and
+    # `_challenge_visible`), and never in a route or a template.
+    Column("visible_from", DateTime(timezone=True), nullable=True),
     created_at(),
     # Note what this does not distinguish: `reorder_challenges` renumbers every
     # challenge of a course, so moving one with the arrows bumps all of them.

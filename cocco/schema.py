@@ -50,6 +50,10 @@ class Challenge(Base):
     # archived course is archived with this still NULL. See `Challenge` in
     # `model.py` for where that `or` lives.
     archived_at: datetime | None = None
+    # NULL is hidden, a past instant visible, a future one scheduled. Defaulted
+    # for `Course.archived_at`'s reason: nothing validates a `Challenge` on its
+    # way through a door, and the gate reads `query_challenge_visibility`.
+    visible_from: datetime | None = None
 
 
 class TestCase(Base):

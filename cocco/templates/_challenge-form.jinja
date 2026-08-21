@@ -93,6 +93,76 @@
     </div>
   </div>
 
+  <!-- ══ VISIBILITY ══════════════════════════════════════════════════ -->
+  <!-- One column behind three radios: "hidden", "live" and "opens on Tuesday"
+       are three answers to one question, so `challenge.visible_from` is NULL,
+       a past instant, or a future one. Inside the same form as everything
+       else - one Save covers the lot. -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg">Visibility</h2>
+      <p class="text-[13px] text-base-content/55 -mt-1">
+        When the class may see this challenge. Course staff always can, so this
+        is the page you publish from. Hiding a challenge that students have
+        already submitted to takes it off their page without touching their
+        attempts or their scores.
+      </p>
+
+      {# `is_visible` is the server's answer, computed with the database's
+         clock - see `_CHALLENGE_VISIBLE_SQL`. The create page passes a plain
+         dict with neither key, so both fall back to false / none. #}
+      {% set scheduled = challenge.visible_from and not challenge.is_visible %}
+      <div class="flex flex-col gap-2 mt-3">
+        <label class="flex items-start gap-3 rounded-xl border border-base-300 p-3 cursor-pointer hover:border-primary/40">
+          <input type="radio" name="visibility" value="hidden" class="radio radio-sm mt-0.5"
+                 {{ 'checked' if not challenge.visible_from }} />
+          <span>
+            <span class="font-semibold">Hidden</span>
+            <span class="block text-[13px] text-base-content/55">
+              Nobody but course staff is shown it, or can open it. This is how a
+              new challenge starts.
+            </span>
+          </span>
+        </label>
+
+        <label class="flex items-start gap-3 rounded-xl border border-base-300 p-3 cursor-pointer hover:border-primary/40">
+          <input type="radio" name="visibility" value="now" class="radio radio-sm mt-0.5"
+                 {{ 'checked' if challenge.is_visible }} />
+          <span>
+            <span class="font-semibold">Visible now</span>
+            <span class="block text-[13px] text-base-content/55">
+              {% if challenge.is_visible %}
+              Open to the class since {{ challenge.visible_from | datetime }} —
+              saving keeps that date.
+              {% else %}
+              Open it to the class as soon as you save.
+              {% endif %}
+            </span>
+          </span>
+        </label>
+
+        <label class="flex items-start gap-3 rounded-xl border border-base-300 p-3 cursor-pointer hover:border-primary/40">
+          <input type="radio" name="visibility" value="scheduled" class="radio radio-sm mt-0.5"
+                 {{ 'checked' if scheduled }} />
+          <span class="min-w-0 flex-1">
+            <span class="font-semibold">Visible from</span>
+            <span class="block text-[13px] text-base-content/55">
+              It opens by itself at this moment — nobody has to be here for it.
+              Until then the class sees the title and a note saying when, and
+              cannot open it.
+            </span>
+            {# The box carries the server's clock at both ends: this filter and
+               the `| datetime` above are the same `astimezone()`. #}
+            <input type="datetime-local" name="visible_at"
+                   value="{{ challenge.visible_from | datetime_local }}"
+                   class="input font-mono w-full mt-2 max-w-xs"
+                   onfocus="this.form.visibility.value = 'scheduled'" />
+          </span>
+        </label>
+      </div>
+    </div>
+  </div>
+
   <!-- ══ SANDBOX LIMITS ══════════════════════════════════════════════ -->
   <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
     <div class="card-body p-7">

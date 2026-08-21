@@ -10,8 +10,24 @@ resolves it exactly as the app does - which is the point, without the reach.
 """
 
 import os
+from datetime import datetime, timezone
 
 import pytest
+
+# A challenge that has been open to the class since long before any test ran.
+#
+# It is here, in the one module every test file already imports implicitly,
+# because `insert_challenge` - and a bare `insert(Challenge)` - leaves
+# `visible_from` NULL, which means *hidden*: a fixture that did not say this
+# would build a challenge no student could open, and every test about something
+# else would fail with a 404 that had nothing to do with what it was testing.
+#
+# A fixed instant rather than `datetime.now()`, and one far from now, because
+# the route tests run on SQLite: its `CURRENT_TIMESTAMP` is a naive UTC string
+# and SQLAlchemy stores an aware datetime as its own wall clock, so a comparison
+# between two moments seconds apart could land either way. Years apart, it
+# cannot.
+PUBLISHED = datetime(2020, 1, 1, tzinfo=timezone.utc)
 
 # Whether any test actually asked for Postgres this session. The teardown below
 # turns on it, because "PGDATABASE is set" is true for a plain

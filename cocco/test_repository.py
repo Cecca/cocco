@@ -6,6 +6,7 @@ from sqlalchemy import create_engine, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import cocco.model as cm
+from cocco.conftest import PUBLISHED
 from cocco.avatar import generate_identicon
 from cocco.model import (
     Administrator,
@@ -45,6 +46,7 @@ from cocco.repository import (
     query_challenge_ranking,
     query_challenge_standings,
     query_challenge_testcases,
+    query_challenge_visibility,
     query_course_challenges,
     query_course_info,
     query_course_people,
@@ -167,6 +169,11 @@ def _make_example_database(db_url="sqlite:///:memory:"):
                     max_memory_bytes=mem,
                     max_time_s=time_s,
                     max_threads=threads,
+                    # Published. NULL here means hidden, and the page queries
+                    # drop a hidden challenge for everybody but staff - so a
+                    # seed that left it out would test the filter rather than
+                    # whatever the test was about.
+                    visible_from=PUBLISHED,
                 )
                 .returning(Challenge.c.id)
             ).scalar_one()
@@ -1641,6 +1648,118 @@ async def test_a_challenge_under_an_archived_course_is_archived_in_effect(postgr
         by_title = {c["title"]: c for c in cards}
         assert by_title["Hello"]["archived_at"] is None
         assert by_title["Sum"]["archived_at"] is not None
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_the_two_spellings_of_visible_agree(postgres_url):
+    """`_CHALLENGE_VISIBLE_SQL` and `_challenge_visible` are one rule the module
+    has to spell twice - the page queries are raw text and the plain-Core reads
+    are what the route tests reach on SQLite. This is the test that pins them
+    together, `test_a_challenge_under_an_archived_course_is_archived_in_effect`'s
+    counterpart for the other end of a challenge's life.
+    """
+    sync_engine = create_engine(postgres_url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(postgres_url)
+
+    engine = create_async_engine(postgres_url)
+    async with engine.connect() as conn:
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
+        algorithms = await _course_id(conn, "Algorithms 101")
+        hello = await _challenge_id(conn, "Hello")
+
+        # Published by the seed, and every reading of it says so.
+        assert (await query_challenge_visibility(conn, hello))[1] is True
+        page = await query_challenge(conn, user_id=carol, challenge_id=hello)
+        assert page["is_visible"] is True
+
+        for visible_from, expected in (
+            (None, False),
+            (datetime.now(timezone.utc) + timedelta(days=7), False),
+            (datetime.now(timezone.utc) - timedelta(days=7), True),
+        ):
+            await conn.execute(
+                update(Challenge)
+                .where(Challenge.c.id == hello)
+                .values(visible_from=visible_from)
+            )
+            await conn.commit()
+
+            stored, core = await query_challenge_visibility(conn, hello)
+            assert core is expected
+            assert stored == visible_from
+            page = await query_challenge(conn, user_id=carol, challenge_id=hello)
+            assert page["is_visible"] is expected
+            # ...and the card's list, from the shared CTE, is the third reading.
+            cards = await query_course_challenges(
+                conn, algorithms, user_id=carol, include_hidden=True
+            )
+            by_title = {c["title"]: c for c in cards}
+            assert by_title["Hello"]["is_visible"] is expected
+
+        # A challenge that does not exist answers as a hidden one does, which is
+        # the right answer to both halves: the caller 404s.
+        assert await query_challenge_visibility(conn, 10_000) == (None, False)
+    await engine.dispose()
+
+
+@pytest.mark.integration
+async def test_a_hidden_challenge_is_dropped_and_keeps_its_number(postgres_url):
+    """Two things at once, because they are one bug. Hidden challenges leave a
+    student's list, scheduled ones stay in it as a teaser - and the number a
+    card prints comes off the row, ranked over the whole course, so a student is
+    not told to solve a "Challenge 02" that staff call 03."""
+    sync_engine = create_engine(postgres_url)
+    metadata.drop_all(sync_engine)
+    _make_example_database(postgres_url)
+
+    engine = create_async_engine(postgres_url)
+    async with engine.connect() as conn:
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
+        algorithms = await _course_id(conn, "Algorithms 101")
+        hello = await _challenge_id(conn, "Hello")
+        summing = await _challenge_id(conn, "Sum")
+
+        # Hidden, and the *first* of the two, which is what makes the numbering
+        # half of this test bite: counting rows on the page would renumber
+        # everything after it.
+        await conn.execute(
+            update(Challenge)
+            .where(Challenge.c.id == hello)
+            .values(visible_from=None, position=0)
+        )
+        await conn.execute(
+            update(Challenge)
+            .where(Challenge.c.id == summing)
+            .values(visible_from=datetime.now(timezone.utc) + timedelta(days=7),
+                    position=1)
+        )
+        await conn.commit()
+
+        staff = await query_course_challenges(
+            conn, algorithms, user_id=carol, include_hidden=True
+        )
+        assert [c["title"] for c in staff] == ["Hello", "Sum"]
+        assert [c["number"] for c in staff] == [1, 2]
+
+        # The student loses the hidden one and keeps the scheduled one, which is
+        # the teaser - with the date it opens on, so the card can print it.
+        student = await query_course_challenges(conn, algorithms, user_id=carol)
+        assert [c["title"] for c in student] == ["Sum"]
+        assert student[0]["is_visible"] is False
+        assert student[0]["visible_from"] is not None
+        # ...and it is still number 2 to them, exactly as it is to staff.
+        assert student[0]["number"] == 2
+
+        # The nested document the course page actually renders says the same.
+        page = await query_course_info(conn, algorithms, user_id=carol)
+        assert [c["title"] for c in page["challenges"]] == ["Sum"]
+        assert page["challenges"][0]["number"] == 2
+
+        # The default is the safe answer: a caller who forgets the flag shows a
+        # student's list, never a teacher's.
+        assert len(await query_course_challenges(conn, algorithms, user_id=carol)) == 1
     await engine.dispose()
 
 

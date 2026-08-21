@@ -23,6 +23,7 @@ unique within a challenge; `tests/` keeps exactly that shape.
 
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 import tomllib
@@ -90,6 +91,14 @@ class Manifest:
     the URL, not a number inside a file somebody may have copied. And
     `execution_order`, because the order of the blocks *is* the order, which is
     the whole point of editing this in a text editor.
+
+    `visible_from` is not one of them, and the difference is worth stating: it
+    is a column a challenge form writes, so `_challenge_fields` validates it for
+    a push exactly as it does for the editor. Absent means hidden - which is a
+    real value and not a missing one - so a pulled hidden challenge has no key
+    and pushing that file back hides it, which round-trips. TOML has native
+    datetimes, so it is written offset-carrying; one typed by hand without an
+    offset is read on the server's clock, the same rule the form's box uses.
     """
 
     title: str
@@ -99,6 +108,7 @@ class Manifest:
     max_threads: int
     evaluator: str | None
     testcases: tuple[ManifestTestCase, ...]
+    visible_from: datetime | None = None
 
     @property
     def evaluator_name(self) -> str | None:
@@ -169,6 +179,8 @@ def dump_manifest(manifest: Manifest, header: str = "") -> str:
         "max_memory_mb": manifest.max_memory_mb,
         "max_threads": manifest.max_threads,
     }
+    if manifest.visible_from is not None:
+        document["visible_from"] = manifest.visible_from
     if manifest.evaluator is not None:
         document["evaluator"] = manifest.evaluator
     document["testcase"] = [
@@ -272,6 +284,18 @@ def parse_manifest(text: str) -> Manifest:
     )
     max_threads = _require(table, "max_threads", (int,), MANIFEST_NAME)
 
+    # Read through and not validated, exactly as the limits above are: whether
+    # a datetime is one `_challenge_fields` will accept is that function's
+    # business, and this is not a second opinion. The type *is* checked, because
+    # `visible_from = "soon"` is a TOML string and would otherwise arrive at the
+    # database as one.
+    visible_from = table.get("visible_from")
+    if visible_from is not None and not isinstance(visible_from, datetime):
+        raise ManifestError(
+            "`visible_from` must be a date and time, e.g. "
+            "2026-09-01T09:00:00+02:00. Leave it out to hide the challenge."
+        )
+
     evaluator = table.get("evaluator")
     if evaluator is not None:
         evaluator = _member_path(evaluator, EVALUATOR_DIR, "`evaluator`")
@@ -324,6 +348,7 @@ def parse_manifest(text: str) -> Manifest:
         max_threads=max_threads,
         evaluator=evaluator,
         testcases=tuple(testcases),
+        visible_from=visible_from,
     )
 
 

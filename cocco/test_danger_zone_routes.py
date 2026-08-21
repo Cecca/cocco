@@ -22,6 +22,7 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import StaticPool
 
+from cocco.conftest import PUBLISHED
 from cocco.model import (
     Administrator,
     Challenge,
@@ -117,6 +118,7 @@ async def world(app_engine, storage):
                         max_memory_bytes=1 << 20,
                         max_time_s=1.0,
                         max_threads=1,
+                        visible_from=PUBLISHED,
                     )
                     .returning(Challenge.c.id)
                 )

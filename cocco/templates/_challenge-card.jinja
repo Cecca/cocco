@@ -2,17 +2,28 @@
    editor's reorderable list, so the two cannot drift apart. Never served from
    a route, hence the `_` prefix.
 
-   Context: `challenge` (a row of `query_course_challenges`, carrying `n_mine`
-   and `n_submitters`), `course_id`, `n` - its 1-based place in the list - and
-   optionally:
+   Context: `challenge` (a row of `query_course_challenges`, carrying `number`,
+   `n_mine` and `n_submitters`), `course_id`, and optionally:
 
      `can_edit`  add the Edit link, and read the badge as staff do
      `reorder`   add the ↑/↓ column, with `first` / `last` disabling an end
+
+   The number comes off the row and never off `loop.index`: a student's list is
+   filtered - no hidden challenges - so counting the rows on the page would
+   print a different "Challenge 03" to them than to staff. See
+   `_COURSE_CHALLENGES_CTE`.
 #}
 {# `effective_archived_at` and never `challenge.archived_at`: the second is the
    challenge's own state, and a card under an archived course has to grey
-   itself too. See `_EFFECTIVE_ARCHIVED_SQL` in `repository.py`. #}
-<div class="card bg-base-100 border border-base-300 shadow-sm transition-colors hover:border-primary/40{% if challenge.effective_archived_at %} opacity-60{% endif %}">
+   itself too. See `_EFFECTIVE_ARCHIVED_SQL` in `repository.py`.
+
+   `is_visible` is its neighbour and greys the card for the other reason: this
+   one is not open yet. Two states that look alike and are not - archived is
+   readable and closed, unpublished is neither - so they badge differently.
+   A student only ever gets a card that is false here when the challenge is
+   *scheduled*; a hidden one is not in their list at all. #}
+{% set openable = challenge.is_visible or can_edit %}
+<div class="card bg-base-100 border border-base-300 shadow-sm transition-colors hover:border-primary/40{% if challenge.effective_archived_at or not challenge.is_visible %} opacity-60{% endif %}">
   <div class="card-body flex-row items-center gap-4 p-5">
 
     {% if reorder %}
@@ -34,19 +45,39 @@
 
     <div class="min-w-0 flex-1">
       <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
-        Challenge {{ "%02d" | format(n) }}
+        Challenge {{ "%02d" | format(challenge.number) }}
       </p>
       <h3 class="font-serif text-xl font-semibold tracking-tight mt-0.5">
+        {# Plain text and not a dead link for a student looking at a scheduled
+           challenge: `require_challenge_viewer` refuses it, which is the real
+           check, and this is the affordance agreeing with it. Staff open it
+           whatever it says. #}
+        {% if openable %}
         <a href="{{ url_for('get_challenge', course_id=course_id, challenge_id=challenge.id) }}"
            class="hover:text-primary">
           {{ challenge.title }}
         </a>
+        {% else %}
+        {{ challenge.title }}
+        {% endif %}
       </h3>
 
       <div class="flex flex-wrap items-center gap-2 mt-2">
         {% if challenge.effective_archived_at %}
         <span class="badge badge-warning badge-outline font-semibold"
               title="Readable, but not taking new submissions">Archived</span>
+        {% endif %}
+
+        {# Only staff ever see the first of these - a hidden challenge is not in
+           anybody else's list. The second is the whole point of the teaser. #}
+        {% if not challenge.visible_from %}
+        <span class="badge badge-neutral badge-outline font-semibold"
+              title="Only course staff can see this">Hidden</span>
+        {% elif not challenge.is_visible %}
+        <span class="badge badge-info badge-outline font-semibold"
+              title="It opens by itself at this time">
+          Opens {{ challenge.visible_from | datetime }}
+        </span>
         {% endif %}
 
         {# The viewer's own history. A student sees this and nothing else, so
@@ -86,9 +117,11 @@
         <span class="text-primary">✎</span> Edit
       </a>
       {% endif %}
+      {% if openable %}
       <a href="{{ url_for('get_challenge', course_id=course_id, challenge_id=challenge.id) }}"
          class="btn btn-sm btn-ghost font-mono text-base-content/50 hover:text-primary"
          aria-label="Open {{ challenge.title }}">→</a>
+      {% endif %}
     </div>
   </div>
 </div>
