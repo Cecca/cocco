@@ -1,28 +1,25 @@
 """End-to-end tests of the two danger zones: archiving and deleting a course
 or a challenge.
 
-Same harness as `test_challenge_routes.py`, and for the same reason: `get_db`
-is overridden with SQLite, which works because everything these routes touch -
-`query_course`, `query_challenge_config`, `query_course_archived_at`,
-`query_effective_archived_at`, `query_challenge_file_paths`,
-`lock_*_submissions`, `set_*_archived`, `delete_challenge`, `delete_course` -
-is plain Core. The `FOR UPDATE` the two lock helpers add is simply omitted by
-SQLAlchemy's SQLite dialect, so the *count* is what is tested here and the
-locking itself is left to `test_repository.py`.
+The delete tests are the reason this file is worth more than it used to be. No
+foreign key in `model.py` declares an `ON DELETE`, so `delete_challenge` spells
+the cascade out by hand - testoutcome by `submission_id`, then by
+`testcase_id`, then submission, testcase, challenge - and the database's job is
+to raise if that order is ever got wrong. It now does: these tests used to run
+where foreign keys were declared and not enforced, so they could assert that the
+rows were gone but not that a real database had let them go, and a wrong order
+would have passed.
 
-What is deliberately not here is proof that the cascade is in the right order:
-SQLite does not enforce foreign keys unless `PRAGMA foreign_keys=ON`, so a
-wrong order would pass. These tests assert the rows are gone; the integration
-tests in `test_repository.py` assert that a real database let them go.
+`lock_challenge_submissions` and `lock_course_submissions` take their rows
+`FOR UPDATE` and count in the same statement. The count is what is asserted
+here; the locking itself needs two connections racing and is documented on the
+helpers rather than tested.
 """
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import func, insert, select
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.pool import StaticPool
 
-from cocco.conftest import PUBLISHED
+from cocco.conftest import PUBLISHED, sign_in_as
 from cocco.model import (
     Administrator,
     Challenge,
@@ -35,7 +32,6 @@ from cocco.model import (
     TestOutcome,
     User,
     UserRole,
-    metadata,
 )
 from cocco.storage import Storage
 
@@ -45,15 +41,6 @@ ADMIN = "matteo.ceccarello@unipd.it"
 
 COURSE_TITLE = "Algorithms 101"
 CHALLENGE_TITLE = "Shortest Route Planner"
-
-
-@pytest.fixture
-async def app_engine():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
-    async with engine.begin() as conn:
-        await conn.run_sync(metadata.create_all)
-    yield engine
-    await engine.dispose()
 
 
 @pytest.fixture
@@ -188,32 +175,12 @@ def storage(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def client(app_engine, world, monkeypatch):
+def client(make_client, world):
     # `world` is a dependency rather than an argument of the tests alone,
     # because signing in *creates* the account if it is missing: without the
     # ordering, the fixture would insert alice a moment before the seed does and
     # the seed would trip over its own unique index.
-    import cocco.main as main
-
-    async def _get_db():
-        async with app_engine.connect() as conn:
-            yield conn
-
-    main.app.dependency_overrides[main.get_db] = _get_db
-    monkeypatch.setattr(main, "DUMMY_AUTH", True)
-
-    client = TestClient(main.app)
-    _sign_in_as(client, TEACHER)
-    yield client
-    main.app.dependency_overrides.clear()
-
-
-def _sign_in_as(client, email: str):
-    """Become somebody else. Dummy auth is a real session now, so this is a
-    request rather than a monkeypatch, and `_sign_in` clears the old session
-    before writing the new id - no identity leaks into the next one."""
-    response = client.post("/auth/dummy", data={"email": email}, follow_redirects=False)
-    assert response.status_code == 303, response.text
+    return make_client(as_=TEACHER)
 
 
 async def _count(app_engine, table, *where):
@@ -244,10 +211,10 @@ async def test_deleting_a_course_is_administrators_only(client, world, monkeypat
     data = {"confirm": COURSE_TITLE}
 
     assert client.post(url, data=data).status_code == 403  # alice, the teacher
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     assert client.post(url, data=data).status_code == 403
 
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     assert client.post(url, data=data).status_code == 204
 
 
@@ -255,10 +222,10 @@ async def test_archiving_a_course_is_administrators_only(client, world, monkeypa
     url = f"/courses/{world['course']}/archive"
 
     assert client.post(url).status_code == 403  # alice, the teacher
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     assert client.post(url).status_code == 403
 
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     assert client.post(url).status_code == 204
 
 
@@ -269,12 +236,12 @@ async def test_deleting_a_challenge_is_course_staff(client, world, monkeypatch):
     course, challenge = world["course"], world["challenge"]
     data = {"confirm": CHALLENGE_TITLE}
 
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     assert client.post(f"/courses/{course}/{challenge}/delete", data=data).status_code == 403
 
     # Alice teaches this course but not the other one, and naming her own
     # course in front of its challenge is a 404 rather than a way in.
-    _sign_in_as(client, TEACHER)
+    sign_in_as(client, TEACHER)
     other = world["other_challenge"]
     assert client.post(f"/courses/{course}/{other}/delete", data=data).status_code == 404
     assert client.post(f"/courses/{world['other']}/{other}/delete", data=data).status_code == 403
@@ -288,7 +255,7 @@ async def test_an_administrator_may_delete_a_challenge_anywhere(
     """`effective_course_role` promotes an administrator to `teacher`, so
     `ChallengeEditor` admits them without an enrollment - here, on a course
     nobody put them on."""
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     response = client.post(
         f"/courses/{world['other']}/{world['other_challenge']}/delete",
         data={"confirm": "BST insert"},
@@ -316,7 +283,7 @@ async def test_a_course_delete_checks_the_typed_name(
     """The dialog's script only *enables* the button; a disabled control is
     presentation, never the check. So the refusal has to come from the route,
     and it is a 200 with an alert because htmx does not swap error responses."""
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     response = client.post(
         f"/courses/{world['course']}/delete", data={"confirm": typed}
     )
@@ -382,7 +349,7 @@ async def test_a_deleted_challenge_leaves_nothing_behind(
 async def test_a_deleted_course_takes_its_challenges_and_enrollments(
     client, world, monkeypatch, app_engine, storage
 ):
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     response = client.post(
         f"/courses/{world['course']}/delete", data={"confirm": COURSE_TITLE}
     )
@@ -428,7 +395,7 @@ async def test_a_delete_is_refused_while_a_judge_is_running(
     assert "A judge is running 1 submission" in response.text
     assert await _count(app_engine, Challenge, Challenge.c.id == world["challenge"]) == 1
 
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     response = client.post(
         f"/courses/{world['course']}/delete", data={"confirm": COURSE_TITLE}
     )
@@ -444,7 +411,7 @@ async def test_a_delete_is_refused_while_a_judge_is_running(
 async def test_archiving_a_course_is_a_round_trip(
     client, world, monkeypatch, app_engine
 ):
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     course = world["course"]
 
     assert client.post(f"/courses/{course}/archive").status_code == 204
@@ -468,7 +435,7 @@ async def test_archiving_a_challenge_is_a_round_trip(client, world, app_engine):
 
 async def test_archiving_destroys_nothing(client, world, monkeypatch, app_engine, storage):
     """The whole point of the button beside Delete: it is a visibility state."""
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     client.post(f"/courses/{world['course']}/archive")
 
     assert await _count(app_engine, Challenge, Challenge.c.id == world["challenge"]) == 1
@@ -490,7 +457,7 @@ async def test_an_archived_challenge_refuses_a_submission(
     course, challenge = world["course"], world["challenge"]
     client.post(f"/courses/{course}/{challenge}/archive")
 
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     response = _submit(client, course, challenge)
     # 200 with an alert, never a 4xx: htmx does not swap the body of an error
     # response, and the fragment is the whole point of the request.
@@ -505,11 +472,11 @@ async def test_a_challenge_under_an_archived_course_refuses_a_submission(
     """The `or` that `_EFFECTIVE_ARCHIVED_SQL` spells: the challenge's own
     column is still NULL here."""
     course, challenge = world["course"], world["challenge"]
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     client.post(f"/courses/{course}/archive")
     assert await _archived_at(app_engine, Challenge, challenge) is None
 
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     response = _submit(client, course, challenge)
     assert response.status_code == 200
     assert "This challenge is archived" in response.text
@@ -519,7 +486,7 @@ async def test_a_challenge_under_an_archived_course_refuses_a_submission(
 async def test_a_live_challenge_still_takes_submissions(client, world, monkeypatch, app_engine):
     """The other half of the two tests above: the refusal is about archiving
     and not about the harness."""
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     response = _submit(client, world["course"], world["challenge"])
     assert response.status_code == 200
     assert "was queued as a python submission" in response.text
@@ -533,7 +500,7 @@ async def test_an_archived_course_is_not_taking_new_students(
     enrollment key, because an archived course refuses whether or not the key
     is right."""
     course = world["course"]
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     client.post(f"/courses/{course}/archive")
 
     # Matteo teaches nothing here and has no enrollment row of his own; the

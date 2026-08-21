@@ -3231,11 +3231,12 @@ def _as_aware(value: datetime | None) -> datetime | None:
     """A datetime with an offset on it, reading a naive one as this server's own
     clock.
 
-    Naive values reach us from three directions and all three mean the same
-    thing: an `<input type="datetime-local">` posts a wall clock with no offset,
-    a `challenge.toml` may spell a TOML local-datetime, and SQLite - which is
-    what the route tests run on - hands back what Postgres would have made
-    aware. Reading all of them on the server's clock is the same rule
+    Naive values reach us from two directions and both mean the same thing: an
+    `<input type="datetime-local">` posts a wall clock with no offset, and a
+    `challenge.toml` may spell a TOML local-datetime. The column itself is
+    `timestamptz` and Postgres hands its values back aware, so nothing read from
+    the database arrives here needing this. Reading both on the server's clock
+    is the same rule
     `render_datetime` prints in and `render_datetime_local` fills the box with,
     which is what stops a challenge opening an hour away from where it said.
     """

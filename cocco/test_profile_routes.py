@@ -1,31 +1,25 @@
 """End-to-end tests of the profile page.
 
-The seam between the two halves is `test_admin_routes.py`'s. Refusals happen in
-a dependency, and so does every write here - `update_user` and `query_user` are
-plain Core, so the whole of "who may change what" fits on SQLite. Only the page
-itself needs Postgres: `query_user_profile` is `json_agg`, and those tests are
-marked `integration` and drop every table in `$PGDATABASE`.
-
-The rule the second half is really about is the asymmetry between the two
-dependencies: a site administrator *reads* somebody's profile and cannot touch
-it. Oversight is not impersonation.
+One URL and two pages - the owner gets forms, a site administrator gets the same
+facts as text - so the rule this file is really about is the asymmetry between
+the two dependencies. `require_profile_reader` allows either and reports which;
+`require_profile_owner` has no administrator branch at all. Oversight is not
+impersonation, and a site administrator may block an account without ever being
+able to rename it.
 """
 
 
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, insert, select
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import insert, select
 
 from cocco.avatar import MAX_AVATAR_BYTES, generate_identicon, sniff_image_mime
+from cocco.conftest import sign_in_as
 from cocco.model import (
     Administrator,
     Course,
     Enrollment,
     User,
     UserRole,
-    metadata,
 )
 
 TEACHER = "alice@unipd.it"
@@ -42,19 +36,6 @@ def _write_urls(user_id: int):
         (f"/users/{user_id}/profile", {"nickname": "impostor"}),
         (f"/users/{user_id}/avatar/reset", {}),
     ]
-
-
-########################################################################
-# who may change what
-
-
-@pytest.fixture
-async def app_engine():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
-    async with engine.begin() as conn:
-        await conn.run_sync(metadata.create_all)
-    yield engine
-    await engine.dispose()
 
 
 @pytest.fixture
@@ -99,34 +80,12 @@ async def world(app_engine):
 
 
 @pytest.fixture
-def client(app_engine, world, monkeypatch):
+def client(make_client, world):
     # `world` is a dependency rather than an argument of the tests alone,
     # because signing in *creates* the account if it is missing: without the
     # ordering, the fixture would insert alice a moment before the seed does and
     # the seed would trip over its own unique index.
-    import cocco.main as main
-
-    async def _get_db():
-        async with app_engine.connect() as conn:
-            yield conn
-
-    main.app.dependency_overrides[main.get_db] = _get_db
-    monkeypatch.setattr(main, "DUMMY_AUTH", True)
-
-    # Not `with TestClient(...)`: entering the context runs the startup event,
-    # which reaches for the real Postgres engine.
-    client = TestClient(main.app)
-    _sign_in_as(client, TEACHER)
-    yield client
-    main.app.dependency_overrides.clear()
-
-
-def _sign_in_as(client, email: str):
-    """Become somebody else. Dummy auth is a real session now, so this is a
-    request rather than a monkeypatch, and `_sign_in` clears the old session
-    before writing the new id - no identity leaks into the next one."""
-    response = client.post("/auth/dummy", data={"email": email}, follow_redirects=False)
-    assert response.status_code == 303, response.text
+    return make_client(as_=TEACHER)
 
 
 async def _read_user(app_engine, user_id: int):
@@ -138,7 +97,7 @@ async def _read_user(app_engine, user_id: int):
 
 async def test_a_stranger_may_not_read_or_change_a_profile(client, world, monkeypatch):
     """Being on the same course as somebody is not oversight of them."""
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     assert client.get(f"/users/{world['alice']}").status_code == 403
     for url, data in _write_urls(world["alice"]):
         assert client.post(url, data=data).status_code == 403, url
@@ -158,7 +117,7 @@ async def test_an_administrator_may_look_but_not_touch(
     Only the writes are asserted here: the read is `query_user_profile`, which
     is Postgres-only and so is tested in the other half.
     """
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     for url, data in _write_urls(world["alice"]):
         assert client.post(url, data=data).status_code == 403, url
     assert (
@@ -299,82 +258,19 @@ def test_only_the_four_raster_formats_are_pictures():
     assert sniff_image_mime(b"GIF" + PNG) is None
 
 
-########################################################################
-# the page itself
-#
-# Postgres, because `query_user_profile` is `json_agg`.
-
-
-@pytest.fixture
-async def pg_client(monkeypatch, postgres_url):
-    """The profile page over a live Postgres, signed in as Alice.
-
-    Drops every table in `$PGDATABASE` first, as the other integration tests do.
-    """
-    import cocco.main as main
-
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    metadata.create_all(sync_engine)
-    ids = {}
-    with sync_engine.begin() as conn:
-        for email, nickname in ((TEACHER, "alice"), (STUDENT, "bob"), (ADMIN, "matteo")):
-            image, image_mime = generate_identicon(nickname)
-            ids[nickname] = conn.execute(
-                insert(User)
-                .values(
-                    email=email,
-                    nickname=nickname,
-                    image=image,
-                    image_mime=image_mime,
-                )
-                .returning(User.c.id)
-            ).scalar_one()
-        ids["course"] = conn.execute(
-            insert(Course)
-            .values(title="Algorithms 101", description="...")
-            .returning(Course.c.id)
-        ).scalar_one()
-        conn.execute(
-            insert(Enrollment).values(
-                user_id=ids["bob"], course_id=ids["course"], role=UserRole.student
-            )
-        )
-        conn.execute(insert(Administrator).values(email=ADMIN))
-
-    engine = create_async_engine(postgres_url)
-
-    async def _get_db():
-        async with engine.connect() as conn:
-            yield conn
-
-    main.app.dependency_overrides[main.get_db] = _get_db
-    monkeypatch.setattr(main, "DUMMY_AUTH", True)
-
-    client = TestClient(main.app)
-    _sign_in_as(client, TEACHER)
-    yield client, ids
-    main.app.dependency_overrides.clear()
-    await engine.dispose()
-
-
-@pytest.mark.integration
-async def test_your_own_profile_is_a_form(pg_client):
-    client, ids = pg_client
-    response = client.get(f"/users/{ids['alice']}")
+async def test_your_own_profile_is_a_form(client, world):
+    response = client.get(f"/users/{world['alice']}")
     assert response.status_code == 200
     assert 'name="nickname"' in response.text
-    assert f"/users/{ids['alice']}/avatar/reset" in response.text
+    assert f"/users/{world['alice']}/avatar/reset" in response.text
     # Everything but the address, which has no input anywhere on the page.
     assert TEACHER in response.text
     assert 'name="email"' not in response.text
 
 
-@pytest.mark.integration
-async def test_an_administrator_sees_the_same_facts_as_text(pg_client, monkeypatch):
-    client, ids = pg_client
-    _sign_in_as(client, ADMIN)
-    response = client.get(f"/users/{ids['bob']}")
+async def test_an_administrator_sees_the_same_facts_as_text(client, world, monkeypatch):
+    sign_in_as(client, ADMIN)
+    response = client.get(f"/users/{world['bob']}")
     assert response.status_code == 200
     # What we know about them: the address, the name, the class list.
     assert STUDENT in response.text
@@ -382,29 +278,23 @@ async def test_an_administrator_sees_the_same_facts_as_text(pg_client, monkeypat
     assert "Algorithms 101" in response.text
     # And no way to change any of it.
     assert 'name="nickname"' not in response.text
-    assert f"/users/{ids['bob']}/avatar/reset" not in response.text
+    assert f"/users/{world['bob']}/avatar/reset" not in response.text
 
 
-@pytest.mark.integration
-async def test_a_profile_that_is_not_there_is_a_404(pg_client, monkeypatch):
-    client, _ = pg_client
-    _sign_in_as(client, ADMIN)
+async def test_a_profile_that_is_not_there_is_a_404(client, world, monkeypatch):
+    sign_in_as(client, ADMIN)
     assert client.get("/users/99999").status_code == 404
 
 
-@pytest.mark.integration
-async def test_a_stranger_gets_a_page_and_not_a_traceback(pg_client, monkeypatch):
-    client, ids = pg_client
-    _sign_in_as(client, STUDENT)
-    response = client.get(f"/users/{ids['alice']}")
+async def test_a_stranger_gets_a_page_and_not_a_traceback(client, world, monkeypatch):
+    sign_in_as(client, STUDENT)
+    response = client.get(f"/users/{world['alice']}")
     assert response.status_code == 403
     assert "You can only look at your own profile." in response.text
 
 
-@pytest.mark.integration
-async def test_the_navbar_offers_your_own_profile(pg_client):
+async def test_the_navbar_offers_your_own_profile(client, world):
     """The second way in, beside the admin list."""
-    client, ids = pg_client
     response = client.get("/")
     assert response.status_code == 200
-    assert f'href="http://testserver/users/{ids["alice"]}"' in response.text
+    assert f'href="http://testserver/users/{world["alice"]}"' in response.text

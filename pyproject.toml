@@ -63,7 +63,6 @@ entrypoint = "cocco.main:app"
 
 [dependency-groups]
 dev = [
-    "aiosqlite>=0.22.1",
     "httpx>=0.28.1",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
@@ -71,6 +70,14 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Explicit, because the whole database fixture design turns on it: an async
+# fixture's loop scope otherwise falls through to its *caching* scope, so a
+# session-scoped async engine would hand out connections belonging to a loop no
+# test is running on. Every async fixture in the suite is function-scoped, so
+# this changes nothing today - it stops the default from drifting under us.
+asyncio_default_fixture_loop_scope = "function"
+# The marker means isolate and a nix with flakes, and nothing else. It used to
+# mean Postgres too; the tests all need Postgres now, and say so by skipping.
 markers = [
-    "integration: tests requiring external services (isolate, nix, postgres)",
+    "integration: tests requiring external services (isolate, nix)",
 ]

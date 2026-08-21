@@ -2,12 +2,11 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine, func, insert, or_, select, update
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import func, insert, or_, select, update
 
 import cocco.model as cm
-from cocco.conftest import PUBLISHED
 from cocco.avatar import generate_identicon
+from cocco.conftest import PUBLISHED
 from cocco.model import (
     Administrator,
     Challenge,
@@ -17,7 +16,6 @@ from cocco.model import (
     TestCase,
     TestOutcome,
     User,
-    metadata,
 )
 from cocco.model import LeaderboardRanking, UserRole
 from cocco.auth import get_or_create_user
@@ -79,21 +77,17 @@ from cocco.schema import SubmissionRunData
 
 
 async def _course_id(conn, title):
-    """The seeded course with this title. `_make_example_database` builds them
+    """The seeded course with this title. `_seed` builds them
     from a list, so the ids are not known to the test that wants one."""
     return (
         await conn.execute(select(Course.c.id).where(Course.c.title == title))
     ).scalar_one()
 
 
-def _make_engine(db_url="sqlite:///:memory:"):
-    engine = create_engine(db_url)
-    metadata.create_all(engine)
-    return engine
-
-
-def _make_example_database(db_url="sqlite:///:memory:"):
-    engine = _make_engine(db_url)
+def _seed(engine):
+    """Fill an empty database with the cast every query in this file is asked
+    about: six users, three courses, five challenges, three test cases each and
+    nine submissions."""
     now = datetime.now(timezone.utc)
 
     with engine.begin() as conn:
@@ -266,11 +260,9 @@ def _make_example_database(db_url="sqlite:///:memory:"):
                     )
                 )
 
-    return engine
 
-
-async def test_get_queued_submission_returns_oldest_queued():
-    engine = _make_engine()
+async def test_get_queued_submission_returns_oldest_queued(db):
+    engine = db
     now = datetime.now(timezone.utc)
 
     with engine.begin() as conn:
@@ -342,10 +334,10 @@ async def test_get_queued_submission_returns_oldest_queued():
     assert result.evaluator_path is None
 
 
-async def test_queued_submission_carries_the_challenge_evaluator():
+async def test_queued_submission_carries_the_challenge_evaluator(db):
     """The judge learns which checker to grade with from the run data, and
     from nowhere else."""
-    engine = _make_engine()
+    engine = db
 
     with engine.begin() as conn:
         image, image_mime = generate_identicon("the-admin")
@@ -388,9 +380,9 @@ async def test_queued_submission_carries_the_challenge_evaluator():
     assert result.evaluator_path == "evaluator_1/checker.py"
 
 
-async def test_queued_submission_skips_retired_testcases():
+async def test_queued_submission_skips_retired_testcases(db):
     """Retiring a test case is what stops it grading new submissions."""
-    engine = _make_engine()
+    engine = db
 
     with engine.begin() as conn:
         image, image_mime = generate_identicon("the-admin")
@@ -445,22 +437,18 @@ async def test_queued_submission_skips_retired_testcases():
     assert [t.execution_order for t in result.test_cases] == [0, 2]
 
 
-async def test_get_queued_submission_returns_none_when_empty():
-    engine = _make_engine()
+async def test_get_queued_submission_returns_none_when_empty(db):
+    engine = db
     with engine.connect() as conn:
         result = await pull_queued_submission(conn)
     assert result is None
 
 
-# The json_agg / row_to_json queries backing the web pages are Postgres-only,
-# so this needs a live server (see PGUSER/PGDATABASE/PGHOST in the devShell).
-@pytest.mark.integration
-async def test_challenge_page_queries(postgres_url):
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+# The json_agg / row_to_json queries backing the web pages. They return one
+# nested document rather than a row set, so what is asserted below is the shape
+# a template walks - see `DESIGN.md` for why the pages are built this way.
+async def test_challenge_page_queries(example_database, app_engine):
+    engine = app_engine
     async with engine.connect() as conn:
         # carol (user 4) is a student on Algorithms 101
         challenge = await query_challenge(conn, user_id=4, challenge_id=1)
@@ -647,22 +635,16 @@ async def test_challenge_page_queries(postgres_url):
                 select(Submission.c.status).where(Submission.c.challenge_id == 2)
             )
         ).scalars().all() == [cm.SubmissionStatus.done]
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_submission_page_queries(postgres_url):
+async def test_submission_page_queries(example_database, app_engine):
     """The two queries behind the single-submission page.
 
     Submission ids follow the order of the fixture's `submissions` list, so 1
     and 2 are carol's two attempts at "Hello" - the older one (2) being the one
     the fixture's outcome cycle gives a compile failure.
     """
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         newer = await query_submission(conn, 1)
         assert newer is not None
@@ -730,36 +712,32 @@ async def test_submission_page_queries(postgres_url):
         ]
 
         assert await query_submission_outcomes(conn, 999) is None
-    await engine.dispose()
 
 
 
 ########################################################################
-# Magic-link authentication. These helpers are plain Core, so unlike the page
-# queries they run on the fast in-memory engine - which matters, because they
-# are what enforces "a link works once".
+# Accounts, sign-in and the two site-wide powers: who exists, who administers
+# the site, and who is blocked. Plain Core rather than the raw SQL above, and
+# read back through the same helpers the routes use.
 
 
-def _make_async_engine(db_url="sqlite+aiosqlite:///:memory:"):
-    """An async engine over one in-memory database.
+@pytest.fixture
+def example_database(db):
+    """`_seed` on the emptied database, as a fixture rather than the four-line
+    preamble that stood at the top of twenty tests.
 
-    `StaticPool` keeps every connection on the same SQLite database: with the
-    default pool a second connection would find an empty schema.
+    It hands back the sync engine and not a map of ids, because there never was
+    one: a test looks a course up by title with `_course_id`, or names the id
+    the seed order fixes - carol is user 4, "Hello" is challenge 1 - and what
+    keeps that true from one test to the next is the `RESTART IDENTITY` in
+    conftest's truncation.
     """
-    from sqlalchemy.pool import StaticPool
-
-    return create_async_engine(db_url, poolclass=StaticPool)
-
-
-async def _async_database():
-    engine = _make_async_engine()
-    async with engine.begin() as conn:
-        await conn.run_sync(metadata.create_all)
-    return engine
+    _seed(db)
+    return db
 
 
-async def test_get_or_create_user_is_idempotent():
-    engine = await _async_database()
+async def test_get_or_create_user_is_idempotent(app_engine):
+    engine = app_engine
     async with engine.connect() as conn:
         created = await get_or_create_user(conn, "dave@unipd.it")
         await conn.commit()
@@ -772,10 +750,9 @@ async def test_get_or_create_user_is_idempotent():
         assert row is not None and row.id == created.id
         # An address that was never seen is simply absent.
         assert await query_user_by_email(conn, "nobody@unipd.it") is None
-    await engine.dispose()
 
 
-async def test_record_sign_in_stamps_the_first_login_once():
+async def test_record_sign_in_stamps_the_first_login_once(app_engine):
     """`first_login_at` is written by the first sign-in and by no later one.
 
     It is the column that separates "has never been near the login page" from
@@ -784,7 +761,7 @@ async def test_record_sign_in_stamps_the_first_login_once():
     commits, because `now()` is the *transaction's* clock: two stamps inside one
     transaction are the same instant by design.
     """
-    engine = await _async_database()
+    engine = app_engine
 
     async def logins(conn, user_id):
         # Read straight off the row: `_USER_COLUMNS` deliberately does not carry
@@ -817,13 +794,12 @@ async def test_record_sign_in_stamps_the_first_login_once():
         second = await logins(conn, user.id)
         assert second.first_login_at == first.first_login_at
         assert second.last_login_at >= first.last_login_at
-    await engine.dispose()
 
 
-async def test_course_role_is_the_editors_check():
+async def test_course_role_is_the_editors_check(app_engine):
     """The editor authorizes on the course, not on a challenge: that is what
     lets it answer the question a challenge cannot, "may I create one here?"."""
-    engine = await _async_database()
+    engine = app_engine
     async with engine.connect() as conn:
         course_id = (
             await conn.execute(
@@ -849,17 +825,16 @@ async def test_course_role_is_the_editors_check():
         assert await query_course_role(conn, user_id=student, course_id=course_id) == UserRole.student
         # Enrolled on one course says nothing about another
         assert await query_course_role(conn, user_id=teacher, course_id=other_id) is None
-    await engine.dispose()
 
 
-async def test_an_administrator_is_not_a_role_on_a_course():
+async def test_an_administrator_is_not_a_role_on_a_course(app_engine):
     """The check behind "may create a course": a row in `administrator`.
 
     A teacher is course staff on the course they teach and still fails it -
     that distinction is the whole point, and it is why the answer does not come
     from `enrollment` at all.
     """
-    engine = await _async_database()
+    engine = app_engine
     async with engine.connect() as conn:
         course_id = await insert_course(conn, title="Algorithms 101", description="intro")
         teacher = await insert_user(conn, "alice@unipd.it", "alice", b"", "image/svg+xml")
@@ -871,25 +846,23 @@ async def test_an_administrator_is_not_a_role_on_a_course():
         assert not await is_administrator(conn, "alice@unipd.it")
         # An address with no account behind it at all is still not one
         assert not await is_administrator(conn, "bob@unipd.it")
-    await engine.dispose()
 
 
-async def test_an_administrator_needs_no_account_yet():
+async def test_an_administrator_needs_no_account_yet(app_engine):
     """The table is keyed on the address precisely so that `cocco.toml` can name
     someone who has never signed in - the account only appears on the first
     accepted callback from Google."""
-    engine = await _async_database()
+    engine = app_engine
     async with engine.connect() as conn:
         await insert_administrators(conn, ["nobody@unipd.it"])
         await conn.commit()
         assert await is_administrator(conn, "nobody@unipd.it")
-    await engine.dispose()
 
 
-async def test_bootstrapping_administrators_is_idempotent():
+async def test_bootstrapping_administrators_is_idempotent(app_engine):
     """The configured list is replayed on every boot, so inserting it twice has
     to be a no-op rather than a primary key violation."""
-    engine = await _async_database()
+    engine = app_engine
     async with engine.connect() as conn:
         await insert_administrators(conn, ["matteo@unipd.it", "alice@unipd.it"])
         await insert_administrators(conn, ["matteo@unipd.it", "bob@unipd.it"])
@@ -899,17 +872,16 @@ async def test_bootstrapping_administrators_is_idempotent():
 
         rows = (await conn.execute(select(Administrator.c.email))).scalars().all()
         assert sorted(rows) == ["alice@unipd.it", "bob@unipd.it", "matteo@unipd.it"]
-    await engine.dispose()
 
 
-async def test_blocking_never_touches_an_administrator():
+async def test_blocking_never_touches_an_administrator(app_engine):
     """The rule lives in `block_user`'s WHERE clause, not in a check before it.
 
     Appointing is one-way through the app, so a blocked administrator would be
     a lockout with no way back - and a check and a write that are two
     statements can be told apart by an appointment landing between them.
     """
-    engine = await _async_database()
+    engine = app_engine
     async with engine.connect() as conn:
         admin = await insert_user(conn, "matteo@unipd.it", "matteo", b"", "image/svg+xml")
         student = await insert_user(conn, "bob@unipd.it", "bob", b"", "image/svg+xml")
@@ -924,24 +896,22 @@ async def test_blocking_never_touches_an_administrator():
         row = await query_user(conn, student)
         assert row.blocked_at is not None
         assert row.blocked_reason == "spamming the judge"
-    await engine.dispose()
 
 
-async def test_blocking_an_absent_user_changes_nothing():
+async def test_blocking_an_absent_user_changes_nothing(app_engine):
     """False for an id that is not there, exactly as for an administrator: the
     route says the same thing about both, because in both cases nothing
     happened."""
-    engine = await _async_database()
+    engine = app_engine
     async with engine.connect() as conn:
         assert not await block_user(conn, 404, "who?")
         assert not await unblock_user(conn, 404)
-    await engine.dispose()
 
 
-async def test_unblocking_forgets_the_reason():
+async def test_unblocking_forgets_the_reason(app_engine):
     """The reason exists to be shown to the person it shut out, so it has no
     life after they are let back in."""
-    engine = await _async_database()
+    engine = app_engine
     async with engine.connect() as conn:
         student = await insert_user(conn, "bob@unipd.it", "bob", b"", "image/svg+xml")
         await conn.commit()
@@ -953,13 +923,12 @@ async def test_unblocking_forgets_the_reason():
         row = await query_user(conn, student)
         assert row.blocked_at is None
         assert row.blocked_reason is None
-    await engine.dispose()
 
 
-async def test_a_block_reaches_both_user_lookups():
+async def test_a_block_reaches_both_user_lookups(app_engine):
     """`get_user` reads nothing but these two, so a trimmed column list in
     either one would fail open - the block would simply not be there to see."""
-    engine = await _async_database()
+    engine = app_engine
     async with engine.connect() as conn:
         student = await insert_user(conn, "bob@unipd.it", "bob", b"", "image/svg+xml")
         await block_user(conn, student, "spamming the judge")
@@ -975,11 +944,10 @@ async def test_a_block_reaches_both_user_lookups():
         # And the model built from either of them carries it, which is what
         # `get_user` actually refuses on.
         assert schema.User.model_validate(by_id).blocked_at is not None
-    await engine.dispose()
 
 
-async def test_insert_challenge_and_its_course():
-    engine = await _async_database()
+async def test_insert_challenge_and_its_course(app_engine):
+    engine = app_engine
     async with engine.connect() as conn:
         course_id = (
             await conn.execute(
@@ -1021,18 +989,12 @@ async def test_insert_challenge_and_its_course():
         # the challenge's own, or staff of one course could edit another's.
         assert await challenge_in_course(conn, challenge_id, course_id)
         assert not await challenge_in_course(conn, challenge_id, other_id)
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_course_page_query_survives_an_empty_course(postgres_url):
+async def test_course_page_query_survives_an_empty_course(example_database, app_engine):
     """A course with no challenges is a real course - it is the one whose page
     staff open to create the first one - so it must not come back as NULL."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         empty_id = (
             await conn.execute(
@@ -1053,19 +1015,13 @@ async def test_course_page_query_survives_an_empty_course(postgres_url):
         assert empty is not None
         assert empty["title"] == "Compilers"
         assert empty["challenges"] == []
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_the_course_page_says_who_has_submitted(postgres_url):
+async def test_the_course_page_says_who_has_submitted(example_database, app_engine):
     """The badge on a challenge card. `n_mine` is the viewer's own history, so
     it is what a student's "Submitted" means; `n_submitters` is the class, and
     only course staff are shown it."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         erin = (await query_user_by_email(conn, "erin@unipd.it")).id
@@ -1085,19 +1041,13 @@ async def test_the_course_page_says_who_has_submitted(postgres_url):
             for c in await query_course_challenges(conn, 1, user_id=erin)
         }
         assert theirs == {"Hello": (0, 2), "Sum": (0, 1)}
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_challenges_are_listed_in_their_stored_order(postgres_url):
+async def test_challenges_are_listed_in_their_stored_order(example_database, app_engine):
     """`position` is what the arrows write, and both the page query and the
     fragment order by it - with the id breaking a tie, so challenges nobody has
     reordered keep the order they were created in."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         alice = (await query_user_by_email(conn, "alice@unipd.it")).id
 
@@ -1124,18 +1074,12 @@ async def test_challenges_are_listed_in_their_stored_order(postgres_url):
         assert [c["title"] for c in course["challenges"]] == ["Sum", "Hello"]
         moved = await query_challenge(conn, user_id=alice, challenge_id=ordered[0])
         assert moved["number"] == 2
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_courses_page_query(postgres_url):
+async def test_courses_page_query(example_database, app_engine):
     """The home page's list: every course, split by whether the viewer is on
     it, and filtered by the page's search box."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
 
@@ -1181,18 +1125,12 @@ async def test_courses_page_query(postgres_url):
 
         # An empty filter is no filter, i.e. the unfiltered call above
         assert await query_courses(conn, user_id=carol, q="") == courses
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_users_page_query(postgres_url):
+async def test_users_page_query(example_database, app_engine):
     """The admin page's list: everyone with an account, plus the appointed
     addresses that have none yet."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         await insert_administrators(conn, ["alice@unipd.it", "nobody@unipd.it"])
         bob = (await query_user_by_email(conn, "bob@unipd.it")).id
@@ -1252,17 +1190,11 @@ async def test_users_page_query(postgres_url):
 
         # An empty filter is no filter, i.e. the unfiltered call above
         assert await query_users(conn, q="") == users
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_user_profile_query(postgres_url):
+async def test_user_profile_query(example_database, app_engine):
     """One person's page: who they are, and every course they are on."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         profile = await query_user_profile(conn, carol)
@@ -1311,18 +1243,13 @@ async def test_user_profile_query(postgres_url):
         # No such account is no document at all, which the route turns into a
         # 404 rather than rendering a page about nobody.
         assert await query_user_profile(conn, 99999) is None
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_self_enrollment(postgres_url):
+async def test_self_enrollment(example_database, app_engine):
     """The home page's `Enroll!` button: it makes students, only students, and
-    never unmakes anything. Postgres-only - it rests on ON CONFLICT."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    never unmakes anything. It rests on `ON CONFLICT DO NOTHING`, which is what
+    makes a double click a no-op instead of an IntegrityError."""
+    engine = app_engine
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         systems = (await query_courses(conn, user_id=carol))["non_enrolled"][0]
@@ -1361,18 +1288,12 @@ async def test_self_enrollment(postgres_url):
         assert (
             await query_course_role(conn, user_id=bob, course_id=systems["id"])
         ) == UserRole.teacher
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_the_roster_is_the_enrolled_and_counts_this_course_only(postgres_url):
+async def test_the_roster_is_the_enrolled_and_counts_this_course_only(example_database, app_engine):
     """`query_course_people` is the class list, not the scoreboard's cohort:
     strictly the enrolled, and the submission counts stop at this course."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         algorithms = await _course_id(conn, "Algorithms 101")
         roster = await query_course_people(conn, algorithms)
@@ -1405,18 +1326,12 @@ async def test_the_roster_is_the_enrolled_and_counts_this_course_only(postgres_u
         # Counted outside the filter: hiding the other teachers must not make
         # the visible one look like the last.
         assert (await query_course_people(conn, algorithms, q="dave"))["n_teachers"] == 1
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_a_course_never_loses_its_last_teacher(postgres_url):
+async def test_a_course_never_loses_its_last_teacher(example_database, app_engine):
     """The guard both writes carry, from underneath the routes: it lives in the
     WHERE clause, so the rule and the write are one statement."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         algorithms = await _course_id(conn, "Algorithms 101")
         alice = (await query_user_by_email(conn, "alice@unipd.it")).id
@@ -1445,18 +1360,12 @@ async def test_a_course_never_loses_its_last_teacher(postgres_url):
         # A row that is not there is False too, and the route says the same
         # thing about both, because in both cases nothing happened.
         assert not await delete_enrollment(conn, algorithms, alice)
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_setting_a_role_is_one_upsert(postgres_url):
+async def test_setting_a_role_is_one_upsert(example_database, app_engine):
     """"Enrol them as a teacher" and "make them a teacher" name one row:
     `enrollment` is keyed on (user_id, course_id)."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         systems = await _course_id(conn, "Systems Programming")
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
@@ -1477,18 +1386,12 @@ async def test_setting_a_role_is_one_upsert(postgres_url):
         assert (
             await query_course_role(conn, user_id=carol, course_id=systems)
         ) == UserRole.student
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_the_enrollment_key_is_reported_but_never_returned(postgres_url):
+async def test_the_enrollment_key_is_reported_but_never_returned(example_database, app_engine):
     """Both course queries feed pages served to people who do not know the key,
     so they answer whether one is wanted and never what it is."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         # carol is a student on Algorithms 101 and not on Systems Programming,
@@ -1520,28 +1423,27 @@ async def test_the_enrollment_key_is_reported_but_never_returned(postgres_url):
         assert await query_enrollment_key(conn, systems_id) == "Sesame-2026"
         data_structures = by_title["Data Structures"]["id"]
         assert await query_enrollment_key(conn, data_structures) is None
-    await engine.dispose()
 
 
-async def test_a_duplicate_address_is_refused():
+async def test_a_duplicate_address_is_refused(app_engine):
     """`user.email` is unique: it is the login identifier, and it is the
     backstop for two first logins racing each other."""
     from sqlalchemy.exc import IntegrityError
 
-    engine = await _async_database()
+    engine = app_engine
     async with engine.connect() as conn:
         await insert_user(conn, "eve@unipd.it", "eve", b"<svg/>", "image/svg+xml")
         await conn.commit()
         with pytest.raises(IntegrityError):
             await insert_user(conn, "eve@unipd.it", "eve2", b"<svg/>", "image/svg+xml")
-    await engine.dispose()
 
 
 ########################################################################
-# Archiving and deleting. Integration tests, and not only because
-# `query_courses` is `json_agg`: SQLite does not enforce foreign keys unless
-# `PRAGMA foreign_keys=ON`, so a cascade written in the wrong order would pass
-# there and prove nothing. These run against a database that would refuse.
+# Archiving and deleting. No foreign key in `model.py` declares an `ON DELETE`,
+# so `delete_challenge` spells the cascade out by hand and the database's job is
+# to raise if the order is ever got wrong - which is what makes these tests
+# worth anything, and why they have to run against a database that enforces
+# them.
 
 
 async def _challenge_id(conn, title):
@@ -1550,15 +1452,10 @@ async def _challenge_id(conn, title):
     ).scalar_one()
 
 
-@pytest.mark.integration
-async def test_an_archived_course_is_listed_only_to_the_people_on_it(postgres_url):
+async def test_an_archived_course_is_listed_only_to_the_people_on_it(example_database, app_engine):
     """The offer is withdrawn, not the course: it drops out of the half nobody
     is enrolled in and stays in the half they are."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         systems = await _course_id(conn, "Systems Programming")
@@ -1593,20 +1490,14 @@ async def test_an_archived_course_is_listed_only_to_the_people_on_it(postgres_ur
         assert [c["title"] for c in reopened["non_enrolled"]] == [
             "Systems Programming"
         ]
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_a_challenge_under_an_archived_course_is_archived_in_effect(postgres_url):
+async def test_a_challenge_under_an_archived_course_is_archived_in_effect(example_database, app_engine):
     """The `or` that `_EFFECTIVE_ARCHIVED_SQL` and `_effective_archived_at`
     spell twice. This is the test that pins the two spellings together: the
     page queries answer in SQL, `query_effective_archived_at` in Core, and they
     have to agree."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         algorithms = await _course_id(conn, "Algorithms 101")
@@ -1648,22 +1539,16 @@ async def test_a_challenge_under_an_archived_course_is_archived_in_effect(postgr
         by_title = {c["title"]: c for c in cards}
         assert by_title["Hello"]["archived_at"] is None
         assert by_title["Sum"]["archived_at"] is not None
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_the_two_spellings_of_visible_agree(postgres_url):
+async def test_the_two_spellings_of_visible_agree(example_database, app_engine):
     """`_CHALLENGE_VISIBLE_SQL` and `_challenge_visible` are one rule the module
     has to spell twice - the page queries are raw text and the plain-Core reads
-    are what the route tests reach on SQLite. This is the test that pins them
+    are what a single-row gate reads. This is the test that pins them
     together, `test_a_challenge_under_an_archived_course_is_archived_in_effect`'s
     counterpart for the other end of a challenge's life.
     """
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         algorithms = await _course_id(conn, "Algorithms 101")
@@ -1701,20 +1586,14 @@ async def test_the_two_spellings_of_visible_agree(postgres_url):
         # A challenge that does not exist answers as a hidden one does, which is
         # the right answer to both halves: the caller 404s.
         assert await query_challenge_visibility(conn, 10_000) == (None, False)
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_a_hidden_challenge_is_dropped_and_keeps_its_number(postgres_url):
+async def test_a_hidden_challenge_is_dropped_and_keeps_its_number(example_database, app_engine):
     """Two things at once, because they are one bug. Hidden challenges leave a
     student's list, scheduled ones stay in it as a teaser - and the number a
     card prints comes off the row, ranked over the whole course, so a student is
     not told to solve a "Challenge 02" that staff call 03."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
         algorithms = await _course_id(conn, "Algorithms 101")
@@ -1760,18 +1639,12 @@ async def test_a_hidden_challenge_is_dropped_and_keeps_its_number(postgres_url):
         # The default is the safe answer: a caller who forgets the flag shows a
         # student's list, never a teacher's.
         assert len(await query_course_challenges(conn, algorithms, user_id=carol)) == 1
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_deleting_a_challenge_leaves_nothing_behind(postgres_url):
+async def test_deleting_a_challenge_leaves_nothing_behind(example_database, app_engine):
     """The hand-ordered cascade, against a database that enforces every
     foreign key it walks past."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         hello = await _challenge_id(conn, "Hello")
         summing = await _challenge_id(conn, "Sum")
@@ -1814,16 +1687,10 @@ async def test_deleting_a_challenge_leaves_nothing_behind(postgres_url):
                 .where(Submission.c.challenge_id == summing)
             )
         ).scalar_one() > 0
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_deleting_a_course_leaves_nothing_behind(postgres_url):
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+async def test_deleting_a_course_leaves_nothing_behind(example_database, app_engine):
+    engine = app_engine
     async with engine.connect() as conn:
         algorithms = await _course_id(conn, "Algorithms 101")
         systems = await _course_id(conn, "Systems Programming")
@@ -1866,21 +1733,15 @@ async def test_deleting_a_course_leaves_nothing_behind(postgres_url):
         assert (
             await conn.execute(select(func.count()).select_from(User))
         ).scalar_one() == 6
-    await engine.dispose()
 
 
-@pytest.mark.integration
-async def test_the_lock_helpers_count_the_running_submissions(postgres_url):
+async def test_the_lock_helpers_count_the_running_submissions(example_database, app_engine):
     """The count both danger zones refuse on. The *locking* half needs two
     connections racing each other and is documented on
     `lock_challenge_submissions` rather than tested here; what is asserted is
     that the answer is the same one `count_running_submissions` gives, so the
     stronger helper did not change the question."""
-    sync_engine = create_engine(postgres_url)
-    metadata.drop_all(sync_engine)
-    _make_example_database(postgres_url)
-
-    engine = create_async_engine(postgres_url)
+    engine = app_engine
     async with engine.connect() as conn:
         systems = await _course_id(conn, "Systems Programming")
         buffer_copy = await _challenge_id(conn, "Buffer copy")
@@ -1897,4 +1758,3 @@ async def test_the_lock_helpers_count_the_running_submissions(postgres_url):
         algorithms = await _course_id(conn, "Algorithms 101")
         assert await lock_course_submissions(conn, algorithms) == 0
         await conn.rollback()
-    await engine.dispose()

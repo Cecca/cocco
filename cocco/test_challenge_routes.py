@@ -1,23 +1,17 @@
-"""End-to-end tests of creating a challenge and a course, over an in-memory
-database.
+"""End-to-end tests of creating a challenge and a course.
 
-Same harness as `test_auth_routes.py`, and for the same reason: `get_db` is
-overridden with SQLite, which works because everything these routes touch -
-`query_course`, `query_course_role`, `challenge_in_course`, `insert_challenge`,
-`is_administrator`, `insert_course` - is plain Core. The course page itself is not
-tested here, nor is the home page carrying the "New course" button: both run the
-`json_agg` query only Postgres has.
+Alice teaches the first course and Bob studies it; the second has nobody on it,
+which is what makes it the course Alice may not name in front of her own
+challenge. Matteo administers the site, so he is staff on both without an
+enrollment anywhere - `effective_course_role`'s promotion, from the outside.
 """
 
 from datetime import datetime, timezone
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import insert, select
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.pool import StaticPool
 
-from cocco.conftest import PUBLISHED
+from cocco.conftest import PUBLISHED, sign_in_as
 from cocco.model import (
     Administrator,
     Challenge,
@@ -25,7 +19,6 @@ from cocco.model import (
     Enrollment,
     User,
     UserRole,
-    metadata,
 )
 
 TEACHER = "alice@unipd.it"
@@ -44,15 +37,6 @@ FORM = {
     "max_threads": "1",
     "ranking": "total_score",
 }
-
-
-@pytest.fixture
-async def app_engine():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
-    async with engine.begin() as conn:
-        await conn.run_sync(metadata.create_all)
-    yield engine
-    await engine.dispose()
 
 
 @pytest.fixture
@@ -117,36 +101,12 @@ async def world(app_engine):
 
 
 @pytest.fixture
-def client(app_engine, world, monkeypatch):
+def client(make_client, world):
     # `world` is a dependency rather than an argument of the tests alone,
     # because signing in *creates* the account if it is missing: without the
     # ordering, the fixture would insert alice a moment before the seed does and
     # the seed would trip over its own unique index.
-    import cocco.main as main
-
-    async def _get_db():
-        async with app_engine.connect() as conn:
-            yield conn
-
-    main.app.dependency_overrides[main.get_db] = _get_db
-    # Signed in without a cookie and without Google. The user rows already
-    # exist, so `get_or_create_user` finds them rather than making new ones.
-    monkeypatch.setattr(main, "DUMMY_AUTH", True)
-
-    # Not `with TestClient(...)`: entering the context runs the startup event,
-    # which reaches for the real Postgres engine.
-    client = TestClient(main.app)
-    _sign_in_as(client, TEACHER)
-    yield client
-    main.app.dependency_overrides.clear()
-
-
-def _sign_in_as(client, email: str):
-    """Become somebody else. Dummy auth is a real session now, so this is a
-    request rather than a monkeypatch, and `_sign_in` clears the old session
-    before writing the new id - no identity leaks into the next one."""
-    response = client.post("/auth/dummy", data={"email": email}, follow_redirects=False)
-    assert response.status_code == 303, response.text
+    return make_client(as_=TEACHER)
 
 
 async def test_the_form_is_staff_only(client, world, monkeypatch):
@@ -154,7 +114,7 @@ async def test_the_form_is_staff_only(client, world, monkeypatch):
 
     assert client.get(url).status_code == 200
 
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     assert client.get(url).status_code == 403
     # ...and hiding the button is not what stops them: the POST refuses too.
     assert client.post(url, data=FORM).status_code == 403
@@ -230,7 +190,7 @@ async def test_the_course_editor_is_staff_only(client, world, monkeypatch):
     asserted here - see the module docstring - which is exactly the refusal.
     """
     course_id = world["course"]
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
 
     assert client.get(f"/courses/{course_id}/edit").status_code == 403
     assert (
@@ -291,11 +251,11 @@ async def test_creating_a_course_is_admin_only(client, world, monkeypatch):
     Alice is course staff and may do everything else in the editor; this is the
     one thing `EDITOR_ROLES` does not open.
     """
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     assert client.get("/courses/new").status_code == 200
 
     for email in (TEACHER, STUDENT):
-        _sign_in_as(client, email)
+        sign_in_as(client, email)
         assert client.get("/courses/new").status_code == 403
         # ...and hiding the button is not what stops them: the POST refuses too.
         assert client.post("/courses/new", data=COURSE_FORM).status_code == 403
@@ -304,7 +264,7 @@ async def test_creating_a_course_is_admin_only(client, world, monkeypatch):
 async def test_a_created_course_lands_on_its_editor(
     client, world, app_engine, monkeypatch
 ):
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     response = client.post("/courses/new", data=COURSE_FORM)
 
     # 204 + HX-Redirect, not a 302: htmx would splice a whole page into the
@@ -335,7 +295,7 @@ async def test_a_created_course_lands_on_its_editor(
 
 async def test_a_new_course_needs_a_title(client, world, app_engine, monkeypatch):
     """200 with an alert, never a 4xx: htmx does not swap an error response."""
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     response = client.post("/courses/new", data={**COURSE_FORM, "title": "   "})
     assert response.status_code == 200
     assert "A course needs a title." in response.text
@@ -383,7 +343,7 @@ async def test_an_administrator_is_staff_on_every_course(client, world, monkeypa
     # queries only Postgres has, and a 403 would prove nothing about a 200.
     url = f"/courses/{theirs}/challenges/new"
 
-    _sign_in_as(client, ADMIN)
+    sign_in_as(client, ADMIN)
     assert client.get(url).status_code == 200
     # 204 + HX-Redirect is the success path: he did not merely see the form, he
     # created a challenge on a course nobody enrolled him on.
@@ -393,7 +353,7 @@ async def test_an_administrator_is_staff_on_every_course(client, world, monkeypa
     assert client.get(f"/courses/{world['course']}/{challenge}/edit").status_code == 404
 
     # And the power did not leak into `EDITOR_ROLES` on the way past.
-    _sign_in_as(client, TEACHER)
+    sign_in_as(client, TEACHER)
     assert client.get(url).status_code == 403
 
 
@@ -406,9 +366,9 @@ async def test_an_administrator_is_staff_on_every_course(client, world, monkeypa
 # that already gate a challenge - so these tests are about what those two
 # refuse, and about the form that writes the column.
 
-# Far from now on purpose: SQLite's `CURRENT_TIMESTAMP` is a naive UTC string
-# and SQLAlchemy stores an aware datetime as its own wall clock, so two moments
-# seconds apart could compare either way. Years apart, they cannot.
+# Far from now on purpose. The comparison is made by the database's `now()` and
+# the constant is written by this process, so anything close would be a race
+# between two clocks. Decades away, it cannot be.
 SCHEDULED = datetime(2099, 1, 1, 9, 0, tzinfo=timezone.utc)
 
 
@@ -450,7 +410,7 @@ async def test_a_hidden_challenge_does_not_exist_for_a_student(
     asked here is the gate in front of it - and the gate is what decides.
     """
     challenge_id = await _add_challenge(app_engine, world["course"], None)
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     response = client.get(f"/courses/{world['course']}/{challenge_id}")
     assert response.status_code == 404
     assert "Dijkstra" not in response.text
@@ -461,7 +421,7 @@ async def test_a_scheduled_challenge_says_when_it_opens(client, world, app_engin
     this challenge on their course page saying it opens, so a dead link there
     would read as a bug."""
     challenge_id = await _add_challenge(app_engine, world["course"], SCHEDULED)
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     response = client.get(f"/courses/{world['course']}/{challenge_id}")
     assert response.status_code == 403
     assert "opens on" in response.text
@@ -479,7 +439,7 @@ async def test_an_unpublished_challenge_takes_no_submission(
     it being read. Note this is a real status code and not archiving's "200 with
     an alert" - the request never reaches the route that would render one."""
     challenge_id = await _add_challenge(app_engine, world["course"], visible_from)
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     assert _submit(client, world["course"], challenge_id).status_code == status
 
 
@@ -487,7 +447,7 @@ async def test_a_published_challenge_takes_one(client, world, app_engine):
     """The third state, so the refusals above are about visibility and not about
     the harness."""
     challenge_id = await _add_challenge(app_engine, world["course"], PUBLISHED)
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     assert _submit(client, world["course"], challenge_id).status_code == 200
 
 
@@ -507,7 +467,7 @@ async def test_the_fragments_are_gated_too(client, world, app_engine):
     so they simply freeze - exactly as they do for a student unenrolled
     mid-session."""
     challenge_id = await _add_challenge(app_engine, world["course"], None)
-    _sign_in_as(client, STUDENT)
+    sign_in_as(client, STUDENT)
     for url in (
         f"/f/submissions/{challenge_id}",
         f"/f/leaderboard/{challenge_id}",

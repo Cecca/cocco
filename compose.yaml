@@ -5,8 +5,11 @@
 # PGPORT, PGUSER and PGDATABASE. `pg-start` runs a cluster on a unix socket at
 # $PWD/.pg/sock; this runs one on 127.0.0.1:5432. Point the PG* variables at
 # whichever is up and every part of cocco follows - the web app, the judge,
-# `cocco-migrate`, `psql` and the Postgres tests, none of which are told about
-# this file:
+# `cocco-migrate`, `psql` and the tests, none of which are told about this file.
+# The tests are the one exception to the sentence above: they read PGHOST,
+# PGPORT and PGUSER like everything else but deliberately *not* PGDATABASE,
+# naming their own `cocco-test` and creating it if it is not there, so a test
+# run cannot empty the database `just dev` is using:
 #
 #   export PGHOST=127.0.0.1
 #   export PGPORT=5432

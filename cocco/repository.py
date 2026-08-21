@@ -43,9 +43,9 @@ from cocco.model import (
 # A challenge is archived when it says so, or when its course does. That `or`
 # is the whole of "archiving a course archives its challenges", and it is
 # written here twice and nowhere else: once as SQL, because the page queries
-# are raw text, and once as a Core expression, because the plain-Core reads are
-# what the route tests reach on SQLite. Both are named, both point at each
-# other, and an integration test asserts they agree.
+# are raw text, and once as a Core expression, because the routes that need the
+# answer for one row read the rule rather than re-deriving it. Both are named,
+# both point at each other, and a test asserts they agree.
 #
 # Nothing downstream - no route, no template - may spell it a third time, the
 # way nothing downstream spells `effective_course_role`'s promotion again. A
@@ -66,9 +66,8 @@ def _effective_archived_at():
 #
 # The neighbour of `_EFFECTIVE_ARCHIVED_SQL` above and written under the same
 # discipline: twice and nowhere else, once as SQL because the page queries are
-# raw text and once as a Core expression because the plain-Core reads are what
-# the route tests reach on SQLite. Nothing downstream may spell it a third
-# time.
+# raw text and once as a Core expression for the single-row reads a gate makes.
+# Nothing downstream may spell it a third time.
 #
 # Two differences from its neighbour. It does not cascade from the course - a
 # course has no hidden state to cascade, so this needs only `challenge` in its
@@ -1165,9 +1164,8 @@ async def query_challenge_config(conn: AsyncConnection, challenge_id: int):
     """A challenge's own row, plain Core.
 
     Deliberately not `query_challenge`, which is the *page* query: that one
-    needs a viewer to compute their role, joins five tables and is written in
-    Postgres-only SQL. The transfer format wants the columns and nothing else,
-    and wants them somewhere the route tests can reach on SQLite.
+    needs a viewer to compute their role, joins five tables and returns one
+    nested document. The transfer format wants the columns and nothing else.
     """
     stmt = select(Challenge).where(Challenge.c.id == challenge_id)
     return (await conn.execute(stmt)).first()
@@ -1183,8 +1181,8 @@ async def query_editable_challenges(
 
     This is what `cocco ls` prints, and the only thing that makes an id
     discoverable from a command line. Plain Core rather than the `json_agg`
-    shape the page queries use, deliberately: those are Postgres-only, and the
-    route tests run on SQLite.
+    shape the page queries use, deliberately: a list of ids and titles is a row
+    set, and nothing here renders a page.
 
     `editor_roles` is passed in rather than spelled here so that `EDITOR_ROLES`
     stays the one definition of course staff, and `every_course` is how a site
@@ -1473,7 +1471,7 @@ async def query_effective_archived_at(
 
     The single Python-side read of the rule - `post_submission` is its caller,
     and `query_challenge` answers the same question in SQL for the page. Plain
-    Core, so the route tests reach it on SQLite.
+    Core, because one row is not a document.
     """
     stmt = (
         select(_effective_archived_at())
@@ -1492,8 +1490,8 @@ async def query_challenge_visibility(
     second caller, which is what earns it a name.
 
     `query_effective_archived_at`'s twin: the single Python-side read of the
-    rule, plain Core so the route tests reach it on SQLite, with
-    `query_challenge` answering the same question in SQL for the page. Both
+    rule, plain Core for its reason, with `query_challenge` answering the same
+    question in SQL for the page. Both
     halves come back in one round trip because `require_challenge_visible`
     needs both - the boolean to decide, and the timestamp to say when to come
     back.

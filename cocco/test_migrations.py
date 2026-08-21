@@ -1,21 +1,22 @@
 """The test that stops `model.py` and `cocco/migrations/versions/` drifting apart.
 
-Everything else in the suite builds its schema with `metadata.create_all`, which
-is right - a route test has no business replaying every revision - and is exactly
-why this file has to exist: nothing else would ever notice a column added to
-`model.py` and to no revision, and the failure that follows is a deployment that
-migrates cleanly and then 500s on a missing column.
+The rest of the suite now builds its schema by running these very revisions, so
+a column added to `model.py` and to no revision would show up there as well - as
+a query against a column that is not there. This file is still the direct
+question rather than the inference: `compare_metadata` names the drift, on
+exactly the terms `revision --autogenerate` would, instead of leaving somebody to
+work it out from a failure three files away.
 
-The Postgres half is destructive, and more so than the rest: it drops the whole
-`public` schema of `$PGDATABASE` before *and* after. Before, because a previous
-run may have left an `alembic_version` behind, and an `upgrade head` against a
-stale one is a silent no-op that would make this test pass on an empty database.
-After, so the next test finds an empty database rather than a version table
-pointing at head. Every other integration test opens with `metadata.drop_all`,
-which no-ops on an empty schema, so they are unaffected either way.
+It runs against **`cocco-test-migrations`, a database of its own**, and that is
+load-bearing rather than tidy. This test drops the whole `public` schema before
+*and* after: before, because a previous run may have left an `alembic_version`
+behind, and an `upgrade head` against a stale one is a silent no-op that would
+make this pass on an empty database; after, so that nothing inherits a version
+table pointing at head. The session database next door is migrated once and
+truncated between tests, so a file that empties it would strand whatever ran
+next - and which test that was would depend on collection order.
 """
 
-import pytest
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine
@@ -40,9 +41,8 @@ def test_the_revisions_ship_with_the_package():
     assert head_revisions(), "no revision scripts in cocco/migrations/versions/"
 
 
-@pytest.mark.integration
-def test_the_migrations_build_exactly_the_model(postgres_url):
-    engine = create_engine(postgres_url)
+def test_the_migrations_build_exactly_the_model(migrations_database):
+    engine = create_engine(migrations_database)
     try:
         with engine.begin() as conn:
             reset_schema(conn)

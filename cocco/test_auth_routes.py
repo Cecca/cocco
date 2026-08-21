@@ -1,18 +1,19 @@
-"""End-to-end tests of the auth *and* authorization routes, over an in-memory
-database.
+"""End-to-end tests of the auth *and* authorization routes.
 
-Importing `cocco.main` mounts `cocco/static/` and reads `cocco/templates/`,
-both resolved against the package rather than the working directory, so these
-run from anywhere - and they need no database and never connect to one:
-building an engine does not
-connect, and `get_db` is overridden with a SQLite connection, which is enough
-because the auth routes use plain Core only. Google is replaced wholesale by
-`_FakeGoogleClient`, so nothing here reaches the network either.
+Google is replaced wholesale by `_FakeGoogleClient`, so nothing here reaches the
+network: `authorize_redirect` is what a browser would follow and
+`authorize_access_token` returns the claims as Authlib would have verified them,
+or raises the way a cancelled or tampered flow does. That fake is the whole
+point of `cocco/auth.py` being the half of sign-in with no network in it.
 
-The authorization tests at the bottom run here for the same reason, and it is
-not a coincidence: a refusal happens in a *dependency*, so the route body - and
-with it every Postgres-only page query - never runs. Which means the interesting
-half, "who is turned away", is a unit test.
+The authorization tests at the bottom sit in this file rather than beside the
+pages they guard, and that is not filing: a refusal happens in a *dependency*,
+so the route body never runs and what is being tested is who is turned away
+rather than what they would have seen.
+
+This file has no seeded cast. It *is* the account-creation test - the first
+accepted address is what makes a user - so each fixture below builds only what
+its own tests need.
 """
 
 from dataclasses import replace
@@ -21,10 +22,7 @@ import pytest
 from authlib.integrations.base_client.errors import MismatchingStateError
 from authlib.integrations.starlette_client import OAuthError
 from fastapi.responses import RedirectResponse
-from fastapi.testclient import TestClient
 from sqlalchemy import insert
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.pool import StaticPool
 
 from cocco.conftest import PUBLISHED
 from cocco.auth import get_or_create_user
@@ -35,7 +33,6 @@ from cocco.model import (
     Course,
     Enrollment,
     UserRole,
-    metadata,
 )
 from cocco.repository import (
     block_user,
@@ -44,50 +41,21 @@ from cocco.repository import (
     query_user_by_email,
 )
 
-# A signed-in visitor asking for something that does not need Postgres. Most
-# pages run `json_agg` queries that only Postgres has, so this avatar route -
-# a plain SELECT, and behind `CurrentUser` - is the canary for "am I signed
-# in?" throughout this file.
+# A signed-in visitor asking for the cheapest thing there is: an avatar is a
+# plain SELECT behind `CurrentUser`, so it answers "am I signed in?" without
+# dragging a whole page in behind it. The id is 1 because the tables are emptied
+# with `RESTART IDENTITY` between tests (see `conftest.db`), so the first
+# account created is always the first row.
 BEHIND_THE_WALL = "/users/1/avatar"
 
 VERIFIED = {"email": "dave@unipd.it", "email_verified": True}
 
 
 @pytest.fixture
-async def app_engine():
-    """An empty database with the schema on it.
-
-    The tables are created here rather than in `client` because not every test
-    needs a client: the authorization dependencies are worth calling directly,
-    and they still need somewhere to look a role up.
-    """
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
-    async with engine.begin() as conn:
-        await conn.run_sync(metadata.create_all)
-    yield engine
-
-
-@pytest.fixture
-async def client(app_engine, monkeypatch):
-    """A client whose app talks to `app_engine` and never reaches Google."""
-    import cocco.main as main
-
-    async def _get_db():
-        async with app_engine.connect() as conn:
-            yield conn
-
-    main.app.dependency_overrides[main.get_db] = _get_db
-    # Off unless a test says otherwise: the dummy shortcut bypasses everything
-    # these tests are about.
-    monkeypatch.setattr(main, "DUMMY_AUTH", False)
-
-    # Deliberately not `with TestClient(...)`: entering the context runs the
-    # startup event, which calls `prepare_database` against the real
-    # Postgres engine. Nothing here needs it, and these stay unit tests.
-    client = TestClient(main.app)
-    yield client
-    main.app.dependency_overrides.clear()
-    await app_engine.dispose()
+def client(make_client):
+    """A client whose app never reaches Google, and whose development sign-in
+    box is off: the shortcut bypasses everything these tests are about."""
+    return make_client(dummy_auth=False)
 
 
 class _FakeGoogleClient:

@@ -1,27 +1,22 @@
-"""End-to-end tests of the transfer API, over an in-memory database.
-
-Same harness as `test_challenge_routes.py` - `get_db` overridden with SQLite -
-which works because everything these routes touch is plain Core: the page
-queries with their `json_agg` are deliberately not on this path.
+"""End-to-end tests of the transfer API.
 
 Nothing here touches `DUMMY_AUTH`, and it used to have to: the shortcut was the
 first branch of `get_api_user` and never looked at a header, so a bearer token
 presented to a development server was simply ignored - and the header is the
 whole subject of this file. `get_api_user` has no such branch any more; the
 development sign-in is a session like any other, and the session is already the
-last way in here.
+last way in here. The client below says `dummy_auth=False` out loud for that
+reason: the one identity in this app that is not a cookie deserves a harness
+where the cookie shortcut is not even switched on.
 """
 
 import io
 import re
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
-from fastapi.testclient import TestClient
 from sqlalchemy import insert, select, update
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy.pool import StaticPool
 
 from cocco.conftest import PUBLISHED
 from cocco.model import (
@@ -38,7 +33,6 @@ from cocco.model import (
     TestOutcome,
     User,
     UserRole,
-    metadata,
 )
 from cocco.storage import Storage
 from cocco.tokens import hash_token, mint_token
@@ -48,15 +42,6 @@ TEACHER = "alice@unipd.it"
 STUDENT = "bob@unipd.it"
 OUTSIDER = "charlie@unipd.it"
 ADMIN = "matteo.ceccarello@unipd.it"
-
-
-@pytest.fixture
-async def app_engine():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool)
-    async with engine.begin() as conn:
-        await conn.run_sync(metadata.create_all)
-    yield engine
-    await engine.dispose()
 
 
 @pytest.fixture
@@ -146,18 +131,8 @@ async def world(app_engine, tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def client(app_engine):
-    import cocco.main as main
-
-    async def _get_db():
-        async with app_engine.connect() as conn:
-            yield conn
-
-    main.app.dependency_overrides[main.get_db] = _get_db
-
-    client = TestClient(main.app)
-    yield client
-    main.app.dependency_overrides.clear()
+def client(make_client):
+    return make_client(dummy_auth=False)
 
 
 def auth(world, nickname: str) -> dict:
@@ -261,7 +236,7 @@ async def test_a_blocked_account_is_refused_even_with_a_good_token(
     async with app_engine.connect() as conn:
         await conn.execute(
             update(User).where(User.c.id == world["alice"])
-            .values(blocked_at=datetime(2026, 1, 1), blocked_reason="no")
+            .values(blocked_at=datetime(2026, 1, 1, tzinfo=timezone.utc), blocked_reason="no")
         )
         await conn.commit()
     assert client.get("/api/challenges", headers=auth(world, "alice")).status_code == 403
@@ -341,7 +316,7 @@ async def test_the_listing_marks_archived_challenges(client, world, app_engine):
     async with app_engine.connect() as conn:
         await conn.execute(
             update(Course).where(Course.c.id == world["other"])
-            .values(archived_at=datetime(2026, 1, 1))
+            .values(archived_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
         )
         await conn.commit()
 
@@ -368,7 +343,7 @@ async def test_a_push_to_an_archived_challenge_still_works(
     async with app_engine.connect() as conn:
         await conn.execute(
             update(Challenge).where(Challenge.c.id == world["challenge"])
-            .values(archived_at=datetime(2026, 1, 1))
+            .values(archived_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
         )
         await conn.commit()
 
