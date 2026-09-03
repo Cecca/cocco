@@ -8,7 +8,7 @@
       nixpkgs.lib.genAttrs nixpkgs.lib.systems.flakeExposed (system: f nixpkgs.legacyPackages.${system});
   in {
     packages = eachSystem (pkgs: {
-      python3 = pkgs.python312;
+      python3 = pkgs.python312.withPackages (ps: with ps; [numpy pyspark bitarray]);
       gcc = pkgs.gcc;
       jdk = pkgs.jdk21;
     });
