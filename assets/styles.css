@@ -202,6 +202,35 @@ body {
   color: var(--color-error);
 }
 
+/* A code block inside rendered markdown (a challenge statement, a course
+   description, the editor's live preview). Pygments wraps a fence in the same
+   `.cocco-code` div it wraps a submission in - `css_class` in main.py's
+   `_MARKDOWN_EXTENSION_CONFIGS` - so every token colour above applies unchanged.
+   What a fence has to supply for itself is the chrome submission.jinja writes by
+   hand around the source: the light card, the border, the radius. Scoped under
+   `.prose` for exactly that reason - styling `.cocco-code` bare would draw a
+   second border inside the one that page already has.
+
+   Specificity is the whole trick, and both rules rely on it: typography writes
+   its own `pre` styles as `.prose :where(pre):not(...)`, and `:where()` counts
+   for nothing, so `.prose .cocco-code` and the `.cocco-code pre` rule above both
+   win. `overflow-x` sits on the wrapper rather than the `pre`, which leaves that
+   rule's `overflow: visible` correct and lets a long line scroll inside a border
+   that stays put. */
+.prose .cocco-code {
+  overflow-x: auto;
+  border: 1px solid var(--color-base-300);
+  border-radius: 0.75rem;
+  background: color-mix(in oklch, var(--color-base-200) 40%, transparent);
+}
+/* Typography paints `pre` dark and colours its text. The shared rule above
+   already wins on background, margin and padding, but nothing there sets a
+   colour - so every token with no rule of its own (punctuation, plain names,
+   whitespace) would inherit prose's pale-on-dark ink onto a light card. */
+.prose .cocco-code pre {
+  color: var(--color-base-content);
+}
+
 /* htmx request-in-flight helpers */
 .htmx-indicator {
   opacity: 0;

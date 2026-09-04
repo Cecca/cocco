@@ -320,8 +320,34 @@ EDITOR_ROLES = {UserRole.teacher, UserRole.collaborator}
 EDITOR_ROLE_NAMES = {role.value for role in EDITOR_ROLES}
 
 
+# `codehilite` is what puts a fenced block through Pygments; `fenced_code` hands
+# every fence to it once it is registered, and it picks up indented blocks itself,
+# so a statement has one code-block shape and not two. The configuration is three
+# deliberate choices:
+#   css_class - `cocco-code`, the scope `assets/styles.css` writes the token
+#     colours under. The default is `codehilite`, which matches nothing here.
+#   guess_lang - off. A fence with no language stays plain: guessing is slow, and
+#     on the three lines of *sample input* a statement usually fences it would
+#     colour data as if it were code.
+#   linenums - off. Line numbers belong on a submission, where a compiler error
+#     names one. They are also what makes `render_source`'s output a
+#     `.cocco-codetable`; without them a fence is the plain `<div><pre><code>` the
+#     `.cocco-code pre` rule already fits.
+# An unknown fence language cannot raise: `CodeHilite.hilite` falls back to the
+# `text` lexer, which is the same `TextLexer` fallback `render_source` spells by
+# hand, so ```pseudocode renders plain rather than 500ing a challenge page.
+_MARKDOWN_EXTENSIONS = ["fenced_code", "tables", "codehilite"]
+_MARKDOWN_EXTENSION_CONFIGS = {
+    "codehilite": {"css_class": "cocco-code", "guess_lang": False, "linenums": False},
+}
+
+
 def render_markdown(text: str | None) -> Markup:
-    html = md.markdown(text or "", extensions=["fenced_code", "tables"])
+    html = md.markdown(
+        text or "",
+        extensions=_MARKDOWN_EXTENSIONS,
+        extension_configs=_MARKDOWN_EXTENSION_CONFIGS,
+    )
     return Markup(html)
 
 # Line numbers in their own table column so that selecting the code does not

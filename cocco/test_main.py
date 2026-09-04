@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cocco.judge import load_languages
-from cocco.main import app, render_source, static_url, visible_outcomes
+from cocco.main import app, render_markdown, render_source, static_url, visible_outcomes
 
 
 def _outcome(is_sample: bool, **overrides):
@@ -48,6 +48,49 @@ def test_render_source_escapes_the_source():
     # never contiguous in the output either way
     assert "<script>" not in html
     assert "&lt;" in html and "&gt;" in html
+
+
+def test_render_markdown_highlights_a_fenced_block():
+    """A fence goes through Pygments and lands in the same `.cocco-code` scope
+    a submission's source does, which is what makes the two look alike."""
+    html = render_markdown("```python\ndef f():\n    return 1\n```\n")
+    assert 'class="cocco-code"' in html
+    assert '<span class="k">def</span>' in html
+
+
+def test_render_markdown_leaves_an_unknown_language_plain():
+    """A teacher writing ```pseudocode must get a code block, not a 500:
+    codehilite falls back to the text lexer rather than raising."""
+    html = render_markdown("```pseudocode\nfor each x in S\n```\n")
+    assert 'class="cocco-code"' in html
+    assert "for each x in S" in html
+    assert '<span class="k">' not in html
+
+
+def test_render_markdown_does_not_guess_the_language():
+    """`guess_lang` is off, so a fence with no language stays plain - a block of
+    sample *input* is the commonest thing a statement fences, and guessing would
+    colour data as if it were code."""
+    html = render_markdown("```\n3\n1 2 3\n```\n")
+    assert 'class="cocco-code"' in html
+    assert '<span class="k">' not in html
+    assert '<span class="s">' not in html
+
+
+def test_render_markdown_escapes_a_fenced_block():
+    """The statement is staff-written and lands in the page as Markup, so
+    Pygments' escaping is what stands between a fence and the DOM."""
+    html = render_markdown("```python\n\"<script>alert(1)</script>\"\n```\n")
+    assert "<script>" not in html
+    assert "&lt;" in html and "&gt;" in html
+
+
+def test_render_markdown_leaves_inline_code_alone():
+    """Only blocks are highlighted; inline code stays a bare `<code>` for prose
+    to style, with no wrapper of its own."""
+    html = render_markdown("Call `solve(n)` with the input.\n")
+    assert "<code>solve(n)</code>" in html
+    assert "cocco-code" not in html
 
 
 def test_visible_outcomes_redacts_hidden_test_cases_for_students():
