@@ -55,6 +55,9 @@ def test_load_config_without_a_file(tmp_path):
     assert config.judge.flake == DEFAULT_FLAKE_REF
     assert config.dev.dummy_auth is False
     assert config.dev.reset_db is False
+    # Off, and that is the whole reason the setting exists: a password proves
+    # only that somebody typed an address this app cannot send anything to.
+    assert config.auth.password_login is False
 
 
 def test_load_config_reads_the_settings(tmp_path):
@@ -248,6 +251,14 @@ def test_dev_is_off_unless_the_file_says_so(tmp_path):
 
 ########################################################################
 # the allowlist and the bootstrap administrators
+
+
+def test_password_login_is_read_from_the_file(tmp_path):
+    """A setting and not a secret, so it has a file spelling and only a file
+    spelling - there is no environment variable to disagree with it."""
+    path = tmp_path / "cocco.toml"
+    path.write_text("[auth]\npassword_login = true\n")
+    assert load_config(path).auth.password_login is True
 
 
 def test_an_empty_allowed_domains_list_is_honoured(tmp_path):

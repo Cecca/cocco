@@ -48,7 +48,7 @@
           {% if can_edit %}
           This is what you sign in with, so it cannot be changed here.
           {% else %}
-          The address Google signs this account in with.
+          The address this account signs in with.
           {% endif %}
         </p>
       </div>
@@ -142,6 +142,31 @@
       <div class="card-body p-7">
         <div id="tokens">
           {% include "f-tokens.jinja" %}
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  {# ══ PASSWORD ════════════════════════════════════════════════════ #}
+  {# The owner alone, for the tokens' reason one step further along: reading a
+     profile is oversight, and setting somebody's password is the ability to
+     become them. Behind `[auth] password_login` as well — with it off the
+     routes 404, and this section would be a form for a feature that is not
+     there. An administrator resets a forgotten one from `/admin`. #}
+  {% if is_owner and password_login %}
+  <div class="mt-8">
+    <h2 class="font-bold text-lg">Password</h2>
+    <p class="text-[13px] text-base-content/55 mb-3">
+      The other way to sign in, beside whatever this site has configured. Only
+      a hash of it is stored, so nobody — including a site administrator — can
+      read it back; a forgotten one is replaced rather than recovered.
+    </p>
+
+    <div class="card bg-base-100 border border-base-300 shadow-sm">
+      <div class="card-body p-7">
+        <div id="password">
+          {% include "f-password.jinja" %}
         </div>
       </div>
     </div>

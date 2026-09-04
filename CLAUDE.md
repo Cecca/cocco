@@ -399,6 +399,56 @@ the return from Google is a top-level cross-site navigation, and under `"strict"
 carrying the `state` would not reach the callback, so every sign-in would fail as a state
 mismatch.
 
+**`[auth] password_login` is the second real way in, and its default is the design.** An address
+and a password, for the deployment Google cannot serve; off unless the file says otherwise, and
+when it is off the feature *does not exist* — `_require_password_login` answers **404**, which is
+`post_auth_dummy`'s rule, because hiding a form is presentation and never the check. Google proves
+that someone owns the mailbox; a password proves nothing about the address, and cocco has no mail
+path anywhere in it, so it cannot send a verification link. Registration is therefore a **claim**,
+and `claim_user_password` narrows it as far as it can be narrowed without email — a single
+conditional INSERT whose `WHERE` is `first_login_at IS NULL`, with `ON CONFLICT DO NOTHING`, so the
+rule is in the statement rather than in a check before it, the way `block_user` refuses an
+administrator. `first_login_at` means exactly "this account has never been near the login page", so
+a roster a teacher wrote out before term is claimable by its owner and an account somebody has
+actually used never is. What remains — whoever types an unused institutional address first gets it
+— is what a deployment accepts when it turns this on, and is why the default is false and why
+`cocco.example.toml` spends a screen on it.
+
+Three consequences. **`_complete_sign_in` stays the single funnel**, and registration is a
+`claim_password=` keyword on it rather than a route with its own opinions: the allowlist is checked
+*before* `get_or_create_user` writes anything, so an address outside `allowed_domains` never
+becomes a row, and the blacklist refusal still runs afterwards. **Every way a sign-in can be wrong
+is one sentence** — `_BAD_CREDENTIALS`, one module constant — because an unknown address, an
+account with no password and a wrong password are the same event from outside; `verify_password`
+takes `str | None` and turns None into False rather than short-circuiting, so they cost the same
+work too, and a route that returned early for an address nobody has would be a way to read a class
+list off the login page. Registration is the opposite and deliberately so: it is a form somebody is
+filling in, so it says which field is wrong. And **scrypt runs in a threadpool** — 32 MiB of
+sequential work on the event loop would stop every polled fragment in the app for its duration.
+
+`cocco/passwords.py` is `tokens.py`'s deliberate opposite, and that file's `hash_token` already
+says why: a token is 256 bits of `secrets`, so SHA-256 is right for it; a password is something a
+person chose, so it needs a salt per password and a work factor. Stdlib `hashlib.scrypt`, no new
+dependency, and `maxmem` passed explicitly because its 32 MiB default is exactly what `N=2**15,
+r=8` needs plus overhead. The encoding `scrypt$n$r$p$salt$key` carries its own parameters, so
+raising them later leaves every stored password working and `needs_rehash` upgrades each one the
+next time its owner types it. **The hash lives in `user_password`, not on `user`**, for one reason
+above the others: `_USER_COLUMNS` is read on every single request, and a credential has no business
+travelling with the identity every route already holds. Keyed on `user.id` for `api_token`'s
+reason — the account always exists — and no row means no password, which is what a Google-only
+account looks like.
+
+There are two places a password is set and they are not variations on one route. The **owner** sets
+theirs at `/users/{id}/password`, behind `ProfileOwner` and never `ProfileReader` — that page
+already draws the line between oversight and impersonation, and setting somebody's password is the
+far side of it — and the current one is required whenever there is one to replace, because a
+session left open on a shared machine is the ordinary way an account is taken. A **site
+administrator** issues one from `/admin`, generated rather than chosen and shown exactly once,
+`f-tokens.jinja`'s discipline; that is the whole answer to a forgotten password and the reason no
+SMTP setting exists anywhere. It leaves `first_login_at` alone, so it never re-opens an account to
+somebody else's claim. There is **no rate limiting** anywhere in this app, here included; that
+belongs at the reverse proxy and `cocco.example.toml` says so.
+
 **`[dev] dummy_auth` is a sign-in, not a bypass, and that is the whole of its design.** It puts a
 text box on `/login`; `post_auth_dummy` takes the address typed into it and mints an ordinary
 session, so everything downstream — the cookie, `get_user`, the block — is the **one** code path

@@ -178,6 +178,34 @@ ApiToken = Table(
 )
 
 
+# A password, for the deployments that turn `[auth] password_login` on. Its own
+# table and not a nullable column on `user`, for one reason above all the
+# others: `_USER_COLUMNS` in `repository.py` is read on every single request,
+# and a credential has no business travelling with the identity that every
+# route already holds. Keyed on `user.id` for `ApiToken`'s reason - a password
+# belongs to an account that exists, unlike `Administrator`, which is keyed on
+# an address precisely so it can name somebody who has never signed in.
+#
+# The row is the whole of the feature's state: no row means no password, which
+# is what a Google-only account looks like and what an account looks like
+# before anybody has claimed it.
+UserPassword = Table(
+    "user_password",
+    metadata,
+    # The primary key, so an account has at most one password and the upsert in
+    # `set_user_password` has something to conflict on.
+    Column("user_id", Integer, ForeignKey("user.id"), primary_key=True),
+    # `scrypt$n$r$p$<salt>$<key>` - see `cocco/passwords.py`, which owns the
+    # shape. Self-describing, so the parameters can be raised without
+    # invalidating what is already stored.
+    Column("password_hash", String, nullable=False),
+    created_at(),
+    # Bumped whenever the password changes, which is the one thing an owner
+    # might want to know about a credential they cannot read back.
+    updated_at(),
+)
+
+
 Administrator = Table(
     "administrator",
     metadata,

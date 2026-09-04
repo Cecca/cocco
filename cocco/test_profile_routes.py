@@ -29,12 +29,25 @@ ADMIN = "matteo.ceccarello@unipd.it"
 PNG = b"\x89PNG\r\n\x1a\n" + b"the rest is not parsed"
 JPEG = b"\xff\xd8\xff\xe0" + b"jfif-ish"
 
+# Long enough for `check_password`, so a refusal in these tests is about who is
+# asking rather than about the password itself.
+PASSWORD = "a perfectly fine password"
+OTHER_PASSWORD = "another perfectly fine password"
+
 
 def _write_urls(user_id: int):
-    """Every way to change a profile that takes a plain form."""
+    """Every way to change a profile that takes a plain form.
+
+    The two password routes belong here even though `[auth] password_login` is
+    off in these tests: `ProfileOwner` is a dependency and runs before the body
+    that would 404, so a stranger is turned away by the same 403 as everywhere
+    else on this page - which is the property being asserted.
+    """
     return [
         (f"/users/{user_id}/profile", {"nickname": "impostor"}),
         (f"/users/{user_id}/avatar/reset", {}),
+        (f"/users/{user_id}/password", {"password": PASSWORD, "confirm": PASSWORD}),
+        (f"/users/{user_id}/password/delete", {}),
     ]
 
 
@@ -298,3 +311,128 @@ async def test_the_navbar_offers_your_own_profile(client, world):
     response = client.get("/")
     assert response.status_code == 200
     assert f'href="http://testserver/users/{world["alice"]}"' in response.text
+
+
+########################################################################
+# The password section
+#
+# Behind `ProfileOwner`, like the tokens beside it and for the tokens' reason
+# one step further along: reading a profile is oversight, and setting somebody
+# else's password is the ability to become them. Behind `[auth] password_login`
+# as well, and that half is a 404 rather than a hidden form - the rule
+# `post_auth_dummy` states.
+
+
+@pytest.fixture
+def passwords(monkeypatch):
+    """`[auth] password_login` on, as `test_password_routes.py` turns it on."""
+    from dataclasses import replace
+
+    import cocco.main as main
+
+    monkeypatch.setattr(
+        main,
+        "CONFIG",
+        replace(main.CONFIG, auth=replace(main.CONFIG.auth, password_login=True)),
+    )
+
+
+def _password_state(client, user_id: int):
+    return client.get(f"/f/users/{user_id}/password")
+
+
+async def test_the_section_is_absent_without_the_setting(client, world):
+    """Not merely undrawn: the routes are gone."""
+    body = client.get(f"/users/{world['alice']}").text
+    assert "password" not in body.lower() or "/password" not in body
+    assert _password_state(client, world["alice"]).status_code == 404
+    assert (
+        client.post(
+            f"/users/{world['alice']}/password",
+            data={"password": PASSWORD, "confirm": PASSWORD},
+        ).status_code
+        == 404
+    )
+
+
+async def test_the_owner_sets_a_first_password_without_the_old_one(
+    client, world, passwords
+):
+    """There is nothing to ask for before the first password - the session is
+    the only thing that could have reached the form."""
+    response = client.post(
+        f"/users/{world['alice']}/password",
+        data={"password": PASSWORD, "confirm": PASSWORD},
+    )
+    assert response.status_code == 200
+    assert "Password set." in response.text
+    assert "A password is set" in _password_state(client, world["alice"]).text
+
+
+async def test_changing_one_needs_the_current_one(client, world, passwords):
+    """A session left open on a shared machine is the ordinary way an account
+    is taken; without this the person who found it could lock its owner out."""
+    client.post(
+        f"/users/{world['alice']}/password",
+        data={"password": PASSWORD, "confirm": PASSWORD},
+    )
+
+    refused = client.post(
+        f"/users/{world['alice']}/password",
+        data={
+            "current_password": "not it",
+            "password": OTHER_PASSWORD,
+            "confirm": OTHER_PASSWORD,
+        },
+    )
+    assert "not your current password" in refused.text
+
+    accepted = client.post(
+        f"/users/{world['alice']}/password",
+        data={
+            "current_password": PASSWORD,
+            "password": OTHER_PASSWORD,
+            "confirm": OTHER_PASSWORD,
+        },
+    )
+    assert "Password changed." in accepted.text
+
+
+@pytest.mark.parametrize(
+    "data, fragment",
+    [
+        ({"password": "short", "confirm": "short"}, "12"),
+        ({"password": PASSWORD, "confirm": OTHER_PASSWORD}, "not the same"),
+    ],
+)
+async def test_a_password_that_will_not_do_says_why(
+    client, world, passwords, data, fragment
+):
+    response = client.post(f"/users/{world['alice']}/password", data=data)
+    assert fragment in response.text
+    assert "No password is set" in _password_state(client, world["alice"]).text
+
+
+async def test_the_owner_can_take_it_away_again(client, world, passwords):
+    client.post(
+        f"/users/{world['alice']}/password",
+        data={"password": PASSWORD, "confirm": PASSWORD},
+    )
+    response = client.post(f"/users/{world['alice']}/password/delete")
+    assert "Password removed." in response.text
+    assert "No password is set" in _password_state(client, world["alice"]).text
+
+
+async def test_an_administrator_cannot_read_or_set_one(client, world, passwords):
+    """`ProfileOwner`, never `ProfileReader`. An administrator who has to get an
+    account back in issues a password from `/admin` instead - which is shown to
+    them once and expected to be replaced from here."""
+    sign_in_as(client, ADMIN)
+    assert _password_state(client, world["alice"]).status_code == 403
+    assert (
+        client.post(
+            f"/users/{world['alice']}/password",
+            data={"password": PASSWORD, "confirm": PASSWORD},
+        ).status_code
+        == 403
+    )

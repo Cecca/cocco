@@ -156,11 +156,16 @@ async def test_the_login_page_is_public_and_offers_google(client, google):
     assert "/auth/google?next=%2Fcourses%2F1%2F2" in response.text
 
 
-async def test_the_login_page_says_so_when_google_is_unconfigured(client, no_google):
-    """A checkout with no credentials must boot and explain itself, not 500."""
+async def test_the_login_page_says_so_when_nothing_is_configured(client, no_google):
+    """A checkout with no credentials must boot and explain itself, not 500.
+
+    The warning is about the page having *no* way in rather than about Google
+    in particular: with `[dev] dummy_auth` or `[auth] password_login` on there
+    is a form here, and complaining about the absence of Google beside it would
+    be a warning about a thing nobody is looking for."""
     response = client.get("/login")
     assert response.status_code == 200
-    assert "not configured" in response.text
+    assert "No sign-in method is configured" in response.text
     assert "Sign in with Google" not in response.text
 
 

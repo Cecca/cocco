@@ -16,6 +16,26 @@
 </div>
 {% endif %}
 
+{% if issued %}
+{# The only time this string exists anywhere but on this screen: only its
+   scrypt hash is stored, so there is no "show again" — `f-tokens.jinja` prints
+   a minted token the same way and for the same reason. Read it out to its
+   owner, who is expected to replace it from their own profile page. #}
+<div class="rounded-xl border-2 border-primary bg-primary/5 p-4 mb-4">
+  <p class="text-xs font-bold uppercase tracking-wider text-primary mb-2">
+    Copy this now — it is not shown again
+  </p>
+  <p class="text-[13px] text-base-content/70 mb-2">
+    The new password for <code class="font-mono">{{ issued[0] }}</code>:
+  </p>
+  <code class="block font-mono text-sm break-all select-all bg-base-100 rounded-lg border border-base-300 p-3">{{ issued[1] }}</code>
+  <p class="text-[13px] text-base-content/55 mt-2">
+    Give it to them by some means other than this page, and have them set their
+    own from their profile — until they do, you know their password too.
+  </p>
+</div>
+{% endif %}
+
 <div class="overflow-x-auto">
   <table class="table">
     <thead>
@@ -102,6 +122,25 @@
                    class="input input-xs flex-1" />
             <button type="submit" class="btn btn-xs btn-error btn-outline font-semibold">
               Block
+            </button>
+          </form>
+          {% endif %}
+
+          {% if password_login %}
+          {# Only where there are passwords to reset. Issued rather than
+             chosen, and shown once above — this is the whole answer to a
+             forgotten password, because cocco has no way to send an email.
+             `hx-confirm` and not a dialog, for the block form's reason: N
+             dialogs would be rebuilt on every keystroke in the filter. #}
+          <form hx-post="{{ url_for('post_user_password_reset', user_id=u.id) }}"
+                hx-target="#users"
+                hx-swap="innerHTML"
+                hx-disabled-elt="find button"
+                hx-confirm="Issue a new password for {{ u.nickname }}? It is shown to you once, and replaces any password they have now."
+                class="mt-1.5">
+            <input type="hidden" name="q" value="{{ q }}" />
+            <button type="submit" class="btn btn-xs btn-ghost border border-base-300 font-semibold">
+              Reset password
             </button>
           </form>
           {% endif %}

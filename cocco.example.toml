@@ -159,6 +159,42 @@ allowed_domains = ["unipd.it"]
 # unset if your students' addresses live in a secondary domain.
 # google_hd = "unipd.it"
 
+# The second way in: an address and a password, for the deployment Google
+# cannot serve - no Workspace, or no wish to register an OAuth client. Off
+# unless this says otherwise, and the default is false for a reason worth
+# reading before you change it.
+#
+# GOOGLE PROVES THAT SOMEBODY OWNS THE MAILBOX. A PASSWORD PROVES NOTHING ABOUT
+# THE ADDRESS. cocco has no mail path anywhere in it - no SMTP setting, no
+# queue, nothing - so it cannot send a verification link, and registering here
+# is therefore a *claim* rather than a proof. It is narrowed as far as it can
+# be without email: a claim succeeds only on an account that has never been
+# signed in, so
+#
+#   - an address a teacher wrote onto a roster before term can be claimed by
+#     its owner, which is the workflow this is shaped around;
+#   - an account somebody has actually used cannot be taken over, ever;
+#   - and what is left is that whoever types an unused address in
+#     `allowed_domains` first gets it.
+#
+# That last line is what you are accepting. Inside an institution where the
+# addresses are already known it is usually fine; on anything reachable from
+# the open internet with a permissive `allowed_domains`, it is not. Turning
+# this on does not turn Google off - configure both and the login page offers
+# both, which is the safest way to run it: Google for everyone who has it, a
+# password for the people who do not.
+#
+# There is no "forgot my password", again because there is no mail: a site
+# administrator issues a new one from /admin, sees it once, and reads it out.
+# Its owner replaces it from their own profile page, which is also the only
+# place anybody can set their own.
+#
+# Passwords are stored as salted scrypt (see `cocco/passwords.py`), never in
+# the clear and never recoverably - an administrator resets one, nobody reads
+# one back. There is no rate limiting anywhere in this app, so put one in front
+# of `POST /auth/password` at your reverse proxy before you rely on this.
+# password_login = false
+
 [site]
 # The absolute base for the OAuth redirect URI. Leave it unset to derive it from
 # the incoming request, which is only correct if the reverse proxy sets

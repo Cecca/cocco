@@ -14,6 +14,7 @@ from sqlalchemy import (
     exists,
     func,
     insert,
+    literal,
     or_,
     select,
     text,
@@ -36,6 +37,7 @@ from cocco.model import (
     TestCase,
     TestOutcome,
     User,
+    UserPassword,
     UserRole,
 )
 
@@ -1063,6 +1065,123 @@ async def delete_api_token(
         .returning(ApiToken.c.id)
     )
     return (await conn.execute(stmt)).first() is not None
+
+
+# ---------------------------------------------------------------------------
+# Passwords, for the deployments that turn `[auth] password_login` on. As with
+# tokens, the password itself never reaches this module: what is stored is
+# `hash_password`'s output - see `cocco/passwords.py`.
+
+
+async def query_password_hash(conn: AsyncConnection, email: str) -> str | None:
+    """The stored hash for an address, or None.
+
+    None for two different situations on purpose - nobody has that address, and
+    that account has no password - because the sign-in route must not be able
+    to tell them apart, and neither must whoever is guessing at it.
+    `verify_password` takes `str | None` for exactly this: the route hands
+    whatever comes back straight to it, and every wrong answer costs the same
+    work and produces the same sentence.
+
+    A join and not a lookup on `user_password` alone, because the address is
+    what a person types and `user.email` is where it lives.
+    """
+    stmt = (
+        select(UserPassword.c.password_hash)
+        .select_from(
+            User.join(UserPassword, UserPassword.c.user_id == User.c.id)
+        )
+        .where(User.c.email == email)
+    )
+    return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def claim_user_password(
+    conn: AsyncConnection, email: str, password_hash: str
+) -> bool:
+    """Give an unclaimed account its first password. Does not commit. True if
+    it did.
+
+    This is registration, and it is the one statement the whole feature's
+    safety rests on, so the rule is *in* it rather than in a check before it -
+    `block_user` refusing an administrator in its own WHERE clause is the
+    precedent, and the reason is the same: two requests racing must not be able
+    to pass a check each and then both write.
+
+    The rule is `first_login_at IS NULL`, and that column means precisely "this
+    account has never been near the login page" - `get_or_create_user` leaves
+    it NULL for a roster a teacher writes out before term, and `record_sign_in`
+    sets it the first time somebody actually signs in. So an address a teacher
+    has enrolled can be claimed by its owner, and an account somebody has
+    already used cannot be taken over. `ON CONFLICT DO NOTHING` is the other
+    half: an account that already has a password is never re-claimed, whatever
+    its `first_login_at` says.
+
+    That leaves exactly one thing a claim proves - that whoever made it can
+    type an address `allowed_domains` admits - which is why this is off by
+    default and why `cocco.example.toml` says so at length.
+    """
+    stmt = (
+        pg_insert(UserPassword)
+        .from_select(
+            ["user_id", "password_hash"],
+            select(User.c.id, literal(password_hash)).where(
+                and_(User.c.email == email, User.c.first_login_at.is_(None))
+            ),
+        )
+        .on_conflict_do_nothing(index_elements=[UserPassword.c.user_id])
+        .returning(UserPassword.c.user_id)
+    )
+    return (await conn.execute(stmt)).first() is not None
+
+
+async def set_user_password(
+    conn: AsyncConnection, user_id: int, password_hash: str
+) -> None:
+    """Set or replace an account's password. Does not commit.
+
+    An upsert, and it names `updated_at` itself: SQLAlchemy fires the column's
+    `onupdate` for an UPDATE and not for the DO UPDATE of an upsert, which is
+    the trap `set_enrollment_role` already documents.
+    """
+    stmt = (
+        pg_insert(UserPassword)
+        .values(user_id=user_id, password_hash=password_hash)
+        .on_conflict_do_update(
+            index_elements=[UserPassword.c.user_id],
+            set_={"password_hash": password_hash, "updated_at": func.now()},
+        )
+    )
+    await conn.execute(stmt)
+
+
+async def delete_user_password(conn: AsyncConnection, user_id: int) -> bool:
+    """Take an account's password away. Does not commit. True if there was one.
+
+    Nothing else goes with it: the account, its enrollments and its submissions
+    stay exactly where they are, and if Google is configured its owner signs in
+    there tomorrow. This is the app's usual line - a block does not retract
+    work, `delete_enrollment` takes one row - applied to a credential.
+    """
+    stmt = (
+        delete(UserPassword)
+        .where(UserPassword.c.user_id == user_id)
+        .returning(UserPassword.c.user_id)
+    )
+    return (await conn.execute(stmt)).first() is not None
+
+
+async def query_password_state(conn: AsyncConnection, user_id: int):
+    """Whether this account has a password and when it last changed, for the
+    profile page to describe a credential it can never show.
+
+    None when there is no password, which is what the section's other half
+    reads as.
+    """
+    stmt = select(UserPassword.c.created_at, UserPassword.c.updated_at).where(
+        UserPassword.c.user_id == user_id
+    )
+    return (await conn.execute(stmt)).first()
 
 
 async def query_challenge_testcases(conn: AsyncConnection, challenge_id: int):
