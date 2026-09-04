@@ -53,6 +53,15 @@ url = "postgresql+psycopg://cocco@localhost/cocco"
 # path from the database, not stored in it (see DESIGN.md). The web app and the
 # judge must resolve a path to the same bytes; they agree by both reading this.
 root = "/var/lib/cocco/storage"
+#
+# Every file under it is gzip-compressed, transparently: a million-line test
+# case is line-oriented text and compresses several times over, and nothing
+# that reads or writes one sees anything but plaintext. There is no fallback
+# for a root that predates this, deliberately - `cocco-migrate
+# compress-storage` converts one in place (idempotent, and safe to interrupt
+# and re-run), and cocco-web and cocco-judge refuse to start until it has been,
+# exactly as they refuse a database that is behind its migrations. A brand new
+# root needs nothing: it is created marked.
 
 [judge]
 # The two settings the web app never reads, and the first is the one an

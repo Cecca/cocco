@@ -10,7 +10,7 @@ from sqlalchemy import func, insert, select
 from cocco.avatar import MAX_AVATAR_BYTES, generate_identicon, sniff_image_mime
 from cocco.evaluators import BUNDLED, DEFAULT_EVALUATOR, bundled_path
 from cocco.judge import extension_to_language, load_languages
-from cocco.storage import Storage, safe_filename
+from cocco.storage import Storage, check_storage_format, safe_filename
 from cocco.model import (
     Challenge,
     Course,
@@ -77,6 +77,7 @@ from fastapi.responses import (
     JSONResponse,
     RedirectResponse,
     Response,
+    StreamingResponse,
 )
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
@@ -300,6 +301,41 @@ templates = Jinja2Templates(directory=TEMPLATES_DIR)
 # root, and the two agree because they read it out of the same file.
 storage = Storage(CONFIG.storage.root)
 
+# How a stored file is handed to somebody outside. Everything under the storage
+# root is compressed and nothing the other end reads is, so a download is a
+# decompressing stream rather than a `FileResponse`: there is no file holding
+# the right bytes to point one at, and a million-line test case must not be
+# inflated into memory to make one. The generator is deliberately *sync* -
+# Starlette iterates one of those on a thread, which is what keeps the inflate
+# off the event loop.
+def _stored_file_download(relative: str, filename: str) -> StreamingResponse:
+    def chunks():
+        with storage.reader(relative) as fp:
+            while chunk := fp.read(1 << 16):
+                yield chunk
+
+    return StreamingResponse(
+        chunks(),
+        # text/plain whatever the name says, so a file named .html can never be
+        # served as a page on this origin.
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _zip_stored(zf: zipfile.ZipFile, relative: str, arcname: str) -> None:
+    """Copy a stored file into an open zip, decompressing on the way.
+
+    `zf.write` would put the gzip bytes in under a plain name: what leaves here
+    is the transfer format, which is plaintext at both ends and is a directory
+    somebody edits. Through `zf.open(..., "w")` rather than `writestr`, so a
+    million-line test case is still never held in memory.
+    """
+    with storage.reader(relative) as source, zf.open(arcname, "w") as sink:
+        while chunk := source.read(1 << 20):
+            sink.write(chunk)
+
+
 # Uploads are mapped to a language by their extension, so the challenge page
 # needs no language picker. `languages.toml` is the same file the judge loads -
 # literally, since `load_languages` resolves it against the checkout rather
@@ -499,6 +535,12 @@ async def prepare_database(reset=False):
     database that *passes* the check below and 500s on the first query. See
     `reset_schema`.
     """
+    # Beside the schema check below and for the same reason, on the other half
+    # of what a deployment has to bring forward: every file under the storage
+    # root is compressed, and a root that predates that would fail one download
+    # and one submission at a time instead of saying so once, here.
+    check_storage_format(CONFIG.storage.root)
+
     if reset:
         async with engine.begin() as conn:
             await conn.run_sync(reset_schema)
@@ -3207,13 +3249,10 @@ async def get_sample_file(
     relative = (
         testcase.input_path if kind == "input" else testcase.expected_output_path
     )
-    path = storage.resolve(relative)
-    if not path.is_file():
+    if not storage.exists(relative):
         raise HTTPException(status_code=404)
-    return FileResponse(
-        path,
-        media_type="text/plain",
-        filename=f"sample{testcase.execution_order + 1}_{kind}.txt",
+    return _stored_file_download(
+        relative, f"sample{testcase.execution_order + 1}_{kind}.txt"
     )
 
 
@@ -4071,14 +4110,17 @@ async def get_evaluator_download(
     """
     relative = await query_evaluator_path(db, challenge_id)
     if relative is None:
+        # The bundled default lives in the source tree rather than in storage,
+        # so it is plain and is served as the file it is.
         path = bundled_path(DEFAULT_EVALUATOR)
-    else:
-        path = storage.resolve(relative)
-    if not path.is_file():
+        if not path.is_file():
+            raise HTTPException(status_code=404)
+        # text/plain whatever the extension says, so a script named .html can
+        # never be served as a page on this origin.
+        return FileResponse(path, media_type="text/plain", filename=path.name)
+    if not storage.exists(relative):
         raise HTTPException(status_code=404)
-    # text/plain whatever the extension says, so a script named .html can
-    # never be served as a page on this origin.
-    return FileResponse(path, media_type="text/plain", filename=path.name)
+    return _stored_file_download(relative, Path(relative).name)
 
 
 @app.post("/f/markdown-preview")
@@ -4139,9 +4181,14 @@ async def post_testcase(
             "A file with that name already exists for this challenge.", ok=False,
         )
 
-    # Streamed, not read: test inputs can be several megabytes (DESIGN.md)
-    storage.save_stream(input_path, input_file.file)
-    storage.save_stream(output_path, expected_output_file.file)
+    # Streamed, not read: test inputs can be several megabytes (DESIGN.md).
+    # On a thread, because they are compressed on the way down and deflating
+    # tens of megabytes on the event loop would stop every polled fragment in
+    # the site for its duration - the rule `hash_password` is here for.
+    await run_in_threadpool(storage.save_stream, input_path, input_file.file)
+    await run_in_threadpool(
+        storage.save_stream, output_path, expected_output_file.file
+    )
 
     await insert_testcase(
         db, challenge_id, input_path, output_path, is_sample=is_sample
@@ -4996,7 +5043,11 @@ async def api_export_challenge(
         )
 
     handle = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
-    try:
+
+    # Every member is now inflated out of storage and deflated back into the
+    # zip, so the whole build goes on a thread rather than on the event loop -
+    # `post_testcase`'s rule, read the other way round.
+    def build() -> None:
         with zipfile.ZipFile(handle, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(
                 MANIFEST_NAME,
@@ -5011,14 +5062,14 @@ async def api_export_challenge(
             )
             zf.writestr(STATEMENT_NAME, challenge.description or "")
             for row, entry in zip(rows, manifest.testcases):
-                zf.write(storage.resolve(row.input_path), entry.input)
-                zf.write(
-                    storage.resolve(row.expected_output_path),
-                    entry.expected_output,
-                )
+                _zip_stored(zf, row.input_path, entry.input)
+                _zip_stored(zf, row.expected_output_path, entry.expected_output)
             if evaluator_path is not None and manifest.evaluator is not None:
-                zf.write(storage.resolve(evaluator_path), manifest.evaluator)
+                _zip_stored(zf, evaluator_path, manifest.evaluator)
         handle.close()
+
+    try:
+        await run_in_threadpool(build)
     except (OSError, ValueError):
         handle.close()
         os.unlink(handle.name)
@@ -5199,18 +5250,25 @@ async def api_import_challenge(
             directory = _testcase_dir(challenge_id)
             written: set[str] = set()
 
-            def store(member: str, name: str) -> str:
+            async def store(member: str, name: str) -> str:
                 path = f"{directory}/{name}"
-                with archive.open(member) as source:
-                    storage.save_stream(path, source)
+
+                # Inflate out of the zip and deflate into storage, both on a
+                # thread: a push carries every test case of a challenge at
+                # once, and `post_testcase`'s rule applies a hundredfold here.
+                def save() -> None:
+                    with archive.open(member) as source:
+                        storage.save_stream(path, source)
+
+                await run_in_threadpool(save)
                 written.add(path)
                 return path
 
             superseded: list[str] = []
 
             for update in plan.updated:
-                store(update.entry.input, update.entry.input_name)
-                output_path = store(
+                await store(update.entry.input, update.entry.input_name)
+                output_path = await store(
                     update.entry.expected_output, update.entry.expected_output_name
                 )
                 if update.existing.expected_output_name != update.entry.expected_output_name:
@@ -5227,8 +5285,10 @@ async def api_import_challenge(
 
             added_ids: list[int] = []
             for addition in plan.added:
-                input_path = store(addition.entry.input, addition.entry.input_name)
-                output_path = store(
+                input_path = await store(
+                    addition.entry.input, addition.entry.input_name
+                )
+                output_path = await store(
                     addition.entry.expected_output,
                     addition.entry.expected_output_name,
                 )

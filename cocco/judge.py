@@ -5,7 +5,7 @@ import os
 import shutil
 import tempfile
 import tomllib
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Sequence
@@ -34,7 +34,14 @@ from cocco.migrate import SchemaOutOfDate, check_schema_is_current
 from cocco.model import (
     OutcomeEnum,
 )
-from cocco.storage import Storage, safe_filename
+from cocco.storage import (
+    Storage,
+    StorageFormatError,
+    check_storage_format,
+    expand,
+    open_plaintext,
+    safe_filename,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -246,30 +253,74 @@ class CompileOutcome(object):
     stderr: str | None = None
 
 
+async def _drain(stream: asyncio.StreamReader) -> None:
+    """Read a pipe to EOF and throw it away. Isolate's own messages go here,
+    and a pipe nobody empties is a process that never exits."""
+    await stream.read()
+
+
+async def _feed_stdin(writer: asyncio.StreamWriter, path: Path) -> None:
+    """Decompress `path` into a running box's standard input.
+
+    Storage is compressed and a box is plain, and this is the one crossing that
+    costs no file: the input is inflated straight into the pipe isolate is
+    reading, so a million-line test case is never written out whole. It used to
+    be `open(stdin)` and the file's own descriptor, which only worked while the
+    bytes on disk were the bytes the program should read.
+
+    The chunk reads go through a thread because zlib releases the GIL and a
+    multi-megabyte inflate on the event loop would stall every other box. A
+    program that exits before reading all of its input is ordinary - that is
+    what a broken pipe means here - and is not the submission's problem to
+    report: the box's own status already says how it ended.
+    """
+    try:
+        with open_plaintext(path) as fp:
+            while chunk := await asyncio.to_thread(fp.read, 1 << 20):
+                writer.write(chunk)
+                await writer.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        with suppress(BrokenPipeError, ConnectionResetError):
+            writer.close()
+
+
 async def isolate_run(
     exe: Path,
-    stdin: Path,
+    stdin: Path | None,
     args: List[str],
     time_limit: float = 2.0,
     mem_limit_kb: int = 512 * 1024,
     processes: int = 1,
     additional_files: List[Path] = [],
     box_files: Dict[str, Path] | None = None,
+    compressed_box_files: Dict[str, Path] | None = None,
 ) -> RunOutcome:
     """Run `exe` in a fresh isolate box.
+
+    `stdin` is `None` for an empty standard input, or a **compressed file in
+    storage**, which is decompressed into the box's stdin as it runs. One rule
+    with no flag to get wrong: everything under the storage root is gzip, and
+    nothing else is ever passed here.
 
     `args` that happen to name an existing file or directory are copied into
     the box and rewritten to their *basename*: the box is one flat directory,
     so every path collapses into a single namespace. `box_files` is the
     explicit form of the same thing - a box-relative name to put a file under,
     whatever it is called outside - and is the only way to be sure two
-    unrelated paths do not land on the same name.
+    unrelated paths do not land on the same name. `compressed_box_files` is
+    that same argument for a file that comes out of storage, and so has to be
+    expanded rather than copied; the two are separate arguments rather than one
+    clever value because a caller mixing them up would be silent.
 
-    Ordering is load-bearing and easy to reverse by accident: `box_files` is
-    copied first, then `args`, then `additional_files`, so a later stage
-    silently wins a name collision with an earlier one.
+    Ordering is load-bearing and easy to reverse by accident: `box_files` and
+    `compressed_box_files` are placed first, then `args`, then
+    `additional_files`, so a later stage silently wins a name collision with an
+    earlier one.
     """
     box_files = box_files or {}
+    compressed_box_files = compressed_box_files or {}
     async with _IDS_POOL.acquire() as box_id:
         logger.debug(
             "isolate run on box %s: exe=%s args=%s time=%.2fs mem=%dKB",
@@ -301,11 +352,18 @@ async def isolate_run(
             else:
                 shutil.copy(source, box_path / box_name)
 
+        for box_name, source in compressed_box_files.items():
+            # One write, the same one `shutil.copy` above was already doing:
+            # the file is inflated straight into the box rather than through a
+            # plaintext copy somewhere else first. On a thread for
+            # `_feed_stdin`'s reason.
+            await asyncio.to_thread(expand, source, box_path / box_name)
+
         filtered_args = []
         for arg in args:
             # A name we placed ourselves is already in the box under exactly
             # that name; the `isfile` heuristic below must not touch it.
-            if arg in box_files:
+            if arg in box_files or arg in compressed_box_files:
                 filtered_args.append(arg)
             elif os.path.isfile(arg):
                 arg = Path(arg)
@@ -327,28 +385,41 @@ async def isolate_run(
         stdout_file = box_path / "_stdout"
         stderr_file = box_path / "_stderr"
         meta_file = f"/tmp/meta-{box_id}.txt"
-        with open(stdin) as fp:
-            isolate_run = await asyncio.create_subprocess_exec(
-                "isolate",
-                "--cg",
-                "--box-id",
-                str(box_id),
-                f"--time={time_limit}",
-                f"--cg-mem={mem_limit_kb}",
-                f"--processes={processes}",
-                "--dir=/nix/store",  # this allows running the compilers/interpreters
-                f"--meta={meta_file}",
-                f"--stdout={stdout_file.name}",
-                f"--stderr={stderr_file.name}",
-                "--run",
-                "--",
-                str(exe),
-                *filtered_args,
-                stdin=fp,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await isolate_run.communicate()
+        isolate_run = await asyncio.create_subprocess_exec(
+            "isolate",
+            "--cg",
+            "--box-id",
+            str(box_id),
+            f"--time={time_limit}",
+            f"--cg-mem={mem_limit_kb}",
+            f"--processes={processes}",
+            "--dir=/nix/store",  # this allows running the compilers/interpreters
+            f"--meta={meta_file}",
+            f"--stdout={stdout_file.name}",
+            f"--stderr={stderr_file.name}",
+            "--run",
+            "--",
+            str(exe),
+            *filtered_args,
+            stdin=asyncio.subprocess.DEVNULL if stdin is None else asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        # This is `communicate()` written out, and it has to be: given a stdin
+        # pipe, that method closes it before returning *whether or not it was
+        # given anything to write*, so the box would see EOF while the feeder
+        # was still inflating into it. The two output pipes still have to be
+        # drained here rather than after the wait - isolate's own messages fill
+        # them, and a full pipe is a process that never exits. Both are then
+        # discarded: what the run printed is read back out of the box's own
+        # `_stdout` and `_stderr` below.
+        assert isolate_run.stdout is not None and isolate_run.stderr is not None
+        pumps = [_drain(isolate_run.stdout), _drain(isolate_run.stderr)]
+        if stdin is not None:
+            assert isolate_run.stdin is not None
+            pumps.append(_feed_stdin(isolate_run.stdin, stdin))
+        await asyncio.gather(*pumps)
+        await isolate_run.wait()
 
         retcode = isolate_run.returncode
         # Submitted programs may emit non-UTF-8 bytes; decode permissively
@@ -488,12 +559,13 @@ class Language:
     async def run(
         self,
         executable: Path,
-        stdin: Path,
+        stdin: Path | None,
         args: List[str] | None = None,
         time_limit: float = 2.0,
         mem_limit_kb: int = 262144,
         processes: int = 1,
         box_files: Dict[str, Path] | None = None,
+        compressed_box_files: Dict[str, Path] | None = None,
     ) -> RunOutcome:
         args = args or []
         if self.is_interpreted:
@@ -519,6 +591,7 @@ class Language:
                 # three are named with a leading dot.
                 additional_files=self._run_artifacts(executable),
                 box_files=box_files,
+                compressed_box_files=compressed_box_files,
             )
         return await isolate_run(
             # For compiled executables, we strip the absolute path, which is instead needed
@@ -531,6 +604,7 @@ class Language:
             processes=processes + self.additional_processes,
             additional_files=[executable],
             box_files=box_files,
+            compressed_box_files=compressed_box_files,
         )
 
 
@@ -621,10 +695,6 @@ _ACTUAL_IN_BOX = ".actual_output"
 _EXPECTED_IN_BOX = ".expected_output"
 _INPUT_IN_BOX = ".test_input"
 
-# The evaluator reads its three files by path; stdin is deliberately empty, so
-# that "what does my checker read?" has one answer.
-_DEV_NULL = Path("/dev/null")
-
 # A compiler's complaint about the *evaluator* is emitted against every test
 # case, and `visible_outcomes` only redacts hidden ones - so on a public sample
 # this reaches students. Enough to identify the problem, not enough to paste
@@ -700,8 +770,10 @@ async def prepare_evaluator(
     """
     if evaluator_path is None:
         source = bundled_path(DEFAULT_EVALUATOR)
+        from_storage = False
     else:
         source = storage.resolve(evaluator_path)
+        from_storage = True
         if not source.is_file():
             raise EvaluatorError(
                 f"The evaluator script {evaluator_path} is missing from storage."
@@ -719,7 +791,12 @@ async def prepare_evaluator(
     # `public class Foo`, and the extension is what tells a compiler what it is
     # being handed.
     local = workdir / source.name
-    shutil.copy(source, local)
+    # A bundled evaluator lives in the source tree and is plain; an uploaded
+    # one lives in storage and so is compressed, like everything there.
+    if from_storage:
+        expand(source, local)
+    else:
+        shutil.copy(source, local)
 
     compiled = await language.compile(local, workdir)
     if not compiled.success or compiled.executable is None:
@@ -758,12 +835,18 @@ async def evaluate(
 
     res = await evaluator.language.run(
         evaluator.executable,
-        _DEV_NULL,
+        # The evaluator reads its three files by path; stdin is deliberately
+        # empty, so that "what does my checker read?" has one answer.
+        None,
         args=[_ACTUAL_IN_BOX, _EXPECTED_IN_BOX, _INPUT_IN_BOX],
         time_limit=EVALUATOR_TIME_LIMIT_S,
         mem_limit_kb=EVALUATOR_MEM_LIMIT_KB,
-        box_files={
-            _ACTUAL_IN_BOX: actual_path,
+        # Which of the three is which is the boundary this judge draws:
+        # storage is compressed and a box is plain, so the two files that come
+        # out of storage are expanded into the box while the one written here
+        # is copied.
+        box_files={_ACTUAL_IN_BOX: actual_path},
+        compressed_box_files={
             _EXPECTED_IN_BOX: expected_output_path,
             _INPUT_IN_BOX: test_input_path,
         },
@@ -1061,6 +1144,16 @@ def main(argv: list[str] | None = None) -> None:
 
     storage = Storage(config.storage.root)
     engine = create_engine(config.database.url)
+
+    # The same refusal as the schema check below, for the storage root: every
+    # file under it is compressed, and a root that predates that is a judge
+    # whose every submission would fail on the first test case with the fix
+    # buried in this log. Asked once, here, where it names the command.
+    try:
+        check_storage_format(config.storage.root)
+    except StorageFormatError as e:
+        logger.error("%s", e)
+        raise SystemExit(1)
 
     # The judge never builds a schema and never migrates one: it is the process
     # that must not surprise anybody with DDL, and it used to call
