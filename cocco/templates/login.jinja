@@ -1,11 +1,11 @@
 {% extends "base.jinja" %}
 {% block title %}Sign in{% endblock %}
 
-{# A full page, and deliberately htmx-free: the Google flow leaves the site
+{# A full page, and deliberately htmx-free: an OAuth flow leaves the site
    entirely and comes back through a redirect, which is exactly what htmx is
    bad at, and the password forms answer with this same page on a refusal.
 
-   There are up to three ways in on this page and any combination of them may
+   There are several ways in on this page and any combination of them may
    be configured, so the "or" between them cannot be hard-coded to one pair.
    `ns.shown` is the running answer to "has anything been drawn yet", and each
    block puts a divider in front of itself if something has. #}
@@ -119,18 +119,20 @@
       {% set ns.shown = true %}
       {% endif %}
 
-      {% if google_configured %}
+      {# One button per configured provider — a loop rather than a block each,
+         so adding a third is a line in `OAUTH_PROVIDERS` and nothing here. #}
+      {% for name, label in oauth_providers %}
       {% if ns.shown %}<div class="divider text-xs">or</div>{% endif %}
       <p class="text-sm opacity-70">
-        Sign in with your institutional Google account. No password, and no
+        Sign in with your institutional {{ label }} account. No password, and no
         account to create first — your first sign-in creates one.
       </p>
       <a class="btn btn-primary w-full"
-         href="{{ url_for('get_auth_google').include_query_params(next=next) }}">
-        Sign in with Google
+         href="{{ url_for('get_auth_provider', provider=name).include_query_params(next=next) }}">
+        Sign in with {{ label }}
       </a>
       {% set ns.shown = true %}
-      {% endif %}
+      {% endfor %}
 
       {% if ns.shown %}
       <p class="text-xs opacity-60">
@@ -146,7 +148,9 @@
         <span class="font-semibold">No sign-in method is configured</span>
         <span>
           Put <code>COCCO_GOOGLE_CLIENT_ID</code> and
-          <code>COCCO_GOOGLE_CLIENT_SECRET</code> in the environment — they have
+          <code>COCCO_GOOGLE_CLIENT_SECRET</code> — or
+          <code>COCCO_GITHUB_CLIENT_ID</code> and
+          <code>COCCO_GITHUB_CLIENT_SECRET</code> — in the environment; they have
           no spelling in <code>cocco.toml</code>; see
           <code>cocco.example.toml</code>. Or set
           <code>password_login = true</code> under <code>[auth]</code> to sign

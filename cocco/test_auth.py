@@ -1,16 +1,16 @@
-"""Tests for the pure half of Google sign-in: nothing here needs a database,
-an app or a network."""
+"""Tests for the pure half of signing in: nothing here needs a database, an
+app or a network."""
 
 import pytest
 
 from cocco.auth import (
     MAX_EMAIL_LENGTH,
     email_domain,
-    google_redirect_uri,
     is_allowed_email,
     nickname_from_email,
     normalize_domains,
     normalize_email,
+    oauth_redirect_uri,
     safe_next_path,
 )
 from cocco.config import DEFAULT_ALLOWED_DOMAINS
@@ -49,15 +49,16 @@ def test_safe_next_path_keeps_a_local_path():
     assert safe_next_path("/courses/1/2") == "/courses/1/2"
 
 
-def test_google_redirect_uri_carries_no_query_string():
-    """It is matched character for character against the console registration,
-    so a destination could never ride along in it."""
+@pytest.mark.parametrize("provider", ["google", "github"])
+def test_oauth_redirect_uri_carries_no_query_string(provider):
+    """It is matched character for character against the registration at the
+    provider, so a destination could never ride along in it."""
     assert (
-        google_redirect_uri("https://cocco.example.org/")
-        == "https://cocco.example.org/auth/google/callback"
+        oauth_redirect_uri("https://cocco.example.org/", provider)
+        == f"https://cocco.example.org/auth/{provider}/callback"
     )
-    assert google_redirect_uri("http://localhost:8000") == (
-        "http://localhost:8000/auth/google/callback"
+    assert oauth_redirect_uri("http://localhost:8000", provider) == (
+        f"http://localhost:8000/auth/{provider}/callback"
     )
 
 

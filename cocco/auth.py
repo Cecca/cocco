@@ -1,9 +1,12 @@
-"""Google sign-in: the domain allowlist and the account behind a confirmed
+"""Signing in: the domain allowlist and the account behind a confirmed
 address.
 
-Nothing here talks to Google. The OAuth client and the routes live in
-`main.py`, where the request is; what is left is pure and unit-testable, except
-`get_or_create_user`, which is the one place the flow touches the schema.
+Nothing here talks to a provider, and nothing here knows which one asked. The
+OAuth clients and the routes live in `main.py`, where the request is; what is
+left is pure and unit-testable, except `get_or_create_user`, which is the one
+place the flow touches the schema - and which is keyed on the address alone, so
+somebody who signs in with Google today and with GitHub tomorrow lands on the
+same account by construction rather than by a rule anybody had to write.
 
 The configuration is not here either - it is `cocco/config.py`, because the
 judge reads it too and a database URL is none of sign-in's business.
@@ -22,10 +25,12 @@ from cocco.repository import insert_user, query_user_by_email
 
 logger = logging.getLogger(__name__)
 
-# Where Google sends the browser back. A constant because it must match, byte
-# for byte, an "Authorized redirect URI" registered in the Google Cloud
-# console - it is not something a route can invent per request.
-GOOGLE_CALLBACK_PATH = "/auth/google/callback"
+# Where a provider sends the browser back. A shape rather than a constant
+# because there is more than one provider now, but it is still not something a
+# route may invent per request: it must match, byte for byte, a redirect URI
+# registered with the provider - an "Authorized redirect URI" in the Google
+# Cloud console, an "Authorization callback URL" in a GitHub OAuth app.
+OAUTH_CALLBACK_PATH = "/auth/{provider}/callback"
 
 # RFC 5321's ceiling. Checked before the address is looked at any further, so a
 # preposterous claim costs nothing.
@@ -117,14 +122,15 @@ def nickname_from_email(email: str) -> str:
     return email.split("@", 1)[0][:64] or email[:64]
 
 
-def google_redirect_uri(base_url: str) -> str:
-    """Where Google sends the browser back.
+def oauth_redirect_uri(base_url: str, provider: str) -> str:
+    """Where a provider sends the browser back.
 
-    Must equal an Authorized redirect URI in the Google Cloud console character
-    for character - which is why it carries no query string, and why the
-    post-login destination travels in the session instead.
+    Must equal the redirect URI registered with that provider character for
+    character - which is why it carries no query string, and why the
+    post-login destination travels in the session instead. One function for
+    both providers, so the two can only differ in the segment that names them.
     """
-    return f"{base_url.rstrip('/')}{GOOGLE_CALLBACK_PATH}"
+    return f"{base_url.rstrip('/')}{OAUTH_CALLBACK_PATH.format(provider=provider)}"
 
 
 def safe_next_path(raw: str | None) -> str:

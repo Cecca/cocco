@@ -1,3 +1,5 @@
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated
 import markdown as md
@@ -26,9 +28,9 @@ from cocco.model import (
 from cocco import schema
 from cocco.auth import (
     get_or_create_user,
-    google_redirect_uri,
     is_allowed_email,
     normalize_email,
+    oauth_redirect_uri,
     safe_next_path,
 )
 from cocco.config import config_path, load_config
@@ -178,7 +180,7 @@ logger = logging.getLogger(__name__)
 # Everything the app is configured with: the database, the storage root, the
 # allowed domains, the session cookie and the development shortcuts. A missing
 # file is fine - the app boots on the defaults, and the login page says that
-# Google sign-in is unconfigured.
+# no sign-in method is configured.
 CONFIG = load_config(config_path())
 
 # The development cast, and the addresses `post_auth_dummy` is there to be
@@ -191,7 +193,7 @@ DUMMY_TEACHERS = ["alice@unipd.it"]
 DUMMY_STAFF = [DUMMY_ADMIN, *DUMMY_TEACHERS]
 DUMMY_STUDENTS = ["bob@unipd.it", "charlie@unipd.it"]
 
-# Development shortcut: no Google and no credentials. `/login` grows a box, and
+# Development shortcut: no provider and no credentials. `/login` grows a box, and
 # whatever address is typed into it is signed in - so it is `post_auth_dummy`
 # that branches on this, and `get_user` no longer does. On anything public it is
 # equivalent to publishing every account's password.
@@ -212,7 +214,7 @@ app.add_middleware(
     session_cookie=CONFIG.session.cookie_name,
     max_age=CONFIG.session.max_age,
     https_only=CONFIG.session.https_only,
-    # Not "strict": the return from Google is a top-level cross-site
+    # Not "strict": the return from a provider is a top-level cross-site
     # navigation, and under "strict" the cookie carrying the OAuth `state`
     # would not be sent to the callback, so every sign-in would fail as a state
     # mismatch.
@@ -220,8 +222,11 @@ app.add_middleware(
 )
 
 # Registered at import, but nothing is fetched here: Authlib pulls Google's
-# metadata document lazily, on the first `authorize_redirect`. That is what
-# lets a checkout with no credentials boot and merely say so on the login page.
+# metadata document lazily, on the first `authorize_redirect`, and GitHub has
+# no metadata document at all. That is what lets a checkout with no credentials
+# boot and merely say so on the login page. Each provider is registered only
+# when its own two environment variables are set, which is the whole of what
+# turns one on.
 oauth = OAuth()
 if CONFIG.auth.google is not None:
     oauth.register(
@@ -240,13 +245,34 @@ if CONFIG.auth.google is not None:
     )
 
 
-def google_client():
-    """The registered client, or None when there are no credentials.
+if CONFIG.auth.github is not None:
+    oauth.register(
+        name="github",
+        client_id=CONFIG.auth.github.client_id,
+        client_secret=CONFIG.auth.github.client_secret,
+        authorize_url="https://github.com/login/oauth/authorize",
+        access_token_url="https://github.com/login/oauth/access_token",
+        api_base_url="https://api.github.com/",
+        client_kwargs={
+            # `user:email` and not `read:user`: the nickname is derived from
+            # the address, so a profile scope would be data we hold without
+            # using - the same reason Google is asked for `openid email` and
+            # not `profile`. GitHub is plain OAuth2, so there is no PKCE
+            # method to name and no ID token to come back.
+            "scope": "user:email",
+        },
+    )
+
+
+def oauth_client(provider: str):
+    """The registered client for one provider, or None when it has no
+    credentials.
 
     A function rather than a module constant so a test can replace the whole of
-    Google with two methods.
+    a provider with a few methods; taking the name rather than there being one
+    of these per provider is what keeps that seam single.
     """
-    return oauth.create_client("google")
+    return oauth.create_client(provider)
 
 # Static files. Resolved against the package rather than the working directory,
 # the rule `load_languages` already follows for `languages.toml` - and inside
@@ -1112,17 +1138,19 @@ async def handle_blocked(request: Request, exc: Blocked):
 ########################################################################
 # authentication
 #
-# A visitor proves an address by signing in with Google, and the account is
-# created the first time an accepted address comes back. None of these routes
-# depends on `CurrentUser`: they are the way in.
+# A visitor proves an address by signing in with an OAuth provider - Google or
+# GitHub, each enabled by its own pair of environment variables and neither
+# knowing about the other - and the account is created the first time an
+# accepted address comes back. None of these routes depends on `CurrentUser`:
+# they are the way in.
 
 
 def _base_url(request: Request) -> str:
-    """The absolute origin Google must redirect back to.
+    """The absolute origin a provider must redirect back to.
 
     Configured explicitly when there is a proxy in front, since only the
     deployment knows the public name - and a proxy that terminates TLS makes
-    `request.base_url` say `http`, which Google would refuse as a mismatch.
+    `request.base_url` say `http`, which a provider would refuse as a mismatch.
     """
     if CONFIG.base_url:
         return CONFIG.base_url
@@ -1146,7 +1174,13 @@ def _login_page(
             "user": None,
             "next": next_path,
             "error": error,
-            "google_configured": CONFIG.auth.google is not None,
+            # The single-sign-on buttons: one per configured provider, so the
+            # template loops rather than growing a block each time one is
+            # added. A pair per provider and not the descriptor itself - a
+            # template has no business holding the resolver.
+            "oauth_providers": [
+                (p.name, p.label) for p in _configured_oauth_providers()
+            ],
             # Draws the address-and-password form and the account it can
             # create. `[auth] password_login` and nothing else, the way
             # `dummy_auth` below works: the routes 404 without it, because a
@@ -1185,7 +1219,8 @@ async def _complete_sign_in(
     """Everything between a proved address and a session, for every one of the
     ways an address is proved.
 
-    Google's callback proves one by verifying an ID token; `post_auth_password`
+    A provider's callback proves one - Google by verifying an ID token, GitHub
+    by asking which of the account's addresses are verified; `post_auth_password`
     proves one by a password already on the account; `post_auth_dummy` "proves"
     one by being development. What has to happen next is the same three rules
     every way - the domain allowlist, the account, the blacklist - and they are
@@ -1195,8 +1230,8 @@ async def _complete_sign_in(
     could explain, and the box is the configuration this all gets developed in.
 
     The address must already be through `normalize_email`: canonicalizing it is
-    each caller's, because the sentence for an unusable one differs - Google
-    returning no address is not the same event as an empty text box.
+    each caller's, because the sentence for an unusable one differs - a
+    provider returning no address is not the same event as an empty text box.
 
     `claim_password` is registration, and it is a keyword here rather than a
     route of its own precisely so that it cannot skip any of the above: the
@@ -1221,7 +1256,7 @@ async def _complete_sign_in(
 
     if claim_password is not None:
         # The account may have existed already - a roster a teacher wrote out,
-        # or somebody who signed in with Google - so this is a *claim* and not
+        # or somebody who signed in with a provider - so this is a *claim* and not
         # an insert, and `claim_user_password` refuses in its own WHERE clause
         # rather than here. False means the address is spoken for.
         if not await claim_user_password(db, email, claim_password):
@@ -1262,15 +1297,154 @@ async def _complete_sign_in(
     return _sign_in(request, user, next_path)
 
 
+class _NoProvedAddress(Exception):
+    """A provider came back without an address this app can accept.
+
+    Carries the sentence and the status code, so the two resolvers below fail
+    the same way and the callback has one `except` rather than a branch per
+    provider.
+    """
+
+    def __init__(self, message: str, status_code: int = 400):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+
+
+async def _google_email(client, token) -> str:
+    """Google's address, out of the ID token Authlib has already verified.
+
+    `userinfo` is its decoded claims, so the signature, the issuer, the
+    audience and the nonce are all checked by the time this runs.
+    """
+    claims = token.get("userinfo") or {}
+    try:
+        email = normalize_email(claims.get("email") or "")
+    except ValueError:
+        raise _NoProvedAddress("Google did not return an email address.")
+
+    if claims.get("email_verified") not in (True, "true"):
+        # Google says the address is unconfirmed, so it proves nothing. Matched
+        # against the two affirmative spellings rather than tested for
+        # truthiness: the string "false" is truthy, and this is the kind of
+        # mistake that would never fail visibly.
+        raise _NoProvedAddress(
+            "That Google account's email address is not verified.", 403
+        )
+    return email
+
+
+async def _github_email(client, token) -> str:
+    """GitHub's address, which has to be asked for.
+
+    GitHub is plain OAuth2: there is no ID token and no `email_verified` claim,
+    so the account's addresses come from `GET /user/emails` - the one place in
+    this app where signing in makes an API call of its own.
+
+    An account holds several, and only the **verified** ones prove anything, so
+    the unverified are dropped outright and are never candidates. Among what is
+    left the primary comes first, but it is not the answer on its own: a
+    student's primary is usually personal while the institutional address sits
+    beside it as a verified secondary, and refusing that would refuse the very
+    people this is for. So the first verified address that passes
+    `allowed_domains` wins.
+
+    When none of them does, the primary is returned anyway rather than refused
+    here: `_complete_sign_in` then prints its "not an institutional address"
+    sentence, which names the domains and is the one a person can act on. A
+    second, vaguer refusal for the same event would be a difference nobody
+    could explain.
+    """
+    try:
+        response = await client.get("user/emails", token=token)
+        response.raise_for_status()
+        addresses = response.json()
+    except Exception:
+        logger.exception("could not read the addresses of a GitHub account")
+        raise _NoProvedAddress(
+            "Could not reach GitHub right now. Please try again.", 502
+        )
+
+    verified = []
+    for entry in addresses if isinstance(addresses, list) else []:
+        if not entry.get("verified"):
+            continue
+        try:
+            address = normalize_email(entry.get("email") or "")
+        except ValueError:
+            continue
+        # The primary first, the rest in the order GitHub gave them.
+        if entry.get("primary"):
+            verified.insert(0, address)
+        else:
+            verified.append(address)
+
+    if not verified:
+        raise _NoProvedAddress(
+            "That GitHub account has no verified email address.", 403
+        )
+
+    for address in verified:
+        if is_allowed_email(address, CONFIG.auth.allowed_domains):
+            return address
+    return verified[0]
+
+
+@dataclass(frozen=True)
+class _OAuthProvider:
+    """One way in through somebody else's login page.
+
+    Everything the two providers share is written once, in the two routes
+    below; this is the whole of what differs. `label` is the word every
+    sentence and the button on the login page use, and `email` is the step that
+    turns a token into a proved address - the only genuinely provider-shaped
+    piece of the flow.
+    """
+
+    name: str
+    label: str
+    email: Callable[[object, dict], Awaitable[str]]
+
+
+OAUTH_PROVIDERS = {
+    "google": _OAuthProvider("google", "Google", _google_email),
+    "github": _OAuthProvider("github", "GitHub", _github_email),
+}
+
+
+def _oauth_provider(provider: str) -> _OAuthProvider:
+    """The descriptor for a URL segment, or 404.
+
+    A **404** and not a 422, `post_auth_dummy`'s reason: a path this app does
+    not serve should not be admitted to exist. Whether the provider is
+    *configured* is a separate question, asked from `CONFIG.auth` at call time
+    so a test that swaps the config still gets an answer about it.
+    """
+    descriptor = OAUTH_PROVIDERS.get(provider)
+    if descriptor is None:
+        raise HTTPException(status_code=404)
+    return descriptor
+
+
+def _configured_oauth_providers() -> list[_OAuthProvider]:
+    """The providers a visitor can actually use, in registry order."""
+    return [
+        descriptor
+        for name, descriptor in OAUTH_PROVIDERS.items()
+        if getattr(CONFIG.auth, name) is not None
+    ]
+
+
 def _prune_stale_oauth_state(request: Request) -> None:
     """Drop the leftovers of abandoned sign-ins.
 
     Authlib stashes one entry per *started* flow in the session and removes
     only the one that finishes, so a visitor who keeps bouncing off the consent
     screen would grow the cookie without bound. Only the flow about to start
-    matters.
+    matters - and only one of them can be in flight, so this takes every
+    provider's leftovers rather than just the one being started.
     """
-    for key in [k for k in request.session if k.startswith("_state_google_")]:
+    for key in [k for k in request.session if k.startswith("_state_")]:
         del request.session[key]
 
 
@@ -1320,10 +1494,10 @@ async def post_auth_dummy(
 
 
 # ---------------------------------------------------------------------------
-# Passwords: the second real way in, and off unless `[auth] password_login`
+# Passwords: the third real way in, and off unless `[auth] password_login`
 # says otherwise.
 #
-# Google proves that the person owns the mailbox. A password proves only that
+# A provider proves that the person owns the mailbox. A password proves only that
 # somebody typed an address, because this app has no mail path and so cannot
 # send a verification link. Registration is therefore a *claim*, narrowed as
 # far as it can be without email: `claim_user_password` writes only where
@@ -1454,68 +1628,77 @@ async def post_auth_password_register(
     )
 
 
-@app.get("/auth/google")
-async def get_auth_google(request: Request, next: str = "/"):
-    """Hand off to Google.
+@app.get("/auth/{provider}")
+async def get_auth_provider(request: Request, provider: str, next: str = "/"):
+    """Hand off to the provider.
 
-    Authlib puts the `state`, the `nonce` and the PKCE verifier in the session
-    and returns the redirect to the consent screen.
+    Authlib puts the `state` - and, for an OIDC provider, the `nonce` and the
+    PKCE verifier - in the session and returns the redirect to the consent
+    screen. One route for both providers rather than one each: everything here
+    except the `hd` hint is the same sentence twice, and two copies of it would
+    be two things to keep in step.
     """
+    descriptor = _oauth_provider(provider)
     next_path = safe_next_path(next)
-    client = google_client()
+    client = oauth_client(provider)
     if client is None:
         return _login_page(
             request,
             next_path=next_path,
-            error="Google sign-in is not configured on this server.",
+            error=f"{descriptor.label} sign-in is not configured on this server.",
             status_code=503,
         )
 
     # The destination rides in the session, not in the redirect URI: that URI is
-    # matched character for character against the console registration, so it
-    # cannot carry a query string. Unlike an emailed link this is the same
+    # matched character for character against the registration at the provider,
+    # so it cannot carry a query string. Unlike an emailed link this is the same
     # browser throughout, which makes the session the natural place for it.
     request.session["login_next"] = next_path
     _prune_stale_oauth_state(request)
 
     params = {}
-    if CONFIG.auth.google is not None and CONFIG.auth.google.hd:
+    google = CONFIG.auth.google
+    if provider == "google" and google is not None and google.hd:
         # A hint for the account chooser, never a check: `hd` is absent for
         # consumer accounts, and the gate is `is_allowed_email` on the address.
-        params["hd"] = CONFIG.auth.google.hd
+        # Google's alone - GitHub has no notion of an organisation domain to
+        # pre-select, which is why this is the one branch on the name here.
+        params["hd"] = google.hd
 
     try:
         return await client.authorize_redirect(
-            request, google_redirect_uri(_base_url(request)), **params
+            request, oauth_redirect_uri(_base_url(request), provider), **params
         )
     except Exception:
         # Typically the metadata document could not be fetched. A machine that
         # is offline should say so rather than raise a 500.
-        logger.exception("could not start the Google sign-in flow")
+        logger.exception("could not start the %s sign-in flow", descriptor.label)
         return _login_page(
             request,
             next_path=next_path,
-            error="Could not reach Google right now. Please try again.",
+            error=f"Could not reach {descriptor.label} right now. Please try again.",
             status_code=502,
         )
 
 
-@app.get("/auth/google/callback")
-async def get_auth_google_callback(request: Request, db: DBDep):
-    """Finish the flow: verify the ID token, check the domain, sign in.
+@app.get("/auth/{provider}/callback")
+async def get_auth_provider_callback(request: Request, provider: str, db: DBDep):
+    """Finish the flow: get the address the provider vouches for, check the
+    domain, sign in.
 
     Every failure lands on the login page with one sentence, never a traceback:
-    the visitor arrives here from Google, so a 500 would be a dead end.
+    the visitor arrives here from the provider, so a 500 would be a dead end.
     """
+    descriptor = _oauth_provider(provider)
     # Read before `_sign_in` clears the session. A callback that arrives
     # without one - a bookmarked URL, a cleared cookie - lands on the root.
     next_path = safe_next_path(request.session.get("login_next"))
 
-    client = google_client()
+    client = oauth_client(provider)
     if client is None:
         return _login_page(
             request,
-            error="Google sign-in is not configured on this server.",
+            error=f"{descriptor.label} sign-in is not configured on this server.",
             status_code=503,
         )
 
@@ -1526,7 +1709,7 @@ async def get_auth_google_callback(request: Request, db: DBDep):
         # expired `state`, and a token endpoint that refused the code. Keep the
         # clause this narrow: widening it would fold a failed state check into
         # a success path, which is the one bug here that fails silently.
-        logger.info("a Google sign-in did not complete: %s", err.error)
+        logger.info("a %s sign-in did not complete: %s", descriptor.label, err.error)
         return _login_page(
             request,
             next_path=next_path,
@@ -1534,29 +1717,17 @@ async def get_auth_google_callback(request: Request, db: DBDep):
             status_code=400,
         )
 
-    # Authlib has already verified the ID token's signature, issuer, audience
-    # and nonce; `userinfo` is its decoded claims.
-    claims = token.get("userinfo") or {}
+    # The one thing the two providers do differently, and the only reason there
+    # is a registry at all: Google hands the address over in a verified ID
+    # token, GitHub has to be asked for it.
     try:
-        email = normalize_email(claims.get("email") or "")
-    except ValueError:
+        email = await descriptor.email(client, token)
+    except _NoProvedAddress as refusal:
         return _login_page(
             request,
             next_path=next_path,
-            error="Google did not return an email address.",
-            status_code=400,
-        )
-
-    if claims.get("email_verified") not in (True, "true"):
-        # Google says the address is unconfirmed, so it proves nothing. Matched
-        # against the two affirmative spellings rather than tested for
-        # truthiness: the string "false" is truthy, and this is the kind of
-        # mistake that would never fail visibly.
-        return _login_page(
-            request,
-            next_path=next_path,
-            error="That Google account's email address is not verified.",
-            status_code=403,
+            error=refusal.message,
+            status_code=refusal.status_code,
         )
 
     # The domain, the account and the blacklist, shared with the sign-in box.
@@ -2872,7 +3043,7 @@ async def post_course_person(
     where a teacher types out a roster, and most of those people have not signed
     in yet. Unlike that table, `enrollment` is keyed on `user.id` and so cannot
     name an address with no account behind it - which is why the account is
-    *created* here, through the same `get_or_create_user` the Google callback
+    *created* here, through the same `get_or_create_user` a provider's callback
     uses. The row then sits waiting, and their first sign-in finds it.
 
     That makes this the second place in the app where a human types an address,
@@ -4396,7 +4567,7 @@ async def post_testcase_move(
 # and those are powers over somebody. What they are called and what their face
 # looks like is not a power, it is theirs; an administrator who needs to change
 # it can look at the page and ask. The address is nobody's to edit: it is the
-# login identifier Google proves, and `user.email` is unique on it.
+# login identifier a provider proves, and `user.email` is unique on it.
 #
 # None of these routes collide with a path parameter elsewhere, so their
 # position in this file is not load-bearing the way `/courses/new`'s is.
@@ -4509,7 +4680,7 @@ async def get_profile(
             "min_password_length": MIN_PASSWORD_LENGTH,
             # `f-password.jinja` says different things about removing a
             # password depending on whether there is another way in.
-            "google_configured": CONFIG.auth.google is not None,
+            "sso_configured": bool(_configured_oauth_providers()),
             "title": profile["nickname"],
             "user": user,
             "message": None,
@@ -4751,7 +4922,7 @@ async def _render_password(
             "profile_id": user_id,
             "password": await query_password_state(db, user_id),
             "min_password_length": MIN_PASSWORD_LENGTH,
-            "google_configured": CONFIG.auth.google is not None,
+            "sso_configured": bool(_configured_oauth_providers()),
             "message": message,
             "ok": ok,
         },

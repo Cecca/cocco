@@ -1,10 +1,11 @@
 """End-to-end tests of the auth *and* authorization routes.
 
-Google is replaced wholesale by `_FakeGoogleClient`, so nothing here reaches the
-network: `authorize_redirect` is what a browser would follow and
-`authorize_access_token` returns the claims as Authlib would have verified them,
-or raises the way a cancelled or tampered flow does. That fake is the whole
-point of `cocco/auth.py` being the half of sign-in with no network in it.
+Both providers are replaced wholesale by `_FakeOAuthClient`, so nothing here
+reaches the network: `authorize_redirect` is what a browser would follow,
+`authorize_access_token` returns the claims as Authlib would have verified them
+(or raises the way a cancelled or tampered flow does), and `get` is the whole of
+GitHub's address API. That fake is the point of `cocco/auth.py` being the half
+of sign-in with no network in it.
 
 The authorization tests at the bottom sit in this file rather than beside the
 pages they guard, and that is not filing: a refusal happens in a *dependency*,
@@ -26,7 +27,7 @@ from sqlalchemy import insert
 
 from cocco.conftest import PUBLISHED
 from cocco.auth import get_or_create_user
-from cocco.config import GoogleConfig
+from cocco.config import GithubConfig, GoogleConfig
 from cocco.model import (
     Administrator,
     Challenge,
@@ -50,32 +51,57 @@ BEHIND_THE_WALL = "/users/1/avatar"
 
 VERIFIED = {"email": "dave@unipd.it", "email_verified": True}
 
+# GitHub's `/user/emails`, the shape the API actually returns: an account holds
+# several addresses and only the verified ones prove anything. The common case
+# is exactly this one - a personal primary with the institutional address
+# beside it as a verified secondary.
+GITHUB_EMAILS = [
+    {"email": "dave@personal.test", "primary": True, "verified": True},
+    {"email": "dave@unipd.it", "primary": False, "verified": True},
+]
+
 
 @pytest.fixture
 def client(make_client):
-    """A client whose app never reaches Google, and whose development sign-in
-    box is off: the shortcut bypasses everything these tests are about."""
+    """A client whose app never reaches a provider, and whose development
+    sign-in box is off: the shortcut bypasses everything these tests are
+    about."""
     return make_client(dummy_auth=False)
 
 
-class _FakeGoogleClient:
-    """Stands in for Authlib's registered client.
+class _FakeResponse:
+    """What `client.get` hands back: the two things `_github_email` uses."""
 
-    These are the only two methods the routes call, so the whole of Google is
-    these few lines: `authorize_redirect` is what a browser would follow, and
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _FakeOAuthClient:
+    """Stands in for Authlib's registered client, for either provider.
+
+    These are the only methods the routes call, so the whole of a provider is
+    these few lines: `authorize_redirect` is what a browser would follow,
     `authorize_access_token` returns the claims as Authlib would have verified
-    them - or raises, the way a cancelled or tampered flow does.
+    them - or raises, the way a cancelled or tampered flow does - and `get` is
+    GitHub's address API, which Google's flow never touches.
     """
 
-    def __init__(self, claims=None, error=None):
+    def __init__(self, claims=None, error=None, emails=None):
         self.claims = claims
         self.error = error
+        self.emails = emails
         self.redirects = []
 
     async def authorize_redirect(self, request, redirect_uri, **params):
         self.redirects.append((redirect_uri, params))
         return RedirectResponse(
-            f"https://accounts.google.test/o/oauth2/v2/auth?redirect_uri={redirect_uri}",
+            f"https://provider.test/o/oauth2/v2/auth?redirect_uri={redirect_uri}",
             status_code=302,
         )
 
@@ -83,6 +109,26 @@ class _FakeGoogleClient:
         if self.error is not None:
             raise self.error
         return {"userinfo": self.claims}
+
+    async def get(self, path, token=None):
+        assert path == "user/emails"
+        if isinstance(self.emails, Exception):
+            raise self.emails
+        return _FakeResponse(self.emails)
+
+
+def _install_client(monkeypatch, provider: str, client):
+    """Point the app's one client seam at a fake, for one provider only.
+
+    `oauth_client` takes the name, so a test that configures Google must still
+    get None for GitHub - otherwise the login page would grow a button for a
+    provider the test never set up.
+    """
+    import cocco.main as main
+
+    monkeypatch.setattr(
+        main, "oauth_client", lambda name: client if name == provider else None
+    )
 
 
 @pytest.fixture
@@ -95,8 +141,8 @@ def google(monkeypatch):
     import cocco.main as main
 
     def _install(claims=None, error=None, hd="unipd.it"):
-        client = _FakeGoogleClient(claims, error)
-        monkeypatch.setattr(main, "google_client", lambda: client)
+        client = _FakeOAuthClient(claims, error)
+        _install_client(monkeypatch, "google", client)
         monkeypatch.setattr(
             main,
             "CONFIG",
@@ -105,6 +151,33 @@ def google(monkeypatch):
                 auth=replace(
                     main.CONFIG.auth,
                     google=GoogleConfig("an-id", "a-secret", hd=hd),
+                    github=None,
+                ),
+            ),
+        )
+        return client
+
+    return _install
+
+
+@pytest.fixture
+def github(monkeypatch):
+    """The same toggle for GitHub, whose credentials are the whole of its
+    configuration - there is no `hd` and no metadata document."""
+    import cocco.main as main
+
+    def _install(emails=None, error=None):
+        client = _FakeOAuthClient(error=error, emails=emails)
+        _install_client(monkeypatch, "github", client)
+        monkeypatch.setattr(
+            main,
+            "CONFIG",
+            replace(
+                main.CONFIG,
+                auth=replace(
+                    main.CONFIG.auth,
+                    google=None,
+                    github=GithubConfig("an-id", "a-secret"),
                 ),
             ),
         )
@@ -118,11 +191,11 @@ def no_google(monkeypatch):
     """A server with no credentials at all, which must still serve pages."""
     import cocco.main as main
 
-    monkeypatch.setattr(main, "google_client", lambda: None)
+    monkeypatch.setattr(main, "oauth_client", lambda name: None)
     monkeypatch.setattr(
         main,
         "CONFIG",
-        replace(main.CONFIG, auth=replace(main.CONFIG.auth, google=None)),
+        replace(main.CONFIG, auth=replace(main.CONFIG.auth, google=None, github=None)),
     )
 
 
@@ -201,7 +274,7 @@ async def test_starting_the_flow_redirects_to_google(client, google):
     fake = google()
     response = client.get("/auth/google?next=/courses/1/2", follow_redirects=False)
     assert response.status_code == 302
-    assert "accounts.google.test" in response.headers["location"]
+    assert "provider.test" in response.headers["location"]
 
     [(redirect_uri, params)] = fake.redirects
     assert redirect_uri.endswith("/auth/google/callback")
@@ -322,6 +395,125 @@ async def test_a_mismatched_state_lands_on_the_login_page(client, google):
 
 async def test_a_callback_without_credentials_does_not_crash(client, no_google):
     response = client.get("/auth/google/callback?code=x")
+    assert response.status_code == 503
+
+
+########################################################################
+# GitHub, which is the same flow with one different step: there is no ID token,
+# so the address is asked for rather than handed over.
+
+
+async def test_the_login_page_offers_github(client, github):
+    github(emails=GITHUB_EMAILS)
+    response = client.get("/login?next=/courses/1/2")
+    assert response.status_code == 200
+    assert "Sign in with GitHub" in response.text
+    assert "/auth/github?next=%2Fcourses%2F1%2F2" in response.text
+    # One button per *configured* provider: Google is off in this fixture.
+    assert "Sign in with Google" not in response.text
+
+
+async def test_starting_the_github_flow_sends_no_hd(client, github):
+    """`hd` is Google's account-chooser hint and nothing else has one, so the
+    one branch on the provider name in `get_auth_provider` is pinned here."""
+    fake = github(emails=GITHUB_EMAILS)
+    response = client.get("/auth/github?next=/courses/1/2", follow_redirects=False)
+    assert response.status_code == 302
+
+    [(redirect_uri, params)] = fake.redirects
+    assert redirect_uri.endswith("/auth/github/callback")
+    assert "?" not in redirect_uri
+    assert params == {}
+
+
+async def test_starting_the_github_flow_without_credentials_does_not_crash(
+    client, no_google
+):
+    response = client.get("/auth/github", follow_redirects=False)
+    assert response.status_code == 503
+    assert "not configured" in response.text
+
+
+@pytest.mark.parametrize("path", ["/auth/gitlab", "/auth/gitlab/callback"])
+async def test_an_unknown_provider_is_a_404(client, github, path):
+    """A path this app does not serve should not admit that it exists -
+    `post_auth_dummy`'s rule, and the reason this is not a 422."""
+    github(emails=GITHUB_EMAILS)
+    assert client.get(path, follow_redirects=False).status_code == 404
+
+
+async def test_github_signs_in_with_the_verified_institutional_address(
+    client, github, app_engine
+):
+    """The primary is personal and the institutional address sits beside it as
+    a verified secondary, which is the ordinary shape of a student's account.
+    The one that passes `allowed_domains` is the one that signs them in."""
+    github(emails=GITHUB_EMAILS)
+    client.get("/auth/github", follow_redirects=False)
+
+    response = client.get("/auth/github/callback?code=x&state=y", follow_redirects=False)
+    assert response.status_code == 303
+
+    async with app_engine.connect() as conn:
+        row = await query_user_by_email(conn, "dave@unipd.it")
+    assert row is not None and row.nickname == "dave"
+    # And nothing was created for the address that did not admit them.
+    async with app_engine.connect() as conn:
+        assert await query_user_by_email(conn, "dave@personal.test") is None
+
+
+async def test_github_never_looks_at_an_unverified_address(client, github, app_engine):
+    """Unverified proves nothing, so it is not a candidate at all - even when
+    it is the only address inside the allowed domains."""
+    github(
+        emails=[
+            {"email": "dave@personal.test", "primary": True, "verified": True},
+            {"email": "eve@unipd.it", "primary": False, "verified": False},
+        ]
+    )
+    response = client.get("/auth/github/callback?code=x")
+    assert response.status_code == 403
+    assert "not an institutional address" in response.text
+
+    async with app_engine.connect() as conn:
+        assert await query_user_by_email(conn, "eve@unipd.it") is None
+
+
+async def test_github_with_no_address_in_the_domains_names_the_domains(client, github):
+    """The primary comes back for the refusal rather than a second, vaguer
+    sentence of GitHub's own: `_complete_sign_in` names the domains, which is
+    the message a person can act on."""
+    github(emails=[{"email": "eve@gmail.com", "primary": True, "verified": True}])
+    response = client.get("/auth/github/callback?code=x")
+    assert response.status_code == 403
+    assert "not an institutional address" in response.text
+
+
+async def test_github_with_no_verified_address_at_all_is_refused(client, github):
+    github(emails=[{"email": "eve@unipd.it", "primary": True, "verified": False}])
+    response = client.get("/auth/github/callback?code=x")
+    assert response.status_code == 403
+    assert "no verified email address" in response.text
+
+
+async def test_a_github_api_failure_lands_on_the_login_page(client, github):
+    """The one network call signing in makes. A provider that is down is a
+    sentence, never a traceback: the visitor arrived here from GitHub."""
+    github(emails=RuntimeError("boom"))
+    response = client.get("/auth/github/callback?code=x")
+    assert response.status_code == 502
+    assert "Could not reach GitHub" in response.text
+
+
+async def test_a_denied_github_consent_lands_on_the_login_page(client, github):
+    github(error=OAuthError(error="access_denied"))
+    response = client.get("/auth/github/callback?error=access_denied")
+    assert response.status_code == 400
+    assert "did not complete" in response.text
+
+
+async def test_a_github_callback_without_credentials_does_not_crash(client, no_google):
+    response = client.get("/auth/github/callback?code=x")
     assert response.status_code == 503
 
 

@@ -118,6 +118,30 @@ def test_the_google_client_is_read_from_the_environment(tmp_path, monkeypatch):
     assert google.hd == "unipd.it"
 
 
+def test_the_github_client_is_read_from_the_environment(tmp_path, monkeypatch):
+    """Its own pair of variables and nothing in the file: GitHub is not OIDC,
+    so there is no metadata URL and no `hd` to go with them."""
+    path = tmp_path / "absent.toml"
+    monkeypatch.setenv("COCCO_GITHUB_CLIENT_ID", "an-id")
+    monkeypatch.setenv("COCCO_GITHUB_CLIENT_SECRET", "a-secret")
+    config = load_config(path)
+    github = config.auth.github
+    assert github is not None
+    assert (github.client_id, github.client_secret) == ("an-id", "a-secret")
+    # Each provider is turned on by its own variables and neither knows about
+    # the other.
+    assert config.auth.google is None
+
+
+def test_half_a_github_credential_is_no_credential(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("COCCO_GITHUB_CLIENT_SECRET", "a-secret")
+    path = tmp_path / "absent.toml"
+    with caplog.at_level("WARNING", logger="cocco.config"):
+        config = load_config(path)
+    assert config.auth.github is None
+    assert "COCCO_GITHUB_CLIENT_ID" in caplog.text
+
+
 def test_half_a_credential_is_no_credential(tmp_path, monkeypatch, caplog):
     """A typo must not stop the app from booting: it warns, and Google sign-in
     is simply off."""
@@ -372,7 +396,7 @@ def test_the_postgres_variables_are_not_warned_about(tmp_path, monkeypatch, capl
 def test_the_committed_dev_config_loads():
     """`cocco.dev.toml` is tracked and `just dev` depends on it, so it is
     parsed by a test rather than left to rot - and the assertion that it
-    configures no Google client is the guard on what makes committing it
+    configures no OAuth client is the guard on what makes committing it
     possible at all: there is no secret in it.
 
     Located from this file rather than from the working directory: it is one
@@ -384,4 +408,5 @@ def test_the_committed_dev_config_loads():
     assert config.dev.dummy_auth is True
     assert config.dev.reset_db is False
     assert config.auth.google is None
+    assert config.auth.github is None
     assert config.database.url == DEFAULT_DATABASE_URL

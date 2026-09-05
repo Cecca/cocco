@@ -1,17 +1,23 @@
 # Copy this to `cocco.toml` and edit it. Nothing here is required: cocco boots
-# with no file at all, and the login page then says Google sign-in is
-# unconfigured. For development you want none of this - `cocco.dev.toml` is in
+# with no file at all, and the login page then says no sign-in method is
+# configured. For development you want none of this - `cocco.dev.toml` is in
 # git and `just dev` reads it.
 #
 # The path is `cocco.toml` in the working directory, overridable with
 # COCCO_CONFIG. `cocco.toml` is gitignored.
 #
-# THE FILE IS SETTINGS; THE ENVIRONMENT IS SECRETS. The three secrets have no
-# file spelling at all - writing them here does nothing but earn a warning:
+# THE FILE IS SETTINGS; THE ENVIRONMENT IS SECRETS. The secrets have no file
+# spelling at all - writing them here does nothing but earn a warning:
 #
 #   COCCO_SECRET_KEY              the session cookie's signing key
-#   COCCO_GOOGLE_CLIENT_ID        the OAuth client
+#   COCCO_GOOGLE_CLIENT_ID        the Google OAuth client
 #   COCCO_GOOGLE_CLIENT_SECRET
+#   COCCO_GITHUB_CLIENT_ID        the GitHub OAuth app
+#   COCCO_GITHUB_CLIENT_SECRET
+#
+# Each provider is turned on by its own pair being present and by nothing else:
+# set both halves of one and the login page grows its button, leave them out and
+# it does not. Neither knows about the other, and configuring both offers both.
 #
 # One source each, so there is no precedence to reason about and nothing secret
 # in a file that gets copied, diffed and pasted into a bug report. COCCO_CONFIG
@@ -142,7 +148,7 @@ allowed_domains = ["unipd.it"]
 #   UPDATE "user" SET blocked_at = NULL, blocked_reason = NULL WHERE email = '...';
 #
 # An address is listed before its owner has ever signed in - the account is
-# created on the first accepted callback from Google - so it must be one
+# created on the first accepted callback from a provider - so it must be one
 # `allowed_domains` admits, or they will never be able to use it.
 # administrators = ["you@unipd.it"]
 
@@ -168,13 +174,31 @@ allowed_domains = ["unipd.it"]
 # unset if your students' addresses live in a secondary domain.
 # google_hd = "unipd.it"
 
-# The second way in: an address and a password, for the deployment Google
-# cannot serve - no Workspace, or no wish to register an OAuth client. Off
+# GitHub is the second provider, on exactly the same terms and with no settings
+# of its own at all: an OAuth app from Settings > Developer settings > OAuth
+# Apps > New OAuth App, and its two halves in COCCO_GITHUB_CLIENT_ID and
+# COCCO_GITHUB_CLIENT_SECRET. Register one app per origin you browse to and put
+# the callback in "Authorization callback URL", exactly:
+#   http://localhost:8000/auth/github/callback     (development)
+#   https://cocco.example.org/auth/github/callback (production)
+#
+# cocco asks for the `user:email` scope and nothing more - the nickname is
+# derived from the address, so a profile scope would be data held without being
+# used. GitHub is plain OAuth2 rather than OIDC, so there is no ID token: the
+# callback asks the API which addresses the account holds, and only a VERIFIED
+# one proves anything. `allowed_domains` still decides, and an account whose
+# GitHub *primary* is personal signs in fine as long as the institutional
+# address is verified beside it - the first verified address inside the domains
+# is the one that admits them.
+
+# The way in for the deployment neither provider can serve - no Workspace, no
+# GitHub, or no wish to register an OAuth client at all: an address and a
+# password. Off
 # unless this says otherwise, and the default is false for a reason worth
 # reading before you change it.
 #
-# GOOGLE PROVES THAT SOMEBODY OWNS THE MAILBOX. A PASSWORD PROVES NOTHING ABOUT
-# THE ADDRESS. cocco has no mail path anywhere in it - no SMTP setting, no
+# A PROVIDER PROVES THAT SOMEBODY OWNS THE MAILBOX. A PASSWORD PROVES NOTHING
+# ABOUT THE ADDRESS. cocco has no mail path anywhere in it - no SMTP setting, no
 # queue, nothing - so it cannot send a verification link, and registering here
 # is therefore a *claim* rather than a proof. It is narrowed as far as it can
 # be without email: a claim succeeds only on an account that has never been
@@ -189,9 +213,9 @@ allowed_domains = ["unipd.it"]
 # That last line is what you are accepting. Inside an institution where the
 # addresses are already known it is usually fine; on anything reachable from
 # the open internet with a permissive `allowed_domains`, it is not. Turning
-# this on does not turn Google off - configure both and the login page offers
-# both, which is the safest way to run it: Google for everyone who has it, a
-# password for the people who do not.
+# this on does not turn a provider off - configure them together and the login
+# page offers each of them, which is the safest way to run it: single sign-on
+# for everyone who has it, a password for the people who do not.
 #
 # There is no "forgot my password", again because there is no mail: a site
 # administrator issues a new one from /admin, sees it once, and reads it out.
@@ -208,8 +232,9 @@ allowed_domains = ["unipd.it"]
 # The absolute base for the OAuth redirect URI. Leave it unset to derive it from
 # the incoming request, which is only correct if the reverse proxy sets
 # X-Forwarded-* and uvicorn runs with --proxy-headers. Set it whenever what
-# cocco builds and what the console has registered could disagree - a proxy that
-# terminates TLS makes the request say `http`, and Google refuses the mismatch.
+# cocco builds and what the provider has registered could disagree - a proxy
+# that terminates TLS makes the request say `http`, and the redirect URI is
+# matched character for character, so the mismatch is refused.
 # base_url = "https://cocco.example.org"
 
 # There is deliberately no [dev] table here. It carries `dummy_auth`, which

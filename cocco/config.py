@@ -3,9 +3,10 @@
 Two sources, and the line between them is one sentence: **the file is
 settings, the environment is secrets**. The database, the storage root, the
 domain allowlist, the bootstrap administrators and the development shortcuts
-are written in `cocco.toml`; the session signing key and the Google client are
-read from `COCCO_SECRET_KEY`, `COCCO_GOOGLE_CLIENT_ID` and
-`COCCO_GOOGLE_CLIENT_SECRET` and have no file spelling at all. One source
+are written in `cocco.toml`; the session signing key and the OAuth clients are
+read from `COCCO_SECRET_KEY`, `COCCO_GOOGLE_CLIENT_ID`,
+`COCCO_GOOGLE_CLIENT_SECRET`, `COCCO_GITHUB_CLIENT_ID` and
+`COCCO_GITHUB_CLIENT_SECRET` and have no file spelling at all. One source
 each, so there is no precedence to reason about and nothing secret in a file
 that gets copied, diffed and pasted into a bug report.
 
@@ -100,6 +101,21 @@ class GoogleConfig:
 
 
 @dataclass(frozen=True)
+class GithubConfig:
+    """The registered OAuth app, and deliberately shorter than `GoogleConfig`.
+
+    GitHub is plain OAuth2 and not OIDC, so there is no metadata document to
+    point at and no ID token to verify; the callback asks the API which of the
+    account's addresses are verified. Nor is there an `hd`: GitHub has no
+    notion of a Workspace domain to hint at, and `allowed_domains` was always
+    the thing that actually decides.
+    """
+
+    client_id: str
+    client_secret: str
+
+
+@dataclass(frozen=True)
 class AuthConfig:
     # Suffix-matched on a dot boundary: "unipd.it" admits unipd.it and every
     # subdomain of it. See `is_allowed_email`.
@@ -107,6 +123,10 @@ class AuthConfig:
     # None means Google sign-in is unconfigured, which is not an error: the app
     # boots and the login page says so. `[dev] dummy_auth` needs no credentials.
     google: GoogleConfig | None = None
+    # The second provider, on exactly the same terms: None means unconfigured,
+    # which is not an error. Each is enabled by its own pair of environment
+    # variables and neither knows about the other.
+    github: GithubConfig | None = None
     # The site's first administrators, normalized. A *bootstrap*, not the
     # truth: they are inserted into `administrator` on every boot and the table
     # is what is asked afterwards, so this list can only ever add. An empty one
@@ -269,6 +289,32 @@ def _load_session_config(section: dict) -> SessionConfig:
     )
 
 
+def _oauth_credentials(provider: str) -> tuple[str, str] | None:
+    """The two halves of one provider's OAuth client, or None.
+
+    The environment and only the environment: `COCCO_GOOGLE_CLIENT_ID` and
+    `COCCO_GITHUB_CLIENT_SECRET` are the same kind of thing spelled twice, so
+    the reading of them is written once. Both halves are required, which is
+    what makes a provider config that exists one a flow can be started with -
+    and half a credential is a typo, not a decision, so it says so and then
+    carries on unconfigured rather than refusing to boot.
+    """
+    prefix = f"COCCO_{provider.upper()}_"
+    client_id = os.environ.get(prefix + "CLIENT_ID")
+    client_secret = os.environ.get(prefix + "CLIENT_SECRET")
+    if client_id and client_secret:
+        return client_id, client_secret
+    if client_id or client_secret:
+        logger.warning(
+            "%s sign-in needs both %sCLIENT_ID and %sCLIENT_SECRET in the "
+            "environment; it is disabled",
+            provider,
+            prefix,
+            prefix,
+        )
+    return None
+
+
 def _load_auth_config(section: dict) -> AuthConfig:
     """The `[auth]` table - which is the settings half of signing in. The
     credentials themselves come from the environment, and an absent setting is
@@ -279,9 +325,6 @@ def _load_auth_config(section: dict) -> AuthConfig:
         if raw_domains is not None
         else DEFAULT_ALLOWED_DOMAINS
     )
-
-    client_id = os.environ.get("COCCO_GOOGLE_CLIENT_ID")
-    client_secret = os.environ.get("COCCO_GOOGLE_CLIENT_SECRET")
 
     administrators = normalize_administrators(section.get("administrators") or ())
     for email in administrators:
@@ -296,25 +339,26 @@ def _load_auth_config(section: dict) -> AuthConfig:
             )
 
     google = None
-    if client_id and client_secret:
+    credentials = _oauth_credentials("google")
+    if credentials is not None:
         google = GoogleConfig(
-            client_id=client_id,
-            client_secret=client_secret,
+            client_id=credentials[0],
+            client_secret=credentials[1],
             hd=section.get("google_hd"),
             server_metadata_url=section.get(
                 "google_metadata_url", GOOGLE_METADATA_URL
             ),
         )
-    elif client_id or client_secret:
-        # Half a credential is a typo, not a decision: say so, then carry on
-        # unconfigured rather than refusing to boot.
-        logger.warning(
-            "Google sign-in needs both COCCO_GOOGLE_CLIENT_ID and "
-            "COCCO_GOOGLE_CLIENT_SECRET in the environment; it is disabled"
-        )
+
+    github = None
+    credentials = _oauth_credentials("github")
+    if credentials is not None:
+        github = GithubConfig(client_id=credentials[0], client_secret=credentials[1])
+
     return AuthConfig(
         allowed_domains=domains,
         google=google,
+        github=github,
         administrators=administrators,
         # A plain bool and no warning when it is on: unlike half a Google
         # credential, this one cannot be a typo - it is a switch, and the file

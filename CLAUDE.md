@@ -43,7 +43,7 @@ The web app and the judge are **separate processes** that must agree on three th
 
 `[dev] reset_db` drops the schema and reseeds dummy data on startup. Leave it false in normal development — `cocco.dev.toml` ships it that way — because `cocco-web --reload` reloads on every file change and each reload would wipe the data. It is not how a schema change reaches a database: that is a migration (see "Migrations"), and `reset_db` is for throwing the *data* away.
 
-**Configuration is split in two, and the line is one sentence: the file is settings, the environment is secrets.** `cocco/config.py` is where both halves are read — its own module rather than a corner of `auth.py`, because the judge reads it too and a database URL is none of sign-in's business. The file carries `[database] url`, `[storage] root`, `[judge] flake`, `[session]`, `[auth]`, `[site]` and `[dev]`; the three secrets — `COCCO_SECRET_KEY`, `COCCO_GOOGLE_CLIENT_ID`, `COCCO_GOOGLE_CLIENT_SECRET` — have **no file spelling at all**, so there is no precedence to reason about and nothing secret in a file that gets copied, diffed and pasted into a bug report. `COCCO_CONFIG` is the exception that proves the rule: it names the file, so it is the one setting that cannot be written in one.
+**Configuration is split in two, and the line is one sentence: the file is settings, the environment is secrets.** `cocco/config.py` is where both halves are read — its own module rather than a corner of `auth.py`, because the judge reads it too and a database URL is none of sign-in's business. The file carries `[database] url`, `[storage] root`, `[judge] flake`, `[session]`, `[auth]`, `[site]` and `[dev]`; the secrets — `COCCO_SECRET_KEY`, `COCCO_GOOGLE_CLIENT_ID`, `COCCO_GOOGLE_CLIENT_SECRET`, `COCCO_GITHUB_CLIENT_ID`, `COCCO_GITHUB_CLIENT_SECRET` — have **no file spelling at all**, so there is no precedence to reason about and nothing secret in a file that gets copied, diffed and pasted into a bug report. `COCCO_CONFIG` is the exception that proves the rule: it names the file, so it is the one setting that cannot be written in one.
 
 There are **two files**, and which one you get is `COCCO_CONFIG`. `cocco.dev.toml` is **committed**: it is secret-free by construction, and `just dev` points at it. `cocco.toml` is gitignored and is a deployment's own; `cocco.example.toml` is its commented template. **A missing file is still not an error** — and now says more than it did, because `DEFAULT_DATABASE_URL` is the empty `postgresql+psycopg://`, which libpq resolves from `PGUSER`/`PGDATABASE`/`PGHOST`. That is deliberate and is what lets a file in git avoid naming the devShell's socket, whose path is `$PWD/.pg/sock`. It also means importing `cocco.main` needs no environment and no file at all, so the unit tests run outside the dev shell. A setting left in its old place — a `COCCO_DUMMY_AUTH` in the shell, a `secret_key` in the file — is **warned about, not ignored**: `_warn_about_removed_settings` names the old spelling and the new one, and only warns, because a stale variable must not stop the app from booting. `dummy_user` is the third kind and has its own sentence there: it did not move, it was **deleted**, so there is no "it is X now" to print — the answer is that `/login` asks. `[dev] dummy_auth` is what makes a fresh checkout usable at all, and `[auth] administrators` is where a deployment's first administrators are listed (a bootstrap — see "Authorization").
 
@@ -314,7 +314,7 @@ Enrolling takes an **address**, not a user id, and this is the second (and last)
 types one: a teacher writes out a roster before term starts, so most of those people have not
 signed in. Unlike `administrator`, `enrollment` is keyed on `user.id` and cannot name an address
 with no account, so the account is **created** here, through the same `get_or_create_user` the
-Google callback uses. Two consequences worth knowing. A pre-enrolled person gets a real `user`
+provider's callback uses. Two consequences worth knowing. A pre-enrolled person gets a real `user`
 row, so `/admin`'s `accounts` list shows them indistinguishably from somebody who has actually
 signed in — there is no `pending_*` half here, because there is nothing pending. And a *blocked*
 account is deliberately **not** refused, the opposite of appointing an administrator: that is
@@ -340,7 +340,7 @@ plays with `is_staff`. `require_profile_owner` has no administrator branch at al
 profile is oversight, renaming somebody is impersonation, and `/admin`'s business is what an
 account may *do* — appoint it, block it — not what it is called. Course staff are strangers here
 even to their own students, because the page spans every course rather than the one in a URL.
-The address is nobody's to edit, including its owner's: it is the login identifier Google proves.
+The address is nobody's to edit, including its owner's: it is the login identifier a provider proves.
 `update_user` is the write, deliberately not the path a block takes — `block_user` has a rule in
 its `WHERE` clause that going through the kwargs helper would lose.
 
@@ -365,45 +365,76 @@ theirs.
 
 ### Authentication (`cocco/auth.py`)
 
-Login is **Google OIDC**, and nothing else. `GET /login` offers one button; `GET /auth/google`
-hands off to Authlib, which puts a `state`, a `nonce` and a PKCE verifier in the session and
-redirects to Google; `GET /auth/google/callback` calls `authorize_access_token`, which exchanges
-the code and verifies the ID token's signature, issuer, audience and nonce. There are no
-passwords and no sign-up step — **the account is created the first time an accepted address
-comes back**. A new user has no enrollments and is therefore read-only everywhere until course
-staff enroll them.
+Login is **somebody else's login page**, and there are two of them: Google OIDC and GitHub OAuth2.
+`GET /login` offers one button per *configured* provider; `GET /auth/{provider}` hands off to
+Authlib and `GET /auth/{provider}/callback` comes back — **one parameterized pair of routes, not
+one pair each**, because everything either provider does is the same sentence apart from the step
+that turns a token into an address. There are no passwords and no sign-up step — **the account is
+created the first time an accepted address comes back** — and it is keyed on the address alone, so
+someone who signs in with Google today and GitHub tomorrow lands on the same account by
+construction rather than by a rule anybody had to write. A new user has no enrollments and is
+therefore read-only everywhere until course staff enroll them.
 
-**The gate is `is_allowed_email`, on the `email` claim.** A configured domain admits itself and
-its subdomains, so `unipd.it` already covers `@studenti.unipd.it` and `@phd.unipd.it`; the suffix
-test is on a dot boundary, so `notunipd.it` does not sneak in, and an **empty allowlist admits
-nobody** — a deleted line in `cocco.toml` should lock the door, not open it. Google's `hd`
-parameter is passed as a hint to the account chooser when `[auth] google_hd` is set and is
-**never** the check: it is absent for consumer accounts, and it is not the identity.
-`email_verified` is required before the address is trusted at all.
+**A provider is enabled by its own two environment variables and by nothing else.**
+`COCCO_GOOGLE_CLIENT_ID`/`_SECRET` and `COCCO_GITHUB_CLIENT_ID`/`_SECRET`, read by one
+`_oauth_credentials` in `config.py`; either half alone is a typo, warned about, and that provider
+stays off. There is no file spelling and therefore no `enabled = true` to disagree with the
+credentials — `AuthConfig.google` / `.github` being non-None *is* "configured", `oauth.register`
+runs only for those, and `oauth_client(name)` answers None for the rest, which is the 503 branch.
+
+**What differs between the two is one function**, and that is the whole of `OAUTH_PROVIDERS`: a
+`_OAuthProvider` carries the URL segment, the label every sentence and button prints, and the
+`email` resolver. `_google_email` reads the ID token Authlib has already verified (`userinfo`,
+plus the `email_verified` check matched against `True`/`"true"`, because the string `"false"` is
+truthy). `_github_email` has to **ask** — GitHub has no ID token, so it calls `GET /user/emails`,
+the only network request signing in makes on its own. The two failures are one exception,
+`_NoProvedAddress`, carrying the sentence and the status, so the callback keeps a single `except`.
+The `hd` hint is the one other branch on the provider name, in `get_auth_provider`.
+
+**GitHub's address rule.** An account holds several addresses, so the **unverified are dropped
+outright** — they prove nothing — and among the rest the first that passes `allowed_domains` wins,
+the primary considered first. Deliberately not "the primary or nothing": a student's primary is
+usually personal with the institutional address verified beside it, and refusing that would refuse
+the people this is for. When none of them passes, the primary is returned anyway so that
+`_complete_sign_in` prints its "not an institutional address" sentence, which names the domains —
+a second, vaguer refusal for the same event would be a difference nobody could explain.
+
+**The gate is `is_allowed_email`, on whatever address the provider vouched for.** A configured
+domain admits itself and its subdomains, so `unipd.it` already covers `@studenti.unipd.it` and
+`@phd.unipd.it`; the suffix test is on a dot boundary, so `notunipd.it` does not sneak in, and an
+**empty allowlist admits nobody** — a deleted line in `cocco.toml` should lock the door, not open
+it. Google's `hd` parameter is passed as a hint to the account chooser when `[auth] google_hd` is
+set and is **never** the check: it is absent for consumer accounts, and it is not the identity.
+A verified address is required before it is trusted at all, by both providers.
 
 Every failure — a denied consent, a mismatched `state`, an unverified address, a domain that is
-not ours, missing credentials — renders `login.jinja` with one sentence. The callback is reached
-by a browser coming back from Google, so a traceback there is a dead end.
+not ours, missing credentials, an unreachable provider — renders `login.jinja` with one sentence.
+The callback is reached by a browser coming back from the provider, so a traceback there is a dead
+end. An **unknown** provider segment is a bare **404** (`_oauth_provider`), `post_auth_dummy`'s
+rule: a path this app does not serve should not admit that it exists.
 
-`cocco/auth.py` never touches the network: it is `is_allowed_email`, `safe_next_path`,
-`nickname_from_email`, `google_redirect_uri` and `get_or_create_user`. Authlib and the routes live
-in `main.py`, which is what keeps the interesting half unit-testable — `test_auth_routes.py`
-replaces the whole of Google with a two-method fake. The configuration is not here either: it is
+`cocco/auth.py` never touches the network and does not know which provider asked: it is
+`is_allowed_email`, `safe_next_path`, `nickname_from_email`, `oauth_redirect_uri` (one function
+for both, so the two can only differ in the segment naming them) and `get_or_create_user`. Authlib
+and the routes live in `main.py`, which is what keeps the interesting half unit-testable —
+`test_auth_routes.py` replaces the whole of both providers with `_FakeOAuthClient`, three methods
+including the `get` that is all of GitHub's API. The configuration is not here either: it is
 `cocco/config.py`, because the judge reads the same file and a database URL is none of sign-in's
 business. The dependency runs one way — `config.py` imports `is_allowed_email` and
 `normalize_administrators` from here, and nothing here imports `config.py`.
 
 The session is a signed cookie (Starlette's `SessionMiddleware`) holding nothing but `user_id`,
 so a renamed or deleted account takes effect on the next request. `same_site` must stay `"lax"`:
-the return from Google is a top-level cross-site navigation, and under `"strict"` the cookie
+the return from a provider is a top-level cross-site navigation, and under `"strict"` the cookie
 carrying the `state` would not reach the callback, so every sign-in would fail as a state
-mismatch.
+mismatch. `_prune_stale_oauth_state` drops every `_state_*` entry rather than one provider's,
+since only one flow can be in flight.
 
-**`[auth] password_login` is the second real way in, and its default is the design.** An address
-and a password, for the deployment Google cannot serve; off unless the file says otherwise, and
-when it is off the feature *does not exist* — `_require_password_login` answers **404**, which is
-`post_auth_dummy`'s rule, because hiding a form is presentation and never the check. Google proves
-that someone owns the mailbox; a password proves nothing about the address, and cocco has no mail
+**`[auth] password_login` is the third real way in, and its default is the design.** An address
+and a password, for the deployment neither provider can serve; off unless the file says otherwise,
+and when it is off the feature *does not exist* — `_require_password_login` answers **404**, which
+is `post_auth_dummy`'s rule, because hiding a form is presentation and never the check. A provider
+proves that someone owns the mailbox; a password proves nothing about the address, and cocco has no mail
 path anywhere in it, so it cannot send a verification link. Registration is therefore a **claim**,
 and `claim_user_password` narrows it as far as it can be narrowed without email — a single
 conditional INSERT whose `WHERE` is `first_login_at IS NULL`, with `ON CONFLICT DO NOTHING`, so the
@@ -435,8 +466,8 @@ raising them later leaves every stored password working and `needs_rehash` upgra
 next time its owner types it. **The hash lives in `user_password`, not on `user`**, for one reason
 above the others: `_USER_COLUMNS` is read on every single request, and a credential has no business
 travelling with the identity every route already holds. Keyed on `user.id` for `api_token`'s
-reason — the account always exists — and no row means no password, which is what a Google-only
-account looks like.
+reason — the account always exists — and no row means no password, which is what a
+single-sign-on-only account looks like.
 
 There are two places a password is set and they are not variations on one route. The **owner** sets
 theirs at `/users/{id}/password`, behind `ProfileOwner` and never `ProfileReader` — that page
@@ -582,7 +613,7 @@ already answer the question, so course staff pay nothing for it. Two consequence
 
 Nothing is reachable without an identity: every route depends on `CurrentUser` or on `ApiUser`,
 directly or through `require_challenge_editor` / `require_api_challenge_editor`, and the only ways
-in are `/login`, `/auth/google`, `/auth/google/callback` and `/static`. For a browser that identity
+in are `/login`, `/auth/{provider}`, `/auth/{provider}/callback` and `/static`. For a browser that identity
 is always the session; **`ApiUser` is the one place a request identifies itself any other way**, and
 it exists because a command line has no browser to run OIDC in — see "The transfer API" below.
 
@@ -700,8 +731,8 @@ though that zip came from our own server.
 - **A block stops a person, it does not retract their work.** The judge grades a blocked student's queued submissions — `pull_queued_submission` does not know who submitted and should not learn: skipping those rows would strand them as `queued` forever, showing as pending in every teacher's standings and muddying the `count_running_submissions` check that guards a regrade. Standings and leaderboards go on listing them for the same reason: they are the record of what happened on a course, and it did happen. Nothing blocked is seeded either — a blocked seeded administrator would lock a developer out of their own fresh checkout the moment they typed him into the sign-in box, which is exactly the trap "an administrator is never blocked" exists to avoid. **Removing an enrollment draws the same line**: `delete_enrollment` takes one row and nothing else, so the person loses access to the course and drops out of its standings, while every submission, outcome and leaderboard entry stays exactly where it was — `submission.user_id` has no `ON DELETE` tie to `enrollment`, and `query_challenge_standings`'s cohort is already a union with everyone who submitted. The confirmation on the people page says so in as many words.
 - **A hidden test case gives away nothing but its verdict.** `visible_outcomes` in `main.py` blanks an outcome's `message`, `stdout` and `stderr` unless the test case is a public sample or the viewer is course staff: `stdout`/`stderr` are the submitted program's own output — the obvious way to print a hidden input back out — and `message` is now written by a *teacher's script that has just read the hidden input and the expected output*, which makes the rule matter more, not less — `diff.py` puts the expected output in it verbatim. The verdict, the score and the resource usage are always shown. Compiler output is exempt, and has its own block on the submission page: it does not depend on any test input. Redact in that function, not in the template, so the rule stays unit testable.
 - **An anonymous htmx request gets `HX-Redirect`, not a 302.** `get_user` raises `NotAuthenticated` rather than returning a redirect — a dependency cannot return a `Response` — and the handler branches on the `HX-Request` header. This matters because most of the app is `f-*` fragments polled every few seconds: htmx follows a redirect inside the XHR, so a 302 would splice the whole login page into whatever div was polling, over and over. A 204 with `HX-Redirect` navigates the browser instead.
-- **A secret has one source, and never a fixed default.** The source is the environment — `COCCO_SECRET_KEY`, `COCCO_GOOGLE_CLIENT_ID`, `COCCO_GOOGLE_CLIENT_SECRET` — and there is no file spelling for any of them, so there is no precedence to get wrong and nothing secret in a file that gets copied, diffed and committed by mistake. It is also what makes `cocco.dev.toml` committable at all. With `COCCO_SECRET_KEY` unset, `load_config` generates a random key per process and logs a warning: an unconfigured deployment then logs everybody out on every restart and no two workers agree, which is loud. A constant in the source tree would be a signing key that ships with the code, which is silent.
-- **A `next` destination is filtered, never trusted.** `safe_next_path` keeps only a path on this site — one leading `/`, no scheme, no authority — so neither the `?next=` on the login page nor the one stashed in the session can be turned into an open redirect. It is applied at both ends: before the destination is stashed, and again after it is read back. The OAuth redirect URI deliberately carries no destination at all — Google matches that URI character for character against the console registration, so `next` travels in the session instead, and a callback arriving without one lands on the root.
+- **A secret has one source, and never a fixed default.** The source is the environment — `COCCO_SECRET_KEY` and each provider's `COCCO_{GOOGLE,GITHUB}_CLIENT_ID`/`_SECRET` — and there is no file spelling for any of them, so there is no precedence to get wrong and nothing secret in a file that gets copied, diffed and committed by mistake. It is also what makes `cocco.dev.toml` committable at all. With `COCCO_SECRET_KEY` unset, `load_config` generates a random key per process and logs a warning: an unconfigured deployment then logs everybody out on every restart and no two workers agree, which is loud. A constant in the source tree would be a signing key that ships with the code, which is silent.
+- **A `next` destination is filtered, never trusted.** `safe_next_path` keeps only a path on this site — one leading `/`, no scheme, no authority — so neither the `?next=` on the login page nor the one stashed in the session can be turned into an open redirect. It is applied at both ends: before the destination is stashed, and again after it is read back. The OAuth redirect URI deliberately carries no destination at all — a provider matches that URI character for character against what was registered with it, so `next` travels in the session instead, and a callback arriving without one lands on the root.
 - **CSRF rests on `same_site="lax"`, app-wide.** `POST /logout` is a form rather than a link so a planted `<img>` cannot fire it, and `lax` means the session cookie is not sent on a cross-site POST at all. That is the whole defence, and it is the same one every other mutating route in the app relies on — there is no CSRF token anywhere. A deliberate position, not an oversight: changing `same_site` would silently remove it.
 - **Source is highlighted server-side.** `render_source` (the `highlight` Jinja filter) runs Pygments over a submission's source, using `submission.language` — every name in `languages.toml` happens to be a Pygments alias too — and falls back to plain text otherwise. The token colours are hand-written under `.cocco-code` in `assets/styles.css`, not a generated Pygments theme.
 - **CSS is a build artifact.** Edit `assets/styles.css`, never `cocco/static/styles.css`. Tailwind only emits classes it can see, so it scans `cocco/templates/**/*.jinja` and `cocco/**/*.py` (`@source` directives); a class assembled dynamically at runtime will not be generated. The input stays in `assets/` and the output lands in the package, which is the same line the packaging draws everywhere else: `assets/` is what the build reads, `cocco/` is what ships. The two multi-megabyte icon sources live there too, and only the three files a template actually names (`icon-small.png`, `favicon.ico`, `styles.css`) are under `cocco/static/`.
