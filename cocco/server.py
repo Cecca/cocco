@@ -88,6 +88,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _check_storage() -> None:
+    """Refuse to serve a storage root this version cannot read.
+
+    `_check_schema`'s twin, here for exactly its reason: the app checks again
+    at startup, and under `--reload` or `--workers` that check cannot become a
+    non-zero exit. The two are separate functions because they answer about
+    different halves of a deployment - the database and the files beside it -
+    and either can be behind without the other.
+    """
+    from cocco.config import config_path, load_config
+    from cocco.storage import StorageFormatError, check_storage_format
+
+    try:
+        check_storage_format(load_config(config_path()).storage.root)
+    except StorageFormatError as e:
+        print(e, file=sys.stderr)
+        raise SystemExit(1)
+
+
 def _check_schema() -> None:
     """Refuse to serve a database that is not at the revision this code expects.
 
@@ -142,6 +161,7 @@ def main(argv: list[str] | None = None) -> None:
         os.environ["COCCO_CONFIG"] = str(args.config)
 
     _check_schema()
+    _check_storage()
 
     uvicorn.run(
         "cocco.main:app",

@@ -1,3 +1,5 @@
+import asyncio
+import gzip
 import tempfile
 import textwrap
 from pathlib import Path
@@ -6,6 +8,19 @@ import pytest
 
 import cocco.judge as cj
 from cocco.storage import Storage
+
+
+def _stdin(directory: Path, contents: str) -> Path:
+    """A compressed standard input, which is the only kind `isolate_run` takes.
+
+    Everything under the storage root is gzip and that is where a test case's
+    input comes from, so a test writing a plaintext file here would be pinning
+    a contract the judge does not have.
+    """
+    path = directory / "stdin.txt"
+    with gzip.open(path, "wt") as fp:
+        fp.write(contents)
+    return path
 
 
 @pytest.mark.parametrize(
@@ -73,9 +88,7 @@ async def test_python_run():
             fp.write(textwrap.dedent("""\
             print("hello", input())
             """))
-        stdin_path = tmp / "stdin.txt"
-        with open(stdin_path, "w") as fp:
-            fp.write("moon")
+        stdin_path = _stdin(tmp, "moon")
         res = await cj.isolate_run(
             python,
             stdin_path,
@@ -95,9 +108,7 @@ async def test_language_python():
             fp.write(textwrap.dedent("""\
             print("hello", input())
             """))
-        stdin_path = tmp / "stdin.txt"
-        with open(stdin_path, "w") as fp:
-            fp.write("moon")
+        stdin_path = _stdin(tmp, "moon")
 
         exe = await python.compile(script_path, tmp)
         assert exe.success and exe.executable is not None
@@ -124,9 +135,7 @@ async def test_language_c():
                 return 0;
             }
             """))
-        stdin_path = tmp / "stdin.txt"
-        with open(stdin_path, "w") as fp:
-            fp.write("moon")
+        stdin_path = _stdin(tmp, "moon")
 
         exe = await c.compile(script_path, tmp)
         assert exe.success and exe.executable is not None
@@ -154,9 +163,7 @@ async def test_language_cpp():
                 return 0;
             }
             """))
-        stdin_path = tmp / "stdin.txt"
-        with open(stdin_path, "w") as fp:
-            fp.write("moon")
+        stdin_path = _stdin(tmp, "moon")
 
         exe = await cpp.compile(script_path, tmp)
         assert exe.success and exe.executable is not None
@@ -180,9 +187,7 @@ async def test_language_java():
                 }
             }
             """))
-        stdin_path = tmp / "stdin.txt"
-        with open(stdin_path, "w") as fp:
-            fp.write("moon")
+        stdin_path = _stdin(tmp, "moon")
 
         exe = await python.compile(script_path, tmp)
         assert exe.success and exe.executable is not None
@@ -618,3 +623,62 @@ async def test_evaluator_in_unknown_language_is_reported(tmp_path: Path):
             tmp_path,
         )
 
+
+
+########################################################################
+# Feeding a compressed input to a box's standard input. No isolate here: the
+# feeder is the one genuinely new mechanism in the run path, and pinning it
+# against a plain subprocess is what makes it testable at all - every test that
+# goes through `isolate_run` needs a sandbox and a nix store.
+
+
+async def _feed_to(command: list[str], path: Path) -> bytes:
+    proc = await asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert proc.stdin is not None and proc.stdout is not None
+    # Read the output alongside the feeder rather than through `communicate`,
+    # which is what `isolate_run` does and for its reason: given a stdin pipe,
+    # that method closes it whether or not it was given anything to write, so
+    # the child would see EOF while the feeder was still inflating into it.
+    stdout, _ = await asyncio.gather(
+        proc.stdout.read(), cj._feed_stdin(proc.stdin, path)
+    )
+    await proc.wait()
+    return stdout
+
+
+async def test_a_compressed_input_arrives_whole(tmp_path: Path):
+    """A million lines, which is the case this exists for: it goes in
+    compressed and comes out byte for byte, without ever being written out."""
+    contents = "".join(f"{i} {i * 2}\n" for i in range(200_000)).encode()
+    path = tmp_path / "in_0.txt"
+    with gzip.open(path, "wb") as fp:
+        fp.write(contents)
+    assert path.stat().st_size < len(contents) // 3
+
+    assert await _feed_to(["cat"], path) == contents
+
+
+async def test_a_program_that_stops_reading_early_is_not_an_error(tmp_path: Path):
+    """The ordinary shape of a solution that reads one number off a huge input,
+    and of every submission that times out. The broken pipe belongs to the
+    feeder, and the box's own status is what says how the run ended - so this
+    must neither raise nor hang."""
+    path = tmp_path / "in_0.txt"
+    with gzip.open(path, "wb") as fp:
+        fp.write(b"x" * (8 << 20))
+
+    out = await asyncio.wait_for(_feed_to(["head", "-c", "10"], path), timeout=30)
+    assert out == b"x" * 10
+
+
+async def test_an_empty_input_is_an_empty_stdin(tmp_path: Path):
+    path = tmp_path / "in_0.txt"
+    with gzip.open(path, "wb") as fp:
+        fp.write(b"")
+
+    assert await _feed_to(["cat"], path) == b""

@@ -10,7 +10,7 @@ from sqlalchemy import func, insert, select
 from cocco.avatar import MAX_AVATAR_BYTES, generate_identicon, sniff_image_mime
 from cocco.evaluators import BUNDLED, DEFAULT_EVALUATOR, bundled_path
 from cocco.judge import extension_to_language, load_languages
-from cocco.storage import Storage, safe_filename
+from cocco.storage import Storage, check_storage_format, safe_filename
 from cocco.model import (
     Challenge,
     Course,
@@ -38,6 +38,14 @@ from cocco.migrate import (
     upgrade_to_head,
 )
 from cocco.tokens import hash_token, mint_token, parse_bearer
+from cocco.passwords import (
+    MIN_PASSWORD_LENGTH,
+    check_password,
+    generate_password,
+    hash_password,
+    needs_rehash,
+    verify_password,
+)
 from cocco import transfer
 from cocco.transfer import (
     EVALUATOR_DIR,
@@ -69,12 +77,14 @@ from fastapi.responses import (
     JSONResponse,
     RedirectResponse,
     Response,
+    StreamingResponse,
 )
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 import hmac
 import io
@@ -87,6 +97,7 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from cocco.repository import (
+    claim_user_password,
     block_user,
     challenge_in_course,
     count_running_submissions,
@@ -97,6 +108,7 @@ from cocco.repository import (
     delete_course,
     delete_enrollment,
     delete_testcase,
+    delete_user_password,
     insert_administrators,
     insert_api_token,
     insert_challenge,
@@ -132,6 +144,8 @@ from cocco.repository import (
     query_enrollment_key,
     query_evaluator_path,
     query_ordered_challenge_ids,
+    query_password_hash,
+    query_password_state,
     query_sample_testcase,
     query_submission,
     query_submission_outcomes,
@@ -148,6 +162,7 @@ from cocco.repository import (
     set_challenge_archived,
     set_course_archived,
     set_enrollment_role,
+    set_user_password,
     swap_testcase_order,
     touch_api_token,
     unblock_user,
@@ -285,6 +300,41 @@ templates = Jinja2Templates(directory=TEMPLATES_DIR)
 # database (see DESIGN.md). The judge resolves the same paths against the same
 # root, and the two agree because they read it out of the same file.
 storage = Storage(CONFIG.storage.root)
+
+# How a stored file is handed to somebody outside. Everything under the storage
+# root is compressed and nothing the other end reads is, so a download is a
+# decompressing stream rather than a `FileResponse`: there is no file holding
+# the right bytes to point one at, and a million-line test case must not be
+# inflated into memory to make one. The generator is deliberately *sync* -
+# Starlette iterates one of those on a thread, which is what keeps the inflate
+# off the event loop.
+def _stored_file_download(relative: str, filename: str) -> StreamingResponse:
+    def chunks():
+        with storage.reader(relative) as fp:
+            while chunk := fp.read(1 << 16):
+                yield chunk
+
+    return StreamingResponse(
+        chunks(),
+        # text/plain whatever the name says, so a file named .html can never be
+        # served as a page on this origin.
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _zip_stored(zf: zipfile.ZipFile, relative: str, arcname: str) -> None:
+    """Copy a stored file into an open zip, decompressing on the way.
+
+    `zf.write` would put the gzip bytes in under a plain name: what leaves here
+    is the transfer format, which is plaintext at both ends and is a directory
+    somebody edits. Through `zf.open(..., "w")` rather than `writestr`, so a
+    million-line test case is still never held in memory.
+    """
+    with storage.reader(relative) as source, zf.open(arcname, "w") as sink:
+        while chunk := source.read(1 << 20):
+            sink.write(chunk)
+
 
 # Uploads are mapped to a language by their extension, so the challenge page
 # needs no language picker. `languages.toml` is the same file the judge loads -
@@ -485,6 +535,12 @@ async def prepare_database(reset=False):
     database that *passes* the check below and 500s on the first query. See
     `reset_schema`.
     """
+    # Beside the schema check below and for the same reason, on the other half
+    # of what a deployment has to bring forward: every file under the storage
+    # root is compressed, and a root that predates that would fail one download
+    # and one submission at a time instead of saying so once, here.
+    check_storage_format(CONFIG.storage.root)
+
     if reset:
         async with engine.begin() as conn:
             await conn.run_sync(reset_schema)
@@ -1091,6 +1147,12 @@ def _login_page(
             "next": next_path,
             "error": error,
             "google_configured": CONFIG.auth.google is not None,
+            # Draws the address-and-password form and the account it can
+            # create. `[auth] password_login` and nothing else, the way
+            # `dummy_auth` below works: the routes 404 without it, because a
+            # hidden form is presentation and never the check.
+            "password_login": CONFIG.auth.password_login,
+            "min_password_length": MIN_PASSWORD_LENGTH,
             "allowed_domains": CONFIG.auth.allowed_domains,
             # Draws the development sign-in box. See `post_auth_dummy`.
             "dummy_auth": DUMMY_AUTH,
@@ -1113,15 +1175,21 @@ def _sign_in(request: Request, user: schema.User, next_path: str):
 
 
 async def _complete_sign_in(
-    request: Request, db: AsyncConnection, email: str, next_path: str
+    request: Request,
+    db: AsyncConnection,
+    email: str,
+    next_path: str,
+    *,
+    claim_password: str | None = None,
 ):
-    """Everything between a proved address and a session, for both of the ways
-    an address is proved.
+    """Everything between a proved address and a session, for every one of the
+    ways an address is proved.
 
-    Google's callback proves one by verifying an ID token; `post_auth_dummy`
-    "proves" one by being development. What has to happen next is the same three
-    rules either way - the domain allowlist, the account, the blacklist - and
-    they are written here once rather than restated at each end, the way
+    Google's callback proves one by verifying an ID token; `post_auth_password`
+    proves one by a password already on the account; `post_auth_dummy` "proves"
+    one by being development. What has to happen next is the same three rules
+    every way - the domain allowlist, the account, the blacklist - and they are
+    written here once rather than restated at each end, the way
     `_challenge_fields` is shared by the three forms that build a challenge. A
     rule the browser enforced and the box did not would be a difference nobody
     could explain, and the box is the configuration this all gets developed in.
@@ -1129,6 +1197,12 @@ async def _complete_sign_in(
     The address must already be through `normalize_email`: canonicalizing it is
     each caller's, because the sentence for an unusable one differs - Google
     returning no address is not the same event as an empty text box.
+
+    `claim_password` is registration, and it is a keyword here rather than a
+    route of its own precisely so that it cannot skip any of the above: the
+    allowlist is checked *before* `get_or_create_user` writes anything, so an
+    address outside the domains never becomes a row, and the claim happens
+    before the blacklist refusal so that a blocked account still refuses.
     """
     if not is_allowed_email(email, CONFIG.auth.allowed_domains):
         logger.info("refused a sign-in from outside the allowed domains: %s", email)
@@ -1144,6 +1218,25 @@ async def _complete_sign_in(
         )
 
     user = await get_or_create_user(db, email)
+
+    if claim_password is not None:
+        # The account may have existed already - a roster a teacher wrote out,
+        # or somebody who signed in with Google - so this is a *claim* and not
+        # an insert, and `claim_user_password` refuses in its own WHERE clause
+        # rather than here. False means the address is spoken for.
+        if not await claim_user_password(db, email, claim_password):
+            await db.rollback()
+            logger.info("refused a password claim on a taken address: %s", email)
+            return _login_page(
+                request,
+                next_path=next_path,
+                error=(
+                    "That address already has an account. Sign in instead, or "
+                    "ask an administrator to reset its password."
+                ),
+                status_code=409,
+            )
+
     await db.commit()
 
     if user.blocked_at is not None:
@@ -1224,6 +1317,141 @@ async def post_auth_dummy(
         )
     logger.warning("dummy sign-in as %s", address)
     return await _complete_sign_in(request, db, address, next_path)
+
+
+# ---------------------------------------------------------------------------
+# Passwords: the second real way in, and off unless `[auth] password_login`
+# says otherwise.
+#
+# Google proves that the person owns the mailbox. A password proves only that
+# somebody typed an address, because this app has no mail path and so cannot
+# send a verification link. Registration is therefore a *claim*, narrowed as
+# far as it can be without email: `claim_user_password` writes only where
+# `first_login_at IS NULL`, so a roster a teacher wrote out before term can be
+# claimed by its owner and an account somebody has actually used cannot be
+# taken over. What is left - anyone who can type an address `allowed_domains`
+# admits gets an unused one - is what a deployment accepts when it turns this
+# on, and is why the default is false.
+#
+# Both routes 404 when the switch is off, `post_auth_dummy`'s reason: a
+# deployment should not admit that a path it does not serve exists. Every field
+# is a defaulted `Form`, `post_administrator`'s reason: a missing one would be
+# a 422 with no page on it, and there is a person in front of this form.
+
+
+def _require_password_login() -> None:
+    if not CONFIG.auth.password_login:
+        raise HTTPException(status_code=404)
+
+
+# One sentence for every way a sign-in can be wrong, and it is a module
+# constant so the two places that print it cannot drift. An unknown address, an
+# account with no password and a wrong password are the same event as far as
+# anybody outside is concerned - saying which of them it was is a user list.
+_BAD_CREDENTIALS = "That address and password do not match."
+
+
+@app.post("/auth/password")
+async def post_auth_password(
+    request: Request,
+    db: DBDep,
+    email: str = Form(""),
+    password: str = Form(""),
+    next: str = Form("/"),
+):
+    """Sign in with an address and a password.
+
+    The three refusals this can make are deliberately one refusal. An address
+    nobody has, an account that has never set a password and a wrong password
+    all arrive at `verify_password` - the first two as None, which it takes and
+    turns into False rather than short-circuiting on - so they cost the same
+    work and produce the same sentence. A route that returned early for an
+    unknown address would answer it faster, and a timing difference on the
+    login page is a way to enumerate a class list.
+
+    scrypt runs in a threadpool. It is 32 MiB of deliberately sequential work,
+    and on the event loop it would stop every other request in the app for its
+    duration - including the fragments each open page is polling.
+    """
+    _require_password_login()
+
+    next_path = safe_next_path(next)
+    try:
+        address = normalize_email(email)
+    except ValueError:
+        # Not `str(err)`: an address this app would not accept is not a
+        # different event from a wrong password, and saying so would tell an
+        # attacker which of their guesses was even a candidate.
+        address = ""
+
+    stored = await query_password_hash(db, address) if address else None
+    if not await run_in_threadpool(verify_password, password, stored):
+        logger.info("a password sign-in did not match: %s", address or email)
+        return _login_page(
+            request, next_path=next_path, error=_BAD_CREDENTIALS, status_code=403
+        )
+
+    if needs_rehash(stored):
+        # The one moment the password is in hand and re-hashing costs nothing
+        # extra. Best effort, and deliberately not a reason to refuse a sign-in
+        # that has already succeeded.
+        user_id = (await query_user_by_email(db, address)).id
+        await set_user_password(
+            db, user_id, await run_in_threadpool(hash_password, password)
+        )
+        await db.commit()
+
+    return await _complete_sign_in(request, db, address, next_path)
+
+
+@app.post("/auth/password/register")
+async def post_auth_password_register(
+    request: Request,
+    db: DBDep,
+    email: str = Form(""),
+    password: str = Form(""),
+    confirm: str = Form(""),
+    next: str = Form("/"),
+):
+    """Claim an address and give it a password.
+
+    Specific sentences here, unlike `post_auth_password` above, and the
+    difference is not an oversight: this is a form somebody is filling in
+    rather than a credential somebody is presenting, so telling them their
+    password is too short helps them and tells an attacker nothing they could
+    not have learned by trying it on their own address.
+
+    The domain check, the account and the blacklist all happen inside
+    `_complete_sign_in`, in that order, which is what stops this route being a
+    second opinion about any of them - and what guarantees an address outside
+    `allowed_domains` never becomes a row.
+    """
+    _require_password_login()
+
+    next_path = safe_next_path(next)
+    try:
+        address = normalize_email(email)
+        check_password(password)
+    except ValueError as err:
+        return _login_page(
+            request, next_path=next_path, error=str(err), status_code=400
+        )
+
+    if password != confirm:
+        return _login_page(
+            request,
+            next_path=next_path,
+            error="Those two passwords are not the same.",
+            status_code=400,
+        )
+
+    return await _complete_sign_in(
+        request,
+        db,
+        address,
+        next_path,
+        claim_password=await run_in_threadpool(hash_password, password),
+    )
 
 
 @app.get("/auth/google")
@@ -1858,6 +2086,7 @@ async def _render_users(
     q: str,
     message: str | None = None,
     ok: bool = False,
+    issued: tuple[str, str] | None = None,
 ):
     """The user list, as every route on the admin page answers with it."""
     users = await query_users(db, q=q)
@@ -1870,6 +2099,14 @@ async def _render_users(
             "user": user,
             "message": message,
             "ok": ok,
+            # Draws the per-row reset button. Off unless the deployment has
+            # passwords at all, in which case there is nothing to reset.
+            "password_login": CONFIG.auth.password_login,
+            # The one thing on this page no query can produce: a freshly issued
+            # password, on the single response that made it. `f-tokens.jinja`
+            # shows a minted token the same way and for the same reason - only
+            # its hash is stored, so there is nowhere to read it back from.
+            "issued": issued,
         },
     )
 
@@ -1889,6 +2126,8 @@ async def get_admin(request: Request, db: DBDep, user: Admin, q: str = ""):
             "user": user,
             "message": None,
             "ok": False,
+            "password_login": CONFIG.auth.password_login,
+            "issued": None,
         },
     )
 
@@ -2011,6 +2250,55 @@ async def post_user_unblock(
     await db.commit()
     return await _render_users(
         request, db, user, q, message="That account is welcome again.", ok=True
+    )
+
+
+@app.post("/admin/users/{user_id}/password/reset")
+async def post_user_password_reset(
+    request: Request,
+    db: DBDep,
+    user: Admin,
+    user_id: int,
+    q: Annotated[str, Form()] = "",
+):
+    """Issue a fresh password for an account, and show it once.
+
+    This is the whole answer to "I have forgotten my password", and it is why
+    no SMTP setting exists anywhere in this app: cocco cannot send a reset
+    link, so a human does instead. The password is generated rather than
+    chosen - `mint_token`'s discipline, and for the same reason: an
+    administrator picking one would pick a memorable one, and would pick the
+    same one twice.
+
+    An administrator does see it, which is a real and deliberate cost. They can
+    already appoint and block, so this is not a new kind of power over an
+    account, but it *is* a credential in somebody else's name, which is why the
+    fragment tells them to have its owner replace it and why the profile page
+    is where that happens. `first_login_at` is untouched, so this never
+    re-opens the account to a claim by somebody else.
+    """
+    row = await query_user(db, user_id)
+    if row is None:
+        return await _render_users(
+            request, db, user, q, message="There is no such account."
+        )
+
+    password = generate_password()
+    await set_user_password(
+        db, user_id, await run_in_threadpool(hash_password, password)
+    )
+    await db.commit()
+    logger.warning(
+        "%s issued a new password for %s", user.email, row.email
+    )
+    return await _render_users(
+        request,
+        db,
+        user,
+        q,
+        message=f"A new password was issued for {row.email}.",
+        ok=True,
+        issued=(row.email, password),
     )
 
 
@@ -2961,13 +3249,10 @@ async def get_sample_file(
     relative = (
         testcase.input_path if kind == "input" else testcase.expected_output_path
     )
-    path = storage.resolve(relative)
-    if not path.is_file():
+    if not storage.exists(relative):
         raise HTTPException(status_code=404)
-    return FileResponse(
-        path,
-        media_type="text/plain",
-        filename=f"sample{testcase.execution_order + 1}_{kind}.txt",
+    return _stored_file_download(
+        relative, f"sample{testcase.execution_order + 1}_{kind}.txt"
     )
 
 
@@ -3825,14 +4110,17 @@ async def get_evaluator_download(
     """
     relative = await query_evaluator_path(db, challenge_id)
     if relative is None:
+        # The bundled default lives in the source tree rather than in storage,
+        # so it is plain and is served as the file it is.
         path = bundled_path(DEFAULT_EVALUATOR)
-    else:
-        path = storage.resolve(relative)
-    if not path.is_file():
+        if not path.is_file():
+            raise HTTPException(status_code=404)
+        # text/plain whatever the extension says, so a script named .html can
+        # never be served as a page on this origin.
+        return FileResponse(path, media_type="text/plain", filename=path.name)
+    if not storage.exists(relative):
         raise HTTPException(status_code=404)
-    # text/plain whatever the extension says, so a script named .html can
-    # never be served as a page on this origin.
-    return FileResponse(path, media_type="text/plain", filename=path.name)
+    return _stored_file_download(relative, Path(relative).name)
 
 
 @app.post("/f/markdown-preview")
@@ -3893,9 +4181,14 @@ async def post_testcase(
             "A file with that name already exists for this challenge.", ok=False,
         )
 
-    # Streamed, not read: test inputs can be several megabytes (DESIGN.md)
-    storage.save_stream(input_path, input_file.file)
-    storage.save_stream(output_path, expected_output_file.file)
+    # Streamed, not read: test inputs can be several megabytes (DESIGN.md).
+    # On a thread, because they are compressed on the way down and deflating
+    # tens of megabytes on the event loop would stop every polled fragment in
+    # the site for its duration - the rule `hash_password` is here for.
+    await run_in_threadpool(storage.save_stream, input_path, input_file.file)
+    await run_in_threadpool(
+        storage.save_stream, output_path, expected_output_file.file
+    )
 
     await insert_testcase(
         db, challenge_id, input_path, output_path, is_sample=is_sample
@@ -4203,6 +4496,20 @@ async def get_profile(
             "profile_id": user_id,
             "tokens": await query_api_tokens(db, user_id) if is_owner else [],
             "minted": None,
+            # The password section, on the same `is_owner` footing as the
+            # tokens above and behind the same switch the login page is: with
+            # `[auth] password_login` off the feature does not exist, and the
+            # routes 404 rather than merely not being drawn.
+            "password_login": CONFIG.auth.password_login,
+            "password": (
+                await query_password_state(db, user_id)
+                if is_owner and CONFIG.auth.password_login
+                else None
+            ),
+            "min_password_length": MIN_PASSWORD_LENGTH,
+            # `f-password.jinja` says different things about removing a
+            # password depending on whether there is another way in.
+            "google_configured": CONFIG.auth.google is not None,
             "title": profile["nickname"],
             "user": user,
             "message": None,
@@ -4414,6 +4721,131 @@ async def post_token_delete(
     )
 
 
+########################################################################
+# The password, which lives beside the tokens because it is the same kind of
+# thing: a credential of this account, on this account's own page. Every route
+# here is behind `ProfileOwner` for the tokens' reason, one step further along
+# - reading a profile is oversight, and setting somebody's password is not
+# oversight but the ability to become them. An administrator who has to get an
+# account back in uses `/admin`'s reset, which issues a password rather than
+# choosing one, and which the owner is expected to replace from here.
+#
+# All of it is behind `[auth] password_login` as well, and a 404 rather than a
+# hidden form, the rule `post_auth_dummy` states.
+
+
+async def _render_password(
+    request: Request,
+    db: AsyncConnection,
+    user_id: int,
+    message: str | None = None,
+    ok: bool = False,
+):
+    """The password section, as every mutation answers with it - one swap
+    target with the alert folded in, which is `/admin`'s rule and
+    `_render_tokens`'s shape."""
+    return templates.TemplateResponse(
+        request=request,
+        name="f-password.jinja",
+        context={
+            "profile_id": user_id,
+            "password": await query_password_state(db, user_id),
+            "min_password_length": MIN_PASSWORD_LENGTH,
+            "google_configured": CONFIG.auth.google is not None,
+            "message": message,
+            "ok": ok,
+        },
+    )
+
+
+@app.get("/f/users/{user_id}/password")
+async def get_fragment_password(
+    user_id: int, request: Request, db: DBDep, owner: ProfileOwner
+):
+    _require_password_login()
+    return await _render_password(request, db, user_id)
+
+
+@app.post("/users/{user_id}/password")
+async def post_password(
+    user_id: int,
+    request: Request,
+    db: DBDep,
+    owner: ProfileOwner,
+    # Defaulted, as everywhere else on this page: a missing field is a 422 and
+    # htmx drops the body of an error response.
+    current_password: Annotated[str, Form()] = "",
+    password: Annotated[str, Form()] = "",
+    confirm: Annotated[str, Form()] = "",
+):
+    """Set a password, or change the one that is there.
+
+    The current password is required whenever there already is one, and is not
+    a formality: a session left open on a shared machine is the ordinary way an
+    account is taken, and without this check the person who found it could lock
+    its owner out. There is nothing to ask for when no password is set yet -
+    the session is the only thing that could have got here.
+    """
+    _require_password_login()
+
+    existing = await query_password_state(db, user_id)
+    if existing is not None:
+        if not await run_in_threadpool(
+            verify_password,
+            current_password,
+            await query_password_hash(db, owner.email),
+        ):
+            return await _render_password(
+                request, db, user_id, "That is not your current password.", ok=False
+            )
+
+    try:
+        check_password(password)
+    except ValueError as err:
+        return await _render_password(request, db, user_id, str(err), ok=False)
+
+    if password != confirm:
+        return await _render_password(
+            request, db, user_id, "Those two passwords are not the same.", ok=False
+        )
+
+    await set_user_password(
+        db, user_id, await run_in_threadpool(hash_password, password)
+    )
+    await db.commit()
+    return await _render_password(
+        request,
+        db,
+        user_id,
+        "Password changed." if existing is not None else "Password set.",
+        ok=True,
+    )
+
+
+@app.post("/users/{user_id}/password/delete")
+async def post_password_delete(
+    user_id: int, request: Request, db: DBDep, owner: ProfileOwner
+):
+    """Take the password off this account.
+
+    Allowed even when it is the only way in, and deliberately: this is the
+    owner's own account and the fragment says plainly what they are about to be
+    left with. The app's usual line applies - nothing else goes with it, and
+    `/admin` can issue a new one.
+    """
+    _require_password_login()
+
+    removed = await delete_user_password(db, user_id)
+    await db.commit()
+    return await _render_password(
+        request,
+        db,
+        user_id,
+        "Password removed." if removed else "There was no password to remove.",
+        ok=removed,
+    )
+
+
 @app.get("/users/{user_id}/avatar")
 async def user_avatar(user_id: int, db: DBDep, user: CurrentUser):
     row = (
@@ -4611,7 +5043,11 @@ async def api_export_challenge(
         )
 
     handle = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
-    try:
+
+    # Every member is now inflated out of storage and deflated back into the
+    # zip, so the whole build goes on a thread rather than on the event loop -
+    # `post_testcase`'s rule, read the other way round.
+    def build() -> None:
         with zipfile.ZipFile(handle, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(
                 MANIFEST_NAME,
@@ -4626,14 +5062,14 @@ async def api_export_challenge(
             )
             zf.writestr(STATEMENT_NAME, challenge.description or "")
             for row, entry in zip(rows, manifest.testcases):
-                zf.write(storage.resolve(row.input_path), entry.input)
-                zf.write(
-                    storage.resolve(row.expected_output_path),
-                    entry.expected_output,
-                )
+                _zip_stored(zf, row.input_path, entry.input)
+                _zip_stored(zf, row.expected_output_path, entry.expected_output)
             if evaluator_path is not None and manifest.evaluator is not None:
-                zf.write(storage.resolve(evaluator_path), manifest.evaluator)
+                _zip_stored(zf, evaluator_path, manifest.evaluator)
         handle.close()
+
+    try:
+        await run_in_threadpool(build)
     except (OSError, ValueError):
         handle.close()
         os.unlink(handle.name)
@@ -4814,18 +5250,25 @@ async def api_import_challenge(
             directory = _testcase_dir(challenge_id)
             written: set[str] = set()
 
-            def store(member: str, name: str) -> str:
+            async def store(member: str, name: str) -> str:
                 path = f"{directory}/{name}"
-                with archive.open(member) as source:
-                    storage.save_stream(path, source)
+
+                # Inflate out of the zip and deflate into storage, both on a
+                # thread: a push carries every test case of a challenge at
+                # once, and `post_testcase`'s rule applies a hundredfold here.
+                def save() -> None:
+                    with archive.open(member) as source:
+                        storage.save_stream(path, source)
+
+                await run_in_threadpool(save)
                 written.add(path)
                 return path
 
             superseded: list[str] = []
 
             for update in plan.updated:
-                store(update.entry.input, update.entry.input_name)
-                output_path = store(
+                await store(update.entry.input, update.entry.input_name)
+                output_path = await store(
                     update.entry.expected_output, update.entry.expected_output_name
                 )
                 if update.existing.expected_output_name != update.entry.expected_output_name:
@@ -4842,8 +5285,10 @@ async def api_import_challenge(
 
             added_ids: list[int] = []
             for addition in plan.added:
-                input_path = store(addition.entry.input, addition.entry.input_name)
-                output_path = store(
+                input_path = await store(
+                    addition.entry.input, addition.entry.input_name
+                )
+                output_path = await store(
                     addition.entry.expected_output,
                     addition.entry.expected_output_name,
                 )

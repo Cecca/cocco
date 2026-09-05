@@ -17,6 +17,7 @@ from cocco.model import (
     Course,
     Enrollment,
     User,
+    UserPassword,
     UserRole,
 )
 
@@ -34,6 +35,7 @@ def _admin_urls(user_id: int):
         ("post", "/admin/administrators", {"email": "eve@unipd.it"}),
         ("post", f"/admin/users/{user_id}/block", {"reason": "no"}),
         ("post", f"/admin/users/{user_id}/unblock", {}),
+        ("post", f"/admin/users/{user_id}/password/reset", {}),
     ]
 
 
@@ -208,4 +210,109 @@ async def test_a_mutation_keeps_the_filter(client, db):
     assert response.status_code == 200
     assert STUDENT in response.text
     # Alice does not match "bob", so the answer is still the filtered list.
+    assert TEACHER not in response.text
+
+
+########################################################################
+# Issuing a password
+#
+# The whole answer to a forgotten password, and the reason there is no SMTP
+# setting anywhere in this app: cocco cannot send a reset link, so a human
+# does. It is generated rather than chosen - `mint_token`'s discipline - and
+# shown exactly once, because only its scrypt hash is stored.
+
+
+@pytest.fixture
+def passwords(monkeypatch):
+    from dataclasses import replace
+
+    import cocco.main as main
+
+    monkeypatch.setattr(
+        main,
+        "CONFIG",
+        replace(main.CONFIG, auth=replace(main.CONFIG.auth, password_login=True)),
+    )
+
+
+async def test_the_reset_button_is_absent_without_the_setting(client, db):
+    assert "password/reset" not in client.get("/admin").text
+
+
+async def test_issuing_a_password_shows_it_once_and_lets_them_in(
+    client, db, passwords, make_client
+):
+    """Shown once here, and then it works - which is the only way to tell that
+    what was printed is what was stored."""
+    with db.connect() as conn:
+        bob = conn.execute(
+            select(User.c.id).where(User.c.email == STUDENT)
+        ).scalar_one()
+
+    assert "password/reset" in client.get("/admin").text
+
+    response = client.post(f"/admin/users/{bob}/password/reset", data={})
+    assert response.status_code == 200
+    assert "not shown again" in response.text
+
+    # Pull the issued password back out of the one response that carries it.
+    import re
+
+    issued = re.search(
+        r'select-all[^>]*>([^<]+)</code>', response.text
+    ).group(1)
+
+    # It is not shown a second time.
+    assert issued not in client.get("/admin").text
+
+    # And it is the password that account now has.
+    other = make_client(dummy_auth=False)
+    signed_in = other.post(
+        "/auth/password",
+        data={"email": STUDENT, "password": issued},
+        follow_redirects=False,
+    )
+    assert signed_in.status_code == 303
+
+
+async def test_issuing_replaces_whatever_was_there(client, db, passwords):
+    with db.connect() as conn:
+        bob = conn.execute(
+            select(User.c.id).where(User.c.email == STUDENT)
+        ).scalar_one()
+
+    client.post(f"/admin/users/{bob}/password/reset", data={})
+    with db.connect() as conn:
+        first = conn.execute(
+            select(UserPassword.c.password_hash).where(
+                UserPassword.c.user_id == bob
+            )
+        ).scalar_one()
+
+    client.post(f"/admin/users/{bob}/password/reset", data={})
+    with db.connect() as conn:
+        second = conn.execute(
+            select(UserPassword.c.password_hash).where(
+                UserPassword.c.user_id == bob
+            )
+        ).scalar_one()
+
+    assert first != second
+
+
+async def test_issuing_for_nobody_says_so(client, db, passwords):
+    response = client.post("/admin/users/9999/password/reset", data={})
+    assert response.status_code == 200
+    assert "no such account" in response.text
+
+
+async def test_issuing_keeps_the_filter(client, db, passwords):
+    with db.connect() as conn:
+        bob = conn.execute(
+            select(User.c.id).where(User.c.email == STUDENT)
+        ).scalar_one()
+    response = client.post(
+        f"/admin/users/{bob}/password/reset", data={"q": "bob"}
+    )
+    assert STUDENT in response.text
     assert TEACHER not in response.text

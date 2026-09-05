@@ -218,6 +218,66 @@ def cmd_revision(args) -> None:
     )
 
 
+def cmd_compress_storage(args) -> None:
+    """Bring a storage root forward to compressed storage.
+
+    A subcommand here rather than a fifth entry point, and it earns the place:
+    this is the command a deployment already runs before starting the servers,
+    it already reads `COCCO_CONFIG` for it, and `[storage] root` is in the same
+    file `[database] url` is. What it moves is not the schema but the files
+    beside it, which is the other half of the same upgrade - and `cocco-web`
+    and `cocco-judge` refuse to start until it has been run, exactly as they
+    refuse a database that is behind.
+
+    Idempotent, and restartable: a file that already begins with the gzip magic
+    is left alone, and each one is written to a sibling and `os.replace`d, so
+    an interrupted run leaves every file either wholly old or wholly new. Run
+    it again and it finishes the job.
+    """
+    from cocco.config import config_path, load_config
+    from cocco.storage import (
+        FORMAT_GZIP,
+        FORMAT_MARKER,
+        compress_file,
+        is_compressed,
+    )
+
+    root = load_config(config_path()).storage.root
+    if not root.is_dir():
+        print(f"cocco-migrate: no storage root at {root}", file=sys.stderr)
+        return
+
+    marker = root / FORMAT_MARKER
+    done = skipped = before = after = 0
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path == marker:
+            continue
+        if is_compressed(path):
+            skipped += 1
+            continue
+        if args.dry_run:
+            done += 1
+            before += path.stat().st_size
+            continue
+        was, now = compress_file(path)
+        done += 1
+        before += was
+        after += now
+
+    if args.dry_run:
+        print(
+            f"would compress {done} file(s), {before} bytes; "
+            f"{skipped} already compressed"
+        )
+        return
+
+    marker.write_text(FORMAT_GZIP + "\n")
+    print(
+        f"compressed {done} file(s), {before} -> {after} bytes; "
+        f"{skipped} already compressed. {root} is marked as {FORMAT_GZIP}."
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Our own argparse over `alembic.command.*`, rather than alembic's
     `CommandLine`.
@@ -230,7 +290,10 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="cocco-migrate",
-        description="Move the cocco database schema between revisions.",
+        description=(
+        "Move the cocco database schema between revisions, and the files "
+        "beside it into the format this version reads."
+    ),
     )
     # The same flag, with the same help text, as `cocco-web` and `cocco-judge`:
     # the database is the thing all three have to agree about, and the way they
@@ -298,6 +361,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stamp.add_argument("revision", nargs="?", default="head")
     stamp.set_defaults(run=cmd_stamp)
+
+    compress = sub.add_parser(
+        "compress-storage",
+        help=(
+            "compress the test case files under [storage] root, which is what "
+            "this version of cocco reads"
+        ),
+    )
+    compress.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be compressed and write nothing",
+    )
+    compress.set_defaults(run=cmd_compress_storage)
 
     return parser
 

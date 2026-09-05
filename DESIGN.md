@@ -44,7 +44,11 @@ That this is safe rests on isolate's defaults as much as on its limits: a box ge
 
 ## Test case inputs
 
-Test inputs can be several megabytes. They are stored on the **filesystem** (not in the database), with only the file path recorded in the database. Isolate accepts stdin from a file path directly, so large inputs are passed without any HTTP overhead.
+Test inputs can be several megabytes. They are stored on the **filesystem** (not in the database), with only the file path recorded in the database.
+
+They are also **gzip-compressed on disk, transparently**. A million-line input is line-oriented ASCII, which is the shape that compresses best, and a course accumulates hundreds of them; nothing outside `cocco/storage.py` knows. There is deliberately no `.gz` suffix: the path in the database is the name the teacher uploaded and the name the transfer format uses, so `resolve`, `exists`, `rename`, `delete` and `plan_testcases` are untouched, and only the codec moves. Uncompressed roots are not a second case to support — `cocco-migrate compress-storage` converts one, and both servers refuse to start until it has been run, the way they refuse a database that is behind its migrations.
+
+The judge draws the boundary: **storage is compressed, an isolate box is plain**. A submission's standard input is inflated straight into the pipe isolate is reading, so a huge input is still never written out whole — the one thing that changed is that stdin is a pipe rather than the file's own descriptor. The evaluator's two files are expanded directly into the box, which is the copy isolate was already making. Nothing an evaluator or a submitted program opens is ever compressed, so the checker contract is exactly what it was.
 
 ## Alternatives considered
 

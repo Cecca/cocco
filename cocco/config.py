@@ -112,6 +112,12 @@ class AuthConfig:
     # is what is asked afterwards, so this list can only ever add. An empty one
     # is the ordinary case for a database that already has its administrators.
     administrators: tuple[str, ...] = ()
+    # The second way in, and off unless a deployment says otherwise. False is
+    # not timidity about a feature: Google proves that the person owns the
+    # mailbox, and a password proves only that somebody typed an address this
+    # app has no way to send anything to. See `cocco.example.toml`, which
+    # spells out what a deployment is accepting when it turns this on.
+    password_login: bool = False
 
 
 @dataclass(frozen=True)
@@ -307,7 +313,13 @@ def _load_auth_config(section: dict) -> AuthConfig:
             "COCCO_GOOGLE_CLIENT_SECRET in the environment; it is disabled"
         )
     return AuthConfig(
-        allowed_domains=domains, google=google, administrators=administrators
+        allowed_domains=domains,
+        google=google,
+        administrators=administrators,
+        # A plain bool and no warning when it is on: unlike half a Google
+        # credential, this one cannot be a typo - it is a switch, and the file
+        # is the only place it can be spelled.
+        password_login=bool(section.get("password_login", False)),
     )
 
 
