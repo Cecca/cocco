@@ -53,33 +53,14 @@
           pkgs.postgresql
           pkgs.nodejs_22
           pkgs.just
-          pgStart
-          pgStop
-          pgCreateDb
         ];
         shellHook = ''
           export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib.outPath}/lib:$LD_LIBRARY_PATH";
-          export PGDATA="$PWD/.pg/data"
-          export PGHOST="$PWD/.pg/sock"
+          export PGHOST="localhost"
           export PGUSER=postgres
           export PGDATABASE=cocco-dev
           test -d .venv || uv venv --python=${pkgs.python3.interpreter} .venv
           source .venv/bin/activate
-
-          echo "===================================================================="
-          echo "                         COCCO                                      "
-          echo "===================================================================="
-          echo ""
-          echo "To manage the database:"
-          echo " - pg-start"
-          echo " - pg-stop"
-          echo " - create-db"
-          echo ""
-          echo "To start the development environment"
-          echo ""
-          echo "   just dev"
-          echo ""
-          echo "===================================================================="
         '';
       };
     });
