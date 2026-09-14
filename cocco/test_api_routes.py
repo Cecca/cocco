@@ -13,11 +13,14 @@ where the cookie shortcut is not even switched on.
 import io
 import re
 import zipfile
+from contextlib import nullcontext
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from sqlalchemy import insert, select, update
 
+from cocco import cli
 from cocco.conftest import PUBLISHED
 from cocco.model import (
     Administrator,
@@ -176,10 +179,10 @@ def pack(members: dict[str, str | bytes]) -> bytes:
     return buffer.getvalue()
 
 
-def push(client, world, nickname, challenge_id, members):
+def push(client, world, nickname, challenge_id, members, headers=None):
     return client.post(
         f"/api/challenges/{challenge_id}",
-        headers=auth(world, nickname),
+        headers={**auth(world, nickname), **(headers or {})},
         files={"file": ("challenge.zip", pack(members), "application/zip")},
     )
 
@@ -483,6 +486,130 @@ async def test_a_retired_test_case_is_still_exported(client, world, app_engine):
     _, archive = pull(client, world, "alice", world["challenge"])
     manifest = parse_manifest(archive.read(MANIFEST_NAME).decode())
     assert [tc.is_active for tc in manifest.testcases] == [True, False]
+
+
+# ── versions ────────────────────────────────────────────────────────────────
+
+
+def _etag(client, world) -> str:
+    response = client.get(
+        f"/api/challenges/{world['challenge']}", headers=auth(world, "alice")
+    )
+    assert response.status_code == 200
+    return response.headers["etag"]
+
+
+async def _execute(app_engine, statement) -> None:
+    async with app_engine.connect() as conn:
+        await conn.execute(statement)
+        await conn.commit()
+
+
+async def test_an_export_carries_its_version_and_a_304_for_it(client, world):
+    etag = _etag(client, world)
+    assert _etag(client, world) == etag
+    response = client.get(
+        f"/api/challenges/{world['challenge']}",
+        headers={**auth(world, "alice"), "If-None-Match": etag},
+    )
+    assert response.status_code == 304
+    assert response.headers["etag"] == etag
+
+
+async def test_every_kind_of_web_edit_moves_the_version(client, world, app_engine):
+    """The version is derived rather than bumped, so there is no route that can
+    forget to bump it - which is only true if each of these shows up in it."""
+    challenge = world["challenge"]
+    seen = {_etag(client, world)}
+    for statement in (
+        update(Challenge).where(Challenge.c.id == challenge)
+        .values(description="Find them fast."),
+        update(Challenge).where(Challenge.c.id == challenge).values(max_threads=2),
+        update(TestCase).where(TestCase.c.id == world["tc02"]).values(is_sample=True),
+        update(TestCase).where(TestCase.c.id == world["tc01"])
+        .values(execution_order=5),
+    ):
+        await _execute(app_engine, statement)
+        etag = _etag(client, world)
+        assert etag not in seen
+        seen.add(etag)
+
+    world["storage"].write(f"challenge_{challenge}/01.out", "a different output\n")
+    assert _etag(client, world) not in seen
+
+
+async def test_a_push_on_the_current_version_returns_the_next_one(client, world):
+    response, archive = pull(client, world, "alice", world["challenge"])
+    members = {name: archive.read(name) for name in archive.namelist()}
+    members[STATEMENT_NAME] = "Edited locally."
+
+    pushed = push(client, world, "alice", world["challenge"], members,
+                  headers={"If-Match": response.headers["etag"]})
+    assert pushed.status_code == 200, pushed.text
+    assert _etag(client, world) == f'"{pushed.json()["version"]}"'
+
+
+async def test_a_push_on_an_old_version_is_a_412_and_writes_nothing(
+    client, world, app_engine
+):
+    response, archive = pull(client, world, "alice", world["challenge"])
+    members = {name: archive.read(name) for name in archive.namelist()}
+    members[STATEMENT_NAME] = "Edited locally."
+    await _execute(app_engine, update(Challenge)
+                   .where(Challenge.c.id == world["challenge"])
+                   .values(description="Edited on the web."))
+
+    refused = push(client, world, "alice", world["challenge"], members,
+                   headers={"If-Match": response.headers["etag"]})
+    assert refused.status_code == 412
+    assert "pull" in refused.json()["detail"].lower()
+    async with app_engine.connect() as conn:
+        row = (await conn.execute(select(Challenge).where(
+            Challenge.c.id == world["challenge"]))).one()
+    assert row.description == "Edited on the web."
+
+    # Without the header - `cocco push --force` - it is applied as it always was.
+    assert push(client, world, "alice", world["challenge"], members).status_code == 200
+
+
+async def test_the_cli_merges_a_web_edit_instead_of_overwriting_it(
+    client, world, app_engine, tmp_path, monkeypatch, capsys
+):
+    """The scenario all of this is for, against the real app: a statement edited
+    on the web while a test output was fixed in a checkout."""
+    client.headers.update(auth(world, "alice"))
+    monkeypatch.setattr(cli, "_client", lambda args: nullcontext(client))
+    monkeypatch.setattr(cli, "CONFIG_PATH", tmp_path / "no-config.toml")
+    monkeypatch.delenv("COCCO_URL", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    def run(*argv: str) -> int:
+        return cli.main(["--url", "http://testserver", *argv])
+
+    challenge = world["challenge"]
+    assert run("pull", str(challenge), "-o", "checkout") == 0
+    monkeypatch.chdir(tmp_path / "checkout")
+    Path("tests/01.out").write_text("output 01, fixed\n")
+    await _execute(app_engine, update(Challenge).where(Challenge.c.id == challenge)
+                   .values(description="Edited on the web."))
+
+    assert run("push") == 1
+    assert "cocco pull" in capsys.readouterr().err
+
+    assert run("pull") == 0
+    assert Path(STATEMENT_NAME).read_text() == "Edited on the web."
+    assert Path("tests/01.out").read_text() == "output 01, fixed\n"
+
+    assert run("push") == 0
+    async with app_engine.connect() as conn:
+        row = (await conn.execute(select(Challenge).where(
+            Challenge.c.id == challenge))).one()
+    assert row.description == "Edited on the web."
+    assert world["storage"].read(f"challenge_{challenge}/01.out") == "output 01, fixed\n"
+
+    capsys.readouterr()
+    assert run("pull") == 0
+    assert "already up to date" in capsys.readouterr().out
 
 
 # ── the round trip ──────────────────────────────────────────────────────────

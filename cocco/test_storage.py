@@ -222,3 +222,14 @@ def test_a_root_that_predates_compression_is_refused(tmp_path: Path):
 def test_a_root_that_does_not_exist_yet_is_not_a_refusal(tmp_path: Path):
     """`cocco-web` asks before `Storage` has had a chance to create it."""
     check_storage_format(tmp_path / "nothing-here")
+
+
+def test_a_stamp_moves_when_a_file_is_rewritten(storage: Storage):
+    """What a challenge's version is made of, so a rewrite must show in it."""
+    assert storage.stamp("challenge_1/01.in") is None
+    storage.write("challenge_1/01.in", "one")
+    first = storage.stamp("challenge_1/01.in")
+    assert first is not None
+    assert storage.stamp("challenge_1/01.in") == first
+    storage.write("challenge_1/01.in", "a longer one")
+    assert storage.stamp("challenge_1/01.in") != first

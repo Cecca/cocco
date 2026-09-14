@@ -236,6 +236,20 @@ class Storage(object):
         size of what was put in. `save_stream` returns that."""
         return self.resolve(path).stat().st_size
 
+    def stamp(self, path: Path | str) -> tuple[int, int] | None:
+        """A stored file's (bytes on disk, mtime in ns), or None if it is missing.
+
+        What a challenge's version is made of instead of the file's contents
+        (see `_challenge_version` in `main.py`): every write here replaces the
+        file and so moves its mtime, and a `stat` is what a version can afford
+        to ask per test case where a read is not.
+        """
+        try:
+            result = self.resolve(path).stat()
+        except FileNotFoundError:
+            return None
+        return result.st_size, result.st_mtime_ns
+
     def delete(self, path: Path | str) -> None:
         """Remove a file. Missing files are not an error: the caller is usually
         deleting a database row whose file may already be gone."""

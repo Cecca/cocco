@@ -68,6 +68,7 @@ from fastapi import (
     FastAPI,
     File,
     Form,
+    Header,
     HTTPException,
     Query,
     Request,
@@ -5138,27 +5139,35 @@ async def api_list_challenges(db: DBDep, user: ApiUser):
     )
 
 
-@app.get("/api/challenges/{challenge_id}")
-async def api_export_challenge(
-    challenge_id: int, db: DBDep, role: ApiChallengeEditor
-):
-    """The whole challenge as a zip: manifest, statement, test data, evaluator.
+@dataclass(frozen=True)
+class _ChallengeSnapshot:
+    """What an export of a challenge is made of, read once, so that a zip and
+    the version it is sent with describe the same rows."""
 
-    Retired and hidden test cases are **included**, carrying their flags. This
-    is the staff view - the same reason `query_challenge_testcases` does not
-    filter `is_active` while the challenge page's `samples` CTE does - and a
-    round trip that silently dropped every retired case would lose data on the
-    way back in.
+    manifest: Manifest
+    statement: str
+    rows: list
+    evaluator_path: str | None
 
-    The zip is built into a temporary file rather than into memory: one test
-    case may be 32 MB and there is no limit on how many there are. The file is
-    unlinked by a background task once the response has been sent.
-    """
+    def stored_files(self) -> list[tuple[str, str]]:
+        """`(path in storage, name in the archive)` for every file exported."""
+        files = []
+        for row, entry in zip(self.rows, self.manifest.testcases):
+            files.append((row.input_path, entry.input))
+            files.append((row.expected_output_path, entry.expected_output))
+        if self.evaluator_path is not None and self.manifest.evaluator is not None:
+            files.append((self.evaluator_path, self.manifest.evaluator))
+        return files
+
+
+async def _challenge_snapshot(
+    db: AsyncConnection, challenge_id: int
+) -> _ChallengeSnapshot | None:
     challenge = await query_challenge_config(db, challenge_id)
     if challenge is None:
-        raise HTTPException(status_code=404)
+        return None
 
-    rows = await query_challenge_testcases(db, challenge_id)
+    rows = list(await query_challenge_testcases(db, challenge_id))
     evaluator_path = await query_evaluator_path(db, challenge_id)
     evaluator_name = (
         None if evaluator_path is None else evaluator_path.rsplit("/", 1)[-1]
@@ -5189,6 +5198,89 @@ async def api_export_challenge(
             for row in rows
         ),
     )
+    return _ChallengeSnapshot(
+        manifest=manifest,
+        statement=challenge.description or "",
+        rows=rows,
+        evaluator_path=evaluator_path,
+    )
+
+
+def _challenge_version(snapshot: _ChallengeSnapshot) -> str:
+    """The version of a challenge a pull records and a push's `If-Match` names.
+
+    Derived and never stored. A revision column would have to be bumped by
+    every route that touches a challenge, its test cases or their files, and
+    the one route that forgot would be a silent overwrite - the very thing the
+    version is for. So it is a digest of what the export carries: the manifest,
+    the statement, and each stored file's size and mtime rather than its bytes.
+    Reading every test case to answer a precondition would cost what the export
+    costs, and gzip's own header timestamp means the stored bytes of identical
+    contents differ anyway. A file rewritten with the same contents therefore
+    reads as a change, which costs one `cocco pull` that finds nothing to merge
+    - the safe direction to be wrong in.
+    """
+    stamps = []
+    for stored, name in snapshot.stored_files():
+        size, mtime_ns = storage.stamp(stored) or (-1, -1)
+        stamps.append((name, size, mtime_ns))
+    return transfer.challenge_version(snapshot.manifest, snapshot.statement, stamps)
+
+
+def _etag(version: str) -> str:
+    return f'"{version}"'
+
+
+def _etag_matches(header: str, version: str, *, weak: bool) -> bool:
+    """Whether an `If-Match` or `If-None-Match` header names `version`.
+
+    Either is `*` or a comma-separated list of entity tags. `If-None-Match`
+    compares weakly, so a `W/` tag still matches; `If-Match` compares strongly
+    and a weak tag never does (RFC 9110 §13.1).
+    """
+    for candidate in header.split(","):
+        candidate = candidate.strip()
+        if candidate == "*":
+            return True
+        if candidate.startswith("W/"):
+            if not weak:
+                continue
+            candidate = candidate[2:]
+        if candidate == _etag(version):
+            return True
+    return False
+
+
+@app.get("/api/challenges/{challenge_id}")
+async def api_export_challenge(
+    challenge_id: int,
+    db: DBDep,
+    role: ApiChallengeEditor,
+    if_none_match: Annotated[str | None, Header()] = None,
+):
+    """The whole challenge as a zip: manifest, statement, test data, evaluator.
+
+    Retired and hidden test cases are **included**, carrying their flags. This
+    is the staff view - the same reason `query_challenge_testcases` does not
+    filter `is_active` while the challenge page's `samples` CTE does - and a
+    round trip that silently dropped every retired case would lose data on the
+    way back in.
+
+    The zip is built into a temporary file rather than into memory: one test
+    case may be 32 MB and there is no limit on how many there are. The file is
+    unlinked by a background task once the response has been sent.
+
+    The challenge's version travels as the `ETag` (see `_challenge_version`),
+    and a request whose `If-None-Match` already names it is answered `304`
+    before the zip is built - which is what makes `cocco pull` on a challenge
+    nobody has touched cost one round trip rather than a download.
+    """
+    snapshot = await _challenge_snapshot(db, challenge_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404)
+    manifest, rows, evaluator_path = (
+        snapshot.manifest, snapshot.rows, snapshot.evaluator_path
+    )
 
     # A row may name a file that is not there - a failed commit after a write,
     # a storage root that moved, a database restored without its files. Asked
@@ -5213,6 +5305,13 @@ async def api_export_challenge(
             ),
         )
 
+    # Stamped before a single file is read, so a file rewritten while the zip
+    # is being built makes the version older than the contents rather than
+    # newer: the next push is refused needlessly, and never let through wrongly.
+    version = _challenge_version(snapshot)
+    if if_none_match is not None and _etag_matches(if_none_match, version, weak=True):
+        return Response(status_code=304, headers={"ETag": _etag(version)})
+
     handle = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
 
     # Every member is now inflated out of storage and deflated back into the
@@ -5231,12 +5330,9 @@ async def api_export_challenge(
                     ),
                 ),
             )
-            zf.writestr(STATEMENT_NAME, challenge.description or "")
-            for row, entry in zip(rows, manifest.testcases):
-                _zip_stored(zf, row.input_path, entry.input)
-                _zip_stored(zf, row.expected_output_path, entry.expected_output)
-            if evaluator_path is not None and manifest.evaluator is not None:
-                _zip_stored(zf, evaluator_path, manifest.evaluator)
+            zf.writestr(STATEMENT_NAME, snapshot.statement)
+            for stored, name in snapshot.stored_files():
+                _zip_stored(zf, stored, name)
         handle.close()
 
     try:
@@ -5249,7 +5345,10 @@ async def api_export_challenge(
     return FileResponse(
         handle.name,
         media_type="application/zip",
-        filename=f"challenge-{challenge_id}-{_slug(challenge.title)}.zip",
+        filename=f"challenge-{challenge_id}-{_slug(manifest.title)}.zip",
+        # Given explicitly, because `FileResponse` would otherwise invent one
+        # from the temporary file's mtime - a tag that changes on every export.
+        headers={"ETag": _etag(version)},
         background=BackgroundTask(os.unlink, handle.name),
     )
 
@@ -5324,8 +5423,20 @@ async def api_import_challenge(
     db: DBDep,
     role: ApiChallengeEditor,
     file: Annotated[UploadFile, File()],
+    if_match: Annotated[str | None, Header()] = None,
 ):
     """Apply a pushed zip to the challenge named in the URL.
+
+    A push based on an older version is a **412**, asked before the upload is
+    read. `If-Match` names the version the pusher last pulled or pushed, so a
+    mismatch means the challenge was changed since - on the web, or from
+    another checkout - and applying the zip would silently undo that. Without
+    the header a push is applied unconditionally, as it always was: that is
+    `cocco push --force`, and a zip pushed by hand. The response carries the
+    version the push produced, which is what lets the next one be conditional.
+    The check and the write are not one transaction, so a web edit landing
+    between them is still overwritten; closing that would take a lock every
+    editor route agreed to take, for a window of one request.
 
     Deliberately an update and never a create: the challenge a push lands on is
     the one in the path, so a manifest carries no id and a directory copied
@@ -5340,6 +5451,21 @@ async def api_import_challenge(
 
     def refuse(message: str):
         return JSONResponse({"detail": message}, status_code=400)
+
+    if if_match is not None:
+        current = await _challenge_snapshot(db, challenge_id)
+        if current is None:
+            raise HTTPException(status_code=404)
+        if not _etag_matches(if_match, _challenge_version(current), weak=False):
+            return JSONResponse(
+                {
+                    "detail": (
+                        "This challenge has changed since the version this push "
+                        "was based on. Pull it again first."
+                    )
+                },
+                status_code=412,
+            )
 
     # Streamed to disk, not read: a push carries every test case at once.
     upload = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
@@ -5533,9 +5659,16 @@ async def api_import_challenge(
         upload.close()
         os.unlink(upload.name)
 
+    # After the superseded files are gone, though they are not part of it: this
+    # is the version the next export will report, so it must be read from the
+    # same state that export will see.
+    after = await _challenge_snapshot(db, challenge_id)
+    version = None if after is None else _challenge_version(after)
+
     return JSONResponse(
         {
             "challenge_id": challenge_id,
+            "version": version,
             "title": manifest.title,
             "testcases": {
                 "updated": len(plan.updated),

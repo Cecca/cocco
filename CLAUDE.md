@@ -671,6 +671,30 @@ second opinion — and `_check_evaluator_source` is the size/extension/UTF-8 cha
 `post_evaluator`, because a script the browser accepted and the CLI refused would be a difference
 nobody could explain.
 
+**A pulled directory remembers where it came from, and a push is conditional on it.** `cocco pull`
+writes `.cocco/state.toml` — the server's URL, the challenge id, the version it pulled and a
+fingerprint per file — and a `.gitignore` of `*` beside it, because that version is what *this*
+checkout agreed with the server on and a colleague's clone has agreed with nothing. The version is
+the export's `ETag` and goes back as the push's `If-Match`, so a challenge edited on the web since
+is a **412** where it used to be silently overwritten; an unchanged one answers a pull's
+`If-None-Match` with a 304. It is **derived, never stored**: `_challenge_version` digests the
+manifest, the statement and each stored file's *size and mtime*, because a revision column would
+have to be bumped by every route that touches a challenge or its files and the one that forgot
+would be exactly the overwrite this exists to stop — and mtime rather than content, because gzip's
+header timestamp makes identical plaintext differ on disk and reading every test case for a
+precondition costs what the export does. A file rewritten with the same bytes therefore reads as a
+change, which costs one pull that finds nothing to merge. A pull into a directory with state is a
+**three-way comparison per file** (`reconcile` in `cli.py`): changed only on the server is taken,
+changed only here is kept, changed on both is refused — or with `--force` taken after the local
+copy is moved into `.cocco/discarded/` — and a file the server no longer has is removed, which is
+what stops a stale `tests/` file breaking the next push. `challenge.toml` is fingerprinted as the
+manifest it *means*, `dump_manifest(parse_manifest(…))`, since the server writes it its own way and
+a byte comparison would make every hand-edited manifest a conflict. The URL in the state is
+**compared and never used**: a token goes wherever the URL points and a directory is something
+people hand around, so a mismatch is refused naming the `--url` to pass. `If-Match` stays optional
+on the server — that is `cocco push --force`, and a zip pushed by hand — and the check is not in
+the push's transaction, so a web edit landing inside that one request is still lost.
+
 **Authentication is `ApiUser`, and it is the one identity in the app that is not a cookie.**
 `get_api_user` tries `Authorization: Bearer`, then the session — that last so a signed-in browser
 can follow a plain link to an export URL, and safe on the mutating half for the reason every other

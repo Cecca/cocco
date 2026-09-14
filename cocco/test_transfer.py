@@ -19,6 +19,7 @@ from cocco.transfer import (
     Manifest,
     ManifestError,
     ManifestTestCase,
+    challenge_version,
     dump_manifest,
     parse_manifest,
     plan_testcases,
@@ -197,6 +198,30 @@ def test_renaming_an_input_replaces_the_test_case():
     ))
     assert [a.entry.input for a in plan.added] == ["tests/renamed.in"]
     assert sorted(tc.input_name for tc in plan.deleted) == ["01.in", "02.in"]
+
+
+def test_the_version_moves_with_anything_an_export_carries():
+    files = [("tests/01.in", 3, 100), ("tests/01.out", 2, 100)]
+    base = challenge_version(a_manifest(), "Find them.", files)
+
+    assert base == challenge_version(a_manifest(), "Find them.", list(reversed(files)))
+    assert base != challenge_version(a_manifest(title="Three Sum"), "Find them.", files)
+    assert base != challenge_version(a_manifest(), "Find them fast.", files)
+    assert base != challenge_version(
+        a_manifest(), "Find them.", [("tests/01.in", 3, 101), ("tests/01.out", 2, 100)]
+    )
+    assert base != challenge_version(
+        a_manifest(), "Find them.", [("tests/01.in", 4, 100), ("tests/01.out", 2, 100)]
+    )
+
+
+def test_the_version_ignores_the_manifest_header():
+    """The header is a comment the server writes; rewording it must not make
+    every checkout look stale."""
+    manifest = a_manifest()
+    assert challenge_version(manifest, "", []) == challenge_version(
+        parse_manifest(dump_manifest(manifest, "# reworded\n")), "", []
+    )
 
 
 def test_an_empty_manifest_retires_or_deletes_everything():

@@ -21,7 +21,9 @@ unique within a challenge; `tests/` keeps exactly that shape.
     evaluator/check.py only when the challenge has an uploaded evaluator
 """
 
+import hashlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -39,9 +41,13 @@ TESTS_DIR = "tests"
 EVALUATOR_DIR = "evaluator"
 
 HEADER = """\
-# A cocco challenge. Edit these files and push the directory back with
+# A cocco challenge. Edit these files, then push them back from this directory:
 #
-#     cocco push {challenge_id} .
+#     cocco push
+#
+# (or `cocco push {challenge_id} <directory>` from anywhere else). If the
+# challenge was changed on the web in the meantime, the push is refused until
+# `cocco pull` has brought those changes in.
 #
 # The problem statement is {statement}, in markdown, and the test data is in
 # {tests}/. The order of the [[testcase]] blocks below is the order the judge
@@ -197,6 +203,31 @@ def dump_manifest(manifest: Manifest, header: str = "") -> str:
     body = toml.dumps(document).replace("[[testcase]]", "\n[[testcase]]")
     body = re.sub(r"\n{3,}", "\n\n", body).strip() + "\n"
     return f"{header}\n{body}" if header else body
+
+
+def challenge_version(
+    manifest: Manifest, statement: str, files: Iterable[tuple[str, int, int]]
+) -> str:
+    """A digest of everything an export carries: the version a pull records and
+    a push's `If-Match` names.
+
+    `files` is `(name in the archive, size, mtime in ns)` per stored file rather
+    than the file's bytes - `_challenge_version` in `main.py` says why. The
+    manifest is hashed without its header, so rewording the comment at the top
+    of `challenge.toml` does not make every checkout look stale. Each part is
+    length-prefixed, so no statement can be spelled to look like a file entry.
+    """
+    digest = hashlib.sha256()
+    for part in (dump_manifest(manifest), statement):
+        data = part.encode("utf-8")
+        digest.update(f"{len(data)}:".encode())
+        digest.update(data)
+    for name, size, mtime_ns in sorted(files):
+        data = name.encode("utf-8")
+        digest.update(f"{len(data)}:".encode())
+        digest.update(data)
+        digest.update(f"{size}:{mtime_ns};".encode())
+    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------------------
