@@ -92,19 +92,51 @@ def _challenge_visible():
     )
 
 
+# The channel the web app tells the judge about new work on. `notify_queue` is
+# the one place it is sent from and `cocco.judge` the one place it is listened
+# on, so both ends read this name rather than spelling it.
+QUEUE_CHANNEL = "cocco_queue"
+
+
+async def notify_queue(conn: AsyncConnection) -> None:
+    """Tell any listening judge there is something queued. Does not commit.
+
+    `pg_notify` inside the caller's transaction, deliberately: PostgreSQL holds
+    a notification until its transaction commits and drops it on a rollback, so
+    a judge woken by it always finds the row it was woken for - never a wake-up
+    ahead of a row it cannot see yet, and never one for a row that did not
+    happen. It carries no payload: the judge's answer to it is the same claim
+    it makes on every poll, and the poll stays as the fallback for a
+    notification nobody was listening for.
+    """
+    await conn.execute(select(func.pg_notify(QUEUE_CHANNEL, "")))
+
+
 async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
     """Get a queued submission, along with all the data required to run it.
     Atomically set it to 'running'."""
-    # Get the submission to run, if any, and atomically sets it to running
+    # Get the submission to run, if any, and atomically sets it to running.
+    #
+    # `FOR UPDATE SKIP LOCKED` is what makes that "atomically" true with more
+    # than one claimer, and the judge now has several. Without it, a second
+    # claimer's subquery picks the row the first has locked, its UPDATE waits
+    # for the first to commit, and then - the subquery is not evaluated again -
+    # it claims the same row a second time: one submission, graded twice. With
+    # it, the second claimer passes over the locked row and takes the next one,
+    # and never waits on another claimer at all.
     submission = conn.execute(
         update(Submission)
         .where(
+            # Redundant with the lock below, and kept as the statement's own
+            # promise: whatever the subquery picked, only a queued row is taken.
+            Submission.c.status == SubmissionStatus.queued,
             Submission.c.id
             == (
                 select(Submission.c.id)
                 .where(Submission.c.status == SubmissionStatus.queued)
                 .order_by(Submission.c.enqueued)
                 .limit(1)
+                .with_for_update(skip_locked=True)
             ).scalar_subquery()
         )
         .values(status=SubmissionStatus.running, started_at=func.now())
@@ -139,6 +171,24 @@ async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
         test_cases=[schema.TestCase.model_validate(t) for t in tests],
         evaluator_path=challenge.evaluator_path,
         challenge_id=challenge.id,
+    )
+
+
+def requeue_submission(conn: Connection, submission_id: int) -> None:
+    """Put a claimed submission back on the queue, as if never picked up.
+
+    For a judge stopped mid-run. Only while it is still `running`, so a
+    submission that was meanwhile regraded, finished or deleted is left alone.
+    """
+    conn.execute(
+        update(Submission)
+        .where(
+            and_(
+                Submission.c.id == submission_id,
+                Submission.c.status == SubmissionStatus.running,
+            )
+        )
+        .values(status=SubmissionStatus.queued, started_at=None)
     )
 
 
@@ -324,8 +374,9 @@ async def insert_submission(
     filename: str,
     source: str,
 ) -> int:
-    """Enqueue a new submission. Like `insert_enrollment`, this does not commit:
-    the caller owns the transaction."""
+    """Enqueue a new submission, and wake the judge for it. Like
+    `insert_enrollment`, this does not commit: the caller owns the transaction,
+    and the notification goes out when - and only if - it commits."""
     stmt = (
         insert(Submission)
         .values(
@@ -338,7 +389,9 @@ async def insert_submission(
         )
         .returning(Submission.c.id)
     )
-    return (await conn.execute(stmt)).scalar_one()
+    submission_id = (await conn.execute(stmt)).scalar_one()
+    await notify_queue(conn)
+    return submission_id
 
 
 async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_id: int):
@@ -1230,7 +1283,8 @@ async def query_testcase(conn: AsyncConnection, challenge_id: int, testcase_id: 
 
 async def regrade_challenge(conn: AsyncConnection, challenge_id: int) -> int:
     """Throw away every recorded outcome of a challenge and requeue its
-    submissions. Returns how many were requeued.
+    submissions. Returns how many were requeued, and if that is any, wakes the
+    judge for them when the caller commits (`notify_queue`).
 
     This is how a fixed expected output or a corrected time limit is applied
     retroactively, without asking students to submit again. Two consequences are
@@ -1262,6 +1316,8 @@ async def regrade_challenge(conn: AsyncConnection, challenge_id: int) -> int:
         # queued submission as having finished.
         .values(status=SubmissionStatus.queued, started_at=None, finished_at=None)
     )
+    if result.rowcount:
+        await notify_queue(conn)
     return result.rowcount
 
 

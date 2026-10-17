@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from cocco.config import (
+    BOX_POOL_SIZE,
     DEFAULT_ALLOWED_DOMAINS,
     DEFAULT_DATABASE_URL,
     DEFAULT_FLAKE_REF,
@@ -251,6 +252,38 @@ def test_the_judge_gcroots_fall_back_to_the_home_state_directory(tmp_path, monke
     path.write_text("")
     expected = tmp_path / ".local" / "state" / "cocco" / "gcroots"
     assert load_config(path).judge.gcroots == expected
+
+
+def test_the_judge_concurrency_is_read(tmp_path):
+    path = tmp_path / "cocco.toml"
+    path.write_text("[judge]\nconcurrency = 3\n")
+    assert load_config(path).judge.concurrency == 3
+
+
+@pytest.mark.parametrize(
+    "cpus, expected", [(16, 8), (2, 1), (1, 1), (None, 1), (128, BOX_POOL_SIZE)]
+)
+def test_the_judge_concurrency_defaults_to_half_the_cpus(
+    tmp_path, monkeypatch, cpus, expected
+):
+    """Sized against the CPU, which is what runs out first, and never past the
+    box pool or below one worker."""
+    monkeypatch.setattr("cocco.config.os.process_cpu_count", lambda: cpus)
+    path = tmp_path / "cocco.toml"
+    path.write_text("[judge]\n")
+    assert load_config(path).judge.concurrency == expected
+
+
+@pytest.mark.parametrize(
+    "value", ["0", "-1", f"{BOX_POOL_SIZE + 1}", "true", '"8"', "2.5"]
+)
+def test_a_judge_concurrency_with_no_safe_reading_is_refused(tmp_path, value):
+    """Zero is a judge that grades nothing, and past the box pool the extra
+    workers only wait for a box - neither is a value to guess a meaning for."""
+    path = tmp_path / "cocco.toml"
+    path.write_text(f"[judge]\nconcurrency = {value}\n")
+    with pytest.raises(ConfigError, match="concurrency"):
+        load_config(path)
 
 
 def test_the_dev_table_is_read(tmp_path):

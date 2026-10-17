@@ -59,6 +59,12 @@ DEFAULT_STORAGE_ROOT = Path("/tmp/cocco-storage")
 # so the default changes nothing for a judge started from a checkout.
 DEFAULT_FLAKE_REF = "."
 
+# How many isolate boxes one judge may have open at once - the size of
+# `cocco.judge._IDS_POOL`. Here rather than in `judge.py` because
+# `[judge] concurrency` is checked against it at load, and a judge that waits on
+# its own pool for longer than it waits on the queue is a setting with no use.
+BOX_POOL_SIZE = 32
+
 
 # Who may tell cocco, through X-Forwarded-For and X-Forwarded-Proto, who the
 # client really is. Loopback in both spellings, because that is a reverse proxy
@@ -98,6 +104,25 @@ def default_gcroots() -> Path:
     state = os.environ.get("XDG_STATE_HOME")
     base = Path(state) if state else Path.home() / ".local" / "state"
     return base / "cocco" / "gcroots"
+
+
+def default_concurrency() -> int:
+    """How many jobs a judge has in flight when `[judge] concurrency` is unset:
+    half the host's hardware threads, within the box pool.
+
+    A function for `default_gcroots`'s reason - it reads the machine, and a
+    constant would read the one the module was imported on. Sized against the
+    CPU and not against the pool because the CPU is what runs out first: a box
+    is mostly a python starting up, and on a 16-thread host the judge stopped
+    getting faster at about 8 jobs in flight, with every box after that only
+    making the others slower. Half rather than all of them because hardware
+    threads are not cores, and the host also runs the compiler outside the box
+    and PostgreSQL.
+    """
+    # `process_cpu_count`, not `cpu_count`: the threads this process may run
+    # on, so a judge pinned to a few cores by systemd or a container sizes
+    # itself against those rather than against the whole machine.
+    return max(1, min(BOX_POOL_SIZE, (os.process_cpu_count() or 2) // 2))
 
 
 @dataclass(frozen=True)
@@ -182,7 +207,7 @@ class StorageConfig:
 
 @dataclass(frozen=True)
 class JudgeConfig:
-    """The two things only the judge reads, and the reason the first is a
+    """The settings only the judge reads, and the reason the first is a
     setting at all: a language entry in `languages.toml` names a runtime that
     some flake has to expose, and `build_runtime` shells out to `nix build` to
     get it - once for each, at startup, from `prewarm_runtimes`.
@@ -214,6 +239,11 @@ class JudgeConfig:
     # the web app and the judge share and it may well be on NFS; a GC root is
     # local to the machine whose store it protects, and means nothing on another.
     gcroots: Path = field(default_factory=default_gcroots)
+
+    # How many jobs the judge works on at once, each a worker task claiming the
+    # next one off the queue. Between 1 and `BOX_POOL_SIZE`: past the pool, the
+    # extra workers would only wait for a box.
+    concurrency: int = field(default_factory=default_concurrency)
 
 
 @dataclass(frozen=True)
@@ -453,7 +483,29 @@ def _load_judge_config(section: dict) -> JudgeConfig:
     return JudgeConfig(
         flake=section.get("flake") or DEFAULT_FLAKE_REF,
         gcroots=Path(gcroots) if gcroots else default_gcroots(),
+        concurrency=_load_concurrency(section),
     )
+
+
+def _load_concurrency(section: dict) -> int:
+    # Refused rather than defaulted, `[log] format`'s rule: a deployment that
+    # wrote `concurrency = 0` has a judge that never grades anything, and one
+    # that wrote 100 believes it is getting a throughput the box pool will not
+    # give it. Neither has a reading that is safe to guess. `bool` is excluded
+    # by name because TOML's `true` is an `int` to Python.
+    if "concurrency" not in section:
+        return default_concurrency()
+    value = section["concurrency"]
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= BOX_POOL_SIZE
+    ):
+        raise ConfigError(
+            f"[judge] concurrency = {value!r} must be a whole number from 1 to "
+            f"{BOX_POOL_SIZE}, the judge's box pool"
+        )
+    return value
 
 
 def _load_log_config(section: dict) -> LogConfig:

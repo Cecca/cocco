@@ -3,20 +3,25 @@ import asyncio
 import logging
 import os
 import shutil
+import signal
 import sys
 import tempfile
 import tomllib
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Sequence
 
+import psycopg
+from psycopg import sql
 from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
 from cocco import repository as repo
 from cocco.config import (
+    BOX_POOL_SIZE,
     DEFAULT_FLAKE_REF,
     ConfigError,
     config_path,
@@ -60,7 +65,7 @@ MAX_OUTPUT_LENGTH = 80000
 class BoxPool:
     """A pool of ids to be used with isolate boxes"""
 
-    def __init__(self, num_boxes: int = 32):
+    def __init__(self, num_boxes: int = BOX_POOL_SIZE):
         self._queue: asyncio.Queue[int] = asyncio.Queue()
         for i in range(num_boxes):
             self._queue.put_nowait(i)
@@ -348,130 +353,163 @@ async def isolate_run(
             raise RuntimeError(
                 f"isolate --init failed (rc={isolate_init.returncode}): {stderr.decode()}"
             )
-        box_path = Path(stdout.decode().strip()) / "box"
+        # From here on the box is initialised, and it is cleaned up whatever
+        # happens - a cancelled worker included, which is now routine (a judge
+        # stopping, a restart) and used to leave the box initialised for the
+        # next `--init` on that id to trip over. A run still in progress is
+        # stopped first, because a box cannot be cleaned up under it - with
+        # SIGTERM and not SIGKILL: isolate kills the box's processes on
+        # SIGTERM, while SIGKILL takes out only isolate itself and leaves the
+        # program running in its cgroup, unlimited, with the box still busy.
+        isolate_run = None
+        try:
+            box_path = Path(stdout.decode().strip()) / "box"
 
-        for box_name, source in box_files.items():
-            if os.path.isdir(source):
-                shutil.copytree(source, box_path / box_name)
-            else:
-                shutil.copy(source, box_path / box_name)
+            for box_name, source in box_files.items():
+                if os.path.isdir(source):
+                    shutil.copytree(source, box_path / box_name)
+                else:
+                    shutil.copy(source, box_path / box_name)
 
-        for box_name, source in compressed_box_files.items():
-            # One write, the same one `shutil.copy` above was already doing:
-            # the file is inflated straight into the box rather than through a
-            # plaintext copy somewhere else first. On a thread for
-            # `_feed_stdin`'s reason.
-            await asyncio.to_thread(expand, source, box_path / box_name)
+            for box_name, source in compressed_box_files.items():
+                # One write, the same one `shutil.copy` above was already doing:
+                # the file is inflated straight into the box rather than through a
+                # plaintext copy somewhere else first. On a thread for
+                # `_feed_stdin`'s reason.
+                await asyncio.to_thread(expand, source, box_path / box_name)
 
-        filtered_args = []
-        for arg in args:
-            # A name we placed ourselves is already in the box under exactly
-            # that name; the `isfile` heuristic below must not touch it.
-            if arg in box_files or arg in compressed_box_files:
-                filtered_args.append(arg)
-            elif os.path.isfile(arg):
-                arg = Path(arg)
-                shutil.copy(arg, box_path / arg.name)
-                filtered_args.append(arg.name)
-            elif os.path.isdir(arg):
-                arg = Path(arg)
-                shutil.copytree(arg, box_path / arg.name)
-                filtered_args.append(arg.name)
-            else:
-                filtered_args.append(arg)
+            filtered_args = []
+            for arg in args:
+                # A name we placed ourselves is already in the box under exactly
+                # that name; the `isfile` heuristic below must not touch it.
+                if arg in box_files or arg in compressed_box_files:
+                    filtered_args.append(arg)
+                elif os.path.isfile(arg):
+                    arg = Path(arg)
+                    shutil.copy(arg, box_path / arg.name)
+                    filtered_args.append(arg.name)
+                elif os.path.isdir(arg):
+                    arg = Path(arg)
+                    shutil.copytree(arg, box_path / arg.name)
+                    filtered_args.append(arg.name)
+                else:
+                    filtered_args.append(arg)
 
-        for f in additional_files:
-            if os.path.isfile(f):
-                shutil.copy(f, box_path / f.name)
-            elif os.path.isdir(f):
-                shutil.copytree(f, box_path / f.name)
+            for f in additional_files:
+                if os.path.isfile(f):
+                    shutil.copy(f, box_path / f.name)
+                elif os.path.isdir(f):
+                    shutil.copytree(f, box_path / f.name)
 
-        stdout_file = box_path / "_stdout"
-        stderr_file = box_path / "_stderr"
-        meta_file = f"/tmp/meta-{box_id}.txt"
-        isolate_run = await asyncio.create_subprocess_exec(
-            "isolate",
-            "--cg",
-            "--box-id",
-            str(box_id),
-            f"--time={time_limit}",
-            f"--cg-mem={mem_limit_kb}",
-            f"--processes={processes}",
-            "--dir=/nix/store",  # this allows running the compilers/interpreters
-            f"--meta={meta_file}",
-            f"--stdout={stdout_file.name}",
-            f"--stderr={stderr_file.name}",
-            "--run",
-            "--",
-            str(exe),
-            *filtered_args,
-            stdin=asyncio.subprocess.DEVNULL if stdin is None else asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        # This is `communicate()` written out, and it has to be: given a stdin
-        # pipe, that method closes it before returning *whether or not it was
-        # given anything to write*, so the box would see EOF while the feeder
-        # was still inflating into it. The two output pipes still have to be
-        # drained here rather than after the wait - isolate's own messages fill
-        # them, and a full pipe is a process that never exits. Both are then
-        # discarded: what the run printed is read back out of the box's own
-        # `_stdout` and `_stderr` below.
-        assert isolate_run.stdout is not None and isolate_run.stderr is not None
-        pumps = [_drain(isolate_run.stdout), _drain(isolate_run.stderr)]
-        if stdin is not None:
-            assert isolate_run.stdin is not None
-            pumps.append(_feed_stdin(isolate_run.stdin, stdin))
-        await asyncio.gather(*pumps)
-        await isolate_run.wait()
-
-        retcode = isolate_run.returncode
-        # Submitted programs may emit non-UTF-8 bytes; decode permissively
-        # rather than raising UnicodeDecodeError.
-        with open(stdout_file, "rb") as fp:
-            stdout = fp.read().decode("utf-8", errors="replace")
-        with open(stderr_file, "rb") as fp:
-            stderr = fp.read().decode("utf-8", errors="replace")
-
-        with open(meta_file) as fp:
-            meta = dict(line.strip().split(":", maxsplit=1) for line in fp.readlines())
-
-        ret = RunOutcome(
-            retcode=retcode or 127,
-            stdout=stdout,
-            stderr=stderr,
-            elapsed_time_s=float(meta["time"]),
-            max_rss_kb=int(meta["max-rss"]),
-            status=meta.get("status", "OK"),
-            message=meta.get("message", None),
-            oom=meta.get("cg-oom-killed", "0").strip() == "1",
-        )
-        logger.debug(
-            "isolate run on box %s done: status=%s rc=%s time=%.3fs rss=%dKB",
-            box_id,
-            ret.status,
-            ret.retcode,
-            ret.elapsed_time_s,
-            ret.max_rss_kb,
-        )
-
-        isolate_cleanup = await asyncio.create_subprocess_exec(
-            "isolate",
-            "--cg",
-            "--box-id",
-            str(box_id),
-            "--cleanup",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await isolate_cleanup.communicate()
-        if isolate_cleanup.returncode != 0:
-            raise RuntimeError(
-                f"isolate --cleanup failed (rc={isolate_cleanup.returncode}):\n"
-                f"{stdout.decode()}\n{stderr.decode()}"
+            stdout_file = box_path / "_stdout"
+            stderr_file = box_path / "_stderr"
+            meta_file = f"/tmp/meta-{box_id}.txt"
+            isolate_run = await asyncio.create_subprocess_exec(
+                "isolate",
+                "--cg",
+                "--box-id",
+                str(box_id),
+                f"--time={time_limit}",
+                f"--cg-mem={mem_limit_kb}",
+                f"--processes={processes}",
+                "--dir=/nix/store",  # this allows running the compilers/interpreters
+                f"--meta={meta_file}",
+                f"--stdout={stdout_file.name}",
+                f"--stderr={stderr_file.name}",
+                "--run",
+                "--",
+                str(exe),
+                *filtered_args,
+                stdin=asyncio.subprocess.DEVNULL if stdin is None else asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
+            # This is `communicate()` written out, and it has to be: given a stdin
+            # pipe, that method closes it before returning *whether or not it was
+            # given anything to write*, so the box would see EOF while the feeder
+            # was still inflating into it. The two output pipes still have to be
+            # drained here rather than after the wait - isolate's own messages fill
+            # them, and a full pipe is a process that never exits. Both are then
+            # discarded: what the run printed is read back out of the box's own
+            # `_stdout` and `_stderr` below.
+            assert isolate_run.stdout is not None and isolate_run.stderr is not None
+            pumps = [_drain(isolate_run.stdout), _drain(isolate_run.stderr)]
+            if stdin is not None:
+                assert isolate_run.stdin is not None
+                pumps.append(_feed_stdin(isolate_run.stdin, stdin))
+            await asyncio.gather(*pumps)
+            await isolate_run.wait()
 
+            retcode = isolate_run.returncode
+            # Submitted programs may emit non-UTF-8 bytes; decode permissively
+            # rather than raising UnicodeDecodeError.
+            with open(stdout_file, "rb") as fp:
+                stdout = fp.read().decode("utf-8", errors="replace")
+            with open(stderr_file, "rb") as fp:
+                stderr = fp.read().decode("utf-8", errors="replace")
+
+            with open(meta_file) as fp:
+                meta = dict(line.strip().split(":", maxsplit=1) for line in fp.readlines())
+
+            ret = RunOutcome(
+                retcode=retcode or 127,
+                stdout=stdout,
+                stderr=stderr,
+                elapsed_time_s=float(meta["time"]),
+                max_rss_kb=int(meta["max-rss"]),
+                status=meta.get("status", "OK"),
+                message=meta.get("message", None),
+                oom=meta.get("cg-oom-killed", "0").strip() == "1",
+            )
+            logger.debug(
+                "isolate run on box %s done: status=%s rc=%s time=%.3fs rss=%dKB",
+                box_id,
+                ret.status,
+                ret.retcode,
+                ret.elapsed_time_s,
+                ret.max_rss_kb,
+            )
+        except BaseException:
+            if isolate_run is not None and isolate_run.returncode is None:
+                with suppress(ProcessLookupError):
+                    isolate_run.terminate()
+                try:
+                    await asyncio.wait_for(isolate_run.wait(), 10)
+                except TimeoutError:
+                    # The last resort, which leaves the box busy: logged
+                    # below when the cleanup fails, rather than a judge that
+                    # cannot stop.
+                    with suppress(ProcessLookupError):
+                        isolate_run.kill()
+                    await isolate_run.wait()
+            # Logged rather than raised: the exception on its way out says what
+            # went wrong, and a cleanup failure must not replace it.
+            try:
+                await _cleanup_box(box_id)
+            except Exception:
+                logger.exception("could not clean up box %s", box_id)
+            raise
+
+        await _cleanup_box(box_id)
         return ret
+
+
+async def _cleanup_box(box_id: int) -> None:
+    isolate_cleanup = await asyncio.create_subprocess_exec(
+        "isolate",
+        "--cg",
+        "--box-id",
+        str(box_id),
+        "--cleanup",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await isolate_cleanup.communicate()
+    if isolate_cleanup.returncode != 0:
+        raise RuntimeError(
+            f"isolate --cleanup failed (rc={isolate_cleanup.returncode}):\n"
+            f"{stdout.decode()}\n{stderr.decode()}"
+        )
 
 
 @dataclass
@@ -1050,6 +1088,10 @@ async def run_from_queue(engine: Engine, storage: Storage) -> bool:
     # `connect`, not `begin`: pull_queued_submission commits by itself as soon
     # as it has claimed the submission, so that the row lock is not held while
     # the challenge and its test cases are read.
+    #
+    # Nothing in the claim may await for real: it holds a pooled sync
+    # connection, and with several workers on one loop, a claim that yielded
+    # would let the others pile up connections behind it.
     with engine.connect() as conn:
         run_data = await repo.pull_queued_submission(conn)
         if run_data is None:
@@ -1077,6 +1119,19 @@ async def run_from_queue(engine: Engine, storage: Storage) -> bool:
             # output some flake has to expose, and an installed judge has no
             # checkout to assume.
             outcomes = await run_submission(storage, run_data)
+        except asyncio.CancelledError:
+            # The judge is stopping - SIGTERM, a restart - with this one half
+            # graded. It goes back on the queue for the next judge rather than
+            # staying `running` forever, which is not just a stale badge: a
+            # running submission refuses every regrade and every delete of its
+            # challenge until somebody fixes the row by hand.
+            with engine.begin() as conn:
+                repo.requeue_submission(conn, run_data.submission_id)
+            logger.info(
+                "submission %s interrupted; put back on the queue",
+                run_data.submission_id,
+            )
+            raise
         except Exception as e:
             logger.exception(
                 "submission %s failed during execution; marking as judge_internal_error",
@@ -1112,13 +1167,145 @@ async def run_from_queue(engine: Engine, storage: Storage) -> bool:
     return True
 
 
-async def run_loop(engine: Engine, storage: Storage, wait_time=5):
-    logger.info("judge run loop started (poll interval %ss)", wait_time)
+# Where a free worker looks for its next job, highest priority first: each entry
+# claims one job off its queue and runs it to the end, answering whether there
+# was one. A worker asks them in this order every time it is free, so the
+# priority is strict - nothing on a later queue starts while an earlier one has
+# work, however long it has waited. Exercise jobs go in front of the one entry
+# there is today: a student staring at Run is the most latency-sensitive person
+# in the building, and a regrade of 300 submissions must not hold a lesson up.
+QUEUES: tuple[Callable[[Engine, Storage], Awaitable[bool]], ...] = (run_from_queue,)
+
+
+async def run_next(engine: Engine, storage: Storage) -> bool:
+    """Run the most urgent job there is, if there is one."""
+    for take in QUEUES:
+        if await take(engine, storage):
+            return True
+    return False
+
+
+class Wakeup:
+    """What an idle worker sleeps on, so that a notification ends the sleep.
+
+    A worker takes a `ticket` *before* it looks at the queue and sleeps on that
+    ticket after finding nothing. `ring` sets the current ticket and hands out a
+    fresh one, so a notification that lands between the look and the sleep has
+    already set the ticket the worker is about to sleep on, and the sleep
+    returns at once - rather than the job waiting out the poll interval for a
+    wake-up that came a moment too early to be heard.
+    """
+
+    def __init__(self) -> None:
+        self._event = asyncio.Event()
+
+    def ticket(self) -> asyncio.Event:
+        return self._event
+
+    def ring(self) -> None:
+        self._event.set()
+        self._event = asyncio.Event()
+
+
+async def worker(engine: Engine, storage: Storage, wakeup: Wakeup, wait_time: float):
+    """Claim and run one job at a time, forever.
+
+    A failure stays with the job it happened in: logged, and the worker carries
+    on after the poll interval - a plain sleep rather than the ticket, so a
+    failure that repeats (the database gone) is not retried in a tight loop
+    every time somebody submits. Every worker is woken by every notification
+    and all but one find nothing; that is a handful of empty claims, and
+    cheaper than deciding which worker should go.
+    """
     while True:
-        has_run = await run_from_queue(engine, storage)
-        if not has_run:
-            logger.debug("judge waiting for %f seconds", wait_time)
+        ticket = wakeup.ticket()
+        try:
+            ran = await run_next(engine, storage)
+        except Exception:
+            logger.exception("judge worker failed; carrying on in %ss", wait_time)
             await asyncio.sleep(wait_time)
+            continue
+        if not ran:
+            logger.debug("judge worker waiting for up to %f seconds", wait_time)
+            with suppress(TimeoutError):
+                await asyncio.wait_for(ticket.wait(), wait_time)
+
+
+def _libpq_url(engine: Engine) -> str:
+    """The engine's database as a URL psycopg will take on its own.
+
+    The same URL with the `+psycopg` dropped, so the listener is pointed at
+    exactly the database the claims go to - an empty `postgresql+psycopg://`
+    included, which becomes `postgresql://` and is resolved by libpq from the
+    same PG* variables.
+    """
+    return engine.url.set(drivername="postgresql").render_as_string(
+        hide_password=False
+    )
+
+
+async def listen_for_work(engine: Engine, wakeup: Wakeup, retry_s: float):
+    """Ring `wakeup` whenever the web app enqueues something (`notify_queue`).
+
+    Its own connection, and an async psycopg one rather than one out of the
+    judge's sync engine: it spends its whole life parked on a socket waiting
+    for the server, which is what the event loop is for. Losing it costs
+    latency and nothing else, because the workers still poll - so a failure is
+    a warning and a reconnect, never a judge that stops. It rings once on every
+    (re)connect too, for whatever was enqueued while nobody was listening.
+    """
+    listen = sql.SQL("LISTEN {}").format(sql.Identifier(repo.QUEUE_CHANNEL))
+    while True:
+        try:
+            # Keepalives, because a connection that only ever waits sends
+            # nothing: dropped by a firewall or a failover, it would wait on a
+            # dead socket forever and the judge would quietly fall back to the
+            # poll. With them, the kernel notices within a couple of minutes.
+            async with await psycopg.AsyncConnection.connect(
+                _libpq_url(engine),
+                autocommit=True,
+                keepalives=1,
+                keepalives_idle=60,
+                keepalives_interval=10,
+                keepalives_count=6,
+            ) as conn:
+                await conn.execute(listen)
+                logger.debug("listening on %s", repo.QUEUE_CHANNEL)
+                wakeup.ring()
+                async for _ in conn.notifies():
+                    wakeup.ring()
+        except psycopg.Error as e:
+            logger.warning(
+                "lost the notification channel (%s); polling until it is back", e
+            )
+        await asyncio.sleep(retry_s)
+
+
+async def run_loop(
+    engine: Engine, storage: Storage, concurrency: int = 1, wait_time: float = 5
+):
+    """`concurrency` workers, each claiming and running one job at a time, and
+    the listener that wakes them.
+
+    Each worker claims on the event loop with the sync engine, which blocks the
+    others for the millisecond a claim takes and no longer: `SKIP LOCKED` means
+    a claim never waits on another claimer's lock. The box pool, not this, is
+    what bounds the sandboxes running at once.
+
+    It runs until it is cancelled, which is how the judge stops: every worker
+    then puts its half-graded submission back on the queue (`run_from_queue`)
+    and cleans up its boxes (`isolate_run`) on the way out.
+    """
+    logger.info(
+        "judge run loop started (%d workers, poll interval %ss)",
+        concurrency,
+        wait_time,
+    )
+    wakeup = Wakeup()
+    async with asyncio.TaskGroup() as tasks:
+        tasks.create_task(listen_for_work(engine, wakeup, wait_time))
+        for _ in range(concurrency):
+            tasks.create_task(worker(engine, storage, wakeup, wait_time))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1222,7 +1409,24 @@ def main(argv: list[str] | None = None) -> None:
         logger.error("%s", e)
         raise SystemExit(1)
 
-    asyncio.run(run_loop(engine, storage))
+    asyncio.run(_serve(engine, storage, config.judge.concurrency))
+    logger.info("judge stopped")
+
+
+async def _serve(engine: Engine, storage: Storage, concurrency: int) -> None:
+    """`run_loop` until SIGTERM, which is how systemd stops a unit.
+
+    SIGTERM's default is to die on the spot, leaving every submission in flight
+    `running` and every box initialised; cancelling instead is what lets each
+    worker put its submission back and clean up. Ctrl-C needs no handler -
+    `asyncio.run` already turns SIGINT into the same cancellation.
+    """
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    assert main_task is not None
+    loop.add_signal_handler(signal.SIGTERM, main_task.cancel)
+    with suppress(asyncio.CancelledError):
+        await run_loop(engine, storage, concurrency)
 
 
 if __name__ == "__main__":

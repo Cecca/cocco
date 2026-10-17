@@ -186,8 +186,8 @@ They are one table, `exercise_job`, with a `kind`, the `version_id` it runs agai
 
 ### The judge learns concurrency, a wake-up and a priority: phase 1, which helps challenges too
 
-1. **Concurrency.** `[judge] concurrency` jobs in flight (default 8), each a task claiming and
-   running a job. The tests of one exercise job run concurrently. The box pool caps how many
+1. **Concurrency.** `[judge] concurrency` jobs in flight (default: half the hardware threads the
+   judge may run on, 8 on step 0's host), each a task claiming and running a job. The tests of one exercise job run concurrently. The box pool caps how many
    boxes run at once. On step 0's 16-thread host, though, the **CPU** saturates first, at about
    8 tasks and about 220 python boxes per second. Eight jobs whose 5 tests all run concurrently
    would ask for 40 boxes, more than the pool's 32, and far more than the CPU can serve. The
@@ -400,7 +400,7 @@ The target spreads the 100 clicks over 10 s. That is about 50 boxes/s, well unde
 ceiling, so jobs barely queue, and p95 should be close to **one job's service time** (about
 0.2 s of boxes plus the claim and the poll). Step 11 re-measures on the lab host.
 
-### [ ] 1. Judge throughput
+### [x] 1. Judge throughput
 
 `[judge] concurrency`, with `config.py` validation and a `cocco.example.toml` entry. Worker tasks.
 `SKIP LOCKED` in `pull_queued_submission`. `LISTEN`/`NOTIFY`, with the `pg_notify` in

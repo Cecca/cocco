@@ -1,12 +1,17 @@
 import asyncio
+import contextlib
 import gzip
 import tempfile
 import textwrap
 from pathlib import Path
 
 import pytest
+from sqlalchemy import insert, select, text
 
 import cocco.judge as cj
+from cocco import model as cm
+from cocco.avatar import generate_identicon
+from cocco.repository import insert_submission
 from cocco.storage import Storage
 
 
@@ -733,3 +738,306 @@ async def test_a_graded_run_logs_with_its_submission_bound(monkeypatch, caplog):
     assert fields["submission_id"] == 812
     assert fields["challenge_id"] == 12
     assert fields["language"] == "python"
+
+
+########################################################################
+# the run loop: workers, the wake-up and the priority
+
+
+async def _cancel(task: asyncio.Task) -> None:
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def test_queues_are_asked_in_priority_order(monkeypatch):
+    """A free worker takes the first queue that has work, so nothing on a
+    later one starts while an earlier one has some."""
+    asked = []
+
+    def queue(name: str, has_work: bool):
+        async def take(engine, storage):
+            asked.append(name)
+            return has_work
+
+        return take
+
+    monkeypatch.setattr(
+        cj, "QUEUES", (queue("first", False), queue("second", True), queue("third", True))
+    )
+    assert await cj.run_next(None, None)
+    assert asked == ["first", "second"]
+
+
+async def test_the_workers_run_concurrently_up_to_the_box_pool(monkeypatch):
+    """More workers than boxes: the workers really do overlap - the pool ends
+    up full, not one box at a time - and the pool, not the worker count, is
+    what bounds the sandboxes open at once."""
+    monkeypatch.setattr(cj, "_IDS_POOL", cj.BoxPool(3))
+    remaining = 24
+    held: set[int] = set()
+    reused: list[int] = []
+    peak = 0
+    finished = 0
+    drained = asyncio.Event()
+
+    async def take(engine, storage):
+        nonlocal remaining, peak, finished
+        if not remaining:
+            return False
+        remaining -= 1
+        async with cj._IDS_POOL.acquire() as box_id:
+            # Recorded rather than asserted: a worker logs and survives an
+            # exception, so an assert here would only show up as a timeout.
+            if box_id in held:
+                reused.append(box_id)
+            held.add(box_id)
+            peak = max(peak, len(held))
+            await asyncio.sleep(0.01)
+            held.discard(box_id)
+        finished += 1
+        if finished == 24:
+            drained.set()
+        return True
+
+    async def no_listener(engine, wakeup, retry_s):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(cj, "QUEUES", (take,))
+    monkeypatch.setattr(cj, "listen_for_work", no_listener)
+
+    loop = asyncio.create_task(cj.run_loop(None, None, concurrency=8, wait_time=60))
+    try:
+        await asyncio.wait_for(drained.wait(), 5)
+    finally:
+        await _cancel(loop)
+    assert reused == []
+    assert peak == 3
+
+
+async def test_a_failing_job_does_not_take_its_worker_down(monkeypatch, caplog):
+    """The failure is logged and the worker carries on, rather than the whole
+    judge stopping with every other worker's submission half graded."""
+    calls = 0
+    recovered = asyncio.Event()
+
+    async def take(engine, storage):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("boom")
+        recovered.set()
+        return False
+
+    async def no_listener(engine, wakeup, retry_s):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(cj, "QUEUES", (take,))
+    monkeypatch.setattr(cj, "listen_for_work", no_listener)
+
+    loop = asyncio.create_task(cj.run_loop(None, None, concurrency=1, wait_time=0.05))
+    try:
+        await asyncio.wait_for(recovered.wait(), 5)
+    finally:
+        await _cancel(loop)
+    assert any("boom" in (r.exc_text or "") for r in caplog.records)
+
+
+async def test_sigterm_stops_the_judge_by_cancelling_it(monkeypatch):
+    """systemd's stop is a cancellation, so every worker gets to put its
+    submission back and clean its boxes up, instead of the process dying with
+    them `running`."""
+    import os
+    import signal
+
+    started = asyncio.Event()
+    cancelled = False
+
+    async def run_loop(engine, storage, concurrency):
+        nonlocal cancelled
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    monkeypatch.setattr(cj, "run_loop", run_loop)
+
+    async def serve():
+        # `_serve` installs its handler on the task it runs in, as it does on
+        # `asyncio.run`'s main task.
+        await cj._serve(None, None, 1)
+
+    task = asyncio.create_task(serve())
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(task, 5)
+    finally:
+        asyncio.get_running_loop().remove_signal_handler(signal.SIGTERM)
+    assert cancelled
+
+
+def test_a_ring_between_the_look_and_the_sleep_is_not_lost():
+    """The ticket is taken before the queue is looked at, so a notification
+    that arrives after the look has already ended the sleep that follows it."""
+    wakeup = cj.Wakeup()
+    ticket = wakeup.ticket()
+    wakeup.ring()
+    assert ticket.is_set()
+    assert not wakeup.ticket().is_set()
+
+
+def _user_and_challenge(db) -> tuple[int, int]:
+    with db.begin() as conn:
+        image, image_mime = generate_identicon("student")
+        user_id = conn.execute(
+            insert(cm.User)
+            .values(email="s@unipd.it", nickname="s", image=image, image_mime=image_mime)
+            .returning(cm.User.c.id)
+        ).scalar_one()
+        challenge_id = conn.execute(
+            insert(cm.Challenge)
+            .values(title="Hi", description="", max_memory_bytes=1 << 20, max_time_s=1.0)
+            .returning(cm.Challenge.c.id)
+        ).scalar_one()
+    return user_id, challenge_id
+
+
+def _listener_pids(db) -> list[int]:
+    """The backends listening on anything, which in a test is the judge's."""
+    with db.connect() as conn:
+        return list(
+            conn.execute(
+                text(
+                    "SELECT pid FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND query LIKE 'LISTEN %'"
+                )
+            ).scalars()
+        )
+
+
+async def _until(predicate, timeout: float = 5) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        assert asyncio.get_running_loop().time() < deadline, "timed out"
+        await asyncio.sleep(0.02)
+
+
+def _status(db, submission_id: int):
+    with db.connect() as conn:
+        return conn.execute(
+            select(cm.Submission.c.status, cm.Submission.c.started_at).where(
+                cm.Submission.c.id == submission_id
+            )
+        ).one()
+
+
+async def _enqueue(app_engine, user_id: int, challenge_id: int) -> int:
+    """A submission, the way `post_submission` makes one - notification and all."""
+    async with app_engine.connect() as conn:
+        submission_id = await insert_submission(
+            conn,
+            user_id=user_id,
+            challenge_id=challenge_id,
+            language="python",
+            filename="a.py",
+            source="",
+        )
+        await conn.commit()
+    return submission_id
+
+
+async def test_a_notification_wakes_an_idle_judge(db, app_engine, monkeypatch):
+    """A submission committed through the web app's own `insert_submission`
+    is picked up far sooner than the poll interval - here a minute - because
+    the commit notifies the judge. No sandbox: the grading is replaced."""
+
+    async def grade(storage, run_data):
+        return []
+
+    monkeypatch.setattr(cj, "run_submission", grade)
+    user_id, challenge_id = _user_and_challenge(db)
+
+    loop = asyncio.create_task(cj.run_loop(db, None, concurrency=2, wait_time=60))
+    try:
+        # Idle: both workers have looked, found nothing, and gone to sleep for
+        # the minute, and the listener is on the channel.
+        await _until(lambda: _listener_pids(db))
+        await asyncio.sleep(0.1)
+
+        start = asyncio.get_running_loop().time()
+        submission_id = await _enqueue(app_engine, user_id, challenge_id)
+        await _until(
+            lambda: _status(db, submission_id).status == cm.SubmissionStatus.done
+        )
+        elapsed = asyncio.get_running_loop().time() - start
+    finally:
+        await _cancel(loop)
+
+    assert elapsed < 1
+
+
+async def test_the_listener_comes_back_after_losing_its_connection(db, app_engine):
+    """A dropped channel costs latency until the reconnect, and nothing else."""
+    user_id, challenge_id = _user_and_challenge(db)
+    wakeup = cj.Wakeup()
+    listener = asyncio.create_task(cj.listen_for_work(db, wakeup, retry_s=0.05))
+    try:
+        await _until(lambda: _listener_pids(db))
+        [pid] = _listener_pids(db)
+        with db.connect() as conn:
+            conn.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": pid})
+        await _until(lambda: _listener_pids(db) not in ([], [pid]))
+
+        ticket = wakeup.ticket()
+        await _enqueue(app_engine, user_id, challenge_id)
+        await asyncio.wait_for(ticket.wait(), 5)
+    finally:
+        await _cancel(listener)
+
+
+async def test_a_judge_stopped_mid_run_puts_the_submission_back(db, app_engine, monkeypatch):
+    """Cancelled while grading - which is what SIGTERM now is - the submission
+    goes back to `queued` with no start time, rather than staying `running`
+    and refusing every regrade and delete of its challenge."""
+    grading = asyncio.Event()
+
+    async def grade(storage, run_data):
+        grading.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(cj, "run_submission", grade)
+    user_id, challenge_id = _user_and_challenge(db)
+    submission_id = await _enqueue(app_engine, user_id, challenge_id)
+
+    run = asyncio.create_task(cj.run_from_queue(db, None))
+    await asyncio.wait_for(grading.wait(), 5)
+    assert _status(db, submission_id).status == cm.SubmissionStatus.running
+
+    await _cancel(run)
+    assert tuple(_status(db, submission_id)) == (cm.SubmissionStatus.queued, None)
+
+
+@pytest.mark.integration
+async def test_a_cancelled_run_cleans_its_box_up():
+    """A box whose run is cancelled is cleaned up and its id handed back, so
+    the next `--init` on it finds nothing left behind."""
+    python = await cj.resolve_runtime("python3", "python")
+    pool = cj.BoxPool(1)
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "spin.py"
+        script.write_text("while True:\n    pass\n")
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(cj, "_IDS_POOL", pool)
+            run = asyncio.create_task(
+                cj.isolate_run(python, None, [str(script)], time_limit=30)
+            )
+            await asyncio.sleep(1)
+            await _cancel(run)
+
+            hello = Path(tmp) / "hello.py"
+            hello.write_text("print('again')\n")
+            res = await asyncio.wait_for(cj.isolate_run(python, None, [str(hello)]), 10)
+    assert res.stdout.strip() == "again"

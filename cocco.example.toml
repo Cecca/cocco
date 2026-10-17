@@ -70,7 +70,7 @@ root = "/var/lib/cocco/storage"
 # root needs nothing: it is created marked.
 
 [judge]
-# The two settings the web app never reads, and the first is the one an
+# The settings the web app never reads, and the first is the one an
 # installed judge cannot do without. A language in `languages.toml` names a
 # runtime - python3, gcc, jdk - that some flake has to expose, and the judge
 # runs `nix build` to get it. This says which flake.
@@ -111,6 +111,29 @@ flake = "/opt/cocco"
 # under `[storage] root` - that is the directory the web app and the judge
 # share, and may be on NFS, while a GC root means nothing off this machine.
 gcroots = "/var/lib/cocco/gcroots"
+
+# How many jobs the judge works on at once. Each is a worker claiming the next
+# job off the queue. Judges on several hosts can share a database, since a job
+# is claimed by exactly one of them; two on one host cannot, because each
+# numbers its isolate boxes from 0 and they would take each other's - raise
+# this instead.
+#
+# The default is half the hardware threads the judge may run on - those its
+# CPU affinity allows, so a unit pinned with CPUAffinity= counts only its own -
+# and it is sized against the
+# CPU rather than against anything else because the CPU is what runs out first.
+# A sandboxed run is mostly an interpreter starting up, and on a 16-thread
+# laptop the judge drained a queue about 9x faster with 8 workers than with
+# one - and no faster with 16, each run only getting slower. Raise it on a host
+# whose runs wait on something other than the CPU; lower it on one that also
+# serves the web app. From 1 to 32, the number of isolate boxes one judge uses.
+#
+# A new submission wakes the judge at once, through a PostgreSQL notification
+# the web app sends when it commits; the judge also looks every 5 seconds, so a
+# notification that went missing costs that long and no more.
+#
+# An example only, not the default - 6 on a 12-thread host:
+# concurrency = 6
 
 [session]
 # Set to true behind TLS, so the cookie is never sent in clear.

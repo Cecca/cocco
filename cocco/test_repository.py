@@ -1,12 +1,15 @@
+import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
+import psycopg
 import pytest
-from sqlalchemy import func, insert, or_, select, update
+from sqlalchemy import func, insert, or_, select, text, update
 
 import cocco.model as cm
 from cocco.avatar import generate_identicon
-from cocco.conftest import PUBLISHED
+from cocco.conftest import PUBLISHED, TEST_DATABASE
 from cocco.model import (
     Administrator,
     Challenge,
@@ -20,6 +23,7 @@ from cocco.model import (
 from cocco.model import LeaderboardRanking, UserRole
 from cocco.auth import get_or_create_user
 from cocco.repository import (
+    QUEUE_CHANNEL,
     block_user,
     challenge_in_course,
     count_running_submissions,
@@ -33,6 +37,7 @@ from cocco.repository import (
     insert_course,
     insert_enrollment,
     insert_self_enrollment,
+    insert_submission,
     insert_user,
     is_administrator,
     lock_challenge_submissions,
@@ -442,6 +447,143 @@ async def test_get_queued_submission_returns_none_when_empty(db):
     with engine.connect() as conn:
         result = await pull_queued_submission(conn)
     assert result is None
+
+
+def _user_and_challenge(engine) -> tuple[int, int]:
+    """One user and one challenge, ids returned, for a queue to be about."""
+    with engine.begin() as conn:
+        image, image_mime = generate_identicon("the-admin")
+        user_id = conn.execute(
+            insert(User)
+            .values(
+                email="me@unipd.it",
+                nickname="the-admin",
+                image=image,
+                image_mime=image_mime,
+            )
+            .returning(User.c.id)
+        ).scalar_one()
+        challenge_id = conn.execute(
+            insert(Challenge)
+            .values(
+                title="Hello",
+                description="say hi",
+                max_memory_bytes=1 << 20,
+                max_time_s=1.0,
+            )
+            .returning(Challenge.c.id)
+        ).scalar_one()
+    return user_id, challenge_id
+
+
+def _queue_submissions(engine, n: int) -> list[int]:
+    """`n` queued submissions to one challenge, oldest first."""
+    user_id, challenge_id = _user_and_challenge(engine)
+    now = datetime.now(timezone.utc)
+    with engine.begin() as conn:
+        return [
+            conn.execute(
+                insert(Submission)
+                .values(
+                    challenge_id=challenge_id,
+                    user_id=user_id,
+                    language="python",
+                    filename="solution.py",
+                    source=f"print({i})",
+                    status=cm.SubmissionStatus.queued,
+                    enqueued=now + timedelta(seconds=i),
+                )
+                .returning(Submission.c.id)
+            ).scalar_one()
+            for i in range(n)
+        ]
+
+
+async def test_a_claim_passes_over_a_row_another_claimer_holds(db):
+    """`SKIP LOCKED`: while one claimer has the oldest row locked, the next
+    takes the second oldest instead of waiting - and instead of claiming the
+    same row again once the first commits, which is what it used to do. The
+    lock timeout turns the old behaviour into a failure rather than a hang."""
+    engine = db
+    oldest, second = _queue_submissions(engine, 2)
+
+    with engine.connect() as holder:
+        holder.execute(
+            select(Submission.c.id).where(Submission.c.id == oldest).with_for_update()
+        )
+        with engine.connect() as conn:
+            conn.execute(text("SET lock_timeout = '2s'"))
+            result = await pull_queued_submission(conn)
+        holder.rollback()
+
+    assert result is not None
+    assert result.submission_id == second
+
+
+def test_concurrent_claimers_never_get_the_same_row(db):
+    """Eight claimers on eight connections, draining forty submissions at once:
+    every submission is claimed, and by exactly one of them."""
+    engine = db
+    queued = _queue_submissions(engine, 40)
+
+    def drain() -> list[int]:
+        claimed = []
+        with engine.connect() as conn:
+            while (run_data := asyncio.run(pull_queued_submission(conn))) is not None:
+                claimed.append(run_data.submission_id)
+        return claimed
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        claims = [i for ids in pool.map(lambda _: drain(), range(8)) for i in ids]
+
+    assert sorted(claims) == queued
+
+
+def _challenge_ids(engine) -> list[int]:
+    with engine.connect() as conn:
+        return list(conn.execute(select(Challenge.c.id)).scalars())
+
+
+def _listener():
+    """A connection listening on the judge's channel, the way the judge does."""
+    conn = psycopg.connect(f"postgresql:///{TEST_DATABASE}", autocommit=True)
+    conn.execute(f"LISTEN {QUEUE_CHANNEL}")
+    return conn
+
+
+async def test_a_submission_wakes_the_judge_when_it_commits(db, app_engine):
+    """The notification goes out with the commit and not before, so a judge
+    woken by it always finds the row it was woken for."""
+    user_id, challenge_id = _user_and_challenge(db)
+    with _listener() as listener:
+        async with app_engine.connect() as conn:
+            await insert_submission(
+                conn,
+                user_id=user_id,
+                challenge_id=challenge_id,
+                language="python",
+                filename="a.py",
+                source="",
+            )
+            assert list(listener.notifies(timeout=0.2)) == []
+            await conn.commit()
+        [notification] = listener.notifies(timeout=2, stop_after=1)
+        assert notification.channel == QUEUE_CHANNEL
+
+
+async def test_a_regrade_wakes_the_judge_unless_it_requeued_nothing(db, app_engine):
+    _queue_submissions(db, 1)
+    [challenge_id] = _challenge_ids(db)
+    with _listener() as listener:
+        async with app_engine.connect() as conn:
+            assert await regrade_challenge(conn, challenge_id=challenge_id + 1) == 0
+            await conn.commit()
+        assert list(listener.notifies(timeout=0.2)) == []
+
+        async with app_engine.connect() as conn:
+            assert await regrade_challenge(conn, challenge_id=challenge_id) == 1
+            await conn.commit()
+        assert len(list(listener.notifies(timeout=2, stop_after=1))) == 1
 
 
 # The json_agg / row_to_json queries backing the web pages. They return one
