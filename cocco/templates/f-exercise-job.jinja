@@ -1,0 +1,146 @@
+{# One Run or Check of the staff preview, swapped into #preview-result.
+
+   While the job is pending the element polls itself every half second and
+   is replaced, `outerHTML`, by each answer; the done copy has no trigger, so
+   swapping it in is what stops the poll.
+
+   Context: `job` (`query_preview_job`, or None with `message` for a request
+   that was refused before anything was queued), `result` (the parsed
+   `schema.ExerciseJobResult` once done), `tests` (a check's rows, with the
+   test each one ran and both outputs as marked lines), `course_id`, `set_id`.
+   Hidden tests are shown in full: this is staff's preview. #}
+
+{% set VERDICTS = {
+  "pass": "passed",
+  "fail": "wrong output",
+  "noerror": "no exception, one was expected",
+  "error": "error",
+  "timeout": "time limit exceeded",
+  "memory": "memory limit exceeded",
+  "no_report": "ended without reporting",
+  "truncated": "too much output",
+} %}
+
+{# How a run ended, when that is not simply "it printed this": the
+   exception with its explanation, the isolate verdict, the cut output. #}
+{% macro execution_notes(run) %}
+  {% if run.status == "timeout" %}
+  <p class="text-sm text-error">It did not finish in time.{% if run.message %} <span class="text-base-content/55">({{ run.message }})</span>{% endif %}</p>
+  {% elif run.status == "memory" %}
+  <p class="text-sm text-error">It ran out of memory.</p>
+  {% elif run.status == "no_report" %}
+  <p class="text-sm text-error">
+    The program ended without the harness reporting how — for example through
+    <code>os._exit()</code>.{% if run.message %} <span class="text-base-content/55">({{ run.message }})</span>{% endif %}
+  </p>
+  {% endif %}
+  {% if run.truncated %}
+  <p class="text-sm text-warning">It printed more than the limit; the output was cut.</p>
+  {% endif %}
+  {% if run.exception %}
+  <div class="text-sm">
+    <span class="font-mono font-semibold text-error">{{ run.exception.type }}</span>
+    <span class="text-base-content/70">— {{ error_hint(run.exception.type, run.exception.line) }}</span>
+  </div>
+  {% if run.exception.traceback %}
+  <details class="text-xs">
+    <summary class="cursor-pointer text-base-content/55">Traceback</summary>
+    <pre class="mt-1 max-h-48 overflow-auto rounded-md bg-neutral text-neutral-content p-2 font-mono whitespace-pre-wrap">{{ run.exception.traceback }}</pre>
+  </details>
+  {% endif %}
+  {% elif run.exit %}
+  <p class="text-sm text-base-content/70">It exited with code {{ run.exit }}.</p>
+  {% endif %}
+  {% if run.stderr %}
+  <details class="text-xs">
+    <summary class="cursor-pointer text-base-content/55">Standard error</summary>
+    <pre class="mt-1 max-h-48 overflow-auto rounded-md bg-base-200 p-2 font-mono whitespace-pre-wrap">{{ run.stderr }}</pre>
+  </details>
+  {% endif %}
+  {% if run.clipped %}
+  <p class="text-xs text-base-content/45">Only the start of the output was kept.</p>
+  {% endif %}
+{% endmacro %}
+
+{% macro marked(lines) -%}
+<pre class="mt-1 max-h-48 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono">
+{%- for line, flagged in lines -%}
+<span class="block min-h-[1lh] {{ 'bg-error/15 text-error' if flagged else '' }}">{{ line }}</span>
+{%- else -%}
+<span class="text-base-content/40">(nothing)</span>
+{%- endfor -%}
+</pre>
+{%- endmacro %}
+
+<div class="flex flex-col gap-3"
+     {% if job is not none and job.status.value != "done" %}
+     hx-get="{{ url_for('get_fragment_exercise_job', course_id=course_id, set_id=set_id, job_id=job.id) }}"
+     hx-trigger="every 500ms"
+     hx-swap="outerHTML"
+     {% endif %}>
+
+  {% if job is none %}
+  <div role="alert" class="alert alert-error text-sm"><span>{{ message }}</span></div>
+
+  {% elif job.status.value != "done" %}
+  <div class="flex items-center gap-2 text-sm text-base-content/70">
+    <span class="loading loading-spinner loading-sm"></span>
+    {{ "Running" if job.kind.value == "run" else "Checking" }} — {{ job.status.value }}…
+  </div>
+
+  {% elif result.kind == "error" %}
+  <div role="alert" class="alert alert-error text-sm"><span>{{ result.message }}</span></div>
+
+  {% elif result.kind == "run" %}
+  <div class="text-[11px] uppercase tracking-wider text-base-content/45">
+    Transcript · {{ "%.2f" | format(result.elapsed_s) }} s
+  </div>
+  <pre class="max-h-80 overflow-auto rounded-xl bg-neutral text-neutral-content p-3 text-xs font-mono whitespace-pre-wrap">{{ result.stdout or "(no output)" }}</pre>
+  {{ execution_notes(result) }}
+
+  {% elif result.kind == "check" %}
+  {% set n_passed = result.tests | selectattr("verdict", "equalto", "pass") | list | length %}
+  <div role="alert" class="alert {{ 'alert-success' if result.passed else 'alert-error' }} text-sm">
+    <span>
+      {% if result.passed %}Every test passed.{% else %}{{ n_passed }} of {{ result.tests | length }} tests passed.{% endif %}
+    </span>
+  </div>
+  {% for row in tests %}
+  {% set r = row.result %}
+  <div class="rounded-xl border {{ 'border-success/40' if r.verdict == 'pass' else 'border-error/40' }} p-3 flex flex-col gap-2">
+    <div class="flex flex-wrap items-center gap-2 text-sm">
+      <span class="font-mono font-semibold text-base-content/55">Test {{ row.n }}</span>
+      {% if r.hidden %}
+      <span class="badge badge-ghost badge-sm font-mono" title="A student sees only the verdict and the exception's type and line">hidden</span>
+      {% endif %}
+      <span class="font-mono font-semibold {{ 'text-success' if r.verdict == 'pass' else 'text-error' }}">
+        {{ "✓" if r.verdict == "pass" else "✗" }} {{ VERDICTS[r.verdict] }}
+      </span>
+      <span class="ml-auto text-xs font-mono text-base-content/45">{{ "%.2f" | format(r.elapsed_s) }} s</span>
+    </div>
+    {% if r.verdict != "pass" %}
+    {% if row.test is not none %}
+    <div>
+      <div class="text-[11px] uppercase tracking-wider text-base-content/45">Input</div>
+      <pre class="mt-1 max-h-32 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono whitespace-pre-wrap">{{ row.test.input or "(empty)" }}</pre>
+    </div>
+    {% endif %}
+    <div class="grid gap-2 sm:grid-cols-2">
+      <div>
+        <div class="text-[11px] uppercase tracking-wider text-base-content/45">Expected</div>
+        {{ marked(row.expected) }}
+      </div>
+      <div>
+        <div class="text-[11px] uppercase tracking-wider text-base-content/45">Printed</div>
+        {{ marked(row.actual) }}
+      </div>
+    </div>
+    {% if r.unordered and r.diff %}
+    <p class="text-xs text-base-content/55">The order of the lines does not matter here; the marked lines found no match.</p>
+    {% endif %}
+    {{ execution_notes(r) }}
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% endif %}
+</div>

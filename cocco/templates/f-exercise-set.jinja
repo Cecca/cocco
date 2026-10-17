@@ -1,0 +1,120 @@
+{# The set page's status: the latest version, its problems, and every version
+   with the current one marked.
+
+   It polls itself while any version is building, and the copy rendered once
+   none is carries no trigger - swapping that one in over itself (`outerHTML`)
+   is what stops the poll. A re-import sends a building copy out of band
+   (`oob`), which starts it again. No alert lives in here: the next poll would
+   wipe it, so a re-import's sentence goes to the form's own result box.
+
+   Context: `exercise_set` (`query_exercise_set`), `course_id`, `oob`. #}
+{% set latest = exercise_set.latest %}
+{% set current_id = exercise_set.current_version_id %}
+<div id="exercise-set-status"
+     {% if oob %}hx-swap-oob="true"{% endif %}
+     {% if exercise_set.any_building %}
+     hx-get="{{ url_for('get_fragment_exercise_set', course_id=course_id, set_id=exercise_set.id) }}"
+     hx-trigger="every 2s"
+     hx-swap="outerHTML"
+     {% endif %}>
+
+  <!-- ── THE LATEST VERSION ─────────────────────────────────────────── -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm">
+    <div class="card-body p-7">
+      <div class="flex flex-wrap items-center gap-3">
+        <h2 class="font-bold text-lg">Latest import</h2>
+        {% with status = latest.status, number = latest.number %}
+        {% include "_exercise-version-badge.jinja" %}
+        {% endwith %}
+      </div>
+      <p class="text-[13px] text-base-content/55">
+        Imported {{ latest.created_at | datetime }}.
+        {% if latest.status == "building" %}
+        The judge is running the solutions to compute the expected outputs.
+        {% elif latest.id == current_id %}
+        This is the current version: a new session is opened on it.
+        {% elif current_id %}
+        It did not build, so the current version is still the one marked below.
+        Fix the file and import it again.
+        {% else %}
+        It did not build, and no version of this set has, so there is nothing to
+        open a session on yet. Fix the file and import it again.
+        {% endif %}
+      </p>
+
+      {% if latest.problems %}
+      <div class="mt-3">
+        {% with problems = latest.problems,
+                link_version = latest.id if latest.status == "ready" else None,
+                set_id = exercise_set.id %}
+        {% include "_exercise-problems.jinja" %}
+        {% endwith %}
+      </div>
+      {% elif latest.status == "ready" %}
+      <p class="text-sm text-success mt-2">No problems found.</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- ── EVERY VERSION ──────────────────────────────────────────────── -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg">Versions</h2>
+      <p class="text-[13px] text-base-content/55">
+        Every import, newest first. A version is never changed once built; the
+        current one is the newest that built without errors.
+      </p>
+      <div class="overflow-x-auto mt-3">
+        <table class="table">
+          <thead>
+            <tr class="text-xs uppercase tracking-wider text-base-content/45 font-mono">
+              <th class="w-16">#</th>
+              <th>Title</th>
+              <th class="w-36">Status</th>
+              <th class="w-28 text-right">Exercises</th>
+              <th class="w-32 text-right">Problems</th>
+              <th class="w-56">Imported</th>
+              <th class="w-48"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for version in exercise_set.versions %}
+            <tr {% if version.id == current_id %}class="bg-primary/5"{% endif %}>
+              <td class="font-mono font-semibold text-base-content/50">v{{ version.number }}</td>
+              <td>
+                {{ version.title }}
+                {% if version.id == current_id %}
+                <span class="badge badge-primary badge-sm font-semibold ml-1">current</span>
+                {% endif %}
+              </td>
+              <td>
+                {% with status = version.status, number = None %}
+                {% include "_exercise-version-badge.jinja" %}
+                {% endwith %}
+              </td>
+              <td class="text-right font-mono text-sm">{{ version.n_exercises if version.n_exercises is not none else "—" }}</td>
+              <td class="text-right font-mono text-sm">
+                {% if version.status == "building" %}—{% else %}
+                <span class="{{ 'text-error' if version.n_errors else '' }}">{{ version.n_errors }}</span>
+                /
+                <span class="{{ 'text-warning' if version.n_warnings else '' }}">{{ version.n_warnings }}</span>
+                {% endif %}
+              </td>
+              <td class="text-xs text-base-content/55">{{ version.created_at | datetime }}</td>
+              <td class="text-right whitespace-nowrap">
+                {% if version.status == "ready" %}
+                <a href="{{ url_for('get_exercise_preview', course_id=course_id, set_id=exercise_set.id, version_id=version.id, n=1) }}"
+                   class="btn btn-xs btn-ghost border border-base-300">Preview</a>
+                {% endif %}
+                <a href="{{ url_for('get_exercise_version_source', course_id=course_id, set_id=exercise_set.id, version_id=version.id) }}"
+                   class="btn btn-xs btn-ghost">Download</a>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      <p class="text-xs text-base-content/45 mt-2">Problems are errors / warnings.</p>
+    </div>
+  </div>
+</div>

@@ -83,6 +83,68 @@
     </div>
     {% endfor %}
   </div>
+
+  {# Course staff only, and `get_course` does not even fetch the sets for
+     anybody else: a set is content being authored, and the class meets it
+     through a session. Every route behind this is `CourseEditor`'s. #}
+  {% if can_edit %}
+  <!-- ══ EXERCISES ═══════════════════════════════════════════════════ -->
+  <div class="mt-10 mb-3">
+    <h2 class="font-bold text-lg">Exercises</h2>
+    <p class="text-[13px] text-base-content/55">
+      Short Python exercises, imported from one Markdown file per set and run
+      by the judge. Only staff see this list.
+    </p>
+  </div>
+
+  <div class="flex flex-col gap-3">
+    {% for exercise_set in exercise_sets %}
+    <a href="{{ url_for('get_exercise_set', course_id=course.id, set_id=exercise_set.id) }}"
+       class="card bg-base-100 border border-base-300 shadow-sm hover:border-primary/50 transition-colors">
+      <div class="card-body flex-row flex-wrap items-center gap-4 px-5 py-4">
+        <div class="min-w-0 flex-1">
+          <div class="font-semibold">{{ exercise_set.title }}</div>
+          <div class="text-xs text-base-content/55 mt-0.5">
+            {% if exercise_set.current_number %}
+            v{{ exercise_set.current_number }} is current ·
+            {{ exercise_set.n_exercises }} exercise{{ "" if exercise_set.n_exercises == 1 else "s" }}
+            {% else %}
+            No version is ready yet.
+            {% endif %}
+          </div>
+        </div>
+        {% with status = exercise_set.latest_status, number = exercise_set.latest_number %}
+        {% include "_exercise-version-badge.jinja" %}
+        {% endwith %}
+      </div>
+    </a>
+    {% else %}
+    <div class="rounded-xl border border-dashed border-base-300 bg-base-200/40 px-4 py-8 text-center text-sm text-base-content/50">
+      No exercise sets yet.
+    </div>
+    {% endfor %}
+  </div>
+
+  <form hx-post="{{ url_for('post_exercise_set_new', course_id=course.id) }}"
+        hx-encoding="multipart/form-data"
+        hx-target="#exercise-import-result"
+        hx-swap="innerHTML"
+        class="mt-4 rounded-xl border border-base-300 bg-base-200/40 p-4">
+    <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Import a set</h3>
+    <div class="flex flex-wrap items-end gap-4">
+      <div>
+        <label class="text-xs text-base-content/55">Exercise file (.md)</label>
+        <input type="file" name="exercise_file" accept=".md,text/markdown" required
+               class="file-input file-input-sm w-72 mt-1" />
+      </div>
+      <button type="submit" class="btn btn-sm btn-primary">
+        <span class="submit-label">Import</span>
+        <span class="htmx-indicator loading loading-spinner loading-xs"></span>
+      </button>
+    </div>
+    <div id="exercise-import-result" class="empty:hidden mt-3"></div>
+  </form>
+  {% endif %}
   {% endif %}
 </main>
 {% endblock %}

@@ -1,0 +1,139 @@
+{% extends "base.jinja" %}
+{% block title %}Preview · {{ exercise.title }}{% endblock %}
+
+{% set crumbs = [
+  {"label": "Courses", "href": url_for('index')},
+  {"label": course.title, "href": url_for('get_course', course_id=course_id)},
+  {"label": exercise_set.title,
+   "href": url_for('get_exercise_set', course_id=course_id, set_id=exercise_set.id)},
+  {"label": "Preview"},
+] %}
+
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+
+  {# What this page is, before anything else on it: the solution and the
+     hidden tests are on screen, which no student page ever does. #}
+  <div role="alert" class="alert alert-info text-sm mb-6">
+    <span>
+      Staff preview of <span class="font-semibold">v{{ version.number }}</span>
+      {%- if version.id == exercise_set.current_version_id %} (the current version){% endif %}.
+      Run and Check go through the judge exactly as a student's would, and
+      nothing is recorded. A student sees the statement, the starter code, the
+      hints and the visible tests; the solution and the hidden tests are shown
+      here because you are staff.
+    </span>
+  </div>
+
+  <!-- ══ EXERCISE STRIP ═════════════════════════════════════════════ -->
+  <nav class="flex flex-wrap gap-2 mb-6" aria-label="Exercises">
+    {% for other in document.exercises %}
+    <a href="{{ url_for('get_exercise_preview', course_id=course_id, set_id=exercise_set.id, version_id=version.id, n=loop.index) }}"
+       title="{{ other.title }}"
+       class="btn btn-sm font-mono {{ 'btn-primary' if loop.index == n else 'btn-ghost border border-base-300' }}">
+      {{ "%02d" | format(loop.index) }}
+    </a>
+    {% endfor %}
+  </nav>
+
+  <div class="grid gap-6 lg:grid-cols-2">
+    <!-- ══ THE EXERCISE ═════════════════════════════════════════════ -->
+    <div class="card bg-base-100 border border-base-300 shadow-sm">
+      <div class="card-body p-7">
+        <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+          Exercise {{ "%02d" | format(n) }} of {{ document.exercises | length }}
+        </p>
+        <h1 class="font-serif text-3xl font-semibold tracking-tight">{{ exercise.title }}</h1>
+
+        <article class="prose prose-sm max-w-none mt-2">
+          {{ exercise.statement | markdown }}
+        </article>
+
+        <p class="text-xs text-base-content/55 mt-3">
+          Output check: {{ rules | join("; ") }}. Up to {{ "%g" | format(exercise.time_s) }} s per test.
+        </p>
+
+        {% if exercise.hints %}
+        <div class="mt-4 flex flex-col gap-2">
+          {% for hint in exercise.hints %}
+          <details class="rounded-lg border border-base-300 bg-base-200/40 px-3 py-2">
+            <summary class="cursor-pointer text-sm font-semibold">Hint {{ loop.index }}</summary>
+            <div class="prose prose-sm max-w-none mt-2">{{ hint | markdown }}</div>
+          </details>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        <h2 class="font-bold mt-6">Tests</h2>
+        <div class="flex flex-col gap-3 mt-2">
+          {% for test in exercise.tests %}
+          <div id="test-{{ loop.index }}"
+               class="rounded-xl border {{ 'border-dashed border-base-300 bg-base-200/30' if test.hidden else 'border-base-300' }} p-3">
+            <div class="flex items-center gap-2 text-xs font-mono font-semibold text-base-content/55">
+              Test {{ loop.index }}
+              {% if test.hidden %}
+              <span class="badge badge-ghost badge-sm font-mono">hidden · staff only</span>
+              {% endif %}
+            </div>
+            <div class="grid gap-2 sm:grid-cols-2 mt-2">
+              <div>
+                <div class="text-[11px] uppercase tracking-wider text-base-content/45">Input</div>
+                <pre class="mt-1 max-h-40 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono whitespace-pre-wrap">{{ test.input or "(empty)" }}</pre>
+              </div>
+              <div>
+                <div class="text-[11px] uppercase tracking-wider text-base-content/45">
+                  {{ "Expected error" if test.expected_error else "Expected output" }}
+                </div>
+                <pre class="mt-1 max-h-40 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono whitespace-pre-wrap">{{ test.expected_error or test.expected_output or "(nothing)" }}</pre>
+              </div>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+
+        {% if exercise.solution %}
+        <details class="mt-6 rounded-lg border border-base-300 px-3 py-2">
+          <summary class="cursor-pointer text-sm font-semibold">Solution · staff only</summary>
+          <pre id="preview-solution" class="mt-2 max-h-80 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono whitespace-pre">{{ exercise.solution }}</pre>
+          <button type="button" class="btn btn-xs btn-ghost border border-base-300 mt-2"
+                  onclick="document.getElementById('preview-source').value = document.getElementById('preview-solution').textContent">
+            Put it in the editor
+          </button>
+        </details>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- ══ THE EDITOR ═════════════════════════════════════════════════ -->
+    {# A plain textarea for now. Both buttons post this one form, so Check
+       sends the same code Run would; the stdin box is a Run's only. #}
+    <div class="card bg-base-100 border border-base-300 shadow-sm self-start">
+      <div class="card-body p-7">
+        <form class="flex flex-col gap-3" onsubmit="return false">
+          <label class="text-xs text-base-content/55" for="preview-source">Code</label>
+          <textarea id="preview-source" name="source" rows="16" spellcheck="false"
+                    class="textarea w-full font-mono text-sm leading-relaxed">{{ exercise.starter }}</textarea>
+          <label class="text-xs text-base-content/55" for="preview-stdin">Input for Run</label>
+          <textarea id="preview-stdin" name="stdin" rows="3" spellcheck="false"
+                    class="textarea w-full font-mono text-sm"></textarea>
+          <div class="flex gap-2">
+            <button type="button" class="btn btn-sm"
+                    hx-post="{{ url_for('post_exercise_preview_run', course_id=course_id, set_id=exercise_set.id, version_id=version.id, n=n) }}"
+                    hx-target="#preview-result"
+                    hx-swap="innerHTML">
+              ▶ Run
+            </button>
+            <button type="button" class="btn btn-sm btn-primary"
+                    hx-post="{{ url_for('post_exercise_preview_check', course_id=course_id, set_id=exercise_set.id, version_id=version.id, n=n) }}"
+                    hx-target="#preview-result"
+                    hx-swap="innerHTML">
+              ✓ Check
+            </button>
+          </div>
+        </form>
+        <div id="preview-result" class="mt-4"></div>
+      </div>
+    </div>
+  </div>
+</main>
+{% endblock %}

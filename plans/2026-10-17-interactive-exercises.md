@@ -492,7 +492,7 @@ Re-importing the file recovers a stuck build. Hard-kill recovery is a follow-up,
 and jobs alike (see Future work). A cancellation (`SIGTERM`, Ctrl-C) is handled: the job goes
 back on the queue.
 
-### [ ] 5. Authoring
+### [x] 5. Authoring
 
 The course page gets an **Exercises** section for staff. **Import a `.md` file** (an upload, as a
 test case is): it parses the file, creates a version and queues its build. The set page shows:
@@ -525,7 +525,8 @@ and the anonymous projector with the pacing and reveal controls.
 ### [ ] 9. Deletion and archiving
 
 `delete_course`'s cascade, session delete, the archived-course refusal on jobs, and a test that a
-judge finishing a job of a deleted course does not crash.
+judge finishing a job of a deleted course does not crash. Staff preview checks (`session_id`
+NULL) count towards nothing either, so `prune_run_jobs` should prune them with the runs.
 
 ### [ ] 10. Transfer (may slip to a follow-up)
 

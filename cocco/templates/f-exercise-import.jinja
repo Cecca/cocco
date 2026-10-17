@@ -1,0 +1,20 @@
+{# An import's answer, swapped into the import form's result box: the
+   sentence, then every problem the parse found.
+
+   On the course page it is only ever a refusal - success is a redirect. On
+   the set page it answers a re-import either way, and brings the set's status
+   with it out of band (`exercise_set` is then given): the status polls itself
+   and would wipe an alert kept inside it. #}
+<div role="alert" class="alert {{ 'alert-success' if ok else 'alert-error' }} text-sm mb-3">
+  <span>{{ message }}</span>
+</div>
+{% if problems %}
+{% with link_version = None %}
+{% include "_exercise-problems.jinja" %}
+{% endwith %}
+{% endif %}
+{% if exercise_set %}
+{% with oob = True %}
+{% include "f-exercise-set.jinja" %}
+{% endwith %}
+{% endif %}

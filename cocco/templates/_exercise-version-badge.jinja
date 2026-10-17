@@ -1,0 +1,13 @@
+{# A version's build status as a badge. Context: `status` (the enum's value,
+   as `row_to_json` has it) and, optionally, `number`, the version's rank
+   within its set. #}
+{% set prefix = "v" ~ number ~ " · " if number else "" %}
+{% if status == "building" %}
+<span class="badge badge-ghost gap-1.5 font-mono font-semibold">
+  <span class="loading loading-spinner loading-xs"></span>{{ prefix }}building
+</span>
+{% elif status == "ready" %}
+<span class="badge badge-success badge-outline font-mono font-semibold">{{ prefix }}ready</span>
+{% else %}
+<span class="badge badge-error badge-outline font-mono font-semibold">{{ prefix }}failed</span>
+{% endif %}

@@ -35,6 +35,7 @@ from cocco.model import (
     ExerciseJob,
     ExerciseJobKind,
     ExerciseJobStatus,
+    ExerciseSession,
     ExerciseSet,
     ExerciseSetVersion,
     ExerciseVersionStatus,
@@ -600,29 +601,347 @@ async def insert_exercise_job(
     stdin: str | None = None,
 ) -> int:
     """Enqueue an exercise job, and wake the judge for it. Does not commit,
-    for `insert_submission`'s reason.
+    for `insert_submission`'s reason. Answers the id of the job that is now
+    queued for this button.
 
-    A plain insert: a second queued Run or Check by the same person on the same
-    exercise is refused by `uq_exercise_job_one_queued` as an IntegrityError.
-    Replacing the queued one instead is the job routes' business.
+    The repeated-button rule lives here, as one upsert on
+    `uq_exercise_job_one_queued`: when the same person already has the same
+    kind of job queued on the same exercise of the same session - or preview -
+    the new code and stdin *replace* that job's, and its id is the answer. The
+    row keeps its `enqueued`, so mashing the button neither builds a backlog
+    nor sends its owner to the back of the queue, and a tab still polling the
+    old id finds the newest request's result there. A job that is already
+    `running` is outside the index's predicate, so it is never touched: the
+    new one is queued beside it. A build is outside the predicate as well, and
+    is always a new row.
+
+    An upsert rather than a delete-then-insert, so two clicks that race cannot
+    both win, and rather than a check before the insert, so a judge claiming
+    the queued row in between cannot turn the replacement into a second queued
+    job: PostgreSQL decides "conflict or not" against the committed claim.
     """
-    stmt = (
-        insert(ExerciseJob)
-        .values(
-            kind=kind,
-            status=ExerciseJobStatus.queued,
-            user_id=user_id,
-            version_id=version_id,
-            session_id=session_id,
-            exercise_index=exercise_index,
-            source=source,
-            stdin=stdin,
-        )
-        .returning(ExerciseJob.c.id)
+    stmt = pg_insert(ExerciseJob).values(
+        kind=kind,
+        status=ExerciseJobStatus.queued,
+        user_id=user_id,
+        version_id=version_id,
+        session_id=session_id,
+        exercise_index=exercise_index,
+        source=source,
+        stdin=stdin,
     )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[
+            ExerciseJob.c.user_id,
+            ExerciseJob.c.kind,
+            ExerciseJob.c.session_id,
+            ExerciseJob.c.version_id,
+            ExerciseJob.c.exercise_index,
+        ],
+        # The index's own predicate, which is what lets PostgreSQL infer the
+        # partial index as the arbiter.
+        index_where=text("status = 'queued' AND kind <> 'build'"),
+        set_={"source": stmt.excluded.source, "stdin": stmt.excluded.stdin},
+    ).returning(ExerciseJob.c.id)
     job_id = (await conn.execute(stmt)).scalar_one()
     await notify_queue(conn)
     return job_id
+
+
+# --- Exercise sets, the web app's side ----------------------------------------
+
+
+async def exercise_set_in_course(
+    conn: AsyncConnection, set_id: int, course_id: int
+) -> bool:
+    """`challenge_in_course` for an exercise set: the role comes from the
+    course in the URL, so the set in it is checked against that course rather
+    than trusted."""
+    stmt = select(ExerciseSet.c.id).where(
+        ExerciseSet.c.id == set_id, ExerciseSet.c.course_id == course_id
+    )
+    return (await conn.execute(stmt)).first() is not None
+
+
+async def insert_exercise_set(conn: AsyncConnection, course_id: int) -> int:
+    """A set with no version yet. Does not commit: an import creates the set,
+    its first version and the build in one transaction, so a file that fails
+    half-way leaves no empty set behind."""
+    stmt = insert(ExerciseSet).values(course_id=course_id).returning(ExerciseSet.c.id)
+    return (await conn.execute(stmt)).scalar_one()
+
+
+async def insert_exercise_version(
+    conn: AsyncConnection, set_id: int, source: str, title: str
+) -> int:
+    """A `building` version of a set: the source verbatim, the title from its
+    front matter. The build that finishes it is queued by the caller, in the
+    same transaction. Does not commit."""
+    stmt = (
+        insert(ExerciseSetVersion)
+        .values(
+            set_id=set_id,
+            source=source,
+            title=title,
+            status=ExerciseVersionStatus.building,
+        )
+        .returning(ExerciseSetVersion.c.id)
+    )
+    return (await conn.execute(stmt)).scalar_one()
+
+
+# Each version of the set, newest first, with what the set page shows about it:
+# its status, how many problems of each level it has and - once built - how
+# many exercises. `number` is its rank within the set, oldest first, so "v3"
+# means the third import of *this* set whatever the ids are. The problems
+# themselves are not listed, only counted: the page prints the latest version's
+# in full and nobody else's, and the fragment carrying this is polled.
+_EXERCISE_VERSIONS_CTE = """
+    versions AS (
+        SELECT v.id, v.set_id, v.title, v.status, v.created_at,
+               row_number() OVER (PARTITION BY v.set_id ORDER BY v.id) AS number,
+               jsonb_array_length(v.document -> 'exercises') AS n_exercises,
+               (SELECT count(*) FROM jsonb_array_elements(v.problems) p
+                WHERE p ->> 'level' = 'error') AS n_errors,
+               (SELECT count(*) FROM jsonb_array_elements(v.problems) p
+                WHERE p ->> 'level' = 'warning') AS n_warnings
+        FROM exercise_set_version v
+        JOIN exercise_set ON exercise_set.id = v.set_id
+        WHERE {where}
+    )
+"""
+
+
+# A set's title, which is its current version's: a failed re-import must not
+# rename the set it failed to change, on the course page or in the delete
+# dialog. The latest version's only while there is no current one - a set whose
+# first build has not succeeded yet still needs a name. Takes the `current` and
+# `latest` rows of `_EXERCISE_VERSIONS_CTE`.
+_EXERCISE_SET_TITLE_SQL = "coalesce(current.title, latest.title)"
+
+
+async def query_exercise_sets(conn: AsyncConnection, course_id: int):
+    """The exercise sets of a course, as its page lists them for staff.
+
+    The title and the exercise count are the current version's - see
+    `_EXERCISE_SET_TITLE_SQL` - and the status badge is the latest's, which is
+    what tells its author a re-import is building or broke.
+    """
+    query = text(f"""
+    WITH
+    {_EXERCISE_VERSIONS_CTE.format(where="exercise_set.course_id = :course_id")},
+    sets AS (
+        SELECT exercise_set.id, exercise_set.archived_at,
+               exercise_set.current_version_id,
+               {_EXERCISE_SET_TITLE_SQL} AS title,
+               latest.status AS latest_status,
+               latest.number AS latest_number,
+               current.number AS current_number,
+               current.n_exercises
+        FROM exercise_set
+        JOIN LATERAL (
+            SELECT * FROM versions WHERE versions.set_id = exercise_set.id
+            ORDER BY versions.id DESC LIMIT 1
+        ) latest ON true
+        LEFT JOIN versions current ON current.id = exercise_set.current_version_id
+        WHERE exercise_set.course_id = :course_id
+    )
+    SELECT coalesce(json_agg(sets ORDER BY sets.id), '[]'::json) FROM sets;
+    """)
+    return (await conn.execute(query, dict(course_id=course_id))).scalar()
+
+
+async def query_exercise_set(conn: AsyncConnection, set_id: int):
+    """The set page's document: the set and its title, every version of it
+    newest first, the latest version's problems in full, whether any version
+    is still building, and how many sessions it has.
+
+    No version's source or document: the page that polls this shows statuses,
+    and the preview reads a document through `query_exercise_version`.
+    """
+    query = text(f"""
+    WITH
+    {_EXERCISE_VERSIONS_CTE.format(where="v.set_id = :set_id")},
+    latest AS (
+        SELECT versions.*, v.problems
+        FROM versions JOIN exercise_set_version v USING (id)
+        ORDER BY versions.id DESC LIMIT 1
+    ),
+    s AS (
+        SELECT exercise_set.*,
+               {_EXERCISE_SET_TITLE_SQL} AS title,
+               row_to_json(latest) AS latest,
+               -- Any, not only the latest: two imports in quick succession are
+               -- two builds, and the older one finishing is news too.
+               EXISTS (SELECT 1 FROM versions WHERE status = 'building')
+                   AS any_building,
+               coalesce(
+                   (SELECT json_agg(versions ORDER BY versions.id DESC) FROM versions),
+                   '[]'::json
+               ) AS versions,
+               (SELECT count(*) FROM exercise_session
+                WHERE exercise_session.set_id = exercise_set.id) AS n_sessions
+        FROM exercise_set
+        JOIN latest ON true
+        LEFT JOIN versions current ON current.id = exercise_set.current_version_id
+        WHERE exercise_set.id = :set_id
+    )
+    SELECT row_to_json(s) FROM s;
+    """)
+    return (await conn.execute(query, dict(set_id=set_id))).scalar()
+
+
+async def query_exercise_version(conn: AsyncConnection, set_id: int, version_id: int):
+    """One version of one set - the set is part of the key, so a version id
+    from another set is not found - with its compiled document, or None."""
+    stmt = select(
+        ExerciseSetVersion.c.id,
+        ExerciseSetVersion.c.title,
+        ExerciseSetVersion.c.status,
+        ExerciseSetVersion.c.document,
+    ).where(
+        ExerciseSetVersion.c.id == version_id,
+        ExerciseSetVersion.c.set_id == set_id,
+    )
+    return (await conn.execute(stmt)).first()
+
+
+async def query_exercise_version_source(
+    conn: AsyncConnection, set_id: int, version_id: int
+):
+    """A version's file as it was imported, with its title and its `number`
+    within the set to name the download by."""
+    earlier = ExerciseSetVersion.alias("earlier")
+    number = (
+        select(func.count())
+        .select_from(earlier)
+        .where(earlier.c.set_id == set_id, earlier.c.id <= version_id)
+        .scalar_subquery()
+    )
+    stmt = select(
+        ExerciseSetVersion.c.source,
+        ExerciseSetVersion.c.title,
+        number.label("number"),
+    ).where(
+        ExerciseSetVersion.c.id == version_id,
+        ExerciseSetVersion.c.set_id == set_id,
+    )
+    return (await conn.execute(stmt)).first()
+
+
+async def query_exercise(
+    conn: AsyncConnection, version_id: int, exercise_index: int
+) -> schema.Exercise | None:
+    """`query_job_exercise` for the web app: one exercise out of a version's
+    document, by its 1-based position, or None."""
+    stmt = select(
+        ExerciseSetVersion.c.document["exercises"][exercise_index - 1]
+    ).where(ExerciseSetVersion.c.id == version_id)
+    exercise = (await conn.execute(stmt)).scalar_one_or_none()
+    return None if exercise is None else schema.Exercise.model_validate(exercise)
+
+
+async def query_preview_job(
+    conn: AsyncConnection, set_id: int, job_id: int, user_id: int
+):
+    """A staff preview job, for the fragment that polls it - only if it is a
+    preview (no session), of a version of this set, and its asker's own.
+
+    Each of the three is a key rather than a check after the read, so any job
+    that is not all of them is simply not found: a check recorded in a session
+    is never readable through a preview URL, and a polling tab never finds
+    another person's job in its place.
+    """
+    stmt = (
+        select(
+            ExerciseJob.c.id,
+            ExerciseJob.c.kind,
+            ExerciseJob.c.status,
+            ExerciseJob.c.version_id,
+            ExerciseJob.c.exercise_index,
+            ExerciseJob.c.result,
+        )
+        .join(ExerciseSetVersion, ExerciseSetVersion.c.id == ExerciseJob.c.version_id)
+        .where(
+            ExerciseJob.c.id == job_id,
+            ExerciseJob.c.user_id == user_id,
+            ExerciseJob.c.session_id.is_(None),
+            ExerciseJob.c.kind != ExerciseJobKind.build,
+            ExerciseSetVersion.c.set_id == set_id,
+        )
+    )
+    return (await conn.execute(stmt)).first()
+
+
+async def lock_exercise_set(conn: AsyncConnection, set_id: int) -> int | None:
+    """Lock a set for deletion and say how many sessions it has, or None if it
+    does not exist. Does not commit: the lock is held until the caller's
+    transaction ends.
+
+    The versions first, then the set - the order the judge takes them in when
+    a build finishes (`finish_version_build` writes the version, then moves the
+    set's `current_version_id`), so a delete and a finishing build queue up
+    behind each other instead of deadlocking. Locking the versions also makes a
+    preview being enqueued on one of them wait, or be waited for: its foreign
+    key holds a share lock on the version row.
+
+    Opening a session on the set has to take the set's row lock too, or a
+    session could be opened between this count and the delete.
+
+    One window stays open: a version imported between the two locks is not
+    covered by the first. The deletes still take it - each statement sees what
+    has committed - and only if a judge is finishing *that* version's build in
+    the same instant can the two deadlock, which PostgreSQL ends by aborting
+    one side; either way nothing is left half-done.
+    """
+    await conn.execute(
+        select(ExerciseSetVersion.c.id)
+        .where(ExerciseSetVersion.c.set_id == set_id)
+        .with_for_update()
+    )
+    n_sessions = (
+        select(func.count())
+        .select_from(ExerciseSession)
+        .where(ExerciseSession.c.set_id == set_id)
+        .scalar_subquery()
+    )
+    stmt = (
+        select(n_sessions)
+        .select_from(ExerciseSet)
+        .where(ExerciseSet.c.id == set_id)
+        .with_for_update(of=ExerciseSet)
+    )
+    return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def delete_exercise_set(conn: AsyncConnection, set_id: int) -> None:
+    """Delete a set with no sessions, its versions and every job on them.
+
+    Hand-ordered for `delete_challenge`'s reason: jobs, then the set's
+    `current_version_id` set to NULL - the set and its versions point at each
+    other - then the versions, then the set. The jobs go **by `version_id`**:
+    a build and a preview have no session, and would otherwise hold the
+    versions down. A judge finishing one of them meanwhile updates zero rows,
+    which is why there is nothing here to wait for - the result is a column of
+    the job, not a row of its own a foreign key could refuse.
+
+    The caller has taken `lock_exercise_set` and found no sessions: a set with
+    sessions is refused, not cascaded, since a session's checks are a class's
+    work.
+    """
+    version_ids = select(ExerciseSetVersion.c.id).where(
+        ExerciseSetVersion.c.set_id == set_id
+    )
+    await conn.execute(delete(ExerciseJob).where(ExerciseJob.c.version_id.in_(version_ids)))
+    await conn.execute(
+        update(ExerciseSet)
+        .where(ExerciseSet.c.id == set_id)
+        .values(current_version_id=None)
+    )
+    await conn.execute(
+        delete(ExerciseSetVersion).where(ExerciseSetVersion.c.set_id == set_id)
+    )
+    await conn.execute(delete(ExerciseSet).where(ExerciseSet.c.id == set_id))
 
 
 async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_id: int):

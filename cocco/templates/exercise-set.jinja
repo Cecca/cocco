@@ -1,0 +1,136 @@
+{% extends "base.jinja" %}
+{% block title %}{{ exercise_set.title }}{% endblock %}
+
+{% set crumbs = [
+  {"label": "Courses", "href": url_for('index')},
+  {"label": course.title, "href": url_for('get_course', course_id=course_id)},
+  {"label": exercise_set.title},
+] %}
+
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+
+  <div class="flex items-start justify-between gap-4 mb-6">
+    <div>
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">Exercise set</p>
+      <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ exercise_set.title }}</h1>
+    </div>
+    <a href="{{ url_for('get_course', course_id=course_id) }}"
+       class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+      ← Back to course
+    </a>
+  </div>
+
+  {# The status polls itself every two seconds while a build runs, so the
+     import form - and the box its answer lands in - sit outside it: a file
+     picked, or an alert shown, inside it would be wiped by the next poll. #}
+  {% include "f-exercise-set.jinja" %}
+
+  <!-- ══ RE-IMPORT ══════════════════════════════════════════════════ -->
+  <form hx-post="{{ url_for('post_exercise_set_import', course_id=course_id, set_id=exercise_set.id) }}"
+        hx-encoding="multipart/form-data"
+        hx-target="#exercise-set-import-result"
+        hx-swap="innerHTML"
+        class="mt-6 rounded-xl border border-base-300 bg-base-200/40 p-4">
+    <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-1">Import a new version</h3>
+    <p class="text-xs text-base-content/55 mb-3">
+      The file replaces nothing until the judge has built it without errors;
+      then it becomes the current version. Open sessions keep the version they
+      were opened on.
+    </p>
+    <div class="flex flex-wrap items-end gap-4">
+      <div>
+        <label class="text-xs text-base-content/55">Exercise file (.md)</label>
+        <input type="file" name="exercise_file" accept=".md,text/markdown" required
+               class="file-input file-input-sm w-72 mt-1" />
+      </div>
+      <button type="submit" class="btn btn-sm btn-primary">
+        <span class="submit-label">Import</span>
+        <span class="htmx-indicator loading loading-spinner loading-xs"></span>
+      </button>
+    </div>
+    <div id="exercise-set-import-result" class="empty:hidden mt-3"></div>
+  </form>
+
+  <!-- ══ DANGER ZONE ════════════════════════════════════════════════ -->
+  <div class="card bg-base-100 border border-error/40 shadow-sm mt-10">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg text-error">Danger zone</h2>
+      <div id="exercise-set-danger-result" class="empty:hidden mt-3"></div>
+
+      <div class="flex flex-wrap items-center justify-between gap-4 mt-4 rounded-xl border border-error/30 p-4">
+        <div class="min-w-0 flex-1">
+          <h3 class="font-semibold">Delete this set</h3>
+          <p class="text-[13px] text-base-content/55">
+            {% if exercise_set.n_sessions %}
+            It has {{ exercise_set.n_sessions }} session{{ "" if exercise_set.n_sessions == 1 else "s" }},
+            so it cannot be deleted: those are a class's work.
+            {% else %}
+            Every version of it and every preview run on them. No session was
+            ever opened on it, so no student's work goes with it. There is no
+            undo.
+            {% endif %}
+          </p>
+        </div>
+        {# Drawn disabled rather than hidden when there are sessions, so the
+           sentence beside it has a button to explain. The route refuses on
+           its own either way. #}
+        <button type="button" class="btn btn-sm btn-error font-semibold"
+                {% if exercise_set.n_sessions %}disabled{% endif %}
+                onclick="delete_exercise_set_modal.showModal()">
+          Delete set…
+        </button>
+      </div>
+    </div>
+  </div>
+</main>
+
+{# The challenge editor's dialog, for a set; the reasoning is in the course
+   editor's. The title reaches the script through `data-expected`, never a JS
+   string literal. #}
+<dialog id="delete_exercise_set_modal" class="modal">
+  <div class="modal-box">
+    <h3 class="font-bold text-lg text-error">Delete {{ exercise_set.title }}?</h3>
+    <p class="py-3 text-sm text-base-content/70">
+      Every version of this set, its source files and every preview run on
+      them are deleted for good.
+    </p>
+    <p class="text-sm text-base-content/70">
+      Type <span class="font-semibold">{{ exercise_set.title }}</span> below to confirm.
+    </p>
+    <input type="text" id="exercise-set-delete-confirm" name="confirm"
+           autocomplete="off" data-expected="{{ exercise_set.title }}"
+           aria-label="Type the set's title to confirm"
+           class="input w-full mt-3 font-mono" />
+    <div class="modal-action">
+      <form method="dialog">
+        <button class="btn btn-sm btn-ghost">Cancel</button>
+      </form>
+      <button type="button" id="exercise-set-delete-button" disabled
+              class="btn btn-sm btn-error"
+              hx-post="{{ url_for('post_exercise_set_delete', course_id=course_id, set_id=exercise_set.id) }}"
+              hx-include="#exercise-set-delete-confirm"
+              hx-target="#exercise-set-danger-result"
+              hx-swap="innerHTML"
+              onclick="delete_exercise_set_modal.close()">
+        Delete for good
+      </button>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<script>
+  (() => {
+    const field = document.getElementById("exercise-set-delete-confirm");
+    const button = document.getElementById("exercise-set-delete-button");
+    const check = () => {
+      button.disabled = field.value.trim() !== field.dataset.expected.trim();
+    };
+    field.addEventListener("input", check);
+    document.getElementById("delete_exercise_set_modal")
+            .addEventListener("close", () => { field.value = ""; check(); });
+    check();
+  })();
+</script>
+{% endblock %}

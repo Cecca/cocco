@@ -1,0 +1,35 @@
+{# The problems an exercise file has, errors first, as the parse or the build
+   found them. Context: `problems` - `schema.ExerciseProblem`s, or the same as
+   JSON - and `link_version`, the id of a *ready* version to link each
+   exercise to its preview of, or None: a failed version has no document to
+   preview, and a refused file has no version at all. The test number is
+   still printed when there is no link, so the author knows where to look.
+   `course_id` and `set_id` are needed only with a link. #}
+{% set ordered = (problems | selectattr("level", "equalto", "error") | list)
+                 + (problems | selectattr("level", "equalto", "warning") | list) %}
+<ul class="flex flex-col gap-2">
+  {% for problem in ordered %}
+  <li class="rounded-lg border {{ 'border-error/40 bg-error/5' if problem.level == 'error' else 'border-warning/40 bg-warning/5' }} px-3 py-2 text-sm">
+    <div class="flex flex-wrap items-baseline gap-x-2">
+      <span class="font-mono text-xs font-bold uppercase {{ 'text-error' if problem.level == 'error' else 'text-warning' }}">
+        {{ problem.level }}
+      </span>
+      <span class="text-xs text-base-content/55">
+        {% if problem.exercise and link_version %}
+        <a class="link link-hover"
+           href="{{ url_for('get_exercise_preview', course_id=course_id, set_id=set_id, version_id=link_version, n=problem.exercise) }}{% if problem.test %}#test-{{ problem.test }}{% endif %}">
+          {{- problem.where -}}
+        </a>
+        {% else %}
+        {{ problem.where }}
+        {% endif %}
+        {%- if problem.test %} · test {{ problem.test }}{% endif %}
+      </span>
+    </div>
+    <div class="mt-0.5">{{ problem.text }}</div>
+    {% if problem.detail %}
+    <pre class="mt-2 max-h-48 overflow-auto rounded-md bg-neutral text-neutral-content p-2 text-xs font-mono whitespace-pre-wrap">{{ problem.detail }}</pre>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
