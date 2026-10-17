@@ -567,7 +567,7 @@ async def prepare_database(reset=False):
 
     `[dev] reset_db` is the one exception, because a reset is somebody asking
     for exactly that. It does not use `metadata.drop_all`: that drops the tables
-    and the four ENUM types with them, but `alembic_version` is not in
+    and the ENUM types with them, but `alembic_version` is not in
     `metadata` and would survive, so the `upgrade head` after it would find a
     database already claiming to be at head and do nothing - leaving an empty
     database that *passes* the check below and 500s on the first query. See

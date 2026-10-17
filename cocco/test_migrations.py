@@ -17,6 +17,7 @@ truncated between tests, so a file that empties it would strand whatever ran
 next - and which test that was would depend on collection order.
 """
 
+from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine
@@ -24,6 +25,8 @@ from sqlalchemy import create_engine
 from cocco.migrate import (
     COMPARE_OPTIONS,
     MIGRATIONS_DIR,
+    alembic_config,
+    applied_revisions,
     head_revisions,
     reset_schema,
     upgrade_to_head,
@@ -62,6 +65,32 @@ def test_the_migrations_build_exactly_the_model(migrations_database):
             'the missing revision with `cocco-migrate revision --autogenerate '
             '-m "what changed"`'
         )
+    finally:
+        with engine.begin() as conn:
+            reset_schema(conn)
+        engine.dispose()
+
+
+def test_every_revision_downgrades_and_upgrades_again(migrations_database):
+    """`downgrade base` then `upgrade head`, the proof CLAUDE.md asks of every
+    revision that adds an ENUM type: `op.drop_table` leaves the type behind, so
+    a `downgrade` that forgot it only fails on the *next* upgrade, as a type
+    that already exists. The same goes for a cycle of foreign keys whose
+    `downgrade` drops the tables in an order the database refuses."""
+    engine = create_engine(migrations_database)
+    try:
+        with engine.begin() as conn:
+            reset_schema(conn)
+        with engine.begin() as conn:
+            upgrade_to_head(conn)
+        with engine.begin() as conn:
+            command.downgrade(alembic_config(connection=conn), "base")
+        with engine.begin() as conn:
+            upgrade_to_head(conn)
+        with engine.connect() as conn:
+            assert applied_revisions(conn) == head_revisions()
+            context = MigrationContext.configure(conn, opts=dict(COMPARE_OPTIONS))
+            assert compare_metadata(context, metadata) == []
     finally:
         with engine.begin() as conn:
             reset_schema(conn)

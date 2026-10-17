@@ -185,9 +185,14 @@ They are one table, `exercise_job`, with a `kind`, the `version_id` it runs agai
   what a student tried before they dared press Check.
 - **Preview jobs are jobs without a session.** Staff try a version as a student would, before
   opening a session on it. `session_id` is NULL, so no progress query ever sees them.
-- **A student has at most one job queued.** A new Run or Check replaces their queued one. It does
-  not touch one that is already running. Mashing the button costs the judge nothing, and "queued"
-  is never a backlog of stale requests.
+- **A student has at most one job queued per button, per exercise.** A new Run replaces their
+  queued Run on the same exercise of the same session (or of the same preview), and a new Check
+  their queued Check. It does not touch one that is already running, and a Run never replaces a
+  Check, nor one exercise's job another's: a recorded attempt cannot vanish, and a polling tab
+  never finds somebody else's job in its place. Mashing the button costs the judge nothing, and
+  "queued" is never a backlog of stale requests. The database enforces it: a unique index on
+  `(user_id, kind, session_id, version_id, exercise_index)` `WHERE status = 'queued' AND kind <>
+  'build'`, `NULLS NOT DISTINCT` so that previews (`session_id` NULL) dedupe too.
 - **Run is not interactive.** Stdin is the text box's contents, given up front, and the harness
   echoes what was read so that the transcript still reads like a terminal. The prototype's
   "type as you go" is the one thing this choice gives up.
@@ -339,6 +344,8 @@ CLAUDE.md sentence that says "two" changes with it. **A blocked student** is ref
 
 `delete_course` gains the exercise tables in its hand-written cascade, in this order: jobs,
 reveals, participants, sessions, then the set's `current_version_id` set to NULL, versions, sets.
+The jobs are deleted **by `version_id`**, not by session: builds and previews have no session, and
+would otherwise hold the versions down. The same goes for deleting a set.
 There is no `ON DELETE`, consistent with the rest of `model.py`. Because results are JSONB on the
 job row, a judge finishing a job whose course has just been deleted updates zero rows instead of
 crashing. So, unlike submissions, no lock is needed.
@@ -433,7 +440,7 @@ The **compiled document's shape** is pinned here, as a Pydantic model in `cocco/
 that the build that writes it and every reader of it agree on one definition. It carries a
 `format` version number, as the prototype's `.json` does.
 
-### [ ] 3. Schema and migration
+### [x] 3. Schema and migration
 
 New tables:
 

@@ -2,19 +2,24 @@ from enum import Enum
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Enum as SAEnum,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
+    Index,
     Integer,
     LargeBinary,
     MetaData,
     String,
     Table,
+    UniqueConstraint,
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 
 
 class UserRole(str, Enum):
@@ -60,6 +65,46 @@ class OutcomeEnum(Enum):
     # are verdicts on the student's program - a checker that times out must
     # never be reported as the submission timing out.
     evaluator_error = "evaluator_error"
+
+
+class ExerciseVersionStatus(Enum):
+    """Where an imported exercise file is in its one and only build.
+
+    A version is created `building` and the build moves it, exactly once, to
+    `ready` or `failed`. Only a `ready` one can become a set's current version
+    or be what a session is opened on.
+    """
+
+    building = "building"
+    ready = "ready"
+    failed = "failed"
+
+
+class ExerciseSessionMode(Enum):
+    """`live` is paced by the teacher, up to `unlocked_through`; `open` has
+    everything unlocked - homework, or a live session after class."""
+
+    live = "live"
+    open = "open"
+
+
+class ExerciseJobKind(Enum):
+    """The three kinds of work an exercise asks of the judge.
+
+    `build` computes a version's expected outputs, for staff; `check` is a
+    recorded attempt, the only kind progress is ever derived from; `run` is the
+    student's own stdin, nothing compared.
+    """
+
+    build = "build"
+    check = "check"
+    run = "run"
+
+
+class ExerciseJobStatus(Enum):
+    queued = "queued"
+    running = "running"
+    done = "done"
 
 
 metadata = MetaData()
@@ -400,4 +445,281 @@ TestOutcome = Table(
     Column("message", String, nullable=True),
     Column("stdout", String, nullable=True),
     Column("stderr", String, nullable=True),
+)
+
+
+# --- Exercises ---------------------------------------------------------------
+#
+# Interactive exercises are their own tables and share nothing with challenges
+# above the judge's execution layer. There is no `exercise` table and no
+# `exercise_test`: the `.md` file a teacher imports is the source of truth, and
+# everything about an exercise lives in the version compiled from it. An
+# exercise is therefore identified by its 1-based position in that version,
+# `exercise_index`, wherever a row has to name one.
+#
+# No foreign key below declares an `ON DELETE`, like every other one in this
+# file: `delete_course`'s hand-written cascade takes them in order - jobs,
+# reveals, participants, sessions, then the set's `current_version_id` set to
+# NULL, versions, sets. Deleting a set is the same list from its sessions down.
+# Either way the jobs go **by `version_id`**, not by session: a build and a
+# staff preview have no session, and a cascade that deleted jobs by session
+# would leave them holding the versions down.
+
+
+ExerciseSet = Table(
+    "exercise_set",
+    metadata,
+    # `autoincrement=True` by hand, and not optional: SQLAlchemy's "auto" only
+    # makes a SERIAL of a key column that is in no foreign key, and `id` is in
+    # `exercise_set_current_version_fkey` below. Left to "auto", the database
+    # still gets its sequence from the migration, but an `insert(ExerciseSet)`
+    # reports no `inserted_primary_key` - a difference the drift test cannot see.
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("course_id", Integer, ForeignKey("course.id"), nullable=False),
+    # The latest *ready* version, or NULL until a first build succeeds. Moved
+    # only by a build that finishes `ready`, so a re-import that fails leaves
+    # everything using the version that worked.
+    #
+    # The set and its versions point at each other, so this foreign key cannot
+    # exist when either table is created: `use_alter` has it added afterwards,
+    # and the cascade has to clear it before the versions can go. It is on
+    # `(id, current_version_id)` rather than the version alone, which is what
+    # makes "the current version is one of *this* set's" the database's rule
+    # and not a route's. A NULL in either column skips the check, as a plain
+    # nullable foreign key does.
+    Column("current_version_id", Integer, nullable=True),
+    # As on `course`. An archived set's course page entry goes, and nothing is
+    # opened on it any more.
+    Column("archived_at", DateTime(timezone=True), nullable=True),
+    created_at(),
+    updated_at(),
+    ForeignKeyConstraint(
+        ["id", "current_version_id"],
+        ["exercise_set_version.set_id", "exercise_set_version.id"],
+        name="exercise_set_current_version_fkey",
+        use_alter=True,
+    ),
+)
+
+
+# One import of a set's `.md` file, and immutable: the source is written when the
+# row is created, and the compiled document, the problems and the status are
+# written exactly once, together, by the build that finishes it. Two values that
+# are both written once and never updated cannot drift apart. That is also why
+# there is no `updated_at`: the only write after the insert is the build's, and
+# when that happened is its job's `finished_at` - the `exercise_job` row with
+# `kind = 'build'` and this `version_id`.
+ExerciseSetVersion = Table(
+    "exercise_set_version",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("set_id", Integer, ForeignKey("exercise_set.id"), nullable=False),
+    # The file verbatim, solutions included. Only staff ever see it.
+    Column("source", String, nullable=False),
+    # From the front matter, at import - so that a set can be listed without
+    # reading a document that does not exist until the build is done.
+    Column("title", String, nullable=False),
+    Column(
+        "status",
+        SAEnum(ExerciseVersionStatus),
+        nullable=False,
+        default=ExerciseVersionStatus.building,
+    ),
+    # A list of `schema.ExerciseProblem`, written by the build: NULL exactly
+    # while the version is building, a list - possibly empty - once it is not.
+    Column("problems", JSONB, nullable=True),
+    # A `schema.ExerciseDocument`, expected outputs filled in. Every reader of
+    # a version's content goes through this, never through `source`.
+    Column("document", JSONB, nullable=True),
+    created_at(),
+    # What the composite foreign keys on `exercise_set` and `exercise_session`
+    # refer to. Redundant as a uniqueness rule, `id` alone being the key, and
+    # there for that reason only.
+    UniqueConstraint("set_id", "id", name="exercise_set_version_set_id_id_key"),
+    CheckConstraint(
+        "(status = 'building') = (problems IS NULL)",
+        name="exercise_set_version_problems_once_built",
+    ),
+    CheckConstraint(
+        "status <> 'ready' OR document IS NOT NULL",
+        name="exercise_set_version_ready_has_document",
+    ),
+)
+
+
+# One run of a set with one group of students: its own pacing, its own progress.
+ExerciseSession = Table(
+    "exercise_session",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    # No foreign key of its own: the one below goes through a version of this
+    # set, whose own `set_id` already has to name a set that exists.
+    Column("set_id", Integer, nullable=False),
+    # The version this session shows, pinned when it is opened. Moved only by
+    # "switch to the latest version", and the foreign key is on `(set_id,
+    # version_id)`, so it can only ever be moved to a version of its own set.
+    Column("version_id", Integer, nullable=False),
+    # "Lab A - 20 Oct", in the teacher's words.
+    Column("label", String, nullable=False),
+    Column("mode", SAEnum(ExerciseSessionMode), nullable=False),
+    # How many exercises a `live` session has unlocked, counted from the first;
+    # ignored in `open` mode. The upper bound is the version's exercise count,
+    # which lives in a JSONB document and so is the routes' to clamp.
+    Column("unlocked_through", Integer, nullable=False),
+    # This table's `created_at`, under the better name, as `submission.enqueued`
+    # is that table's. NULL `closed_at` is a session still accepting work.
+    Column(
+        "opened_at", DateTime(timezone=True), nullable=False, server_default=func.now()
+    ),
+    Column("closed_at", DateTime(timezone=True), nullable=True),
+    updated_at(),
+    ForeignKeyConstraint(
+        ["set_id", "version_id"],
+        ["exercise_set_version.set_id", "exercise_set_version.id"],
+        name="exercise_session_version_fkey",
+    ),
+    CheckConstraint(
+        "unlocked_through >= 0", name="exercise_session_unlocked_through_check"
+    ),
+)
+
+
+# Who came: written on a student's first visit with `ON CONFLICT DO NOTHING`,
+# and the dashboard's denominator - not the course's enrollment, which counts
+# everybody who could have.
+ExerciseSessionParticipant = Table(
+    "exercise_session_participant",
+    metadata,
+    Column("session_id", Integer, ForeignKey("exercise_session.id"), primary_key=True),
+    Column("user_id", Integer, ForeignKey("user.id"), primary_key=True),
+    Column(
+        "joined_at", DateTime(timezone=True), nullable=False, server_default=func.now()
+    ),
+)
+
+
+# A solution shown to the class, per session and per exercise. The key is what
+# makes revealing twice a no-op.
+ExerciseSessionReveal = Table(
+    "exercise_session_reveal",
+    metadata,
+    Column("session_id", Integer, ForeignKey("exercise_session.id"), primary_key=True),
+    Column("exercise_index", Integer, primary_key=True),
+    Column(
+        "revealed_at",
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    ),
+    CheckConstraint(
+        "exercise_index >= 1", name="exercise_session_reveal_exercise_index_check"
+    ),
+)
+
+
+# Every piece of exercise work the judge does, one row each, result included.
+# The result is JSONB on the row rather than child rows, deliberately: a judge
+# finishing a job whose row was deleted meanwhile updates zero rows, where
+# `insert_test_outcomes` would violate a foreign key and take the process down.
+ExerciseJob = Table(
+    "exercise_job",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("kind", SAEnum(ExerciseJobKind), nullable=False),
+    Column(
+        "status",
+        SAEnum(ExerciseJobStatus),
+        nullable=False,
+        default=ExerciseJobStatus.queued,
+    ),
+    # Who asked: the student, or for a build and a preview, the staff member.
+    Column("user_id", Integer, ForeignKey("user.id"), nullable=False),
+    # The version the job ran against, so a check is always read against the
+    # tests it was actually graded on - even after its session has moved on.
+    Column(
+        "version_id", Integer, ForeignKey("exercise_set_version.id"), nullable=False
+    ),
+    # NULL for a build, and for a staff preview: no progress query ever sees a
+    # job without a session.
+    Column("session_id", Integer, ForeignKey("exercise_session.id"), nullable=True),
+    # 1-based; NULL exactly for a build, which is about the whole version.
+    Column("exercise_index", Integer, nullable=True),
+    # The student's code; NULL exactly for a build, which runs the version's own.
+    Column("source", String, nullable=True),
+    # The text box a run is given up front. A check reads its stdin from the
+    # tests, and a build has none.
+    Column("stdin", String, nullable=True),
+    # What came of it, written with `status = 'done'` and never before. The
+    # status is only where the job is in the queue; the verdict - passed or
+    # not, per test, and the variant for a harness or a judge that broke - is
+    # this document's, whose shape step 4 pins in `schema.py`.
+    Column("result", JSONB, nullable=True),
+    # `submission`'s three, for `submission`'s reasons.
+    Column(
+        "enqueued", DateTime(timezone=True), nullable=False, server_default=func.now()
+    ),
+    Column("started_at", DateTime(timezone=True), nullable=True),
+    Column("finished_at", DateTime(timezone=True), nullable=True),
+    CheckConstraint(
+        "(kind = 'build') = (exercise_index IS NULL)",
+        name="exercise_job_exercise_index_unless_build",
+    ),
+    CheckConstraint(
+        "(kind = 'build') = (source IS NULL)", name="exercise_job_source_unless_build"
+    ),
+    CheckConstraint(
+        "kind <> 'build' OR session_id IS NULL", name="exercise_job_build_no_session"
+    ),
+    CheckConstraint(
+        "kind = 'run' OR stdin IS NULL", name="exercise_job_stdin_run_only"
+    ),
+    CheckConstraint("exercise_index >= 1", name="exercise_job_exercise_index_check"),
+    # The status and the columns that say the same thing cannot disagree: a job
+    # is done exactly when it has a result and a `finished_at`, and anything
+    # past the queue has been started.
+    CheckConstraint(
+        "(status = 'done') = (result IS NOT NULL)", name="exercise_job_result_when_done"
+    ),
+    CheckConstraint(
+        "(status = 'done') = (finished_at IS NOT NULL)",
+        name="exercise_job_finished_when_done",
+    ),
+    CheckConstraint(
+        "status = 'queued' OR started_at IS NOT NULL",
+        name="exercise_job_started_unless_queued",
+    ),
+    # Progress is derived from check jobs and nothing else, so every dashboard
+    # and strip query reads through this. Run jobs are kept for six months and
+    # outnumber checks; the predicate keeps them out of it.
+    Index(
+        "ix_exercise_job_check",
+        "session_id",
+        "exercise_index",
+        "user_id",
+        postgresql_where=text("kind = 'check'"),
+    ),
+    # The judge's claim: the oldest queued job of a kind.
+    Index("ix_exercise_job_queue", "status", "kind", "enqueued"),
+    # At most one job queued per person, per button, per exercise: pressing
+    # Run again on the same exercise of the same session (or preview) replaces
+    # the queued Run, so mashing it never builds a backlog - but a Run never
+    # replaces a Check, nor one exercise's job another's, so a recorded
+    # attempt cannot vanish and a polling tab never finds somebody else's job
+    # in its place. An index rather than a check before the insert, so two
+    # clicks that race cannot both win and the replacement can be one
+    # `ON CONFLICT` upsert. NULLS NOT DISTINCT because a preview's
+    # `session_id` is NULL and has to dedupe all the same. Builds are
+    # excluded: they are staff's, per version, and two quick imports are two
+    # builds.
+    Index(
+        "uq_exercise_job_one_queued",
+        "user_id",
+        "kind",
+        "session_id",
+        "version_id",
+        "exercise_index",
+        unique=True,
+        postgresql_nulls_not_distinct=True,
+        postgresql_where=text("status = 'queued' AND kind <> 'build'"),
+    ),
 )

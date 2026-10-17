@@ -180,7 +180,7 @@ def db(database):
     which, unlike before, are real.
     """
     with database.begin() as conn:
-        # `TRUNCATE` wants ACCESS EXCLUSIVE on all nine tables and will queue
+        # `TRUNCATE` wants ACCESS EXCLUSIVE on every table and will queue
         # behind any reader, so one connection leaked by an earlier test would
         # hang here with nothing on the terminal to say why. Five seconds turns
         # that into a failure that names the table it was waiting for.

@@ -169,7 +169,7 @@ def reset_schema(connection: Connection) -> None:
     """Take the whole schema out: tables, `alembic_version` and the ENUM types.
 
     Deliberately **not** `metadata.drop_all`. That drops the tables and, with
-    them, the four PG ENUM types - but `alembic_version` is not in `metadata`
+    them, the PG ENUM types - but `alembic_version` is not in `metadata`
     and survives, so the `upgrade head` that follows finds a database already
     claiming to be at head and does nothing at all. The result is an empty
     database that passes `check_schema_is_current` and 500s on the first query,
