@@ -18,12 +18,14 @@ it - the judge needs the database and the storage root, and neither is any of
 sign-in's business.
 """
 
+import ipaddress
 import logging
 import os
 import secrets
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from cocco.auth import is_allowed_email, normalize_administrators, normalize_domains
 
@@ -56,6 +58,27 @@ DEFAULT_STORAGE_ROOT = Path("/tmp/cocco-storage")
 # directory, which is what this was before it could be written down at all -
 # so the default changes nothing for a judge started from a checkout.
 DEFAULT_FLAKE_REF = "."
+
+
+# Who may tell cocco, through X-Forwarded-For and X-Forwarded-Proto, who the
+# client really is. Loopback in both spellings, because that is a reverse proxy
+# on the same host - nginx reaching the app over 127.0.0.1, or over ::1 when
+# `localhost` resolves that way first.
+DEFAULT_TRUSTED_PROXIES = ("127.0.0.1", "::1")
+
+LOG_FORMATS = ("text", "json")
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+
+class ConfigError(ValueError):
+    """A setting the file spells in a way cocco cannot act on.
+
+    Rare on purpose: almost everything in this module warns and carries on,
+    because a stale line must not stop a deployment from booting. The
+    exceptions are the settings whose wrong spelling has no safe reading - a
+    log format nobody can parse, a proxy address that would trust the wrong
+    peer - and those are refused at load, naming what is accepted.
+    """
 
 
 def default_gcroots() -> Path:
@@ -216,6 +239,20 @@ class DevConfig:
 
 
 @dataclass(frozen=True)
+class LogConfig:
+    """How every process writes its log, which is stdout and nothing else.
+
+    Text is the default so `just dev` stays readable; a deployment asks for
+    one JSON object per line, which is what a collector can query. Where the
+    lines go after stdout - journald, a container runtime, a file rotated by
+    logrotate - is the collector's business, and so is how long they are kept.
+    """
+
+    format: Literal["text", "json"] = "text"
+    level: str = "INFO"
+
+
+@dataclass(frozen=True)
 class AppConfig:
     session: SessionConfig
     auth: AuthConfig
@@ -223,10 +260,18 @@ class AppConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     judge: JudgeConfig = field(default_factory=JudgeConfig)
     dev: DevConfig = field(default_factory=DevConfig)
+    log: LogConfig = field(default_factory=LogConfig)
     # Absolute base for the OAuth redirect URI. None derives it from the
     # incoming request, which is only right behind a proxy that sets
-    # X-Forwarded-* and a uvicorn running with --proxy-headers.
+    # X-Forwarded-* and `proxy_headers` below.
     base_url: str | None = None
+    # Whether X-Forwarded-For / -Proto (and X-Request-ID) are believed at all.
+    # False, as the `--proxy-headers` flag it replaces was: a checkout with no
+    # proxy in front must not let a client name its own address.
+    proxy_headers: bool = False
+    # And from whom: addresses and CIDR networks, already validated. Settings
+    # rather than uvicorn's FORWARDED_ALLOW_IPS, which is the environment.
+    trusted_proxies: tuple[str, ...] = DEFAULT_TRUSTED_PROXIES
 
 
 def config_path() -> Path:
@@ -256,6 +301,7 @@ def load_config(path: Path) -> AppConfig:
 
     _warn_about_removed_settings(path, data)
 
+    site = data.get("site", {})
     return AppConfig(
         session=_load_session_config(data.get("session", {})),
         auth=_load_auth_config(data.get("auth", {})),
@@ -263,8 +309,26 @@ def load_config(path: Path) -> AppConfig:
         storage=_load_storage_config(data.get("storage", {})),
         judge=_load_judge_config(data.get("judge", {})),
         dev=_load_dev_config(data.get("dev", {})),
-        base_url=data.get("site", {}).get("base_url"),
+        log=_load_log_config(data.get("log", {})),
+        base_url=site.get("base_url"),
+        proxy_headers=bool(site.get("proxy_headers", False)),
+        trusted_proxies=_load_trusted_proxies(site),
     )
+
+
+def load_log_config(path: Path) -> LogConfig:
+    """The `[log]` table alone, without anything `load_config` has to say.
+
+    A process has to configure logging *before* it reads the rest of the file,
+    or the warnings `load_config` emits - a missing file, a setting in its old
+    place, no session secret - would come out in whatever format Python's
+    last-resort handler uses rather than the one the deployment asked for.
+    """
+    data: dict = {}
+    if path.is_file():
+        with open(path, "rb") as fp:
+            data = tomllib.load(fp)
+    return _load_log_config(data.get("log", {}))
 
 
 def _load_session_config(section: dict) -> SessionConfig:
@@ -279,7 +343,8 @@ def _load_session_config(section: dict) -> SessionConfig:
         secret_key = secrets.token_urlsafe(32)
         logger.warning(
             "no session secret configured (COCCO_SECRET_KEY); generated an "
-            "ephemeral one, so every restart logs everybody out"
+            "ephemeral one, so every restart logs everybody out",
+            extra={"setting": "COCCO_SECRET_KEY"},
         )
     return SessionConfig(
         secret_key=secret_key,
@@ -311,6 +376,7 @@ def _oauth_credentials(provider: str) -> tuple[str, str] | None:
             provider,
             prefix,
             prefix,
+            extra={"setting": prefix + "CLIENT_ID/SECRET"},
         )
     return None
 
@@ -336,6 +402,7 @@ def _load_auth_config(section: dict) -> AuthConfig:
                 "[auth] administrator %s is outside `allowed_domains`, "
                 "so they could never sign in",
                 email,
+                extra={"setting": "[auth] administrators"},
             )
 
     google = None
@@ -387,6 +454,59 @@ def _load_judge_config(section: dict) -> JudgeConfig:
         flake=section.get("flake") or DEFAULT_FLAKE_REF,
         gcroots=Path(gcroots) if gcroots else default_gcroots(),
     )
+
+
+def _load_log_config(section: dict) -> LogConfig:
+    # Refused rather than defaulted: a deployment that wrote `format = "jsonl"`
+    # is expecting a collector to parse what comes out, and quietly handing it
+    # text would be a log nobody notices is unreadable until it is needed.
+    log_format = section.get("format", LogConfig.format)
+    if log_format not in LOG_FORMATS:
+        raise ConfigError(
+            f"[log] format = {log_format!r} is not one of "
+            + ", ".join(repr(f) for f in LOG_FORMATS)
+        )
+    level = str(section.get("level", LogConfig.level)).upper()
+    if level not in LOG_LEVELS:
+        raise ConfigError(
+            f"[log] level = {section.get('level')!r} is not one of "
+            + ", ".join(LOG_LEVELS)
+        )
+    return LogConfig(format=log_format, level=level)
+
+
+def _load_trusted_proxies(site: dict) -> tuple[str, ...]:
+    """`[site] trusted_proxies`, each entry checked for being an address or a
+    network.
+
+    Checked here because uvicorn does not: its `_TrustedHosts` keeps anything
+    that fails to parse as a literal string, so `127.0.0.1/33` or a hostname
+    would be accepted, match nothing, and leave every request logged with the
+    proxy's address - the exact failure this setting exists to prevent, with
+    nothing to say why.
+    """
+    raw = site.get("trusted_proxies")
+    if raw is None:
+        return DEFAULT_TRUSTED_PROXIES
+    if isinstance(raw, str) or not isinstance(raw, list):
+        raise ConfigError(
+            "[site] trusted_proxies must be a list of addresses or networks, "
+            'e.g. ["127.0.0.1", "10.0.0.0/8"]'
+        )
+    proxies = []
+    for entry in raw:
+        try:
+            if "/" in str(entry):
+                ipaddress.ip_network(entry)
+            else:
+                ipaddress.ip_address(entry)
+        except ValueError:
+            raise ConfigError(
+                f"[site] trusted_proxies: {entry!r} is neither an IP address "
+                "nor a CIDR network"
+            ) from None
+        proxies.append(str(entry))
+    return tuple(proxies)
 
 
 def _load_dev_config(section: dict) -> DevConfig:
@@ -442,6 +562,7 @@ def _warn_about_removed_settings(path: Path, data: dict) -> None:
                 variable,
                 replacement,
                 path,
+                extra={"setting": variable},
             )
     for (table, key), replacement in _REMOVED_KEYS.items():
         if key in data.get(table, {}):
@@ -452,14 +573,20 @@ def _warn_about_removed_settings(path: Path, data: dict) -> None:
                 key,
                 path,
                 replacement,
+                extra={"setting": f"[{table}] {key}"},
             )
     if "COCCO_DUMMY_USER" in os.environ:
-        logger.warning("COCCO_DUMMY_USER is no longer read; %s", _GONE_TO_THE_LOGIN_BOX)
+        logger.warning(
+            "COCCO_DUMMY_USER is no longer read; %s",
+            _GONE_TO_THE_LOGIN_BOX,
+            extra={"setting": "COCCO_DUMMY_USER"},
+        )
     if "dummy_user" in data.get("dev", {}):
         logger.warning(
             "[dev] dummy_user in %s is no longer read; %s",
             path,
             _GONE_TO_THE_LOGIN_BOX,
+            extra={"setting": "[dev] dummy_user"},
         )
 
 

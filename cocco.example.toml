@@ -231,11 +231,127 @@ allowed_domains = ["unipd.it"]
 [site]
 # The absolute base for the OAuth redirect URI. Leave it unset to derive it from
 # the incoming request, which is only correct if the reverse proxy sets
-# X-Forwarded-* and uvicorn runs with --proxy-headers. Set it whenever what
-# cocco builds and what the provider has registered could disagree - a proxy
-# that terminates TLS makes the request say `http`, and the redirect URI is
-# matched character for character, so the mismatch is refused.
+# X-Forwarded-* and `proxy_headers` below is on. Set it whenever what cocco
+# builds and what the provider has registered could disagree - a proxy that
+# terminates TLS makes the request say `http`, and the redirect URI is matched
+# character for character, so the mismatch is refused.
 # base_url = "https://cocco.example.org"
+
+# Believe the reverse proxy about who the client is: X-Forwarded-For becomes the
+# client address on every access-log line, X-Forwarded-Proto the scheme, and
+# X-Request-ID the id the request is filed under. Off by default, so a checkout
+# with nothing in front of it cannot be told its own address by a client.
+# (This used to be `cocco-web --proxy-headers`; the flag still works for one
+# release and warns.)
+proxy_headers = true
+
+# Whom to believe it from: addresses and CIDR networks, and only connections
+# *from* these get their forwarded headers read. The default is loopback in
+# both spellings, which is right for nginx on the same host:
+#
+#   trusted_proxies = ["127.0.0.1", "::1"]
+#
+# Get this wrong and nothing errors - every request is simply logged with the
+# proxy's address instead of the client's, which is useless the day you need
+# it. That happens when nginx runs in another container, on another host, or
+# reaches the app over an address not listed here; name that address, or its
+# network (e.g. "172.18.0.0/16" for a docker bridge). An entry that is neither
+# an address nor a network is refused at startup rather than silently matching
+# nothing.
+#
+# The nginx side is three lines in the `location` that proxies to cocco:
+#
+#   proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+#   proxy_set_header X-Forwarded-Proto $scheme;
+#   proxy_set_header X-Request-ID      $request_id;
+#
+# `$proxy_add_x_forwarded_for` and never `$http_x_forwarded_for`: the first
+# appends the address nginx actually saw to whatever the client sent, and cocco
+# takes the right-most entry that is not a trusted proxy - so a client forging
+# the header only adds entries to the left, which are never read. The second
+# passes the client's forgery through as the whole truth. `$request_id` is what
+# puts the same id on nginx's log line and on cocco's; add it to nginx's
+# `log_format` to see it there, and cocco echoes it back as X-Request-ID.
+#
+# nginx's default access log writes `$request`, which includes the query
+# string - and the OAuth callback's carries the `code` and the `state`, which
+# cocco is careful never to log. Use a `log_format` with `$request_method $uri`
+# instead of `$request` if that matters to you.
+# trusted_proxies = ["127.0.0.1", "::1"]
+
+[log]
+# Every process - cocco-web, cocco-judge, cocco-migrate - writes its log to
+# stdout (cocco-migrate to stderr, since `--sql` prints DDL on stdout). "text"
+# is for reading; "json" is one object per line, for querying:
+#
+#   {"ts": "2026-10-17T09:12:03.120+00:00", "level": "INFO",
+#    "logger": "cocco.access", "msg": "GET /courses/3 200 41.2ms",
+#    "process": "web", "request_id": "6f1c...", "method": "GET",
+#    "path": "/courses/3", "route": "/courses/{course_id}", "status": 200,
+#    "duration_ms": 41.2, "client_ip": "203.0.113.9", "user_id": 17, ...}
+#
+# One `cocco.access` line per request, with the route as declared rather than
+# the path, so it can be grouped by. Query strings are never logged - the OAuth
+# callback's carries the `code` and the `state`. A polled fragment that worked
+# is logged at DEBUG, so the default level is not drowned in polls; one that
+# failed still shows. Every line a request causes carries its `request_id`, and
+# every line of a graded run its `submission_id`, `challenge_id` and `language`.
+format = "json"
+
+# DEBUG, INFO, WARNING, ERROR or CRITICAL. `--log-level` on any of the three
+# commands overrides it for one run.
+# level = "INFO"
+#
+# A few questions, asked of `journalctl -u cocco-web -o cat` saved to cocco.log:
+#
+#   # the slowest routes
+#   jq -r 'select(.logger == "cocco.access") | [.duration_ms, .route] | @tsv' \
+#       cocco.log | sort -rn | head
+#
+#   # every 403 one user got
+#   jq 'select(.status == 403 and .user_id == 17)' cocco.log
+#
+#   # everything that happened to submission 812, from the judge's log
+#   jq 'select(.submission_id == 812)' judge.log
+#
+#   -- in DuckDB: requests and p95 latency per route
+#   SELECT route, count(*), quantile_cont(duration_ms, 0.95)
+#   FROM read_json_auto('cocco.log')
+#   WHERE logger = 'cocco.access' GROUP BY route ORDER BY 3 DESC;
+#
+# WHAT THE LOGS CONTAIN, AND FOR HOW LONG. The access lines carry client IP
+# addresses and user ids, and sign-in lines carry email addresses: all of that
+# is personal data under the GDPR. It is kept in full - not truncated, since
+# the purpose is security and incident investigation, which needs the address
+# itself - for SIX MONTHS, and then deleted. Six months is the purpose-bound
+# period for security logs: the Italian Garante's minimum for
+# system-administrator access logs (2008), and the low end of CNIL's 6-12 month
+# recommendation. It is a storage-limitation decision (Art. 5(1)(e)), so it
+# also belongs in the university's record of processing (Art. 30) and in the
+# privacy notice students see (Art. 13) - confirm both with the DPO.
+#
+# cocco does not enforce it and cannot: it writes to stdout and does not know
+# how old its output is. The collector does:
+#
+#   - journald: `MaxRetentionSec=6month` in /etc/systemd/journald.conf, or a
+#     drop-in under journald.conf.d/. That applies to the WHOLE journal on the
+#     host, not only cocco's units - say so to whoever else uses the machine.
+#
+#   - a file: redirect stdout to it (systemd's `StandardOutput=append:`) and
+#     rotate it with logrotate - `daily`, `rotate 183`, `maxage 183`,
+#     `compress`, and `copytruncate` or a `postrotate` restart, since the
+#     process keeps the file open. Never have several processes rotate one file
+#     themselves: under `--workers N` they overwrite each other.
+#
+#   - nginx's own access log carries the same addresses and needs the same six
+#     months. Left on the distribution's default it keeps them for however long
+#     that is, which makes the app's retention meaningless.
+#
+#   - backups of the log directory fall under the same period.
+#
+# Aggregates computed from the logs that keep no address and no user id -
+# requests per route, error rates, timings - are not personal data and may be
+# kept for as long as they are useful.
 
 # There is deliberately no [dev] table here. It carries `dummy_auth`, which
 # puts a box on the login page that signs you in as whatever address you type -

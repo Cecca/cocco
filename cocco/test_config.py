@@ -15,8 +15,11 @@ from cocco.config import (
     DEFAULT_DATABASE_URL,
     DEFAULT_FLAKE_REF,
     DEFAULT_STORAGE_ROOT,
+    DEFAULT_TRUSTED_PROXIES,
+    ConfigError,
     config_path,
     load_config,
+    load_log_config,
 )
 
 SECRET_VARIABLES = (
@@ -390,6 +393,76 @@ def test_the_postgres_variables_are_not_warned_about(tmp_path, monkeypatch, capl
 
 
 ########################################################################
+# [log] and the proxy in front
+
+
+def test_logging_defaults_to_text_at_info(tmp_path):
+    config = load_config(tmp_path / "absent.toml")
+    assert config.log.format == "text"
+    assert config.log.level == "INFO"
+
+
+def test_the_log_table_is_read(tmp_path):
+    path = tmp_path / "cocco.toml"
+    path.write_text('[log]\nformat = "json"\nlevel = "debug"\n')
+    config = load_config(path)
+    assert config.log.format == "json"
+    # Normalized, so the file can say it the way a person would.
+    assert config.log.level == "DEBUG"
+    # And the early read a process does before anything else agrees with it.
+    assert load_log_config(path) == config.log
+
+
+@pytest.mark.parametrize(
+    "body, named",
+    [
+        ('[log]\nformat = "jsonl"\n', "'json'"),
+        ('[log]\nlevel = "LOUD"\n', "WARNING"),
+    ],
+)
+def test_an_unknown_log_setting_is_refused_naming_the_accepted_ones(
+    tmp_path, body, named
+):
+    path = tmp_path / "cocco.toml"
+    path.write_text(body)
+    with pytest.raises(ConfigError, match=named):
+        load_config(path)
+
+
+def test_the_proxy_is_untrusted_and_loopback_by_default(tmp_path):
+    config = load_config(tmp_path / "absent.toml")
+    assert config.proxy_headers is False
+    assert config.trusted_proxies == DEFAULT_TRUSTED_PROXIES == ("127.0.0.1", "::1")
+
+
+def test_the_proxy_settings_are_read(tmp_path):
+    path = tmp_path / "cocco.toml"
+    path.write_text(
+        """
+        [site]
+        proxy_headers = true
+        trusted_proxies = ["10.0.0.0/8", "::1", "192.168.1.7"]
+        """
+    )
+    config = load_config(path)
+    assert config.proxy_headers is True
+    assert config.trusted_proxies == ("10.0.0.0/8", "::1", "192.168.1.7")
+
+
+@pytest.mark.parametrize(
+    "value",
+    ['["nginx.local"]', '["127.0.0.1/33"]', '["10.0.0.1/8"]', '"127.0.0.1"'],
+)
+def test_a_proxy_that_could_never_match_is_refused(tmp_path, value):
+    """uvicorn would keep each of these as a literal that matches nothing, and
+    every request would then be logged with the proxy's own address."""
+    path = tmp_path / "cocco.toml"
+    path.write_text(f"[site]\ntrusted_proxies = {value}\n")
+    with pytest.raises(ConfigError, match="trusted_proxies"):
+        load_config(path)
+
+
+########################################################################
 # the file that is in git
 
 
@@ -410,3 +483,5 @@ def test_the_committed_dev_config_loads():
     assert config.auth.google is None
     assert config.auth.github is None
     assert config.database.url == DEFAULT_DATABASE_URL
+    # No [log] table: development reads text.
+    assert config.log.format == "text"

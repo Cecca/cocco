@@ -309,9 +309,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Logging verbosity (default: INFO)",
+        help="Logging verbosity for this run (default: [log] level, else INFO)",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -380,21 +380,32 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    from cocco.config import ConfigError, config_path, load_log_config
+    from cocco.logs import configure_logging
 
-    # There is no ini file, so alembic's usual `fileConfig()` never runs and
-    # nothing else would configure logging at all - without this, `upgrade` is
-    # silent about the revisions it just applied.
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(levelname)s %(name)s: %(message)s",
-    )
+    args = build_parser().parse_args(argv)
 
     # Before any alembic command, because `env.py` reads the file for itself.
     # `cocco/server.py`'s trick, for `cocco/server.py`'s reason: the setting has
     # to be in place before the thing that reads it is reached.
     if args.config is not None:
         os.environ["COCCO_CONFIG"] = str(args.config)
+
+    # There is no ini file, so alembic's usual `fileConfig()` never runs and
+    # nothing else would configure logging at all - without this, `upgrade` is
+    # silent about the revisions it just applied. The same `[log]` table as the
+    # two servers, but onto stderr: `--sql` prints DDL on stdout, to be
+    # redirected into a file that must not have log lines in it.
+    try:
+        configure_logging(
+            load_log_config(config_path()),
+            "migrate",
+            args.log_level,
+            stream="ext://sys.stderr",
+        )
+    except ConfigError as e:
+        print(f"cocco-migrate: {e}", file=sys.stderr)
+        return 1
 
     try:
         args.run(args)

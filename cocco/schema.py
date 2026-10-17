@@ -117,6 +117,11 @@ class SubmissionRunData(Base):
     # The challenge's evaluator script, relative to the storage root. None
     # means the bundled default - see `cocco.evaluators`.
     evaluator_path: str | None = None
+    # Only ever read by the log: `run_from_queue` binds it beside the
+    # submission id so every line of a graded run can be filtered by challenge.
+    # Defaulted, unlike `filename`, because nothing is graded differently
+    # without it.
+    challenge_id: int | None = None
 
 
 class EvaluatorResult(Base):

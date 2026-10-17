@@ -682,3 +682,54 @@ async def test_an_empty_input_is_an_empty_stdin(tmp_path: Path):
         fp.write(b"")
 
     assert await _feed_to(["cat"], path) == b""
+
+
+async def test_a_graded_run_logs_with_its_submission_bound(monkeypatch, caplog):
+    """Every line emitted underneath `run_from_queue` carries the submission,
+    without the line naming it. No sandbox: the grading itself is replaced by
+    a function that only logs, and so are the two database writes."""
+    import contextlib
+    import logging
+
+    import cocco.schema as cs
+    from cocco.logs import ContextFilter, record_fields
+
+    run_data = cs.SubmissionRunData(
+        submission_id=812,
+        challenge_id=12,
+        language="python",
+        source="",
+        filename="a.py",
+        max_threads=1,
+        max_memory_bytes=1 << 26,
+        max_time_s=1.0,
+        test_cases=[],
+    )
+
+    async def pull(conn):
+        return run_data
+
+    async def grade(storage, data):
+        logging.getLogger("cocco.judge").info("deep inside the run")
+        return []
+
+    class Engine:
+        def connect(self):
+            return contextlib.nullcontext()
+
+        begin = connect
+
+    monkeypatch.setattr(cj.repo, "pull_queued_submission", pull)
+    monkeypatch.setattr(cj.repo, "insert_test_outcomes", lambda conn, o: None)
+    monkeypatch.setattr(cj.repo, "mark_submission_done", lambda conn, i: None)
+    monkeypatch.setattr(cj, "run_submission", grade)
+
+    caplog.handler.addFilter(ContextFilter())
+    with caplog.at_level(logging.INFO, logger="cocco.judge"):
+        assert await cj.run_from_queue(Engine(), None)
+
+    [inside] = [r for r in caplog.records if r.getMessage() == "deep inside the run"]
+    fields = record_fields(inside)
+    assert fields["submission_id"] == 812
+    assert fields["challenge_id"] == 12
+    assert fields["language"] == "python"

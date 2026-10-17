@@ -34,6 +34,7 @@ from cocco.auth import (
     safe_next_path,
 )
 from cocco.config import config_path, load_config
+from cocco.logs import AccessLogMiddleware
 from cocco.migrate import (
     check_schema_is_current,
     reset_schema,
@@ -220,6 +221,16 @@ app.add_middleware(
     # would not be sent to the callback, so every sign-in would fail as a state
     # mismatch.
     same_site="lax",
+)
+
+# Added last, so it runs first: `add_middleware` puts each new one outside the
+# ones before it, and the access log's duration has to include all of them. It
+# also owns `[site] proxy_headers` - see `AccessLogMiddleware` for why the
+# proxy is handled in here rather than by uvicorn.
+app.add_middleware(
+    AccessLogMiddleware,
+    proxy_headers=CONFIG.proxy_headers,
+    trusted_proxies=CONFIG.trusted_proxies,
 )
 
 # Registered at import, but nothing is fetched here: Authlib pulls Google's
@@ -1215,10 +1226,15 @@ async def _complete_sign_in(
     email: str,
     next_path: str,
     *,
+    provider: str,
     claim_password: str | None = None,
 ):
     """Everything between a proved address and a session, for every one of the
     ways an address is proved.
+
+    `provider` names which one - "google", "github", "password", "dummy" - and
+    is only ever written to the log, where "every refused sign-in through
+    GitHub" should be a filter rather than a guess.
 
     A provider's callback proves one - Google by verifying an ID token, GitHub
     by asking which of the account's addresses are verified; `post_auth_password`
@@ -1241,7 +1257,11 @@ async def _complete_sign_in(
     before the blacklist refusal so that a blocked account still refuses.
     """
     if not is_allowed_email(email, CONFIG.auth.allowed_domains):
-        logger.info("refused a sign-in from outside the allowed domains: %s", email)
+        logger.info(
+            "refused a sign-in from outside the allowed domains: %s",
+            email,
+            extra={"email": email, "provider": provider, "reason": "domain"},
+        )
         domains = ", ".join("@" + d for d in CONFIG.auth.allowed_domains)
         return _login_page(
             request,
@@ -1262,7 +1282,11 @@ async def _complete_sign_in(
         # rather than here. False means the address is spoken for.
         if not await claim_user_password(db, email, claim_password):
             await db.rollback()
-            logger.info("refused a password claim on a taken address: %s", email)
+            logger.info(
+                "refused a password claim on a taken address: %s",
+                email,
+                extra={"email": email, "provider": provider, "reason": "claimed"},
+            )
             return _login_page(
                 request,
                 next_path=next_path,
@@ -1281,7 +1305,11 @@ async def _complete_sign_in(
         # succeeds and dies on the first click, on a page they did not ask for;
         # this way the sentence arrives on the page they are already looking at.
         # `get_or_create_user` created nothing above - a blocked account exists.
-        logger.info("refused a sign-in from a blocked account: %s", email)
+        logger.info(
+            "refused a sign-in from a blocked account: %s",
+            email,
+            extra={"email": email, "provider": provider, "reason": "blocked"},
+        )
         return _login_page(
             request,
             next_path=next_path,
@@ -1490,8 +1518,12 @@ async def post_auth_dummy(
         return _login_page(
             request, next_path=next_path, error=str(err), status_code=400
         )
-    logger.warning("dummy sign-in as %s", address)
-    return await _complete_sign_in(request, db, address, next_path)
+    logger.warning(
+        "dummy sign-in as %s", address, extra={"email": address, "provider": "dummy"}
+    )
+    return await _complete_sign_in(
+        request, db, address, next_path, provider="dummy"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1561,7 +1593,15 @@ async def post_auth_password(
 
     stored = await query_password_hash(db, address) if address else None
     if not await run_in_threadpool(verify_password, password, stored):
-        logger.info("a password sign-in did not match: %s", address or email)
+        logger.info(
+            "a password sign-in did not match: %s",
+            address or email,
+            extra={
+                "email": address or email,
+                "provider": "password",
+                "reason": "bad_credentials",
+            },
+        )
         return _login_page(
             request, next_path=next_path, error=_BAD_CREDENTIALS, status_code=403
         )
@@ -1576,7 +1616,9 @@ async def post_auth_password(
         )
         await db.commit()
 
-    return await _complete_sign_in(request, db, address, next_path)
+    return await _complete_sign_in(
+        request, db, address, next_path, provider="password"
+    )
 
 
 @app.post("/auth/password/register")
@@ -1625,6 +1667,7 @@ async def post_auth_password_register(
         db,
         address,
         next_path,
+        provider="password",
         claim_password=await run_in_threadpool(hash_password, password),
     )
 
@@ -1710,7 +1753,12 @@ async def get_auth_provider_callback(request: Request, provider: str, db: DBDep)
         # expired `state`, and a token endpoint that refused the code. Keep the
         # clause this narrow: widening it would fold a failed state check into
         # a success path, which is the one bug here that fails silently.
-        logger.info("a %s sign-in did not complete: %s", descriptor.label, err.error)
+        logger.info(
+            "a %s sign-in did not complete: %s",
+            descriptor.label,
+            err.error,
+            extra={"provider": descriptor.name, "reason": err.error},
+        )
         return _login_page(
             request,
             next_path=next_path,
@@ -1732,7 +1780,9 @@ async def get_auth_provider_callback(request: Request, provider: str, db: DBDep)
         )
 
     # The domain, the account and the blacklist, shared with the sign-in box.
-    return await _complete_sign_in(request, db, email, next_path)
+    return await _complete_sign_in(
+        request, db, email, next_path, provider=descriptor.name
+    )
 
 
 @app.post("/logout")

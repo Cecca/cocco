@@ -10,8 +10,8 @@ There is no ini file, so:
   `postgresql+psycopg://` survives at all: written into an ini file it would be
   a configparser value, and a `%` in a password would make one unreadable.
 * `fileConfig(config.config_file_name)` is gone. `config_file_name` is None
-  here and the call would raise. `cocco-migrate` runs `logging.basicConfig`
-  instead.
+  here and the call would raise. `cocco-migrate` runs `cocco.logs.configure_logging`
+  instead, from the same `[log]` table the two servers read.
 
 A plain sync engine, and none of alembic's async template: psycopg is the
 driver precisely because it has both faces (see `DEFAULT_DATABASE_URL`), and a

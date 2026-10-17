@@ -15,14 +15,22 @@ import lazy, which is what makes `--config` mean anything.
 The counterpart of `cocco.judge:main`, and deliberately spelled like it: the
 same `--config`, with the same help text, because the two processes reading
 one file is the thing that keeps them agreeing.
+
+Logging reaches uvicorn the same way the app does: as data, not as state. The
+`dictConfig` dict from `cocco.logs` goes in as `log_config=`, which uvicorn
+applies in every process it starts - a handler set up here would stay here,
+and the app under `--reload` or `--workers` runs somewhere else.
 """
 
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
 
 import uvicorn
+
+logger = logging.getLogger("cocco.server")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,26 +77,24 @@ def build_parser() -> argparse.ArgumentParser:
             "about who is signed in."
         ),
     )
+    # Deprecated: `[site] proxy_headers` in the file is the setting now, and
+    # this flag only survives one release so a unit file that still passes it
+    # keeps working - see `_warn_about_proxy_headers_flag`.
     parser.add_argument(
         "--proxy-headers",
         action="store_true",
-        help=(
-            "Trust X-Forwarded-* from the reverse proxy. Without it a "
-            "TLS-terminating proxy makes the request say `http`, and the "
-            "OAuth redirect URI cocco builds will not match the one Google "
-            "has registered - see [site] base_url in cocco.example.toml."
-        ),
+        help="Deprecated: set `[site] proxy_headers = true` in the file instead.",
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Logging verbosity (default: INFO)",
+        help="Logging verbosity for this run (default: [log] level, else INFO)",
     )
     return parser
 
 
-def _check_storage() -> None:
+def _check_storage(config) -> None:
     """Refuse to serve a storage root this version cannot read.
 
     `_check_schema`'s twin, here for exactly its reason: the app checks again
@@ -97,17 +103,16 @@ def _check_storage() -> None:
     different halves of a deployment - the database and the files beside it -
     and either can be behind without the other.
     """
-    from cocco.config import config_path, load_config
     from cocco.storage import StorageFormatError, check_storage_format
 
     try:
-        check_storage_format(load_config(config_path()).storage.root)
+        check_storage_format(config.storage.root)
     except StorageFormatError as e:
-        print(e, file=sys.stderr)
+        logger.error("%s", e)
         raise SystemExit(1)
 
 
-def _check_schema() -> None:
+def _check_schema(config) -> None:
     """Refuse to serve a database that is not at the revision this code expects.
 
     This looks like a duplicate of the check in `cocco.main`'s startup, and it
@@ -129,10 +134,8 @@ def _check_schema() -> None:
     """
     from sqlalchemy import create_engine
 
-    from cocco.config import config_path, load_config
     from cocco.migrate import SchemaOutOfDate, check_schema_is_current
 
-    config = load_config(config_path())
     if config.dev.reset_db:
         # A reset builds the schema itself, so it is allowed to start behind -
         # indeed it is normally started against nothing at all.
@@ -145,13 +148,32 @@ def _check_schema() -> None:
     except SchemaOutOfDate as e:
         # No prefix of our own: `check_schema_is_current` was given the process
         # name and has already put it at the front of the sentence.
-        print(e, file=sys.stderr)
+        logger.error("%s", e)
         raise SystemExit(1)
     finally:
         engine.dispose()
 
 
+def _warn_about_proxy_headers_flag() -> None:
+    """`config.py`'s `_warn_about_removed_settings`, for the one setting that
+    was a flag rather than a variable: named out loud, and only warned about,
+    because a unit file that still passes it must not stop the app booting.
+
+    The flag still does what it did - uvicorn trusts `[site] trusted_proxies`
+    for the client address and the scheme - but only the file's spelling also
+    lets the app adopt nginx's X-Request-ID, since that needs to see the peer
+    before uvicorn has rewritten it.
+    """
+    logger.warning(
+        "--proxy-headers is deprecated; that setting is `[site] proxy_headers "
+        "= true` in the configuration file now"
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
+    from cocco.config import ConfigError, config_path, load_config, load_log_config
+    from cocco.logs import configure_logging, logging_config
+
     args = build_parser().parse_args(argv)
 
     # Before the import string is resolved, which is the point of this module.
@@ -160,8 +182,23 @@ def main(argv: list[str] | None = None) -> None:
     if args.config is not None:
         os.environ["COCCO_CONFIG"] = str(args.config)
 
-    _check_schema()
-    _check_storage()
+    # Logging first, from the `[log]` table alone, so that everything below -
+    # `load_config`'s warnings, the two refusals - comes out in the format the
+    # deployment asked for. A `[log]` table that cannot be read is the one
+    # refusal that has to be a bare `print`: there is no log to write it to.
+    try:
+        log = load_log_config(config_path())
+        configure_logging(log, "web", args.log_level)
+        config = load_config(config_path())
+    except ConfigError as e:
+        print(f"cocco-web: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+    if args.proxy_headers:
+        _warn_about_proxy_headers_flag()
+
+    _check_schema(config)
+    _check_storage(config)
 
     uvicorn.run(
         "cocco.main:app",
@@ -169,8 +206,20 @@ def main(argv: list[str] | None = None) -> None:
         port=args.port,
         reload=args.reload,
         workers=args.workers,
+        # The same dict as above, applied again by uvicorn in every process it
+        # starts - and over `uvicorn.error`, so there is one format in the
+        # stream. `log_level` stays None: it would override the dict's levels.
+        log_config=logging_config(config.log, "web", args.log_level),
+        log_level=None,
+        # `cocco.access`, from the app's own middleware, replaces this line.
+        access_log=False,
+        # Normally False: `[site] proxy_headers` is handled inside the app, by
+        # `cocco.main`'s middleware, which is what lets it see the proxy's own
+        # address before the client's replaces it. Only the deprecated flag
+        # still asks uvicorn to do it - trusting the file's list, never
+        # FORWARDED_ALLOW_IPS from the environment.
         proxy_headers=args.proxy_headers,
-        log_level=args.log_level.lower(),
+        forwarded_allow_ips=list(config.trusted_proxies),
     )
 
 

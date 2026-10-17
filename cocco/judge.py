@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import tomllib
 from contextlib import asynccontextmanager, suppress
@@ -17,11 +18,14 @@ from sqlalchemy.engine import Engine
 from cocco import repository as repo
 from cocco.config import (
     DEFAULT_FLAKE_REF,
+    ConfigError,
     config_path,
     default_gcroots,
     load_config,
+    load_log_config,
 )
 from cocco.evaluators import DEFAULT_EVALUATOR, bundled_path
+from cocco.logs import bind, configure_logging
 from cocco.schema import (
     Challenge,
     EvaluatorResult,
@@ -963,16 +967,22 @@ async def run_submission(
                     processes=run_data.max_threads,
                 )
                 if exec_res.status != "OK":
+                    score = 0.0
+                    eval_msg = exec_res.message or exec_res.status
+                    outcome = _classify_isolate_failure(exec_res)
                     logger.info(
                         "submission %s test %s failed: status=%s message=%s",
                         run_data.submission_id,
                         test_case.id,
                         exec_res.status,
                         exec_res.message,
+                        extra={
+                            "testcase_id": test_case.id,
+                            "outcome": outcome.value,
+                            "elapsed_s": exec_res.elapsed_time_s,
+                            "peak_memory_bytes": exec_res.max_rss_kb * 1024,
+                        },
                     )
-                    score = 0.0
-                    eval_msg = exec_res.message or exec_res.status
-                    outcome = _classify_isolate_failure(exec_res)
                 else:
                     # The evaluator sees the whole output; only what is stored
                     # on the outcome below is truncated.
@@ -992,6 +1002,13 @@ async def run_submission(
                         test_case.id,
                         score,
                         outcome.value,
+                        extra={
+                            "testcase_id": test_case.id,
+                            "outcome": outcome.value,
+                            "score": score,
+                            "elapsed_s": exec_res.elapsed_time_s,
+                            "peak_memory_bytes": exec_res.max_rss_kb * 1024,
+                        },
                     )
                 test_outcome = TestOutcome(
                     submission_id=run_data.submission_id,
@@ -1038,43 +1055,59 @@ async def run_from_queue(engine: Engine, storage: Storage) -> bool:
         if run_data is None:
             return False
 
-    logger.info("picked up submission %s from queue", run_data.submission_id)
+    # Everything below - the compile, every test case, the evaluator, the
+    # outcome rows - is about this one submission, and is logged with these
+    # fields without a single one of those lines naming them. That is what
+    # makes "everything that happened to submission 812" one query.
+    with bind(
+        submission_id=run_data.submission_id,
+        challenge_id=run_data.challenge_id,
+        language=run_data.language,
+    ):
+        logger.info("picked up submission %s from queue", run_data.submission_id)
 
-    outcomes: List[TestOutcome] = []
-    try:
-        # `languages.toml` is deliberately not configurable, unlike the
-        # database and the storage root: it is shipped inside the package and
-        # read from there by both processes, so a file pointed elsewhere would
-        # be one more way for the two of them to disagree in silence. What
-        # *is* configurable is the flake those runtimes are built out of
-        # (`[judge] flake`) - a language entry names an output some flake has
-        # to expose, and an installed judge has no checkout to assume.
-        outcomes = await run_submission(storage, run_data)
-    except Exception as e:
-        logger.exception(
-            "submission %s failed during execution; marking as judge_internal_error",
-            run_data.submission_id,
-        )
-        message = f"Judge internal error: {e!r}"
-        outcomes = [
-            TestOutcome(
-                submission_id=run_data.submission_id,
-                testcase_id=t.id,
-                outcome=OutcomeEnum.judge_internal_error,
-                score=0.0,
-                message=message,
+        outcomes: List[TestOutcome] = []
+        try:
+            # `languages.toml` is deliberately not configurable, unlike the
+            # database and the storage root: it is shipped inside the package
+            # and read from there by both processes, so a file pointed
+            # elsewhere would be one more way for the two of them to disagree
+            # in silence. What *is* configurable is the flake those runtimes
+            # are built out of (`[judge] flake`) - a language entry names an
+            # output some flake has to expose, and an installed judge has no
+            # checkout to assume.
+            outcomes = await run_submission(storage, run_data)
+        except Exception as e:
+            logger.exception(
+                "submission %s failed during execution; marking as judge_internal_error",
+                run_data.submission_id,
             )
-            for t in run_data.test_cases
-        ]
+            message = f"Judge internal error: {e!r}"
+            outcomes = [
+                TestOutcome(
+                    submission_id=run_data.submission_id,
+                    testcase_id=t.id,
+                    outcome=OutcomeEnum.judge_internal_error,
+                    score=0.0,
+                    message=message,
+                )
+                for t in run_data.test_cases
+            ]
 
-    with engine.begin() as conn:
-        repo.insert_test_outcomes(conn, outcomes)
-        repo.mark_submission_done(conn, run_data.submission_id)
-    logger.info(
-        "submission %s done, recorded %d test outcomes",
-        run_data.submission_id,
-        len(outcomes),
-    )
+        with engine.begin() as conn:
+            repo.insert_test_outcomes(conn, outcomes)
+            repo.mark_submission_done(conn, run_data.submission_id)
+        # The headline score the pages show, computed the way they compute it
+        # (the mean, out of 1) so the log and the standings agree.
+        score = (
+            sum(o.score for o in outcomes) / len(outcomes) if outcomes else None
+        )
+        logger.info(
+            "submission %s done, recorded %d test outcomes",
+            run_data.submission_id,
+            len(outcomes),
+            extra={"score": score, "n_tests": len(outcomes)},
+        )
 
     return True
 
@@ -1110,9 +1143,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Logging verbosity (default: INFO)",
+        help="Logging verbosity for this run (default: [log] level, else INFO)",
     )
     return parser
 
@@ -1128,15 +1161,16 @@ def main(argv: list[str] | None = None) -> None:
     """
     args = build_parser().parse_args(argv)
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-    # Read after `basicConfig`, so that what `load_config` has to say -
-    # a missing file, a setting in its old place, no session secret -
-    # actually lands in the judge's log rather than nowhere.
-    config = load_config(args.config)
+    # Logging from the `[log]` table alone, and then the rest of the file, so
+    # that what `load_config` has to say - a missing file, a setting in its old
+    # place, no session secret - lands in the judge's log in the judge's
+    # format. A `[log]` table that cannot be read has no log to go to.
+    try:
+        configure_logging(load_log_config(args.config), "judge", args.log_level)
+        config = load_config(args.config)
+    except ConfigError as e:
+        print(f"cocco-judge: {e}", file=sys.stderr)
+        raise SystemExit(1)
 
     global FLAKE_REF, GCROOTS_DIR
     FLAKE_REF = config.judge.flake

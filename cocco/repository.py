@@ -138,6 +138,7 @@ async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
         max_time_s=challenge.max_time_s,
         test_cases=[schema.TestCase.model_validate(t) for t in tests],
         evaluator_path=challenge.evaluator_path,
+        challenge_id=challenge.id,
     )
 
 

@@ -61,7 +61,12 @@ def normalize_administrators(raw: Iterable[str]) -> tuple[str, ...]:
         try:
             seen.setdefault(normalize_email(entry), None)
         except ValueError as exc:
-            logger.warning("[auth] ignoring administrator %r: %s", entry, exc)
+            logger.warning(
+                "[auth] ignoring administrator %r: %s",
+                entry,
+                exc,
+                extra={"setting": "[auth] administrators"},
+            )
     return tuple(seen)
 
 
