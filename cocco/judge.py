@@ -1,11 +1,16 @@
 import argparse
 import asyncio
+import functools
+import gzip
+import json
 import logging
 import os
+import re
 import shutil
 import signal
 import sys
 import tempfile
+import time
 import tomllib
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
@@ -30,10 +35,26 @@ from cocco.config import (
     load_log_config,
 )
 from cocco.evaluators import DEFAULT_EVALUATOR, bundled_path
+from cocco.exercises import HARNESS_PATH
+from cocco.exercises import format as exercise_format
+from cocco.exercises.compare import Comparison, Rules, compare
 from cocco.logs import bind, configure_logging
 from cocco.schema import (
     Challenge,
     EvaluatorResult,
+    Exercise,
+    ExerciseBuildResult,
+    ExerciseCheckResult,
+    ExerciseExecution,
+    ExerciseJobError,
+    ExerciseJobRunData,
+    ExerciseProblem,
+    ExerciseRunResult,
+    ExerciseTest,
+    ExerciseTestResult,
+    ExerciseVerdict,
+    HarnessException,
+    HarnessReport,
     Submission,
     SubmissionRunData,
     TestCase,
@@ -41,6 +62,8 @@ from cocco.schema import (
 )
 from cocco.migrate import SchemaOutOfDate, check_schema_is_current
 from cocco.model import (
+    ExerciseJobKind,
+    ExerciseVersionStatus,
     OutcomeEnum,
 )
 from cocco.storage import (
@@ -305,6 +328,8 @@ async def isolate_run(
     additional_files: List[Path] = [],
     box_files: Dict[str, Path] | None = None,
     compressed_box_files: Dict[str, Path] | None = None,
+    fsize_kb: int | None = None,
+    env: Dict[str, str] | None = None,
 ) -> RunOutcome:
     """Run `exe` in a fresh isolate box.
 
@@ -313,20 +338,35 @@ async def isolate_run(
     with no flag to get wrong: everything under the storage root is gzip, and
     nothing else is ever passed here.
 
-    `args` that happen to name an existing file or directory are copied into
-    the box and rewritten to their *basename*: the box is one flat directory,
-    so every path collapses into a single namespace. `box_files` is the
-    explicit form of the same thing - a box-relative name to put a file under,
-    whatever it is called outside - and is the only way to be sure two
-    unrelated paths do not land on the same name. `compressed_box_files` is
-    that same argument for a file that comes out of storage, and so has to be
-    expanded rather than copied; the two are separate arguments rather than one
-    clever value because a caller mixing them up would be silent.
+    `args` are passed to the program **exactly as written**, always, and a
+    file reaches the box in exactly three ways, every one of them explicit:
+    `box_files` (a box-relative name to put a file under, whatever it is
+    called outside - the only way to be sure two unrelated paths do not land
+    on the same name), `compressed_box_files` (the same, for a file out of
+    storage, which is expanded rather than copied; a separate argument because
+    a caller mixing the two up would be silent), and `additional_files` (each
+    under its basename). The box is one flat directory, and an argument that
+    names a file names it by its box-relative name.
+
+    There used to be a fourth way: any argument that happened to name an
+    existing file or directory was copied in and rewritten to its basename.
+    That guesswork resolved a bare word against the judge's *working
+    directory*, which under systemd is `/` - so a student's `public class run`,
+    whose class name java is given as an argument, copied `/run`, credentials
+    and all, into a box the student could read. Never reintroduce it.
 
     Ordering is load-bearing and easy to reverse by accident: `box_files` and
-    `compressed_box_files` are placed first, then `args`, then
-    `additional_files`, so a later stage silently wins a name collision with an
-    earlier one.
+    `compressed_box_files` are placed first, then `additional_files`, so the
+    later one silently wins a name collision.
+
+    Two limits beyond the caller's CPU `time_limit`. A wall-clock one,
+    `2 * time_limit + 1` seconds, because `--time` counts CPU and a program
+    that sleeps - `time.sleep`, `signal.pause`, a blocking read - uses none,
+    and would hold a box and a worker for ever; it ends as status `TO`, like
+    the CPU one. And `fsize_kb`, isolate's cap on every file the program
+    writes - its stdout and stderr included, which this function then reads
+    whole into memory - for a caller that knows how much output is plenty.
+    `env` is set in the box, whose environment isolate otherwise empties.
     """
     box_files = box_files or {}
     compressed_box_files = compressed_box_files or {}
@@ -378,23 +418,6 @@ async def isolate_run(
                 # `_feed_stdin`'s reason.
                 await asyncio.to_thread(expand, source, box_path / box_name)
 
-            filtered_args = []
-            for arg in args:
-                # A name we placed ourselves is already in the box under exactly
-                # that name; the `isfile` heuristic below must not touch it.
-                if arg in box_files or arg in compressed_box_files:
-                    filtered_args.append(arg)
-                elif os.path.isfile(arg):
-                    arg = Path(arg)
-                    shutil.copy(arg, box_path / arg.name)
-                    filtered_args.append(arg.name)
-                elif os.path.isdir(arg):
-                    arg = Path(arg)
-                    shutil.copytree(arg, box_path / arg.name)
-                    filtered_args.append(arg.name)
-                else:
-                    filtered_args.append(arg)
-
             for f in additional_files:
                 if os.path.isfile(f):
                     shutil.copy(f, box_path / f.name)
@@ -410,7 +433,10 @@ async def isolate_run(
                 "--box-id",
                 str(box_id),
                 f"--time={time_limit}",
+                f"--wall-time={2 * time_limit + 1}",
                 f"--cg-mem={mem_limit_kb}",
+                *([f"--fsize={fsize_kb}"] if fsize_kb is not None else []),
+                *(f"--env={k}={v}" for k, v in (env or {}).items()),
                 f"--processes={processes}",
                 "--dir=/nix/store",  # this allows running the compilers/interpreters
                 f"--meta={meta_file}",
@@ -419,7 +445,7 @@ async def isolate_run(
                 "--run",
                 "--",
                 str(exe),
-                *filtered_args,
+                *args,
                 stdin=asyncio.subprocess.DEVNULL if stdin is None else asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -613,9 +639,14 @@ class Language:
         if self.is_interpreted:
             assert self.interpreter is not None
             interpreter = await resolve_runtime(self.runtime, self.interpreter)
+            # Box-relative, all three: `isolate_run` passes arguments as they
+            # are and copies nothing on their say-so, and `_run_artifacts`
+            # below puts the executable - and, for java, every class beside
+            # it - in the box under its basename. The box is the program's
+            # working directory, so that is `{workdir}`.
             fmt = dict(
-                executable=str(executable),
-                workdir=str(executable.parent),
+                executable=executable.name,
+                workdir=".",
                 name=executable.stem,
             )
             prefix_args = [a.format(**fmt) for a in (self.interpreter_args)]
@@ -1125,12 +1156,19 @@ async def run_from_queue(engine: Engine, storage: Storage) -> bool:
             # staying `running` forever, which is not just a stale badge: a
             # running submission refuses every regrade and every delete of its
             # challenge until somebody fixes the row by hand.
-            with engine.begin() as conn:
-                repo.requeue_submission(conn, run_data.submission_id)
-            logger.info(
-                "submission %s interrupted; put back on the queue",
-                run_data.submission_id,
-            )
+            # As for an exercise job: nothing here may stop the cancellation.
+            try:
+                with engine.begin() as conn:
+                    repo.requeue_submission(conn, run_data.submission_id)
+                logger.info(
+                    "submission %s interrupted; put back on the queue",
+                    run_data.submission_id,
+                )
+            except Exception:
+                logger.exception(
+                    "submission %s interrupted, and could not be put back",
+                    run_data.submission_id,
+                )
             raise
         except Exception as e:
             logger.exception(
@@ -1167,14 +1205,754 @@ async def run_from_queue(engine: Engine, storage: Storage) -> bool:
     return True
 
 
+########################################################################
+# Exercises
+#
+# An exercise job never runs the student's file directly: every program, the
+# author's solution included, goes through `cocco/exercises/harness.py` in a box
+# of its own, and the judge reads what it did off the last line of the box's
+# stdout (`schema.HarnessReport`). The comparison against the expected output
+# then happens here, in this process, because the rules are declarative and
+# the code applying them is ours - an evaluator box per test would double the
+# cost of a check to buy nothing.
+
+# What one exercise test may use. The time is the exercise's own (`time:` in
+# the file); the memory is fixed, an exercise being a few lines of python on a
+# few lines of input, and the process budget is the python language's, as for
+# a challenge.
+EXERCISE_MEM_LIMIT_KB = 256 * 1024
+
+# isolate's `--fsize` for a harness run: the most any file the program writes
+# may hold, its stdout included - which is where the report goes, and which
+# the judge reads whole. The report of a program that printed right up to the
+# harness's 256 K-character caps is at most about 9 MB, every character
+# escaped to `\uXXXX\uXXXX`; anything past this is a program writing to fd 1
+# directly, which then ends without reporting.
+EXERCISE_FSIZE_KB = 16 * 1024
+
+# Set in every harness box: string hashing, and so the order a `set` prints
+# in, is then the same in the author's solution and in the student's program.
+EXERCISE_ENV = {"PYTHONHASHSEED": "0"}
+
+# What is kept of a program's stdout, stderr and traceback in a job's result.
+# The harness already caps what it captures at 256 K characters, and the
+# comparison sees all of that; what is *stored* is far less, because a check
+# stores every test and a flood on each would be megabytes of JSONB per click.
+#
+# A field never keeps more than `MAX_EXERCISE_STORED_OUTPUT`; a check's tests
+# that did not pass share `MAX_EXERCISE_RESULT_OUTPUT` between their three
+# fields each; and a test that passed keeps `PASSED_TEST_STORED_OUTPUT`, its
+# output being, as far as the rules can tell, the expected one the page
+# already has. Enough of a flood to see how it began.
+MAX_EXERCISE_STORED_OUTPUT = 32 * 1024
+MAX_EXERCISE_RESULT_OUTPUT = 256 * 1024
+PASSED_TEST_STORED_OUTPUT = 1024
+
+# A build problem's `detail` - a traceback, a stderr - as the author page shows
+# it under the sentence.
+MAX_PROBLEM_DETAIL = 2000
+
+# The names the harness and the program take inside the box. `main.py` is the
+# name tracebacks and line numbers are reported against, which is the student's
+# own file as far as they are concerned.
+_HARNESS_IN_BOX = "harness.py"
+_MAIN_IN_BOX = "main.py"
+
+# Code points PostgreSQL will not hold in JSONB: a NUL, which it refuses in
+# `text` too, and a lone surrogate, which is not a character at all. A python
+# `str` keeps a valid astral character as one code point, so anything in this
+# range is lone. Both can come out of the harness's JSON - `\u0000` and
+# `\ud800` are valid escapes there - because a program can print them.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _jsonb_safe(value):
+    """`value` with every string fit for JSONB: NULs dropped, lone surrogates
+    replaced with U+FFFD. Recurses through dicts and lists.
+
+    Applied to the harness's report as soon as it is parsed, rather than to
+    the result on its way into the database: a solution's output becomes an
+    expected output, and if the stored copy lost a NUL that the student's
+    output kept, a correct program would fail. One boundary, so everything the
+    comparison sees is what gets stored. A judge error's message is the only
+    other text that reaches a result, and goes through it too.
+    """
+    if isinstance(value, str):
+        return _SURROGATE.sub("�", value.replace("\x00", ""))
+    if isinstance(value, dict):
+        return {k: _jsonb_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonb_safe(v) for v in value]
+    return value
+
+
+def parse_harness_report(stdout: str) -> HarnessReport | None:
+    """The harness's report, from the last line of a box's stdout, or None.
+
+    The *last* line, because a program can write to fd 1 directly, ahead of
+    the report. None when that line is not a report: the program ended the
+    process first, or wrote over it. A forgery that does parse is accepted -
+    the output is still compared here, so it can only fake the exception
+    check, and exercises grade nothing.
+    """
+    last = stdout.rstrip("\n").rpartition("\n")[2]
+    try:
+        return HarnessReport.model_validate(_jsonb_safe(json.loads(last)))
+    # `RecursionError` because the last line is the program's to write: a
+    # forged `[[[[…` nests deeper than the decoder will follow.
+    except (ValueError, ValidationError, RecursionError):
+        return None
+
+
+def read_execution(res: RunOutcome) -> ExerciseExecution:
+    """What a harness run did, from isolate's outcome.
+
+    The status says how the run ended and the report what the program did. A
+    timeout and an OOM produce no report, by construction; any other ending
+    without one is the program's doing (`no_report`), never the judge's. Only
+    isolate's own failure (`XX`) is the judge's, and raises.
+    """
+    if res.status == "TO":
+        return ExerciseExecution(
+            status="timeout", message=res.message, elapsed_s=res.elapsed_time_s
+        )
+    if res.oom:
+        return ExerciseExecution(
+            status="memory", message=res.message, elapsed_s=res.elapsed_time_s
+        )
+    if res.status == "XX":
+        raise RuntimeError(f"isolate failed: {res.message or res.status}")
+    report = parse_harness_report(res.stdout) if res.status == "OK" else None
+    if report is None:
+        return ExerciseExecution(
+            status="no_report",
+            # Not the report, which is missing: whatever reached the box's
+            # descriptors - the program's direct writes, or should the harness
+            # itself ever break, its traceback.
+            stdout=_jsonb_safe(res.stdout),
+            stderr=_jsonb_safe(res.stderr),
+            message=res.message,
+            elapsed_s=res.elapsed_time_s,
+        )
+    return ExerciseExecution(
+        status="ok",
+        stdout=report.stdout,
+        stderr=report.stderr,
+        truncated=report.truncated,
+        exit=report.exit,
+        exception=report.exception,
+        elapsed_s=res.elapsed_time_s,
+    )
+
+
+def _write_stdin(path: Path, text: str) -> Path:
+    """`text` as the compressed file `isolate_run` takes for a stdin.
+
+    Compressed although it never was in storage: `isolate_run` has one rule
+    for its stdin, and a second, plaintext kind would be the flag to get wrong
+    that the rule exists to avoid. A few bytes, at the fastest level.
+    """
+    with gzip.open(path, "wt", encoding="utf-8", compresslevel=1) as fp:
+        fp.write(text)
+    return path
+
+
+async def run_in_harness(
+    language: Language,
+    mode: str,
+    program: Path,
+    stdin: str,
+    time_limit: float,
+    workdir: Path,
+) -> ExerciseExecution:
+    """Run `program` through the harness in a box, in `check` or `run` mode.
+
+    `workdir` must be private to the caller and its stdin file is named
+    uniquely in it, so the tests of a job can run at once - each in its own
+    box, from the shared pool.
+    """
+    assert language.interpreter is not None
+    interpreter = await resolve_runtime(language.runtime, language.interpreter)
+    stdin_path = None
+    if stdin:
+        fd, name = tempfile.mkstemp(dir=workdir, prefix="stdin-")
+        os.close(fd)
+        stdin_path = _write_stdin(Path(name), stdin)
+    res = await isolate_run(
+        interpreter,
+        stdin_path,
+        [_HARNESS_IN_BOX, mode, _MAIN_IN_BOX],
+        time_limit=time_limit,
+        mem_limit_kb=EXERCISE_MEM_LIMIT_KB,
+        processes=1 + language.additional_processes,
+        box_files={_HARNESS_IN_BOX: HARNESS_PATH, _MAIN_IN_BOX: program},
+        fsize_kb=EXERCISE_FSIZE_KB,
+        env=EXERCISE_ENV,
+    )
+    return read_execution(res)
+
+
+def _cap(text: str, limit: int) -> tuple[str, bool]:
+    if len(text) <= limit:
+        return text, False
+    return text[:limit], True
+
+
+def _stored(
+    execution: ExerciseExecution, limit: int = MAX_EXERCISE_STORED_OUTPUT
+) -> dict:
+    """An execution's fields as a result stores them: stdout, stderr and the
+    traceback each cut at `limit`, and `clipped` set when that cut anything.
+    `truncated` stays the harness's, which is what the verdict was about."""
+    limit = min(limit, MAX_EXERCISE_STORED_OUTPUT)
+    stdout, cut_out = _cap(execution.stdout, limit)
+    stderr, cut_err = _cap(execution.stderr, limit)
+    exception = execution.exception
+    cut_tb = False
+    if exception is not None:
+        traceback, cut_tb = _cap(exception.traceback, limit)
+        exception = exception.model_copy(update={"traceback": traceback})
+    return {
+        **dict(execution),
+        "stdout": stdout,
+        "stderr": stderr,
+        "exception": exception,
+        "clipped": execution.clipped or cut_out or cut_err or cut_tb,
+    }
+
+
+def error_matches(exception: HarnessException | None, expected: str) -> bool:
+    """Whether a program that raised `exception` ended with `expected`: that
+    class or a subclass of it, which is why the harness reports the MRO."""
+    return exception is not None and expected in exception.classes
+
+
+def grade(
+    execution: ExerciseExecution,
+    expected_output: str,
+    expected_error: str | None,
+    rules: Rules,
+) -> tuple[ExerciseVerdict, Comparison | None]:
+    """The verdict on one test, and the comparison when there was one.
+
+    A port of the prototype's `checkTests`, in its order: how the run ended,
+    then a flood, then the exception, then the output. The output printed
+    before an expected exception is compared as usual. Quadratic in the line
+    counts with `order` and `numbers` together, so it is called off the event
+    loop.
+    """
+    if execution.status != "ok":
+        return execution.status, None
+    if execution.truncated:
+        return "truncated", None
+    clean = execution.exception is None and execution.exit == 0
+    if expected_error and clean:
+        return "noerror", None
+    if (
+        not error_matches(execution.exception, expected_error)
+        if expected_error
+        else not clean
+    ):
+        return "error", None
+    comparison = compare(expected_output, execution.stdout, rules)
+    return ("pass" if comparison.ok else "fail"), comparison
+
+
+async def _run_tests(
+    language: Language,
+    exercise: Exercise,
+    program: Path,
+    tests: list[ExerciseTest],
+    workdir: Path,
+) -> list[ExerciseExecution]:
+    """`program` on every one of `tests`, at once, each in its own box.
+
+    A TaskGroup rather than `gather`: when one run raises - isolate itself
+    failing - the others are cancelled, and so cleaned up, instead of carrying
+    on unwatched after the job has already been reported as broken.
+    """
+    async with asyncio.TaskGroup() as tasks:
+        runs = [
+            tasks.create_task(
+                run_in_harness(
+                    language, "check", program, t.input, exercise.time_s, workdir
+                )
+            )
+            for t in tests
+        ]
+    return [run.result() for run in runs]
+
+
+async def check_exercise(
+    language: Language, exercise: Exercise, source: str, workdir: Path
+) -> ExerciseCheckResult:
+    """Run `source` on every test of `exercise` and grade it.
+
+    The exercise must come from a built version: every test's
+    `expected_output` is what the build computed.
+    """
+    program = workdir / _MAIN_IN_BOX
+    program.write_text(source, encoding="utf-8")
+    executions = await _run_tests(language, exercise, program, exercise.tests, workdir)
+    graded = []
+    for test, execution in zip(exercise.tests, executions):
+        assert test.expected_output is not None
+        graded.append(
+            await asyncio.to_thread(
+                grade, execution, test.expected_output, test.expected_error, exercise.rules
+            )
+        )
+    # The result's budget, shared by the tests that did not pass: three
+    # fields each.
+    failed = sum(verdict != "pass" for verdict, _ in graded)
+    share = MAX_EXERCISE_RESULT_OUTPUT // (3 * failed) if failed else 0
+    results = [
+        ExerciseTestResult(
+            **_stored(
+                execution, PASSED_TEST_STORED_OUTPUT if verdict == "pass" else share
+            ),
+            verdict=verdict,
+            hidden=test.hidden,
+            diff=sorted(comparison.diff) if comparison else [],
+            unordered=comparison.unordered if comparison else False,
+        )
+        for test, execution, (verdict, comparison) in zip(
+            exercise.tests, executions, graded
+        )
+    ]
+    return ExerciseCheckResult(
+        passed=all(r.verdict == "pass" for r in results), tests=results
+    )
+
+
+@functools.cache
+def _languages() -> Dict[str, Language]:
+    """`languages.toml`, read once: it is part of the package, so it cannot
+    change under a running judge, and a Run is too small a job to be reading
+    a file for."""
+    return load_languages()
+
+
+def _python(language_name: str) -> Language:
+    """The language an exercise document names. Only an interpreted one can
+    run the harness, and today that is python."""
+    language = _languages().get(language_name)
+    if language is None or not language.is_interpreted:
+        raise ValueError(f"exercises cannot run in language {language_name!r}")
+    return language
+
+
+async def run_exercise_job(engine: Engine, job: ExerciseJobRunData):
+    """A check or a run: its result, in one of the shapes `schema` pins."""
+    assert job.exercise_index is not None and job.source is not None
+    with engine.connect() as conn:
+        found = repo.query_job_exercise(conn, job.version_id, job.exercise_index)
+    if found is None:
+        return ExerciseJobError(
+            message=(
+                f"Version {job.version_id} has no exercise {job.exercise_index}, "
+                "or is not built."
+            )
+        )
+    language_name, exercise = found
+    language = _python(language_name)
+    with tempfile.TemporaryDirectory() as temp:
+        workdir = Path(temp)
+        if job.kind is ExerciseJobKind.check:
+            return await check_exercise(language, exercise, job.source, workdir)
+        program = workdir / _MAIN_IN_BOX
+        program.write_text(job.source, encoding="utf-8")
+        execution = await run_in_harness(
+            language, "run", program, job.stdin or "", exercise.time_s, workdir
+        )
+        return ExerciseRunResult(**_stored(execution))
+
+
+@dataclass(frozen=True)
+class VersionBuild:
+    """What a build writes on its version: all three, once."""
+
+    status: ExerciseVersionStatus
+    problems: list[ExerciseProblem]
+    document: dict | None
+
+
+def _detail(execution: ExerciseExecution) -> str | None:
+    text = (
+        execution.exception.traceback
+        if execution.exception is not None
+        else execution.stderr
+    ).strip()
+    return text[-MAX_PROBLEM_DETAIL:] or None
+
+
+async def build_exercise(
+    language: Language, n: int, exercise: Exercise, workdir: Path
+) -> tuple[Exercise, list[ExerciseProblem]]:
+    """One exercise of a build: its expected outputs, and its problems.
+
+    A port of the prototype's `checkExercise`. The solution runs on every
+    test; then a second time on the tests where its output became the expected
+    one, so that a solution printing something random is caught - and only
+    there, since a run that failed has nothing to be compared with. Then the
+    starter runs on the result, which should not already pass.
+    """
+    label = f'exercise {n}, "{exercise.title}"'
+    problems: list[ExerciseProblem] = []
+
+    def problem(level, text, test=None, detail=None):
+        problems.append(
+            ExerciseProblem(
+                level=level, where=label, text=text, exercise=n, test=test,
+                detail=detail,
+            )
+        )
+
+    tests = list(exercise.tests)
+    if exercise.solution is not None:
+        solution = workdir / "solution.py"
+        solution.write_text(exercise.solution, encoding="utf-8")
+        first = await _run_tests(language, exercise, solution, tests, workdir)
+        # The tests whose expected output is the first run's.
+        computed: list[int] = []
+        for k, (t, r) in enumerate(zip(tests, first)):
+            test_no = k + 1
+            name = f"test {test_no}{' (hidden)' if t.hidden else ''}"
+            if r.status == "timeout":
+                problem(
+                    "error",
+                    f"The solution does not finish within {exercise.time_s:g} s on {name}.",
+                    test_no,
+                )
+                continue
+            if r.status == "memory":
+                problem("error", f"The solution runs out of memory on {name}.", test_no)
+                continue
+            if r.status == "no_report":
+                problem(
+                    "error",
+                    f"The solution ended without reporting on {name}"
+                    + (f" ({r.message})." if r.message else "."),
+                    test_no,
+                    _detail(r),
+                )
+                continue
+            if r.truncated:
+                problem("error", f"The solution prints too much output on {name}.", test_no)
+                continue
+            expected_error = None
+            if t.error is None:
+                if r.exception is not None or r.exit != 0:
+                    tip = (
+                        f' If that is intended, add an "error" block with '
+                        f"{r.exception.type} after the input."
+                        if r.exception is not None
+                        else ""
+                    )
+                    problem(
+                        "error",
+                        f"The solution ends with an error on {name}.{tip}",
+                        test_no,
+                        _detail(r),
+                    )
+                    continue
+            elif r.exception is None:
+                ended = (
+                    f"exited with code {r.exit}" if r.exit != 0 else "ended normally"
+                )
+                wanted = t.error or 'an error, as the "error" block says'
+                problem(
+                    "error",
+                    f"On {name} the solution should end with {wanted}, but it {ended}.",
+                    test_no,
+                )
+                continue
+            elif t.error and not error_matches(r.exception, t.error):
+                problem(
+                    "error",
+                    f"On {name} the solution ends with {r.exception.type}, "
+                    f'but the "error" block says {t.error}.',
+                    test_no,
+                    _detail(r),
+                )
+                continue
+            else:
+                expected_error = t.error or r.exception.type
+            if t.output is not None:
+                if not (await asyncio.to_thread(compare, t.output, r.stdout, exercise.rules)).ok:
+                    problem(
+                        "warning",
+                        f'On {name} the output written in the "output" block differs '
+                        'from the solution\'s. Using the "output" block.',
+                        test_no,
+                    )
+                expected_output = t.output
+            else:
+                expected_output = r.stdout
+                computed.append(k)
+            if not expected_output.strip() and not expected_error:
+                problem("warning", f"The solution prints nothing on {name}.", test_no)
+            tests[k] = t.model_copy(
+                update={
+                    "expected_output": expected_output,
+                    "expected_error": expected_error,
+                }
+            )
+        if computed:
+            second = await _run_tests(
+                language, exercise, solution, [tests[k] for k in computed], workdir
+            )
+            for k, again in zip(computed, second):
+                if again.status == "ok" and again.stdout != first[k].stdout:
+                    name = f"test {k + 1}{' (hidden)' if tests[k].hidden else ''}"
+                    problem(
+                        "warning",
+                        f"The solution gives different outputs in two runs of {name} "
+                        "(random numbers?): students may not be able to pass it.",
+                        k + 1,
+                    )
+    else:
+        # `format.parse` refuses a file without a solution where one is needed,
+        # so every test here has its output written out.
+        tests = [
+            t.model_copy(
+                update={"expected_output": t.output, "expected_error": t.error or None}
+            )
+            for t in tests
+        ]
+
+    built = exercise.model_copy(update={"tests": tests})
+    if any(t.expected_output is None for t in tests):
+        return built, problems
+
+    if exercise.starter.strip():
+        starter_dir = workdir / "starter"
+        starter_dir.mkdir()
+        result = await check_exercise(language, built, exercise.starter, starter_dir)
+        if result.passed:
+            problem("warning", "The starter code already passes every test.")
+    return built, problems
+
+
+async def build_version(source: str, title: str) -> VersionBuild:
+    """Compile a version: parse its source again, then run every exercise.
+
+    Parsed again rather than trusting whatever the import made of it, because
+    the source is the one thing a version is sure of. The exercises one after
+    another, and within one exercise three rounds one after another - the
+    solution, the solution again, the starter - each round's tests at once. So
+    a build never asks the box pool for more than one exercise's tests at a
+    time, as a check does, and a run that arrives meanwhile waits behind a
+    handful of boxes rather than behind every test of the set: the pool hands
+    boxes out in the order they were asked for, and knows nothing of priority.
+    """
+    parsed = exercise_format.parse(source, default_title=title)
+    problems = list(parsed.problems)
+    if parsed.document is None:
+        return VersionBuild(ExerciseVersionStatus.failed, problems, None)
+    document = parsed.document
+    language = _python(document.language)
+
+    exercises = []
+    with tempfile.TemporaryDirectory() as temp:
+        for n, exercise in enumerate(document.exercises, start=1):
+            workdir = Path(temp) / str(n)
+            workdir.mkdir()
+            built, found = await build_exercise(language, n, exercise, workdir)
+            exercises.append(built)
+            problems.extend(found)
+
+    if any(p.level == "error" for p in problems):
+        return VersionBuild(ExerciseVersionStatus.failed, problems, None)
+    document = document.model_copy(update={"exercises": exercises})
+    return VersionBuild(
+        ExerciseVersionStatus.ready, problems, document.model_dump(mode="json")
+    )
+
+
+async def build_job(engine: Engine, job: ExerciseJobRunData) -> VersionBuild:
+    with engine.connect() as conn:
+        version = repo.query_version_to_build(conn, job.version_id)
+    if version is None:
+        raise ValueError(f"version {job.version_id} does not exist")
+    return await build_version(version.source, version.title)
+
+
+async def run_exercise_from_queue(engine: Engine, kind: ExerciseJobKind) -> bool:
+    """`run_from_queue` for one kind of exercise job.
+
+    The same two promises: a judge stopped mid-job puts it back on the queue,
+    and a failure stays with the job it happened in - recorded as its result
+    (`ExerciseJobError`), so a polling tab sees an answer rather than a job
+    that is `running` forever. A build that fails that way fails its version
+    too, which otherwise would stay `building` with nothing left to finish it.
+    """
+    with engine.connect() as conn:
+        job = repo.pull_queued_exercise_job(conn, kind)
+    if job is None:
+        return False
+
+    with bind(
+        exercise_job_id=job.id,
+        job_kind=job.kind.value,
+        version_id=job.version_id,
+        session_id=job.session_id,
+        exercise_index=job.exercise_index,
+    ):
+        logger.info("picked up %s job %s from queue", job.kind.value, job.id)
+        build: VersionBuild | None = None
+        try:
+            if job.kind is ExerciseJobKind.build:
+                build = await build_job(engine, job)
+                result = ExerciseBuildResult(
+                    status=build.status.value,
+                    errors=sum(p.level == "error" for p in build.problems),
+                    warnings=sum(p.level == "warning" for p in build.problems),
+                )
+            else:
+                result = await run_exercise_job(engine, job)
+        except asyncio.CancelledError:
+            # Nothing in here may stop the cancellation from going on its way:
+            # a worker that swallowed it would keep `run_loop`'s TaskGroup
+            # waiting, and the judge would hang on SIGTERM. A failure to put
+            # the job back is logged, and the job is left `running`.
+            try:
+                with engine.begin() as conn:
+                    requeued = repo.requeue_exercise_job(
+                        conn,
+                        job.id,
+                        ExerciseJobError(
+                            message="Interrupted: the judge stopped while running "
+                            "this, and a newer one had already been queued."
+                        ).model_dump(mode="json"),
+                    )
+                logger.info(
+                    "%s job %s interrupted; %s",
+                    job.kind.value,
+                    job.id,
+                    "put back on the queue" if requeued else "a newer one is queued",
+                )
+            except Exception:
+                logger.exception(
+                    "%s job %s interrupted, and could not be put back",
+                    job.kind.value,
+                    job.id,
+                )
+            raise
+        except Exception as e:
+            logger.exception("%s job %s failed in the judge", job.kind.value, job.id)
+            message = _jsonb_safe(f"Judge internal error: {e!r}")[:MAX_OUTPUT_LENGTH]
+            result = ExerciseJobError(message=message)
+            if job.kind is ExerciseJobKind.build:
+                build = VersionBuild(
+                    ExerciseVersionStatus.failed,
+                    [
+                        ExerciseProblem(
+                            level="error",
+                            where="file",
+                            text="The judge failed while building this version. "
+                            "Import the file again; if it fails the same way, "
+                            "this is a bug in cocco.",
+                            detail=message,
+                        )
+                    ],
+                    None,
+                )
+
+        with engine.begin() as conn:
+            if build is not None:
+                written = repo.finish_version_build(
+                    conn,
+                    job.version_id,
+                    build.status,
+                    [p.model_dump(mode="json") for p in build.problems],
+                    build.document,
+                )
+                if isinstance(result, ExerciseBuildResult):
+                    result = result.model_copy(update={"written": written})
+            repo.finish_exercise_job(conn, job.id, result.model_dump(mode="json"))
+        logger.info(
+            "%s job %s done",
+            job.kind.value,
+            job.id,
+            # Named apart from the access log's `status`, which is an HTTP code.
+            extra={
+                "result_kind": result.kind,
+                "passed": getattr(result, "passed", None),
+                "build_status": getattr(result, "status", None),
+            },
+        )
+    return True
+
+
+def exercise_queue(kind: ExerciseJobKind) -> Callable[[Engine, Storage], Awaitable[bool]]:
+    """One entry of `QUEUES`: the oldest queued exercise job of `kind`. The
+    storage is not used - exercises keep their tests in the database."""
+
+    async def take(engine: Engine, storage: Storage) -> bool:
+        return await run_exercise_from_queue(engine, kind)
+
+    take.__name__ = take.__qualname__ = f"run_{kind.value}_from_queue"
+    return take
+
+
+# How often an idle judge looks for run jobs past `repo.RUN_JOB_RETENTION`. An
+# hour, per process: the retention is six months, and a DELETE on every idle
+# tick of every worker would be thousands of them a day to find nothing.
+PRUNE_INTERVAL_S = 3600.0
+_next_prune = 0.0
+
+
+# Rows per DELETE, each in a transaction of its own: the first prune after a
+# term can find tens of thousands, and one statement taking them all would hold
+# its locks for as long.
+PRUNE_BATCH = 1000
+
+
+def _prune(engine: Engine) -> int:
+    pruned = 0
+    while True:
+        with engine.begin() as conn:
+            batch = repo.prune_run_jobs(conn, PRUNE_BATCH)
+        pruned += batch
+        if batch < PRUNE_BATCH:
+            return pruned
+
+
+async def prune_if_due(engine: Engine) -> None:
+    """Delete old run jobs, at most once per `PRUNE_INTERVAL_S`, on a thread -
+    unlike a claim, a prune can take long enough to stall every other worker.
+    A failure is logged and left for the next interval: pruning is
+    housekeeping, and the worker that tried has a queue to get back to."""
+    global _next_prune
+    now = time.monotonic()
+    if now < _next_prune:
+        return
+    _next_prune = now + PRUNE_INTERVAL_S
+    try:
+        pruned = await asyncio.to_thread(_prune, engine)
+    except Exception:
+        logger.exception("could not prune old run jobs")
+        return
+    if pruned:
+        logger.info("pruned %d run jobs older than %s", pruned, repo.RUN_JOB_RETENTION)
+
+
 # Where a free worker looks for its next job, highest priority first: each entry
 # claims one job off its queue and runs it to the end, answering whether there
 # was one. A worker asks them in this order every time it is free, so the
 # priority is strict - nothing on a later queue starts while an earlier one has
-# work, however long it has waited. Exercise jobs go in front of the one entry
-# there is today: a student staring at Run is the most latency-sensitive person
-# in the building, and a regrade of 300 submissions must not hold a lesson up.
-QUEUES: tuple[Callable[[Engine, Storage], Awaitable[bool]], ...] = (run_from_queue,)
+# work, however long it has waited: run > check > build > challenge submission.
+# A student staring at Run is the most latency-sensitive person in the
+# building, a Check is an attempt somebody is waiting on, a build is staff
+# waiting on an import, and a regrade of 300 submissions must not hold a lesson
+# up.
+QUEUES: tuple[Callable[[Engine, Storage], Awaitable[bool]], ...] = (
+    exercise_queue(ExerciseJobKind.run),
+    exercise_queue(ExerciseJobKind.check),
+    exercise_queue(ExerciseJobKind.build),
+    run_from_queue,
+)
 
 
 async def run_next(engine: Engine, storage: Storage) -> bool:
@@ -1215,7 +1993,8 @@ async def worker(engine: Engine, storage: Storage, wakeup: Wakeup, wait_time: fl
     failure that repeats (the database gone) is not retried in a tight loop
     every time somebody submits. Every worker is woken by every notification
     and all but one find nothing; that is a handful of empty claims, and
-    cheaper than deciding which worker should go.
+    cheaper than deciding which worker should go. A worker that finds nothing
+    is also the one that prunes old run jobs, when that is due.
     """
     while True:
         ticket = wakeup.ticket()
@@ -1226,6 +2005,7 @@ async def worker(engine: Engine, storage: Storage, wakeup: Wakeup, wait_time: fl
             await asyncio.sleep(wait_time)
             continue
         if not ran:
+            await prune_if_due(engine)
             logger.debug("judge worker waiting for up to %f seconds", wait_time)
             with suppress(TimeoutError):
                 await asyncio.wait_for(ticket.wait(), wait_time)

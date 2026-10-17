@@ -652,7 +652,7 @@ ExerciseJob = Table(
     # What came of it, written with `status = 'done'` and never before. The
     # status is only where the job is in the queue; the verdict - passed or
     # not, per test, and the variant for a harness or a judge that broke - is
-    # this document's, whose shape step 4 pins in `schema.py`.
+    # this document's, whose shapes `schema.ExerciseJobResult` pins.
     Column("result", JSONB, nullable=True),
     # `submission`'s three, for `submission`'s reasons.
     Column(

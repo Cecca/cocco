@@ -4,12 +4,12 @@ of complex database queries.
 """
 import math
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 from cocco.exercises.compare import Rules
-from cocco.model import OutcomeEnum, SubmissionStatus
+from cocco.model import ExerciseJobKind, OutcomeEnum, SubmissionStatus
 
 
 class Base(BaseModel):
@@ -277,3 +277,137 @@ class HarnessReport(Base):
     truncated: bool
     exit: int
     exception: HarnessException | None
+
+
+# --- Exercise jobs -----------------------------------------------------------
+#
+# What the judge writes into `exercise_job.result`, one shape per kind of job
+# plus one for a job the judge could not do. Pinned here, like the document, so
+# that the judge that writes a result and the pages that read it (the student's
+# Check and Run tabs, the dashboard's drill-in) agree on one definition: read a
+# stored result through `EXERCISE_JOB_RESULT`, never by indexing the JSON.
+#
+# A check stores *every* test, hidden ones included, with what the program
+# printed on each. Hiding a hidden test's input, output and traceback from a
+# student is the reader's job - in one function, as `visible_outcomes` does it
+# for challenges - which is why every test result says whether it is hidden.
+
+
+class ExerciseExecution(Base):
+    """One program run through the harness, as the judge saw it.
+
+    `status` is how the run ended, which is isolate's to say: `ok` (the harness
+    reported), `timeout` and `memory` (no report, by construction), and
+    `no_report` - the box ended otherwise, or ended cleanly without the report
+    the harness always writes. That last one is *something the program did*
+    (`os._exit`, a closed fd 1), never a judge error.
+
+    The rest is the harness's report when there is one. Without one, `stdout`
+    and `stderr` are whatever reached the box's own two streams, which is only
+    what the program wrote to the descriptors directly - and, should the
+    harness itself ever break, its traceback.
+
+    Two flags for two cuts. `truncated` is the harness's: the program printed
+    past its cap, which is a verdict of its own. `clipped` is the judge's: what
+    is *stored* of `stdout`, `stderr` and the traceback is less than what the
+    harness captured and the comparison saw (`judge.MAX_EXERCISE_STORED_OUTPUT`
+    and the budgets beside it). A reader of a clipped result must clamp
+    `ExerciseTestResult.diff` to the lines it actually has.
+    """
+
+    status: Literal["ok", "timeout", "memory", "no_report"]
+    stdout: str = ""
+    stderr: str = ""
+    truncated: bool = False
+    clipped: bool = False
+    exit: int = 0
+    exception: HarnessException | None = None
+    # isolate's own sentence for a run that did not end `ok`, when it has one.
+    message: str | None = None
+    elapsed_s: float = 0.0
+
+
+# A port of the prototype's `checkTests` statuses, minus the ones that only a
+# browser has (`skipped`, `stopped`, `unavailable`): every test runs, in its
+# own box, whatever the others did.
+#
+#   pass       the output matched, and the program ended as the test expects
+#   fail       the output did not match
+#   noerror    the test expects an exception and the program ended normally
+#   error      the program raised (or exited non-zero) when it should not
+#              have, or raised something other than what the test expects
+#   timeout / memory / no_report   `ExerciseExecution.status`, as a verdict
+#   truncated  the program printed past the harness's cap
+ExerciseVerdict = Literal[
+    "pass", "fail", "noerror", "error", "timeout", "memory", "no_report", "truncated"
+]
+
+
+class ExerciseTestResult(ExerciseExecution):
+    verdict: ExerciseVerdict
+    hidden: bool
+    # The lines that differ, as `compare.Comparison.diff` has them: indexes
+    # into the expected output when `unordered`, into both outputs otherwise.
+    # Empty unless the output was compared. Computed on the whole output, so
+    # on a `clipped` result an index can point past the stored `stdout`.
+    diff: list[int] = []
+    unordered: bool = False
+
+
+class ExerciseCheckResult(Base):
+    kind: Literal["check"] = "check"
+    # Every test passed: the one fact progress is derived from.
+    passed: bool
+    # In the version's order, one per test.
+    tests: list[ExerciseTestResult]
+
+
+class ExerciseRunResult(ExerciseExecution):
+    """A run's transcript: `stdout` has the prompts and the lines read echoed
+    into it, so it reads like a terminal."""
+
+    kind: Literal["run"] = "run"
+
+
+class ExerciseBuildResult(Base):
+    """A build's own record. What it built - the document, the problems, the
+    status - is on the version, written in the same transaction; this only
+    says how it went, for whoever reads the job."""
+
+    kind: Literal["build"] = "build"
+    status: Literal["ready", "failed"]
+    errors: int
+    warnings: int
+    # Whether this build is the one that wrote its version. False for a build
+    # that found the version already finished - one requeued after another
+    # judge had completed it - which then changed nothing.
+    written: bool = True
+
+
+class ExerciseJobError(Base):
+    """The judge could not do the job: an exception in the judge itself, or a
+    job naming an exercise its version does not have. Nothing the student's
+    program did ends up here - that is a verdict, in one of the shapes above."""
+
+    kind: Literal["error"] = "error"
+    message: str
+
+
+ExerciseJobResult = Annotated[
+    ExerciseCheckResult | ExerciseRunResult | ExerciseBuildResult | ExerciseJobError,
+    Field(discriminator="kind"),
+]
+EXERCISE_JOB_RESULT: TypeAdapter[ExerciseJobResult] = TypeAdapter(ExerciseJobResult)
+
+
+class ExerciseJobRunData(Base):
+    """A claimed exercise job, as the judge needs it. The exercise itself is
+    read afterwards, out of the version's document (`query_job_exercise`)."""
+
+    id: int
+    kind: ExerciseJobKind
+    version_id: int
+    session_id: int | None
+    exercise_index: int | None
+    source: str | None
+    stdin: str | None

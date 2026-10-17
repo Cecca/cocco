@@ -97,7 +97,8 @@ async def test_python_run():
         res = await cj.isolate_run(
             python,
             stdin_path,
-            [str(script_path)]
+            ["script.py"],
+            box_files={"script.py": script_path},
         )
         
     assert res.stdout.strip() == "hello moon"
@@ -198,6 +199,66 @@ async def test_language_java():
         assert exe.success and exe.executable is not None
         res = await python.run(exe.executable, stdin_path)
     assert res.stdout.strip() == "hello moon"
+
+
+def _decoy(cwd: Path, name: str) -> None:
+    """A directory called `name`, with a secret in it, in what will be the
+    judge's working directory - `/run` under systemd."""
+    (cwd / name).mkdir()
+    (cwd / name / "secret").write_text("credentials")
+
+
+@pytest.mark.integration
+async def test_a_python_argument_is_never_resolved_against_the_working_directory(
+    tmp_path, monkeypatch
+):
+    """`{executable}` reaches the box as `run.py`, a box-relative name, and a
+    directory of that name where the judge runs is not copied in its place."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    _decoy(cwd, "run.py")
+    monkeypatch.chdir(cwd)
+    python = cj.load_languages()["python"]
+    script = tmp_path / "run.py"
+    script.write_text(
+        "import os, sys\n"
+        "print(sys.argv, sorted(os.listdir('.')), os.path.isfile('run.py'))\n"
+    )
+    res = await python.run(script, None)
+    assert res.stdout == "['run.py'] ['_stderr', '_stdout', 'run.py'] True\n"
+
+
+@pytest.mark.integration
+async def test_a_java_class_named_like_a_directory_copies_nothing(
+    tmp_path, monkeypatch
+):
+    """The exploit: java is handed the class name, `{name}`, as an argument,
+    and `public class run` used to copy `/run` into a box the student could
+    read. It is passed as the word it is."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    _decoy(cwd, "run")
+    monkeypatch.chdir(cwd)
+    java = cj.load_languages()["java"]
+    build = tmp_path / "build"
+    build.mkdir()
+    source = build / "run.java"
+    source.write_text(textwrap.dedent("""\
+        import java.io.File;
+        import java.util.Arrays;
+        public class run {
+            public static void main(String[] args) {
+                String[] names = new File(".").list();
+                Arrays.sort(names);
+                System.out.println(String.join(",", names));
+                System.out.println(new File("run").isDirectory());
+            }
+        }
+        """))
+    compiled = await java.compile(source, build)
+    assert compiled.success and compiled.executable is not None
+    res = await java.run(compiled.executable, None)
+    assert res.stdout == "_stderr,_stdout,run.class\nfalse\n", res.stderr
 
 
 # Needs isolate and nix like every other test in this file: it was missing the
@@ -1032,12 +1093,20 @@ async def test_a_cancelled_run_cleans_its_box_up():
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(cj, "_IDS_POOL", pool)
             run = asyncio.create_task(
-                cj.isolate_run(python, None, [str(script)], time_limit=30)
+                cj.isolate_run(
+                    python, None, ["spin.py"], time_limit=30,
+                    box_files={"spin.py": script},
+                )
             )
             await asyncio.sleep(1)
             await _cancel(run)
 
             hello = Path(tmp) / "hello.py"
             hello.write_text("print('again')\n")
-            res = await asyncio.wait_for(cj.isolate_run(python, None, [str(hello)]), 10)
+            res = await asyncio.wait_for(
+                cj.isolate_run(
+                    python, None, ["hello.py"], box_files={"hello.py": hello}
+                ),
+                10,
+            )
     assert res.stdout.strip() == "again"
