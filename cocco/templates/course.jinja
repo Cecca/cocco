@@ -84,6 +84,44 @@
     {% endfor %}
   </div>
 
+  {# Every member's. The open sessions are what a student picks from; the
+     closed ones stay listed, folded away, because a closed session is still
+     where a student reviews what they did in it. #}
+  {% set open_sessions = exercise_sessions | rejectattr("closed_at") | list %}
+  {% set closed_sessions = exercise_sessions | selectattr("closed_at") | list %}
+  {% if exercise_sessions %}
+  <!-- ══ EXERCISE SESSIONS ═══════════════════════════════════════════ -->
+  <div class="mt-10 mb-3">
+    <h2 class="font-bold text-lg">Exercise sessions</h2>
+    <p class="text-[13px] text-base-content/55">
+      Short Python exercises, paced by your teacher. Pick the session of your group.
+    </p>
+  </div>
+
+  <div class="flex flex-col gap-3">
+    {% for exercise_session in open_sessions %}
+    {% with course_id = course.id %}{% include "_exercise-session-card.jinja" %}{% endwith %}
+    {% else %}
+    <div class="rounded-xl border border-dashed border-base-300 bg-base-200/40 px-4 py-6 text-center text-sm text-base-content/50">
+      No session is open right now.
+    </div>
+    {% endfor %}
+  </div>
+
+  {% if closed_sessions %}
+  <details class="mt-3">
+    <summary class="cursor-pointer text-sm text-base-content/60">
+      Closed sessions ({{ closed_sessions | length }}) — still there to review
+    </summary>
+    <div class="flex flex-col gap-3 mt-3">
+      {% for exercise_session in closed_sessions %}
+      {% with course_id = course.id %}{% include "_exercise-session-card.jinja" %}{% endwith %}
+      {% endfor %}
+    </div>
+  </details>
+  {% endif %}
+  {% endif %}
+
   {# Course staff only, and `get_course` does not even fetch the sets for
      anybody else: a set is content being authored, and the class meets it
      through a session. Every route behind this is `CourseEditor`'s. #}

@@ -1,0 +1,27 @@
+{# One session in a list: the course page's, for everybody on the course, and
+   the set page's, for staff. The link is the same for both - the session's
+   URL is one page for staff and another for a student.
+
+   Context: `exercise_session` (a row of `query_exercise_sessions`), `course_id`. #}
+<a href="{{ url_for('get_exercise_session', course_id=course_id, session_id=exercise_session.id) }}"
+   class="card bg-base-100 border border-base-300 shadow-sm hover:border-primary/50 transition-colors">
+  <div class="card-body flex-row flex-wrap items-center gap-4 px-5 py-4">
+    <div class="min-w-0 flex-1">
+      <div class="font-semibold">{{ exercise_session.label }}</div>
+      <div class="text-xs text-base-content/55 mt-0.5">
+        {{ exercise_session.title }} ·
+        {{ exercise_session.n_exercises }} exercise{{ "" if exercise_session.n_exercises == 1 else "s" }} ·
+        opened {{ exercise_session.opened_at | datetime }}
+      </div>
+    </div>
+    {% if exercise_session.closed_at %}
+    <span class="badge badge-ghost badge-sm font-semibold">Closed</span>
+    {% elif exercise_session.mode == "live" %}
+    <span class="badge badge-success badge-sm font-semibold">
+      Live · {{ exercise_session.unlocked_through }} of {{ exercise_session.n_exercises }}
+    </span>
+    {% else %}
+    <span class="badge badge-info badge-sm font-semibold">Open</span>
+    {% endif %}
+  </div>
+</a>

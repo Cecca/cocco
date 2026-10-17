@@ -1,0 +1,243 @@
+{# A session's control panel, for course staff: its state, the pacing, the
+   exercises with their reveal buttons, the version switch and closing it.
+
+   One swap target, `/admin`'s rule: every staff route on the session answers
+   with this whole fragment, alert folded in, swapped over itself. It is not
+   polled, so a second teacher's copy can go stale - which is why each pacing
+   button carries the number its copy shows (`from`), and a move made from a
+   stale copy changes nothing and says so.
+
+   Context: `session` (`query_exercise_session`), `switch` (`_version_switch`),
+   `course_id`, `message`, `ok`. #}
+{% set n_exercises = session.version.titles | length %}
+{% set live = session.mode == "live" %}
+{% set closed = session.closed_at is not none %}
+{% set unlocked = session.unlocked_through %}
+{% macro session_post(route) -%}
+hx-post="{{ url_for(route, course_id=course_id, session_id=session.id) }}"
+hx-target="#exercise-session-controls"
+hx-swap="outerHTML"
+{%- endmacro %}
+<div id="exercise-session-controls" class="flex flex-col gap-6">
+
+  {% if message %}
+  <div role="alert" class="alert {{ 'alert-success' if ok else 'alert-error' }} py-2 text-sm">
+    <span>{{ message }}</span>
+  </div>
+  {% endif %}
+
+  <!-- ── STATE AND PACING ───────────────────────────────────────────── -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm">
+    <div class="card-body p-7">
+      <div class="flex flex-wrap items-center gap-3">
+        <h2 class="font-bold text-lg">
+          {% if closed %}Closed{% elif live %}Live{% else %}Open{% endif %}
+        </h2>
+        {% if closed %}
+        <span class="badge badge-ghost badge-sm font-semibold">Closed</span>
+        {% elif live %}
+        <span class="badge badge-success badge-sm font-semibold">Live</span>
+        {% else %}
+        <span class="badge badge-info badge-sm font-semibold">Open</span>
+        {% endif %}
+      </div>
+      <p class="text-[13px] text-base-content/55">
+        On v{{ session.version.number }} of {{ session.version.title }} ·
+        opened {{ session.opened_at | datetime }}
+        {% if closed %}· closed {{ session.closed_at | datetime }}{% endif %}.
+        {% if closed %}
+        Students can review their work; nothing new is accepted.
+        {% elif live %}
+        Students can work on exercises 1 to {{ unlocked }} and go back to
+        earlier ones; the rest are locked until you move the class on.
+        {% else %}
+        Every exercise is unlocked: there is no pacing.
+        {% endif %}
+      </p>
+
+      {% if live and not closed %}
+      <div class="flex flex-wrap items-center gap-3 mt-4">
+        <span class="font-mono text-sm">
+          <span class="font-semibold text-lg">{{ unlocked }}</span> of {{ n_exercises }} unlocked
+        </span>
+        {% for label, to, primary in [
+             ("← Previous", unlocked - 1, false),
+             ("Next →", unlocked + 1, true),
+             ("Unlock all", n_exercises, false)] %}
+        <form {{ session_post('post_exercise_session_pace') }}>
+          <input type="hidden" name="from" value="{{ unlocked }}" />
+          <input type="hidden" name="to" value="{{ to }}" />
+          <button type="submit"
+                  class="btn btn-sm {{ 'btn-primary' if primary else 'btn-ghost border border-base-300' }}"
+                  {% if to < 0 or to > n_exercises or to == unlocked %}disabled{% endif %}>
+            {{ label }}
+          </button>
+        </form>
+        {% endfor %}
+        <form {{ session_post('post_exercise_session_open') }} class="ml-auto">
+          <button type="submit" class="btn btn-sm btn-ghost border border-base-300">
+            Switch to open
+          </button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- ── EXERCISES ──────────────────────────────────────────────────── -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg">Exercises</h2>
+      <p class="text-[13px] text-base-content/55">
+        Revealing a solution shows it to the class under the statement. It
+        cannot be hidden again.
+      </p>
+      <ol class="mt-3 divide-y divide-base-300">
+        {% for title in session.version.titles %}
+        {% set n = loop.index %}
+        <li class="flex flex-wrap items-center gap-3 py-2">
+          <span class="font-mono text-sm font-semibold text-base-content/50 w-8">{{ n }}</span>
+          <span class="flex-1 min-w-0">{{ title }}</span>
+          {% if live and not closed %}
+            {% if n <= unlocked %}
+            <span class="badge badge-success badge-outline badge-sm">unlocked</span>
+            {% else %}
+            <span class="badge badge-ghost badge-sm">locked</span>
+            {% endif %}
+          {% endif %}
+          {% if n in session.revealed %}
+          <span class="badge badge-primary badge-sm font-semibold">solution revealed</span>
+          {% else %}
+          <form {{ session_post('post_exercise_session_reveal') }}>
+            <input type="hidden" name="n" value="{{ n }}" />
+            <button type="submit" class="btn btn-xs btn-ghost border border-base-300">Reveal solution</button>
+          </form>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ol>
+    </div>
+  </div>
+
+  <!-- ── VERSION ────────────────────────────────────────────────────── -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg">Version</h2>
+      {% if not switch %}
+      <p class="text-[13px] text-base-content/55">
+        The session is on v{{ session.version.number }}, the set's current version.
+        Import a fixed file on the set page, and once it is built you can move
+        the session to it here.
+      </p>
+      {% else %}
+      <p class="text-[13px] text-base-content/55">
+        The session is on v{{ session.version.number }}; the set's current
+        version is v{{ switch.latest.number }}. Exercises are matched by
+        position. Past checks keep their results and the version they were
+        graded on.
+      </p>
+      {% if switch.refusal %}
+      <div role="alert" class="alert alert-warning py-2 text-sm mt-3">
+        <span>{{ switch.refusal }}</span>
+      </div>
+      {% elif closed %}
+      <p class="text-sm text-base-content/55 mt-3">The session is closed, so its version is final.</p>
+      {% else %}
+      <div class="mt-3">
+        <button type="button" class="btn btn-sm btn-primary"
+                onclick="switch_version_modal.showModal()">
+          Switch to v{{ switch.latest.number }}…
+        </button>
+      </div>
+      {% endif %}
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- ── CLOSE ──────────────────────────────────────────────────────── -->
+  {% if not closed %}
+  <div class="card bg-base-100 border border-error/40 shadow-sm">
+    <div class="card-body p-7">
+      <div class="flex flex-wrap items-center justify-between gap-4">
+        <div class="min-w-0 flex-1">
+          <h2 class="font-bold text-lg text-error">Close the session</h2>
+          <p class="text-[13px] text-base-content/55">
+            Students keep their code and results to review, but nothing new is
+            accepted. A session cannot be reopened.
+          </p>
+        </div>
+        <button type="button" class="btn btn-sm btn-error font-semibold"
+                onclick="close_session_modal.showModal()">
+          Close session…
+        </button>
+      </div>
+    </div>
+  </div>
+
+  {# A dialog rather than `hx-confirm`, the regrade's precedent for what
+     cannot be undone. Inside the swap target, so a fresh copy of the panel
+     brings a fresh dialog; nothing polls it. #}
+  <dialog id="close_session_modal" class="modal">
+    <div class="modal-box">
+      <h3 class="font-bold text-lg text-error">Close {{ session.label }}?</h3>
+      <p class="py-3 text-sm text-base-content/70">
+        Nothing new is accepted from then on, and a session cannot be reopened.
+        Students can still review their work.
+      </p>
+      <div class="modal-action">
+        <form method="dialog"><button class="btn btn-sm btn-ghost">Cancel</button></form>
+        <button type="button" class="btn btn-sm btn-error"
+                {{ session_post('post_exercise_session_close') }}
+                onclick="close_session_modal.close()">
+          Close session
+        </button>
+      </div>
+    </div>
+    <form method="dialog" class="modal-backdrop"><button>close</button></form>
+  </dialog>
+  {% endif %}
+
+  {% if switch and not switch.refusal and not closed %}
+  <dialog id="switch_version_modal" class="modal">
+    <div class="modal-box">
+      <h3 class="font-bold text-lg">Switch to v{{ switch.latest.number }}?</h3>
+      <p class="py-3 text-sm text-base-content/70">
+        Students see the new statements and tests from their next click.
+        Exercises are matched by position, so check that this is what changed:
+      </p>
+      {% if switch.renamed %}
+      <p class="text-sm font-semibold mt-1">Titles that changed</p>
+      <ul class="text-sm list-disc pl-5">
+        {% for n, old, new in switch.renamed %}
+        <li>{{ n }}. <span class="line-through text-base-content/55">{{ old }}</span> → {{ new }}</li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+      {% if switch.added %}
+      <p class="text-sm font-semibold mt-2">Added at the end</p>
+      <ul class="text-sm list-disc pl-5">
+        {% for n, title in switch.added %}<li>{{ n }}. {{ title }}</li>{% endfor %}
+      </ul>
+      {% endif %}
+      {% if switch.dropped %}
+      <p class="text-sm font-semibold mt-2">No longer in the file</p>
+      <ul class="text-sm list-disc pl-5">
+        {% for n, title in switch.dropped %}<li>{{ n }}. {{ title }}</li>{% endfor %}
+      </ul>
+      {% endif %}
+      {% if not (switch.renamed or switch.added or switch.dropped) %}
+      <p class="text-sm">Every exercise keeps its title.</p>
+      {% endif %}
+      <div class="modal-action">
+        <form method="dialog"><button class="btn btn-sm btn-ghost">Cancel</button></form>
+        <form {{ session_post('post_exercise_session_switch') }}
+              onsubmit="switch_version_modal.close()">
+          <input type="hidden" name="version_id" value="{{ switch.latest.id }}" />
+          <button type="submit" class="btn btn-sm btn-primary">Switch</button>
+        </form>
+      </div>
+    </div>
+    <form method="dialog" class="modal-backdrop"><button>close</button></form>
+  </dialog>
+  {% endif %}
+</div>

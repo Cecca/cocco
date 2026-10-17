@@ -262,7 +262,9 @@ set's current one. **Open sessions do not change by themselves.** The session's 
   reordered file is the one mistake position-matching cannot catch.
 - **Past checks keep their results** and the version they were graded on. "Solved" stays solved.
   Nothing is regraded, because nothing is graded.
-- **`unlocked_through` is clamped** to the new exercise count, which can only stay or grow.
+- **`unlocked_through` is clamped** to the new exercise count. That count can shrink as well as
+  grow: a version may drop exercises nobody has checked yet. An open session is set to the new
+  count, so it stays fully unlocked.
 
 ### Progress is derived, never stored
 
@@ -504,7 +506,7 @@ test case is): it parses the file, creates a version and queues its build. The s
 
 Delete when there are no sessions.
 
-### [ ] 6. Sessions and pacing
+### [x] 6. Sessions and pacing
 
 Open a session on the current version: label, mode. Then next / previous / unlock all, switch to
 open, close, reveal a solution, and switch to the latest version with its refusal and its
@@ -517,10 +519,15 @@ Vendor CodeMirror under `cocco/static/` (licence noted). The strip fragment, the
 function, the statement, hints, the Run and Check tabs, the job fragment, drafts in localStorage
 with the server copy as fallback, the wait page, and participant registration.
 
+The per-exercise route is declared as `…/sessions/{session_id}/{n:int}`, with the convertor, or
+below step 8's `…/dashboard` and `…/projector`: a plain `{n}` matches those too and answers 422,
+because a route does not fall through to the next one when validation fails.
+
 ### [ ] 8. Dashboard and projector
 
 The progress query, the named grid with drill-in (read against the version each check ran on),
-and the anonymous projector with the pacing and reveal controls.
+and the anonymous projector with the pacing and reveal controls. `…/dashboard` and `…/projector`
+are declared above step 7's `…/{n}` route, unless that route uses the `{n:int}` convertor.
 
 ### [ ] 9. Deletion and archiving
 

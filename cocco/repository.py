@@ -5,11 +5,13 @@ or their combinations
 """
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import (
     Connection,
     and_,
+    case,
     delete,
     exists,
     func,
@@ -36,6 +38,8 @@ from cocco.model import (
     ExerciseJobKind,
     ExerciseJobStatus,
     ExerciseSession,
+    ExerciseSessionMode,
+    ExerciseSessionReveal,
     ExerciseSet,
     ExerciseSetVersion,
     ExerciseVersionStatus,
@@ -942,6 +946,424 @@ async def delete_exercise_set(conn: AsyncConnection, set_id: int) -> None:
         delete(ExerciseSetVersion).where(ExerciseSetVersion.c.set_id == set_id)
     )
     await conn.execute(delete(ExerciseSet).where(ExerciseSet.c.id == set_id))
+
+
+# --- Exercise sessions ---------------------------------------------------------
+#
+# A session pins a version of a set and carries the pacing; see the plan's
+# "Sessions carry pacing and progress". Every write below is a single
+# conditional statement, the way `block_user` refuses an administrator: the
+# rule ("only while open", "only from where the page said it was") is in the
+# `WHERE` clause, so two teachers pressing the same button at once cannot both
+# act on what neither of them saw.
+
+
+# How many exercises a version has. Its document is NULL until it is built, and
+# a session is only ever on a ready one.
+def _n_exercises(version):
+    return func.jsonb_array_length(version.c.document["exercises"])
+
+
+def _session_n_exercises():
+    """The exercise count of the version an `exercise_session` row being
+    updated is on, as a correlated subquery for its `SET`."""
+    return (
+        select(_n_exercises(ExerciseSetVersion))
+        .where(ExerciseSetVersion.c.id == ExerciseSession.c.version_id)
+        .scalar_subquery()
+    )
+
+
+async def exercise_session_in_course(
+    conn: AsyncConnection, session_id: int, course_id: int
+) -> bool:
+    """`exercise_set_in_course` for a session, through its set: the role
+    comes from the course in the URL, so the session in it is checked against
+    that course rather than trusted."""
+    stmt = (
+        select(ExerciseSession.c.id)
+        .join(ExerciseSet, ExerciseSet.c.id == ExerciseSession.c.set_id)
+        .where(ExerciseSession.c.id == session_id, ExerciseSet.c.course_id == course_id)
+    )
+    return (await conn.execute(stmt)).first() is not None
+
+
+@dataclass(frozen=True)
+class ExerciseSetForSession:
+    """What `lock_exercise_set_for_session` read under its lock."""
+
+    current_version_id: int | None
+    archived_at: datetime | None
+    # The current version's; None exactly when there is no current version.
+    n_exercises: int | None
+
+
+async def lock_exercise_set_for_session(
+    conn: AsyncConnection, set_id: int
+) -> ExerciseSetForSession | None:
+    """Lock a set against deletion while a session is opened on it, and read
+    what the session is opened on: the set's `current_version_id`,
+    `archived_at` and the current version's exercise count. None if the set
+    does not exist. Does not commit.
+
+    `lock_exercise_set`'s counterpart, and in its order - the versions, then
+    the set - since the other order deadlocks against it: a delete holding the
+    versions and waiting for the set, an opening holding the set and waiting
+    for the version its new row's foreign key names. The versions are taken
+    `FOR KEY SHARE`, which a delete's `FOR UPDATE` waits for and a finishing
+    build's `UPDATE` does not; the set `FOR SHARE`, which waits for that
+    build to commit, so the current version read here is the one it left.
+
+    The set is locked on its own and the count read in a second statement,
+    never joined into the locking one: a locking read that waited for a
+    concurrent `UPDATE` re-checks its join against the joined row *as it was*,
+    so a build moving `current_version_id` meanwhile would come back with the
+    new id and a NULL count - or, on the first build, no current version at all.
+    """
+    await conn.execute(
+        select(ExerciseSetVersion.c.id)
+        .where(ExerciseSetVersion.c.set_id == set_id)
+        .with_for_update(key_share=True)
+    )
+    row = (
+        await conn.execute(
+            select(ExerciseSet.c.current_version_id, ExerciseSet.c.archived_at)
+            .where(ExerciseSet.c.id == set_id)
+            .with_for_update(read=True)
+        )
+    ).first()
+    if row is None:
+        return None
+    n_exercises = (
+        None
+        if row.current_version_id is None
+        else await query_version_exercise_count(conn, row.current_version_id)
+    )
+    return ExerciseSetForSession(row.current_version_id, row.archived_at, n_exercises)
+
+
+async def query_version_exercise_count(conn: AsyncConnection, version_id: int) -> int | None:
+    """How many exercises a version has; None while it has no document."""
+    stmt = select(_n_exercises(ExerciseSetVersion)).where(
+        ExerciseSetVersion.c.id == version_id
+    )
+    return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def insert_exercise_session(
+    conn: AsyncConnection,
+    set_id: int,
+    version_id: int,
+    label: str,
+    mode: ExerciseSessionMode,
+    unlocked_through: int,
+) -> int:
+    """A session on `version_id`, which the caller read under
+    `lock_exercise_set_for_session`. Does not commit."""
+    stmt = (
+        insert(ExerciseSession)
+        .values(
+            set_id=set_id,
+            version_id=version_id,
+            label=label,
+            mode=mode,
+            unlocked_through=unlocked_through,
+        )
+        .returning(ExerciseSession.c.id)
+    )
+    return (await conn.execute(stmt)).scalar_one()
+
+
+@dataclass(frozen=True)
+class ExerciseSessionState:
+    """What `query_exercise_session_state` answers."""
+
+    id: int
+    set_id: int
+    version_id: int
+    mode: ExerciseSessionMode
+    unlocked_through: int
+    closed_at: datetime | None
+    n_exercises: int
+
+
+async def query_exercise_session_state(
+    conn: AsyncConnection, session_id: int, lock: str | None = None
+) -> ExerciseSessionState | None:
+    """What pacing is decided on: the session's mode, `unlocked_through`,
+    `closed_at`, its version and that version's exercise count - or None.
+
+    `lock` is None for a plain read, `"share"` for the transaction that queues
+    a job, and `"update"` for the one that switches the version: the two
+    conflict, so a check cannot be queued on an exercise the switch has just
+    counted as absent, and a close or a pacing move - each an `UPDATE` of the
+    row - waits for a job being queued to commit, and the other way round.
+
+    The row is locked on its own and the version's count read in a second
+    statement, for `lock_exercise_set_for_session`'s reason: joined into the
+    locking read, a gate that waited behind a version switch would re-check
+    the join against the version the session *was* on, find no match, and
+    answer None - a 404 for a perfectly good Run.
+    """
+    stmt = select(
+        ExerciseSession.c.id,
+        ExerciseSession.c.set_id,
+        ExerciseSession.c.version_id,
+        ExerciseSession.c.mode,
+        ExerciseSession.c.unlocked_through,
+        ExerciseSession.c.closed_at,
+    ).where(ExerciseSession.c.id == session_id)
+    if lock is not None:
+        stmt = stmt.with_for_update(read=lock == "share")
+    row = (await conn.execute(stmt)).first()
+    if row is None:
+        return None
+    n_exercises = await query_version_exercise_count(conn, row.version_id)
+    return ExerciseSessionState(**row._mapping, n_exercises=n_exercises or 0)
+
+
+# One version's exercise titles, as a JSON array in order. Takes a row `v` of
+# `exercise_set_version`; a version that is not built has none.
+_EXERCISE_TITLES_SQL = """
+    coalesce(
+        (SELECT json_agg(e ->> 'title' ORDER BY i)
+         FROM jsonb_array_elements(v.document -> 'exercises') WITH ORDINALITY AS x(e, i)),
+        '[]'::json
+    )
+"""
+
+
+async def query_exercise_session(conn: AsyncConnection, session_id: int):
+    """The session's staff page: the session, its set, the version it is on
+    and the set's current one - each with its `number` within the set and its
+    exercises' titles - the exercises whose solution is revealed, and the
+    highest exercise anybody has checked in it.
+
+    The two versions' titles are what the version switch's confirmation is
+    worked out from, and `max_checked` is what it refuses on; the route
+    decides both again under the lock before it writes.
+    """
+    query = text(f"""
+    WITH
+    s AS (SELECT * FROM exercise_session WHERE id = :session_id),
+    versions AS (
+        SELECT v.id, v.title, v.status,
+               row_number() OVER (ORDER BY v.id) AS number,
+               {_EXERCISE_TITLES_SQL} AS titles
+        FROM exercise_set_version v
+        WHERE v.set_id = (SELECT set_id FROM s)
+    ),
+    doc AS (
+        SELECT s.id, s.set_id, s.label, s.mode, s.unlocked_through,
+               s.opened_at, s.closed_at, exercise_set.course_id,
+               -- The set's name, which is its current version's - a session
+               -- exists only on a ready version, so there always is one.
+               (SELECT title FROM versions
+                WHERE versions.id = exercise_set.current_version_id) AS set_title,
+               (SELECT row_to_json(versions) FROM versions
+                WHERE versions.id = s.version_id) AS version,
+               (SELECT row_to_json(versions) FROM versions
+                WHERE versions.id = exercise_set.current_version_id) AS latest,
+               coalesce(
+                   (SELECT json_agg(r.exercise_index ORDER BY r.exercise_index)
+                    FROM exercise_session_reveal r WHERE r.session_id = s.id),
+                   '[]'::json
+               ) AS revealed,
+               (SELECT max(j.exercise_index) FROM exercise_job j
+                WHERE j.session_id = s.id AND j.kind = 'check') AS max_checked
+        FROM s JOIN exercise_set ON exercise_set.id = s.set_id
+    )
+    SELECT row_to_json(doc) FROM doc;
+    """)
+    return (await conn.execute(query, dict(session_id=session_id))).scalar()
+
+
+async def query_exercise_sessions(
+    conn: AsyncConnection, *, course_id: int | None = None, set_id: int | None = None
+):
+    """The sessions of a course, or of one set, newest first: each with the
+    title of the version it is on - which is what its class is working
+    through, whatever the set has been re-imported as since - and that
+    version's exercise count. Closed ones included; the page decides where
+    they go.
+    """
+    where = "exercise_set.course_id = :course_id" if set_id is None else "s.set_id = :set_id"
+    query = text(f"""
+    WITH sessions AS (
+        SELECT s.id, s.set_id, s.label, s.mode, s.unlocked_through,
+               s.opened_at, s.closed_at,
+               v.title,
+               jsonb_array_length(v.document -> 'exercises') AS n_exercises
+        FROM exercise_session s
+        JOIN exercise_set ON exercise_set.id = s.set_id
+        JOIN exercise_set_version v ON v.id = s.version_id
+        WHERE {where}
+    )
+    SELECT coalesce(json_agg(sessions ORDER BY sessions.id DESC), '[]'::json)
+    FROM sessions;
+    """)
+    params = dict(course_id=course_id) if set_id is None else dict(set_id=set_id)
+    return (await conn.execute(query, params)).scalar()
+
+
+async def pace_exercise_session(
+    conn: AsyncConnection, session_id: int, from_: int, to: int
+) -> bool:
+    """Move a live session's `unlocked_through` from `from_` to `to`, clamped
+    to `0..` the version's exercise count. Answers whether it moved. Does not
+    commit.
+
+    A compare-and-set rather than an increment: `from_` is what the teacher's
+    page showed. Two teachers pressing *next* at once both mean "unlock the
+    exercise after the one I can see", so the second finds the first already
+    moved it and changes nothing - an increment would skip an exercise, and
+    an absolute `to` from a stale page would take the class back. A closed
+    session, or an open one, is not paced at all.
+    """
+    stmt = (
+        update(ExerciseSession)
+        .where(
+            ExerciseSession.c.id == session_id,
+            ExerciseSession.c.unlocked_through == from_,
+            ExerciseSession.c.mode == ExerciseSessionMode.live,
+            ExerciseSession.c.closed_at.is_(None),
+        )
+        .values(
+            unlocked_through=func.least(func.greatest(to, 0), _session_n_exercises())
+        )
+        .returning(ExerciseSession.c.id)
+    )
+    return (await conn.execute(stmt)).first() is not None
+
+
+async def open_exercise_session_to_all(conn: AsyncConnection, session_id: int) -> bool:
+    """Switch a live session to `open`: everything unlocked, no pacing. One
+    way only - homework after class - and never on a closed session. Answers
+    whether it changed. Does not commit.
+
+    `unlocked_through` goes to the exercise count, so that an open session's
+    number never lies, wherever it is read.
+    """
+    stmt = (
+        update(ExerciseSession)
+        .where(
+            ExerciseSession.c.id == session_id,
+            ExerciseSession.c.mode == ExerciseSessionMode.live,
+            ExerciseSession.c.closed_at.is_(None),
+        )
+        .values(mode=ExerciseSessionMode.open, unlocked_through=_session_n_exercises())
+        .returning(ExerciseSession.c.id)
+    )
+    return (await conn.execute(stmt)).first() is not None
+
+
+async def close_exercise_session(conn: AsyncConnection, session_id: int) -> bool:
+    """Close a session: it accepts no new work from then on. Once - a second
+    close keeps the first's time. Answers whether it was this call that closed
+    it. Does not commit."""
+    stmt = (
+        update(ExerciseSession)
+        .where(ExerciseSession.c.id == session_id, ExerciseSession.c.closed_at.is_(None))
+        .values(closed_at=func.now())
+        .returning(ExerciseSession.c.id)
+    )
+    return (await conn.execute(stmt)).first() is not None
+
+
+async def reveal_exercise_solution(
+    conn: AsyncConnection, session_id: int, exercise_index: int
+) -> bool:
+    """Show an exercise's solution to the session's class. Answers whether
+    `exercise_index` is an exercise of the session's version; revealing one
+    twice is a no-op on the key. Does not commit.
+
+    The session row is taken `FOR SHARE` first. The reveal's foreign key holds
+    only a key-share lock on it, which a version switch's `UPDATE` does not
+    wait for - so without this a reveal checked against the old version could
+    commit beside a switch to a shorter one, past its end. With it, the range
+    check below runs after any switch has committed, on the version it left.
+    """
+    await conn.execute(
+        select(ExerciseSession.c.id)
+        .where(ExerciseSession.c.id == session_id)
+        .with_for_update(read=True)
+    )
+    in_range = (
+        select(literal(session_id), literal(exercise_index))
+        .select_from(ExerciseSession)
+        .join(ExerciseSetVersion, ExerciseSetVersion.c.id == ExerciseSession.c.version_id)
+        .where(
+            ExerciseSession.c.id == session_id,
+            literal(exercise_index) >= 1,
+            literal(exercise_index) <= _n_exercises(ExerciseSetVersion),
+        )
+    )
+    stmt = (
+        pg_insert(ExerciseSessionReveal)
+        .from_select(["session_id", "exercise_index"], in_range)
+        .on_conflict_do_nothing()
+        .returning(ExerciseSessionReveal.c.session_id)
+    )
+    if (await conn.execute(stmt)).first() is not None:
+        return True
+    # Already revealed - the conflict returns nothing - or out of range.
+    return (
+        await conn.execute(
+            select(ExerciseSessionReveal.c.session_id).where(
+                ExerciseSessionReveal.c.session_id == session_id,
+                ExerciseSessionReveal.c.exercise_index == exercise_index,
+            )
+        )
+    ).first() is not None
+
+
+async def query_max_checked_exercise(conn: AsyncConnection, session_id: int) -> int | None:
+    """The highest exercise anybody has a check on in this session, on any
+    version, or None. The version switch's refusal; read it under
+    `query_exercise_session_state(..., lock="update")`, or a check can be
+    queued on an exercise it has just counted as absent."""
+    stmt = select(func.max(ExerciseJob.c.exercise_index)).where(
+        ExerciseJob.c.session_id == session_id,
+        ExerciseJob.c.kind == ExerciseJobKind.check,
+    )
+    return (await conn.execute(stmt)).scalar_one()
+
+
+async def switch_exercise_session_version(
+    conn: AsyncConnection, session_id: int, version_id: int, n_exercises: int
+) -> None:
+    """Move a session to another version of its set - the only write that
+    ever changes `exercise_session.version_id` - with `unlocked_through`
+    clamped to its exercise count, and the reveals of exercises it does not
+    have dropped - or, for an open session, set to the new count. Past checks
+    keep the version they ran on. The caller holds
+    the session's row lock and has refused a version with fewer exercises than
+    the session has checks for. Does not commit."""
+    await conn.execute(
+        update(ExerciseSession)
+        .where(ExerciseSession.c.id == session_id)
+        .values(
+            version_id=version_id,
+            # An open session stays fully unlocked, appended exercises
+            # included; a live one keeps its place, unless that is past the end.
+            unlocked_through=case(
+                (ExerciseSession.c.mode == ExerciseSessionMode.open, n_exercises),
+                else_=func.least(ExerciseSession.c.unlocked_through, n_exercises),
+            ),
+        )
+    )
+    await conn.execute(
+        delete(ExerciseSessionReveal).where(
+            ExerciseSessionReveal.c.session_id == session_id,
+            ExerciseSessionReveal.c.exercise_index > n_exercises,
+        )
+    )
+
+
+async def query_set_current_version(conn: AsyncConnection, set_id: int) -> int | None:
+    """The set's current version's id, or None."""
+    stmt = select(ExerciseSet.c.current_version_id).where(ExerciseSet.c.id == set_id)
+    return (await conn.execute(stmt)).scalar_one_or_none()
 
 
 async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_id: int):

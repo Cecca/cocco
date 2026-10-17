@@ -1,0 +1,29 @@
+{% extends "base.jinja" %}
+{% block title %}{{ session.label }}{% endblock %}
+
+{% set crumbs = [
+  {"label": "Courses", "href": url_for('index')},
+  {"label": course.title, "href": url_for('get_course', course_id=course_id)},
+  {"label": session.set_title, "href": url_for('get_exercise_set', course_id=course_id, set_id=session.set_id)},
+  {"label": session.label},
+] %}
+
+{% block body %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+  <div class="flex items-start justify-between gap-4 mb-6">
+    <div>
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">Exercise session</p>
+      <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ session.label }}</h1>
+    </div>
+    <a href="{{ url_for('get_exercise_set', course_id=course_id, set_id=session.set_id) }}"
+       class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+      ← Back to the set
+    </a>
+  </div>
+
+  {# The control panel. Everything a button here changes is inside it, and
+     every route behind a button answers with a fresh copy of it, alert
+     included. #}
+  {% include "f-exercise-session.jinja" %}
+</main>
+{% endblock %}

@@ -26,6 +26,61 @@
      picked, or an alert shown, inside it would be wiped by the next poll. #}
   {% include "f-exercise-set.jinja" %}
 
+  <!-- ══ SESSIONS ═══════════════════════════════════════════════════ -->
+  {# Outside the polled status, for the import form's reason. A session is
+     opened on the current version and keeps it; the session's own page is
+     where it is moved to a newer one. #}
+  <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg">Sessions</h2>
+      <p class="text-[13px] text-base-content/55">
+        One run of this set with one group of students, with its own pacing
+        and its own progress. Students find the open ones on the course page.
+      </p>
+
+      {% if exercise_sessions %}
+      <div class="flex flex-col gap-3 mt-3">
+        {% for exercise_session in exercise_sessions %}
+        {% include "_exercise-session-card.jinja" %}
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      <form hx-post="{{ url_for('post_exercise_session_new', course_id=course_id, set_id=exercise_set.id) }}"
+            hx-target="#exercise-session-new-result"
+            hx-swap="innerHTML"
+            class="mt-4 rounded-xl border border-base-300 bg-base-200/40 p-4">
+        <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-1">Open a session</h3>
+        <p class="text-xs text-base-content/55 mb-3">
+          On the current version. <span class="font-semibold">Live</span>: you
+          unlock the exercises one at a time, starting from the first.
+          <span class="font-semibold">Open</span>: everything is unlocked, for
+          homework.
+        </p>
+        <div class="flex flex-wrap items-end gap-4">
+          <div>
+            <label class="text-xs text-base-content/55" for="exercise-session-label">Label</label>
+            <input type="text" id="exercise-session-label" name="label" required maxlength="200"
+                   placeholder="Lab A — 20 Oct"
+                   class="input input-sm w-72 mt-1 block" />
+          </div>
+          <div class="flex items-center gap-4 pb-1">
+            <label class="flex items-center gap-1.5 text-sm">
+              <input type="radio" name="mode" value="live" class="radio radio-sm" checked /> Live
+            </label>
+            <label class="flex items-center gap-1.5 text-sm">
+              <input type="radio" name="mode" value="open" class="radio radio-sm" /> Open
+            </label>
+          </div>
+          {% with oob = False %}
+          {% include "_exercise-session-open-button.jinja" %}
+          {% endwith %}
+        </div>
+        <div id="exercise-session-new-result" class="empty:hidden mt-3"></div>
+      </form>
+    </div>
+  </div>
+
   <!-- ══ RE-IMPORT ══════════════════════════════════════════════════ -->
   <form hx-post="{{ url_for('post_exercise_set_import', course_id=course_id, set_id=exercise_set.id) }}"
         hx-encoding="multipart/form-data"

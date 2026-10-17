@@ -1,0 +1,19 @@
+{# The set page's "Open session" button, and whether it can be pressed: only
+   once a version has built. Its own partial because that changes while the
+   page is open - the first build finishes under the teacher's eyes - so every
+   copy of the polled status (`f-exercise-set.jinja`) carries a fresh one out
+   of band. Only the button, never the form: a label being typed survives.
+   The route refuses on its own either way.
+
+   Context: `exercise_set`, `oob`. #}
+<span id="exercise-session-open-button" class="flex items-center gap-3"
+      {% if oob %}hx-swap-oob="true"{% endif %}>
+  <button type="submit" class="btn btn-sm btn-primary"
+          {% if not exercise_set.current_version_id %}disabled{% endif %}>
+    <span class="submit-label">Open session</span>
+    <span class="htmx-indicator loading loading-spinner loading-xs"></span>
+  </button>
+  {% if not exercise_set.current_version_id %}
+  <span class="text-xs text-base-content/55">No version has built yet.</span>
+  {% endif %}
+</span>

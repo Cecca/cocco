@@ -7,7 +7,8 @@
    (`oob`), which starts it again. No alert lives in here: the next poll would
    wipe it, so a re-import's sentence goes to the form's own result box.
 
-   Context: `exercise_set` (`query_exercise_set`), `course_id`, `oob`. #}
+   Context: `exercise_set` (`query_exercise_set`), `course_id`, `oob`, and
+   `first_paint` on the page itself. #}
 {% set latest = exercise_set.latest %}
 {% set current_id = exercise_set.current_version_id %}
 <div id="exercise-set-status"
@@ -118,3 +119,12 @@
     </div>
   </div>
 </div>
+
+{# Beside the status rather than inside it, so it is a top-level element of
+   the response for htmx to take out of band: everywhere but the page's own
+   first paint, where the button is drawn in its form. #}
+{% if not first_paint %}
+{% with oob = True %}
+{% include "_exercise-session-open-button.jinja" %}
+{% endwith %}
+{% endif %}
