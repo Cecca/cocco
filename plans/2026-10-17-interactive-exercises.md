@@ -31,9 +31,8 @@ Purely formative: nothing is graded, nothing is exported, no leaderboard. Python
   hidden tests can be decoded, and "solved" can be forged.
 - **cocco's judge cannot serve a classroom as it is.** `run_loop` (`cocco/judge.py:1115`) takes
   **one submission at a time**. `run_submission` runs its tests **one after another**, and an idle
-  loop **sleeps 5 s** before looking again. If 100 students press Check within one minute, with 5
-  tests each and a full `isolate --init` / run / `--cleanup` per test, the last student waits for
-  minutes.
+  loop **sleeps 5 s** before looking again. Measured in step 0: 100 queued submissions of 5 tests
+  take **about 40 s** to drain, and the last student waits that long. The p95 is 38 s.
 - `pull_queued_submission` (`cocco/repository.py:95`) claims a row with `UPDATE … WHERE id =
   (SELECT … LIMIT 1)`. That is enough for one judge doing one thing at a time. Under concurrent
   claimers two of them can claim the same row: the subquery is not re-evaluated when the
@@ -188,10 +187,12 @@ They are one table, `exercise_job`, with a `kind`, the `version_id` it runs agai
 ### The judge learns concurrency, a wake-up and a priority: phase 1, which helps challenges too
 
 1. **Concurrency.** `[judge] concurrency` jobs in flight (default 8), each a task claiming and
-   running a job. The tests of one exercise job run concurrently. The box pool stays the real cap.
-2. **One box per job, not per test**, for exercise jobs. `isolate --init` once, then one `--run`
-   per test in the same box, then `--cleanup`. Init and cleanup are a large share of the cost of a
-   20 ms Python program. Step 0 measures whether this is worth its complexity before it is built.
+   running a job. The tests of one exercise job run concurrently. The box pool caps how many
+   boxes run at once. On step 0's 16-thread host, though, the **CPU** saturates first, at about
+   8 tasks and about 220 python boxes per second. Eight jobs whose 5 tests all run concurrently
+   would ask for 40 boxes, more than the pool's 32, and far more than the CPU can serve. The
+   default should therefore be sized by boxes in flight against the core count, not by the pool.
+2. ~~One box per job~~: not built. See step 0's measurements and "Decided".
 3. **`FOR UPDATE SKIP LOCKED`** in every claim, `pull_queued_submission` included. This is
    required as soon as there is more than one claimer.
 4. **`LISTEN cocco_queue`.** The web app runs `pg_notify` in the transaction that inserts a job
@@ -339,12 +340,65 @@ participants and reveals: this is formative work with nothing to keep a record o
 
 ## Steps
 
-### [ ] 0. Measure before building
+### [x] 0. Measure before building
 
 Time a trivial Python program through `isolate_run`, cold and warm: init + run + cleanup versus a
 second `--run` in an already initialised box. Time 100 checks of 5 tests with the current
 `run_loop`. These numbers decide whether "one box per job" (judge design, item 2) is built, and
 they are the baseline for step 11. Record them in this plan.
+
+**Measured 2026-10-17** on a laptop, not the lab's judge host: i7-1260P (4P + 8E cores, 16
+threads), isolate 2.5 with `--cg`, the flake's python 3.12, PostgreSQL 17 in a local container.
+The scripts were throwaway (`bench_isolate.py`, `bench_drain.py`) and are not in the repo.
+
+One `print(42)` through isolate, n = 100, milliseconds:
+
+| | mean | median | p95 |
+|---|---|---|---|
+| `isolate_run` as the judge calls it (init + copy + run + cleanup) | 35.6 | 35.0 | 46.1 |
+| of which `--init` | 1.7 | 1.7 | 2.2 |
+| of which `--run` | 30.9 | 30.2 | 42.6 |
+| of which `--cleanup` | 1.9 | 1.9 | 2.2 |
+| python's own wall time inside the box (meta `time-wall`) | 27.4 | 27.0 | 38.0 |
+| warm: `--run` in an already initialised box (100 runs in one box, the first included) | 26.1 | 26.4 | 40.6 |
+| the same python on the host, no isolate | 14.2 | 13.9 | 16.1 |
+| 5 tests, a box per test | 178 | 178 | 195 |
+| 5 tests, one box for all 5 | 152 | 160 | 183 |
+
+Init plus cleanup is **about 3.6 ms of 35**. A `--run` in a reused box is also about 5 ms faster
+than the first `--run` in a fresh one (26.1 against 30.9). The warm mean includes the box's first
+run, and excluding it would not change the picture. Reuse therefore saves **roughly 5–10 ms per
+test, 15–25 % of a job**. The two 5-test rows are noisy: 178 → 152 ms is 15 %, against a
+predicted 139 ms. The likely causes are the P/E-core mix and the two rows using different harnesses
+(`isolate_run` against the bare CLI). Most of a box's cost either way is python starting up
+inside it.
+
+The current judge draining 100 queued submissions of a 5-test python challenge, all enqueued
+before it starts. Each test is two isolate runs, the submission plus the bundled `equality.py`
+evaluator, so this is 1000 boxes. Two runs:
+
+- **41.3 s and 40.5 s** to drain, 2.4 submissions/s. 405 ms of service per submission. All 500
+  test outcomes were `success`, so nothing was cut short by an error.
+- Click to verdict: **median 20.4 s, p95 38.4 s, max 40.5 s.**
+
+For step 1's sake, the same drain with N tasks each calling `run_from_queue`. This is not today's
+code, and it is safe here only because the claim is synchronous on the event loop:
+
+- **8 tasks: 4.6 s**, 21.6 submissions/s, p95 4.4 s. That is 8.7× for 8×; it scales linearly.
+  That p95 is the worst case for a *burst*: 1000 boxes, all queued at once.
+- **16 tasks: 4.5 s.** The CPU is saturated at about 220 python boxes per second, and service time
+  per submission doubles to 670 ms.
+
+What this means for the target. A check has no evaluator box (comparison is in-process), so 100
+checks of 5 tests are 500 boxes, about half of the drain above. Serially that is about 18 s, and
+about 15 s with one box per job. Neither meets the target, so **concurrency is the lever**, an
+order of magnitude. Box reuse is a 15–25 % refinement on top. With 8 workers, 500 boxes queued all
+at once would drain in about 2.3 s on this machine. That is a burst drain time, not the target
+metric.
+
+The target spreads the 100 clicks over 10 s. That is about 50 boxes/s, well under the ~220 boxes/s
+ceiling, so jobs barely queue, and p95 should be close to **one job's service time** (about
+0.2 s of boxes plus the claim and the poll). Step 11 re-measures on the lab host.
 
 ### [ ] 1. Judge throughput
 
@@ -478,6 +532,16 @@ target. Record the numbers here.
 
 ## Decided
 
+- **"One box per job" is not built**: step 0's numbers. Reuse saves about 3.6 ms of init and
+  cleanup plus about 5 ms on the run, roughly 5–10 ms per test and 15–25 % of a job. Concurrency
+  (phase 1, item 1) saves about 9×. Reuse also costs isolation between tests: a file one test
+  writes is still in the box for the next, so `isolate_run` would need a second, stateful entry
+  point that every exercise test goes through. Every test keeps its own box through `isolate_run`
+  as it is.
+  - Reconsider only if step 11 misses the p95 target **with the CPU saturated**. That is the one
+    case where reuse helps: it lifts the ~220 boxes/s ceiling by up to about 25 %.
+  - A miss with the CPU *not* saturated calls for more concurrency instead.
+
 - Run and Check both execute on the judge (option b). Run is not interactive: stdin is given up
   front.
 - Repeated sessions: pacing and progress belong to a session, and a set is only content.
@@ -489,10 +553,6 @@ target. Record the numbers here.
 - English keywords in the format, one spelling, no Italian aliases.
 - Run jobs are kept for six months.
 - The interface is in English, error explanations included.
-
-## Open questions
-
-- **"One box per job"**: decided by step 0's numbers.
 
 ## Future work
 
