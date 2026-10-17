@@ -4,8 +4,11 @@ of complex database queries.
 """
 import math
 from datetime import datetime, timezone
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from cocco.exercises.compare import Rules
 from cocco.model import OutcomeEnum, SubmissionStatus
 
 
@@ -168,3 +171,109 @@ class UserFocusedChallengeInfo(Base):
     challenge: Challenge
     submissions: list[SubmissionWithOutcomes]
     
+
+
+# --- Exercises ---------------------------------------------------------------
+#
+# The compiled document of an exercise set: what `cocco.exercises.format` parses
+# out of the `.md` source, plus the expected outputs the judge's build fills in.
+# It is stored whole, as one JSONB value on the version, and this is the one
+# definition the parser that writes it, the build that completes it and every
+# reader agree on. Solutions included: the server needs them, and no student
+# is ever handed this document - see the student view in the plan.
+
+EXERCISE_FORMAT = 1
+
+
+class ExerciseProblem(Base):
+    """Something wrong with an exercise file, as the author page lists it.
+
+    An `error` stops the version from becoming ready; a `warning` is shown and
+    the version is used anyway.
+    """
+
+    level: Literal["error", "warning"]
+    # Where in the file: "front matter", "introduction", "file", or the exercise.
+    where: str
+    text: str
+    # Output worth showing verbatim under the sentence, e.g. a traceback.
+    detail: str | None = None
+    # 1-based positions, when the problem is about one exercise or one of its
+    # tests - for a page that wants to put it next to the thing, not only list it.
+    exercise: int | None = None
+    test: int | None = None
+
+
+class ExerciseTest(Base):
+    # Stdin, with a final newline unless it is empty.
+    input: str
+    hidden: bool = False
+    # As the author wrote them. `output` None means "compute it from the
+    # solution"; `error` None means the program must not raise, and "" means
+    # "whatever the solution raises", which the build resolves.
+    output: str | None = None
+    error: str | None = None
+    # The file line of the `input` block, or of the `# Title` for the one test
+    # an exercise with no `input` gets (`implicit`).
+    line: int
+    implicit: bool = False
+    # Filled by the build; None straight out of the parser.
+    expected_output: str | None = None
+    expected_error: str | None = None
+
+
+class Exercise(Base):
+    title: str
+    # Markdown, rendered when it is shown; hints too.
+    statement: str
+    starter: str
+    solution: str | None
+    hints: list[str]
+    rules: Rules
+    time_s: float
+    tests: list[ExerciseTest]
+    # The file line of its `# Title`.
+    line: int
+
+
+class ExerciseDocument(Base):
+    # A `Literal`, so that a reader handed a document of a format it does not
+    # know fails here rather than misreading it.
+    format: Literal[1] = EXERCISE_FORMAT
+    # Always "python" for now: the harness is Python's. The field exists so a
+    # second language is a new value rather than a new format.
+    language: str = "python"
+    title: str
+    description: str
+    # Markdown shown before the first exercise.
+    intro: str
+    exercises: list[Exercise]
+
+
+class HarnessException(Base):
+    # `mro` on the wire, `classes` here: a field called `mro` would shadow the
+    # method every class has, and Pydantic warns about exactly that.
+    model_config = ConfigDict(
+        from_attributes=True, validate_by_name=True, serialize_by_alias=True
+    )
+
+    type: str
+    # Class names, the exception's own first and `object` last: what an
+    # `error: ValueError` test is matched against, subclasses included.
+    classes: list[str] = Field(alias="mro")
+    line: int | None
+    traceback: str
+
+
+class HarnessReport(Base):
+    """The one JSON object `cocco/exercises/harness.py` writes on stdout.
+
+    Pinned here, beside the document, for the judge that reads it; the harness
+    itself cannot import it, being a stdlib program that runs inside a box.
+    """
+
+    stdout: str
+    stderr: str
+    truncated: bool
+    exit: int
+    exception: HarnessException | None

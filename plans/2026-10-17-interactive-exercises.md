@@ -138,12 +138,20 @@ main.py`. It:
   print stops at the cap instead of filling memory;
 - compiles the student's code under the name `main.py` and runs it, so tracebacks and line
   numbers refer to the student's own file;
-- catches everything and always exits 0, writing **one JSON object** on the real stdout:
-  `stdout`, `stderr`, `truncated`, and `exception: {type, mro, line, traceback}` or null.
+- catches everything and always exits 0, writing **one JSON object**, as the last line of the
+  real stdout: `stdout`, `stderr`, `truncated`, `exit` (the code a `sys.exit()` asked for, as an
+  int, as the prototype's worker already reported it), and `exception: {type, mro, line,
+  traceback}` or null. The traceback is capped like the output. `schema.HarnessReport` pins the
+  shape.
 
 **The isolate status says how the run ended; the JSON says what the program did.** A timeout or
-an OOM is an isolate status and produces no JSON. A missing or unparseable JSON with status `OK`
-is a harness failure, which is a bug.
+an OOM is an isolate status and produces no JSON. The judge reads the **last line** of stdout,
+since a program can write to fd 1 ahead of the report.
+
+A program can also end the process before the report is written (`os._exit(0)`, or
+`os.closerange` taking the harness's copy of fd 1). So a missing or unparseable JSON with status
+`OK` is **something the program did**, reported as "ended without reporting", not a
+`judge_internal_error`.
 
 A student can forge that JSON by writing to fd 1 directly. That is accepted: the comparison
 against the expected output still happens in the judge, so the only thing a forgery can fake is
@@ -410,7 +418,7 @@ step 4. This ships on its own, and challenges get faster from it.
 Tests: two concurrent claimers never get the same row; a notification wakes an idle judge well
 under the poll interval; concurrency never exceeds the box pool.
 
-### [ ] 2. The pure modules, `cocco/exercises/`
+### [x] 2. The pure modules, `cocco/exercises/`
 
 - `format.py`: a port of `formato.js` with the English keywords. It parses a file into the
   compiled document's shape, minus the expected outputs, or returns a list of problems.
@@ -459,7 +467,10 @@ from the job's version, out of the compiled document, in one query.
   problems and the status in one `UPDATE` (only while the version is still `building`); on
   success, move the set's `current_version_id` in the same transaction.
 - **check:** every test through the harness, then compared in-process; the result JSONB holds a
-  verdict per test plus an overall `passed`.
+  verdict per test plus an overall `passed`. `compare` goes through `asyncio.to_thread`: with
+  `order` and `numbers` together it is quadratic in the line counts (seconds, against a program
+  that printed to the cap). Strings bound for JSONB lose their NUL characters first, since
+  PostgreSQL cannot store `\u0000`.
 - **run:** once, transcript back.
 
 Prune run jobs older than six months when idle. Integration tests under
