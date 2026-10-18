@@ -1,5 +1,5 @@
 {% extends "base.jinja" %}
-{% block title %}{{ session.label }}{% endblock %}
+{% block title %}{% autoescape true %}{{ session.label }}{% endautoescape %}{% endblock %}
 
 {% set crumbs = [
   {"label": "Courses", "href": url_for('index')},
@@ -11,6 +11,9 @@
    `session` is `student_session_view`'s, which is all this page is handed -
    the titles past `unlocked_through` never reach the template. #}
 {% block body %}
+{# Escaped explicitly: `Jinja2Templates` autoescapes only .html/.xml, so a
+   `.jinja` file is not. #}
+{% autoescape true %}
 <main class="mx-auto max-w-3xl px-6 py-8">
   <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">Exercise session</p>
   <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ session.label }}</h1>
@@ -27,8 +30,11 @@
 
   <ol class="mt-6 flex flex-col gap-2">
     {% for title in session.titles %}
-    <li class="rounded-xl border border-base-300 bg-base-100 px-4 py-3">
-      <span class="font-mono text-sm font-semibold text-base-content/50 mr-2">{{ loop.index }}</span>{{ title }}
+    <li>
+      <a href="{{ url_for('get_session_exercise', course_id=course_id, session_id=session_id, n=loop.index) }}"
+         class="block rounded-xl border border-base-300 bg-base-100 px-4 py-3 hover:border-primary/50 transition-colors">
+        <span class="font-mono text-sm font-semibold text-base-content/50 mr-2">{{ loop.index }}</span>{{ title }}
+      </a>
     </li>
     {% endfor %}
   </ol>
@@ -38,4 +44,5 @@
   </p>
   {% endif %}
 </main>
+{% endautoescape %}
 {% endblock %}

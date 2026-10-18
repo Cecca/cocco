@@ -39,6 +39,7 @@ from cocco.model import (
     ExerciseJobStatus,
     ExerciseSession,
     ExerciseSessionMode,
+    ExerciseSessionParticipant,
     ExerciseSessionReveal,
     ExerciseSet,
     ExerciseSetVersion,
@@ -645,7 +646,14 @@ async def insert_exercise_job(
         # The index's own predicate, which is what lets PostgreSQL infer the
         # partial index as the arbiter.
         index_where=text("status = 'queued' AND kind <> 'build'"),
-        set_={"source": stmt.excluded.source, "stdin": stmt.excluded.stdin},
+        # `submitted_at` by hand: an upsert's DO UPDATE is not an UPDATE to
+        # SQLAlchemy, and the column has no `onupdate` anyway - the judge's
+        # writes to the row are not the student's.
+        set_={
+            "source": stmt.excluded.source,
+            "stdin": stmt.excluded.stdin,
+            "submitted_at": func.now(),
+        },
     ).returning(ExerciseJob.c.id)
     job_id = (await conn.execute(stmt)).scalar_one()
     await notify_queue(conn)
@@ -1364,6 +1372,154 @@ async def query_set_current_version(conn: AsyncConnection, set_id: int) -> int |
     """The set's current version's id, or None."""
     stmt = select(ExerciseSet.c.current_version_id).where(ExerciseSet.c.id == set_id)
     return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+# --- The student's side of a session --------------------------------------------
+
+
+async def insert_session_participant(
+    conn: AsyncConnection, session_id: int, user_id: int
+) -> None:
+    """Record that a student came to a session: the dashboard's denominator.
+    Once - a later visit is a no-op on the key, so `joined_at` is the first -
+    and only while the session is not closed, a rule in the statement rather
+    than a check before it: somebody reviewing a closed session afterwards did
+    not take part in it. Does not commit."""
+    still_open = select(literal(session_id), literal(user_id)).where(
+        ExerciseSession.c.id == session_id, ExerciseSession.c.closed_at.is_(None)
+    )
+    await conn.execute(
+        pg_insert(ExerciseSessionParticipant)
+        .from_select(["session_id", "user_id"], still_open)
+        .on_conflict_do_nothing()
+    )
+
+
+# One student's check jobs in one session, an aggregate row per exercise: what
+# the strip colours each exercise by. Solved is sticky - any passing check, on
+# any version the session has been on - and `checking` is a check not yet done.
+# `passed` is read only off a finished check: an error result has no such key,
+# which the coalesce makes "not passed". Through `ix_exercise_job_check`.
+_SESSION_CHECKS_CTE = """
+    checks AS (
+        SELECT j.exercise_index AS n,
+               bool_or(j.status = 'done'
+                       AND coalesce((j.result ->> 'passed')::boolean, false)) AS solved,
+               bool_or(j.status <> 'done') AS checking
+        FROM exercise_job j
+        WHERE j.session_id = :session_id AND j.user_id = :user_id AND j.kind = 'check'
+        GROUP BY j.exercise_index
+    )
+"""
+
+
+async def query_session_heading(conn: AsyncConnection, session_id: int):
+    """What the student page needs of a session beyond its pacing: the label
+    and the exercises whose solution is revealed, as a set - or None.
+
+    Not `query_exercise_session`, which is the staff page's and aggregates
+    every version of the set to offer a switch; this page is loaded by every
+    student in the room."""
+    revealed = (
+        select(func.array_agg(ExerciseSessionReveal.c.exercise_index))
+        .where(ExerciseSessionReveal.c.session_id == ExerciseSession.c.id)
+        .scalar_subquery()
+    )
+    stmt = select(ExerciseSession.c.label, revealed.label("revealed")).where(
+        ExerciseSession.c.id == session_id
+    )
+    row = (await conn.execute(stmt)).first()
+    if row is None:
+        return None
+    # `array_agg` of no rows is NULL.
+    return {"label": row.label, "revealed": set(row.revealed or ())}
+
+
+async def query_session_strip(conn: AsyncConnection, session_id: int, user_id: int):
+    """The student page's exercise strip: the session's pacing, the titles of
+    the version it is on, and this person's checks per exercise - or None.
+
+    Polled every few seconds by every student in the room, so it is one round
+    trip and reads no statement, no test and no source. Every title is in it;
+    what the asker may see of them is `session_strip_view`'s to decide.
+    """
+    query = text(f"""
+    WITH
+    {_SESSION_CHECKS_CTE},
+    doc AS (
+        SELECT s.mode, s.unlocked_through, s.closed_at,
+               {_EXERCISE_TITLES_SQL} AS titles,
+               coalesce((SELECT json_agg(checks ORDER BY checks.n) FROM checks),
+                        '[]'::json) AS checks
+        FROM exercise_session s
+        JOIN exercise_set_version v ON v.id = s.version_id
+        WHERE s.id = :session_id
+    )
+    SELECT row_to_json(doc) FROM doc;
+    """)
+    params = dict(session_id=session_id, user_id=user_id)
+    return (await conn.execute(query, params)).scalar()
+
+
+async def query_last_session_jobs(
+    conn: AsyncConnection, session_id: int, user_id: int, exercise_index: int
+) -> dict:
+    """This person's latest Run and latest Check of one exercise in a session,
+    keyed by kind (`"run"`, `"check"`), either absent if there is none.
+
+    What the student page opens with: each tab's last result, and the newest
+    of the two sources as the editor's content when the browser has no draft -
+    after a change of computer, say. Nobody else's, by the key.
+
+    Within a kind the latest is the highest id: a queued job is only ever
+    replaced while it is the newest of its kind. Across the two, the one
+    whose code was sent last is the later `submitted_at` - not the higher id
+    nor `enqueued`, which a replacement keeps.
+    """
+    stmt = (
+        select(
+            ExerciseJob.c.id,
+            ExerciseJob.c.kind,
+            ExerciseJob.c.status,
+            ExerciseJob.c.version_id,
+            ExerciseJob.c.exercise_index,
+            ExerciseJob.c.result,
+            ExerciseJob.c.source,
+            ExerciseJob.c.stdin,
+            ExerciseJob.c.submitted_at,
+        )
+        .distinct(ExerciseJob.c.kind)
+        .where(
+            ExerciseJob.c.session_id == session_id,
+            ExerciseJob.c.user_id == user_id,
+            ExerciseJob.c.exercise_index == exercise_index,
+            ExerciseJob.c.kind != ExerciseJobKind.build,
+        )
+        .order_by(ExerciseJob.c.kind, ExerciseJob.c.id.desc())
+    )
+    return {row.kind.value: row for row in (await conn.execute(stmt)).all()}
+
+
+async def query_session_job(
+    conn: AsyncConnection, session_id: int, job_id: int, user_id: int
+):
+    """A Run or a Check of a session, for the fragment that polls it - only
+    if it is of this session and its asker's own. `query_preview_job`'s rule:
+    each is a key, so anybody else's job, or a preview, is simply not found."""
+    stmt = select(
+        ExerciseJob.c.id,
+        ExerciseJob.c.kind,
+        ExerciseJob.c.status,
+        ExerciseJob.c.version_id,
+        ExerciseJob.c.exercise_index,
+        ExerciseJob.c.result,
+    ).where(
+        ExerciseJob.c.id == job_id,
+        ExerciseJob.c.user_id == user_id,
+        ExerciseJob.c.session_id == session_id,
+        ExerciseJob.c.kind != ExerciseJobKind.build,
+    )
+    return (await conn.execute(stmt)).first()
 
 
 async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_id: int):

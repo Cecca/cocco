@@ -513,7 +513,7 @@ open, close, reveal a solution, and switch to the latest version with its refusa
 title-change confirmation. Students see the open sessions on the course page. The dependency that
 enforces membership, `session_in_course`, the unlocked range and closed-ness.
 
-### [ ] 7. The student page
+### [x] 7. The student page
 
 Vendor CodeMirror under `cocco/static/` (licence noted). The strip fragment, the student-view
 function, the statement, hints, the Run and Check tabs, the job fragment, drafts in localStorage

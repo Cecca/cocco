@@ -1,5 +1,6 @@
 {% extends "base.jinja" %}
-{% block title %}Preview · {{ exercise.title }}{% endblock %}
+{% block title %}{% autoescape true %}Preview · {{ exercise.title }}{% endautoescape %}{% endblock %}
+{% block head %}{% include "_exercise-editor-head.jinja" %}{% endblock %}
 
 {% set crumbs = [
   {"label": "Courses", "href": url_for('index')},
@@ -10,6 +11,9 @@
 ] %}
 
 {% block body %}
+{# Escaped explicitly: `Jinja2Templates` autoescapes only .html/.xml, so a
+   `.jinja` file is not. #}
+{% autoescape true %}
 <main class="mx-auto max-w-6xl px-6 py-8">
 
   {# What this page is, before anything else on it: the solution and the
@@ -96,7 +100,7 @@
           <summary class="cursor-pointer text-sm font-semibold">Solution · staff only</summary>
           <pre id="preview-solution" class="mt-2 max-h-80 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono whitespace-pre">{{ exercise.solution }}</pre>
           <button type="button" class="btn btn-xs btn-ghost border border-base-300 mt-2"
-                  onclick="document.getElementById('preview-source').value = document.getElementById('preview-solution').textContent">
+                  onclick="coccoSetCode('preview-source', document.getElementById('preview-solution').textContent)">
             Put it in the editor
           </button>
         </details>
@@ -105,25 +109,30 @@
     </div>
 
     <!-- ══ THE EDITOR ═════════════════════════════════════════════════ -->
-    {# A plain textarea for now. Both buttons post this one form, so Check
-       sends the same code Run would; the stdin box is a Run's only. #}
+    {# The student page's editor (`exercise.js`), with no draft kept: a
+       preview starts from the starter every time. Both buttons post this one
+       form, so Check sends the same code Run would; the stdin box is a Run's
+       only. #}
     <div class="card bg-base-100 border border-base-300 shadow-sm self-start">
       <div class="card-body p-7">
         <form class="flex flex-col gap-3" onsubmit="return false">
           <label class="text-xs text-base-content/55" for="preview-source">Code</label>
-          <textarea id="preview-source" name="source" rows="16" spellcheck="false"
-                    class="textarea w-full font-mono text-sm leading-relaxed">{{ exercise.starter }}</textarea>
+          <div class="cocco-editor">
+            <textarea id="preview-source" name="source" rows="16" spellcheck="false"
+                      data-editor data-run="preview-run" data-check="preview-check"
+                      class="textarea w-full font-mono text-sm leading-relaxed">{{ exercise.starter }}</textarea>
+          </div>
           <label class="text-xs text-base-content/55" for="preview-stdin">Input for Run</label>
           <textarea id="preview-stdin" name="stdin" rows="3" spellcheck="false"
                     class="textarea w-full font-mono text-sm"></textarea>
           <div class="flex gap-2">
-            <button type="button" class="btn btn-sm"
+            <button type="button" id="preview-run" class="btn btn-sm"
                     hx-post="{{ url_for('post_exercise_preview_run', course_id=course_id, set_id=exercise_set.id, version_id=version.id, n=n) }}"
                     hx-target="#preview-result"
                     hx-swap="innerHTML">
               ▶ Run
             </button>
-            <button type="button" class="btn btn-sm btn-primary"
+            <button type="button" id="preview-check" class="btn btn-sm btn-primary"
                     hx-post="{{ url_for('post_exercise_preview_check', course_id=course_id, set_id=exercise_set.id, version_id=version.id, n=n) }}"
                     hx-target="#preview-result"
                     hx-swap="innerHTML">
@@ -136,4 +145,5 @@
     </div>
   </div>
 </main>
+{% endautoescape %}
 {% endblock %}

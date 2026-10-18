@@ -250,6 +250,11 @@ class ExerciseDocument(Base):
     exercises: list[Exercise]
 
 
+# The largest line `HarnessException.line` is believed to be: far past any
+# exercise anybody types, far short of a number that encodes an input.
+MAX_EXCEPTION_LINE = 10**6
+
+
 class HarnessException(Base):
     # `mro` on the wire, `classes` here: a field called `mro` would shadow the
     # method every class has, and Pydantic warns about exactly that.
@@ -263,6 +268,16 @@ class HarnessException(Base):
     classes: list[str] = Field(alias="mro")
     line: int | None
     traceback: str
+
+    @field_validator("line")
+    @classmethod
+    def _line_in_a_file(cls, line: int | None) -> int | None:
+        """A line number a file could have, or None. The report is the
+        program's to forge - its last line of stdout - and `line` is shown to
+        students, so a number no file has is not passed on as one."""
+        if line is None or not 1 <= line <= MAX_EXCEPTION_LINE:
+            return None
+        return line
 
 
 class HarnessReport(Base):

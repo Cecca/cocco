@@ -1,6 +1,8 @@
 @import "tailwindcss";
 @source "../cocco/templates/**/*.jinja";
 @source "../cocco/**/*.py";
+/* Vendored, and 400 KB of somebody else's class names: nothing to generate. */
+@source not "../cocco/static/codemirror";
 @plugin "@tailwindcss/typography";
 /* No built-in themes: "cocco" below is the only one. */
 @plugin "daisyui" {
@@ -229,6 +231,67 @@ body {
    whitespace) would inherit prose's pale-on-dark ink onto a light card. */
 .prose .cocco-code pre {
   color: var(--color-base-content);
+}
+
+/* The exercise editor: CodeMirror 5 (cocco/static/codemirror/codemirror.css)
+   dressed as the rest of the page - the mono face, the card's border, and as
+   tall as the code with a floor, so a short starter is still a place to type.
+   The token colours are `.cocco-code`'s, mapped onto CodeMirror's names, so
+   the editor and a highlighted solution read as the same code. */
+.cocco-editor .CodeMirror {
+  height: auto;
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  line-height: 1.6;
+  border: 1px solid var(--color-base-300);
+  border-radius: 0.75rem;
+  background: var(--color-base-100);
+  color: var(--color-base-content);
+}
+.cocco-editor .CodeMirror-scroll {
+  min-height: 18rem;
+}
+.cocco-editor .CodeMirror-gutters {
+  border-right: 1px solid var(--color-base-300);
+  background: var(--color-base-200);
+  border-radius: 0.75rem 0 0 0.75rem;
+}
+.cocco-editor .CodeMirror-linenumber {
+  color: color-mix(in oklch, var(--color-base-content) 40%, transparent);
+}
+.cocco-editor .CodeMirror-focused {
+  outline: 2px solid color-mix(in oklch, var(--color-primary) 50%, transparent);
+  outline-offset: 1px;
+}
+.cocco-editor .cm-comment {
+  color: oklch(55% 0.02 60);
+  font-style: italic;
+}
+.cocco-editor .cm-keyword {
+  color: oklch(48% 0.14 285);
+  font-weight: 600;
+}
+.cocco-editor .cm-string {
+  color: oklch(48% 0.12 145);
+}
+.cocco-editor .cm-number {
+  color: oklch(52% 0.13 40);
+}
+.cocco-editor .cm-def {
+  color: oklch(48% 0.12 245);
+  font-weight: 600;
+}
+.cocco-editor .cm-builtin {
+  color: oklch(50% 0.1 200);
+}
+.cocco-editor .cm-meta {
+  color: oklch(55% 0.13 55);
+}
+.cocco-editor .cm-operator {
+  color: oklch(45% 0.02 60);
+}
+.cocco-editor .cm-error {
+  color: var(--color-error);
 }
 
 /* htmx request-in-flight helpers */

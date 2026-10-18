@@ -1,15 +1,22 @@
-{# One Run or Check of the staff preview, swapped into #preview-result.
+{# One Run or Check, swapped into a result box: the staff preview's, and
+   the student page's two tabs.
 
    While the job is pending the element polls itself every half second and
    is replaced, `outerHTML`, by each answer; the done copy has no trigger, so
    swapping it in is what stops the poll.
 
-   Context: `job` (`query_preview_job`, or None with `message` for a request
-   that was refused before anything was queued), `result` (the parsed
-   `schema.ExerciseJobResult` once done), `tests` (a check's rows, with the
-   test each one ran and both outputs as marked lines), `course_id`, `set_id`.
-   Hidden tests are shown in full: this is staff's preview. #}
+   Context: `job` (`query_preview_job` or `query_session_job`, or None with
+   `message` - and perhaps a `link` to go to instead - for a request that was
+   refused before anything was queued),
+   `poll_url`, `result` (the parsed `schema.ExerciseJobResult` once done) and
+   `tests` (a check's rows, `exercise_check_rows`'s), and `earlier_version`
+   (the job ran on a version the session has since left). A `redacted` row is a
+   hidden test as a student may see it - the verdict and, on an error, the
+   exception's type - and carries nothing else to print. #}
 
+{# Escaped explicitly: `Jinja2Templates` autoescapes only .html/.xml, so a
+   `.jinja` file is not, and what this prints is code and program output. #}
+{% autoescape true %}
 {% set VERDICTS = {
   "pass": "passed",
   "fail": "wrong output",
@@ -74,13 +81,23 @@
 
 <div class="flex flex-col gap-3"
      {% if job is not none and job.status.value != "done" %}
-     hx-get="{{ url_for('get_fragment_exercise_job', course_id=course_id, set_id=set_id, job_id=job.id) }}"
+     hx-get="{{ poll_url }}"
+     data-swap-guard
      hx-trigger="every 500ms"
      hx-swap="outerHTML"
      {% endif %}>
 
+  {% if earlier_version %}
+  <p class="text-xs text-warning">
+    This ran on an earlier version of the exercise, before your teacher updated
+    it: the statement and tests may have changed since.
+  </p>
+  {% endif %}
+
   {% if job is none %}
-  <div role="alert" class="alert alert-error text-sm"><span>{{ message }}</span></div>
+  <div role="alert" class="alert {{ 'alert-info' if link else 'alert-error' }} text-sm">
+    <span>{{ message }}{% if link %} <a class="link font-semibold" href="{{ link }}">Open the preview</a>{% endif %}</span>
+  </div>
 
   {% elif job.status.value != "done" %}
   <div class="flex items-center gap-2 text-sm text-base-content/70">
@@ -106,19 +123,29 @@
     </span>
   </div>
   {% for row in tests %}
-  {% set r = row.result %}
-  <div class="rounded-xl border {{ 'border-success/40' if r.verdict == 'pass' else 'border-error/40' }} p-3 flex flex-col gap-2">
+  <div class="rounded-xl border {{ 'border-success/40' if row.verdict == 'pass' else 'border-error/40' }} p-3 flex flex-col gap-2">
     <div class="flex flex-wrap items-center gap-2 text-sm">
       <span class="font-mono font-semibold text-base-content/55">Test {{ row.n }}</span>
-      {% if r.hidden %}
-      <span class="badge badge-ghost badge-sm font-mono" title="A student sees only the verdict and the exception's type and line">hidden</span>
+      {% if row.hidden %}
+      <span class="badge badge-ghost badge-sm font-mono"
+            {% if not row.redacted %}title="A student sees only the verdict and the exception's type"{% endif %}>hidden</span>
       {% endif %}
-      <span class="font-mono font-semibold {{ 'text-success' if r.verdict == 'pass' else 'text-error' }}">
-        {{ "✓" if r.verdict == "pass" else "✗" }} {{ VERDICTS[r.verdict] }}
+      <span class="font-mono font-semibold {{ 'text-success' if row.verdict == 'pass' else 'text-error' }}">
+        {{ "✓" if row.verdict == "pass" else "✗" }} {{ VERDICTS[row.verdict] }}
       </span>
-      <span class="ml-auto text-xs font-mono text-base-content/45">{{ "%.2f" | format(r.elapsed_s) }} s</span>
+      {% if not row.redacted %}
+      <span class="ml-auto text-xs font-mono text-base-content/45">{{ "%.2f" | format(row.elapsed_s) }} s</span>
+      {% endif %}
     </div>
-    {% if r.verdict != "pass" %}
+    {% if row.redacted %}
+    {% if row.exception %}
+    <div class="text-sm">
+      <span class="font-mono font-semibold text-error">{{ row.exception.type }}</span>
+      <span class="text-base-content/70">— {{ error_hint(row.exception.type) }}</span>
+    </div>
+    {% endif %}
+    {% elif row.verdict != "pass" %}
+    {% set r = row.result %}
     {% if row.test is not none %}
     <div>
       <div class="text-[11px] uppercase tracking-wider text-base-content/45">Input</div>
@@ -144,3 +171,4 @@
   {% endfor %}
   {% endif %}
 </div>
+{% endautoescape %}

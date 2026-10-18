@@ -1,0 +1,50 @@
+{% extends "base.jinja" %}
+{% block title %}{% autoescape true %}{{ label }}{% endautoescape %}{% endblock %}
+
+{% set crumbs = [
+  {"label": "Courses", "href": url_for('index')},
+  {"label": course.title, "href": url_for('get_course', course_id=course_id)},
+  {"label": label, "href": url_for('get_exercise_session', course_id=course_id, session_id=session_id)},
+  {"label": "Exercise %02d" | format(n)},
+] %}
+
+{# An exercise the pacing has not reached: `require_session_exercise`'s
+   refusal, as a page to wait on. Nothing of the exercise is on it, not even
+   its title. The strip's poll carries `wait` while `waiting`, and is
+   answered with a redirect to the exercise once the teacher unlocks it - this
+   page has no editor, so the reload costs nothing. In a closed session there
+   is nothing to wait for, and the strip polls only as itself. #}
+{% block body %}
+{# Escaped explicitly: `Jinja2Templates` autoescapes only .html/.xml, so a
+   `.jinja` file is not, and what this prints is code and program output. #}
+{% autoescape true %}
+<main class="mx-auto max-w-3xl px-6 py-8">
+  {% include "f-exercise-strip.jinja" %}
+
+  <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+    <div class="card-body p-7 items-center text-center">
+      {% if waiting %}
+      <span class="loading loading-dots loading-lg text-primary"></span>
+      <h1 class="font-serif text-2xl font-semibold tracking-tight mt-2">Wait for the teacher</h1>
+      {% else %}
+      <h1 class="font-serif text-2xl font-semibold tracking-tight">Not unlocked</h1>
+      {% endif %}
+      {% if waiting %}
+      <p class="text-base-content/70 max-w-prose">{{ message }}</p>
+      {% else %}
+      <p class="text-base-content/70 max-w-prose">
+        The session closed before exercise {{ n }} was unlocked, so there is
+        nothing here to review.
+      </p>
+      {% endif %}
+      {% if waiting %}
+      <p class="text-sm text-base-content/55">
+        This page opens the exercise by itself as soon as it is unlocked. Meanwhile
+        you can go back to an earlier one.
+      </p>
+      {% endif %}
+    </div>
+  </div>
+</main>
+{% endautoescape %}
+{% endblock %}

@@ -1,3 +1,4 @@
+import builtins
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -108,6 +109,7 @@ from pathlib import Path
 from urllib.parse import parse_qs
 
 from cocco.repository import (
+    ExerciseSessionState,
     claim_user_password,
     block_user,
     challenge_in_course,
@@ -131,6 +133,7 @@ from cocco.repository import (
     insert_enrollment,
     insert_exercise_job,
     insert_exercise_session,
+    insert_session_participant,
     insert_exercise_set,
     insert_exercise_version,
     insert_self_enrollment,
@@ -174,12 +177,16 @@ from cocco.repository import (
     query_exercise_sets,
     query_exercise_version,
     query_exercise_version_source,
+    query_last_session_jobs,
     query_max_checked_exercise,
     query_ordered_challenge_ids,
     query_password_hash,
     query_password_state,
     query_preview_job,
     query_sample_testcase,
+    query_session_heading,
+    query_session_job,
+    query_session_strip,
     query_set_current_version,
     query_submission,
     query_submission_outcomes,
@@ -3714,61 +3721,177 @@ def _marked_lines(text: str, marked) -> list[tuple[str, bool]]:
     return [(line, i in marked) for i, line in enumerate(lines)]
 
 
+def _builtin_exception_name(exception: schema.HarnessException) -> str:
+    """The name a hidden test may show for an exception: the nearest of its
+    classes that is one of Python's own.
+
+    The type's own name is the student's to choose - `type(input(), (Exception,),
+    {})` raises a class named after the hidden input - so printing it would
+    hand the input straight back. Python's own names are a fixed list, and for
+    an ordinary error (a `ValueError`, an `IndexError`) the nearest one is the
+    type itself, so nothing is lost for anybody who was not trying.
+
+    That bounds the leak; it does not close it. Which of the roughly sixty
+    built-in exceptions a program raises is still its choice and can depend
+    on the input - about six bits per hidden test per Check, where the
+    verdict alone is already one. Accepted, since nothing here is graded: the
+    plan shows a hidden test's exception type on purpose, because that is
+    what the explanation beside it is about. Closing it means showing none.
+    """
+    for name in (exception.type, *exception.classes):
+        builtin = getattr(builtins, name, None)
+        if isinstance(builtin, type) and issubclass(builtin, BaseException):
+            return name
+    return "Exception"
+
+
+def exercise_check_rows(
+    result: schema.ExerciseCheckResult, exercise: schema.Exercise | None, *, redact: bool
+) -> list[dict]:
+    """A check's tests as the result fragment shows them, one row each.
+
+    `exercise` is the version the check *ran against*, out of which come the
+    inputs and expected outputs - None if it is gone, when only what the judge
+    stored is left. With `redact` a hidden test is its verdict and nothing
+    else, bar - on an error - the exception's type, which is what the
+    explanation (`error_hint`) is about: `visible_outcomes`'s rule, kept in this
+    function so it is testable rather than in a template. Everything else is a
+    channel the program controls: its input and expected output are the test;
+    what it printed and its traceback can echo the input back; its `exit` is a
+    number it chose; so is its line (`exec` of a string compiled as `main.py`,
+    or a forged report), and how long it took (`time.sleep(ord(c))`). A test
+    the version does not have is hidden for this purpose too, since nothing
+    says it is not.
+
+    Without `redact` - staff - every test is shown in full: that is where a
+    teacher finds out why a test of their own fails. `hidden` is on each row
+    either way, so a page can say which ones a student sees only the verdict of.
+    """
+    exercise_tests = exercise.tests if exercise is not None else []
+    rows = []
+    for i, test_result in enumerate(result.tests):
+        test = exercise_tests[i] if i < len(exercise_tests) else None
+        hidden = test_result.hidden or (test is not None and test.hidden)
+        row = {"n": i + 1, "verdict": test_result.verdict, "hidden": hidden}
+        if redact and (hidden or test is None):
+            exception = test_result.exception if test_result.verdict == "error" else None
+            row["redacted"] = True
+            row["exception"] = (
+                None if exception is None else {"type": _builtin_exception_name(exception)}
+            )
+        else:
+            expected = (test.expected_output or "") if test is not None else ""
+            # Computed on the whole output, so an index can point past what was
+            # stored of a `clipped` one; `_marked_lines` marks only lines it has.
+            diff = set(test_result.diff)
+            row.update(
+                redacted=False,
+                elapsed_s=test_result.elapsed_s,
+                result=test_result,
+                test=test,
+                expected=_marked_lines(expected, diff),
+                # An unordered diff indexes the expected output only.
+                actual=_marked_lines(
+                    test_result.stdout, set() if test_result.unordered else diff
+                ),
+            )
+        rows.append(row)
+    return rows
+
+
 async def _render_exercise_job(
     request: Request,
     db: AsyncConnection,
-    course_id: int,
-    set_id: int,
     job,
+    poll_url: str | None,
     message: str | None = None,
+    *,
+    redact: bool = False,
+    link: str | None = None,
+    version_id: int | None = None,
 ):
-    """A preview job's fragment: polling itself while the job is pending, the
-    result once it is done.
+    """A Run's or a Check's fragment - the staff preview's and the student
+    page's - polling itself at `poll_url` while the job is pending, the result
+    once it is done; `exercise_check_rows` decides what a check shows, and
+    `redact` is whether the viewer is a student. `version_id` is the version
+    the session is on, if there is a session: see `_exercise_job_context`.
 
     The poll stops because the done copy replaces the polling element
     (`outerHTML`) and carries no trigger of its own. That, and not the status
     code, is what ends it: the htmx this app loads (4.x) has no special case
     for 286.
+    """
+    context = await _exercise_job_context(
+        db, job, poll_url, message, redact=redact, version_id=version_id
+    )
+    # A refusal that has somewhere better to send its reader.
+    context["link"] = link
+    return templates.TemplateResponse(
+        request=request, name="f-exercise-job.jinja", context=context
+    )
 
-    Staff see every test in full, hidden ones included - input, expected
-    output, what the program printed and its traceback - because this is
-    where a teacher finds out why a test of their own fails. `hidden` is
-    still on each row, so the page can say which ones a student would see
-    only the verdict of.
+
+async def _exercise_job_context(
+    db: AsyncConnection,
+    job,
+    poll_url: str | None,
+    message: str | None = None,
+    *,
+    redact: bool = False,
+    version_id: int | None = None,
+    exercise: schema.Exercise | None = None,
+) -> dict:
+    """`f-exercise-job.jinja`'s context, for `_render_exercise_job` and for a
+    page that includes the fragment on its first paint.
+
+    `version_id` is the version the session is on now, and a job that ran
+    against another one is marked `earlier_version`: a switch keeps past
+    results - nothing is regraded - and a page showing one under a changed
+    statement should say so. `exercise` is that version's exercise when the
+    caller already has it, so a check on it is not read a second time.
     """
     context = {
-        "course_id": course_id,
-        "set_id": set_id,
         "job": job,
+        "poll_url": poll_url,
         "message": message,
+        "link": None,
         "result": None,
         "tests": [],
+        "earlier_version": (
+            job is not None and version_id is not None and job.version_id != version_id
+        ),
     }
     if job is not None and job.status is ExerciseJobStatus.done:
         result = schema.EXERCISE_JOB_RESULT.validate_python(job.result)
         context["result"] = result
         if isinstance(result, schema.ExerciseCheckResult):
-            exercise = await query_exercise(db, job.version_id, job.exercise_index)
-            exercise_tests = exercise.tests if exercise is not None else []
-            for i, test_result in enumerate(result.tests):
-                test = exercise_tests[i] if i < len(exercise_tests) else None
-                expected = (test.expected_output or "") if test is not None else ""
-                diff = set(test_result.diff)
-                context["tests"].append(
-                    {
-                        "n": i + 1,
-                        "result": test_result,
-                        "test": test,
-                        "expected": _marked_lines(expected, diff),
-                        # An unordered diff indexes the expected output only.
-                        "actual": _marked_lines(
-                            test_result.stdout,
-                            set() if test_result.unordered else diff,
-                        ),
-                    }
-                )
-    return templates.TemplateResponse(
-        request=request, name="f-exercise-job.jinja", context=context
+            if exercise is None or job.version_id != version_id:
+                exercise = await query_exercise(db, job.version_id, job.exercise_index)
+            context["tests"] = exercise_check_rows(result, exercise, redact=redact)
+    return context
+
+
+def _exercise_job_refusal(source: str, stdin: str) -> str | None:
+    """Why a Run's or a Check's code or stdin cannot be queued, or None: the
+    staff preview's and the student page's one check before anything is
+    written."""
+    for what, text in (("code", source), ("input", stdin)):
+        if len(text.encode()) > MAX_EXERCISE_CODE_BYTES:
+            return f"The {what} is larger than {MAX_EXERCISE_CODE_BYTES // 1024} KB."
+        if "\x00" in text:
+            # PostgreSQL cannot store a NUL in `text`, so it would be a 500
+            # from the insert; and nothing anybody means to type is one.
+            return f"The {what} contains a NUL character (\\0): remove it."
+    return None
+
+
+def _preview_job_url(request: Request, course_id: int, set_id: int, job) -> str | None:
+    if job is None:
+        return None
+    return str(
+        request.url_for(
+            "get_fragment_exercise_job", course_id=course_id, set_id=set_id, job_id=job.id
+        )
     )
 
 
@@ -3791,18 +3914,9 @@ async def _post_exercise_preview_job(
     200 with the alert, htmx's rule.
     """
     await _ready_exercise(db, set_id, version_id, n)
-    for what, text in (("code", source), ("input", stdin)):
-        refusal = None
-        if len(text.encode()) > MAX_EXERCISE_CODE_BYTES:
-            refusal = f"The {what} is larger than {MAX_EXERCISE_CODE_BYTES // 1024} KB."
-        elif "\x00" in text:
-            # PostgreSQL cannot store a NUL in `text`, so it would be a 500
-            # from the insert; and nothing anybody means to type is one.
-            refusal = f"The {what} contains a NUL character (\\0): remove it."
-        if refusal is not None:
-            return await _render_exercise_job(
-                request, db, course_id, set_id, None, refusal
-            )
+    refusal = _exercise_job_refusal(source, stdin)
+    if refusal is not None:
+        return await _render_exercise_job(request, db, None, None, refusal)
     try:
         job_id = await insert_exercise_job(
             db,
@@ -3821,7 +3935,9 @@ async def _post_exercise_preview_job(
         await db.rollback()
         raise HTTPException(status_code=404)
     job = await query_preview_job(db, set_id, job_id, user.id)
-    return await _render_exercise_job(request, db, course_id, set_id, job)
+    return await _render_exercise_job(
+        request, db, job, _preview_job_url(request, course_id, set_id, job)
+    )
 
 
 @app.post("/courses/{course_id}/exercises/{set_id}/versions/{version_id}/preview/{n}/run")
@@ -3877,7 +3993,9 @@ async def get_fragment_exercise_job(
     job = await query_preview_job(db, set_id, job_id, user.id)
     if job is None:
         raise HTTPException(status_code=404)
-    return await _render_exercise_job(request, db, course_id, set_id, job)
+    return await _render_exercise_job(
+        request, db, job, _preview_job_url(request, course_id, set_id, job)
+    )
 
 
 @app.post("/courses/{course_id}/exercises/{set_id}/delete")
@@ -3998,6 +4116,18 @@ def _session_exercise_in_range(state, n: int) -> None:
         raise HTTPException(status_code=404)
 
 
+class ExerciseLocked(Forbidden):
+    """`require_session_exercise`'s refusal of an exercise the pacing has not
+    reached. A `Forbidden`, so anywhere else it is the 403 page; the student
+    page catches it to say "wait for the teacher" instead, and to wait -
+    `waiting` is whether there is anything to wait for, which in a closed
+    session there is not."""
+
+    def __init__(self, detail: str, waiting: bool):
+        super().__init__(detail)
+        self.waiting = waiting
+
+
 @dataclass(frozen=True)
 class SessionExercise:
     """What `require_session_exercise` answers: the session's state as the
@@ -4031,7 +4161,7 @@ async def require_session_exercise(
     _session_exercise_in_range(state, n)
     refusal = exercise_lock_refusal(state, n, role, attempt=False)
     if refusal is not None:
-        raise Forbidden(refusal)
+        raise ExerciseLocked(refusal, waiting=state.closed_at is None)
     return SessionExercise(state=state, n=n, role=role)
 
 
@@ -4052,11 +4182,20 @@ async def session_job_refusal(
     `Forbidden`, because the caller is an htmx form and its refusal is a 200
     with an alert; an exercise the version does not have is still a 404.
     """
+    return (await _session_job_gate(db, session_id, n, role))[1]
+
+
+async def _session_job_gate(
+    db: AsyncConnection, session_id: int, n: int, role: UserRole
+) -> tuple[ExerciseSessionState, str | None]:
+    """`session_job_refusal`, with the state it was decided on: the version
+    a job lets in is the one the session is on *under that lock*, and a
+    switch cannot move it before the job commits."""
     state = await query_exercise_session_state(db, session_id, lock="share")
     if state is None:
         raise HTTPException(status_code=404)
     _session_exercise_in_range(state, n)
-    return exercise_lock_refusal(state, n, role, attempt=True)
+    return state, exercise_lock_refusal(state, n, role, attempt=True)
 
 
 def _version_switch(session) -> dict | None:
@@ -4225,9 +4364,42 @@ async def get_exercise_session(
         context.update(switch=_version_switch(session), message=None, ok=False)
         name = "exercise-session-staff.jinja"
     else:
+        await _register_participant(db, session_id, user, role)
         context["session"] = student_session_view(session)
+        context["session_id"] = session_id
         name = "exercise-session.jinja"
     return templates.TemplateResponse(request=request, name=name, context=context)
+
+
+async def _register_participant(
+    db: AsyncConnection, session_id: int, user: schema.User, role: UserRole
+) -> None:
+    """A student's visit to a session - its landing or any exercise page of
+    it - makes them one of its participants, the dashboard's denominator: the
+    students who came, not everybody enrolled. Course staff are never
+    participants, administrators included: they come to run the session, and
+    counting them would put the teacher among the students who have not tried.
+    A GET that writes, as `touch_api_token` makes one: committed here, and
+    harmless to repeat (`insert_session_participant`)."""
+    if role in EDITOR_ROLES:
+        return
+    try:
+        await insert_session_participant(db, session_id, user.id)
+        await db.commit()
+    except IntegrityError:
+        # The session was deleted since the gate found it; the page that
+        # follows finds it gone too.
+        await db.rollback()
+
+
+def _n_visible(mode: str, unlocked_through: int, n_exercises: int) -> int:
+    """How many of a session's exercises a student may see: all of them in
+    an open session, the first `unlocked_through` in a live one -
+    `exercise_lock_refusal`'s rule, for a page listing them rather than a gate
+    asking about one."""
+    if mode == ExerciseSessionMode.open.value:
+        return n_exercises
+    return min(unlocked_through, n_exercises)
 
 
 def student_session_view(session) -> dict:
@@ -4239,11 +4411,7 @@ def student_session_view(session) -> dict:
     head, and so do the other version, the reveals and who checked what.
     """
     titles = session["version"]["titles"]
-    visible = (
-        len(titles)
-        if session["mode"] == ExerciseSessionMode.open.value
-        else min(session["unlocked_through"], len(titles))
-    )
+    visible = _n_visible(session["mode"], session["unlocked_through"], len(titles))
     return {
         "label": session["label"],
         "mode": session["mode"],
@@ -4403,6 +4571,417 @@ async def post_exercise_session_switch(
     await db.commit()
     return await _render_exercise_session_controls(
         request, db, course_id, session_id, "Switched to the latest version.", ok=True
+    )
+
+
+########################################################################
+# The student page: one exercise of a session, with the strip of all of them,
+# the statement and the editor; Run and Check are judge jobs. Members of the
+# course, through `require_session_exercise` and `session_job_refusal` - which
+# are the whole of pacing - and, like every session route, **declared above
+# `get_challenge`**. The exercise is `{n:int}`, with the convertor: a plain
+# `{n}` would also match the staff's `.../dashboard` and `.../projector` and
+# 422 on them, since a route does not fall through on a failed validation.
+
+
+def student_exercise_view(exercise: schema.Exercise, revealed: bool) -> dict:
+    """One exercise as a student may see it, out of the compiled document:
+    the statement, the starter, the hints, the comparison rules and time limit,
+    the visible tests with their expected outputs, how many tests are hidden -
+    and the solution once it has been revealed in this session, not before.
+
+    `visible_outcomes`'s rule, kept in a function rather than in a template:
+    the page is handed this and never the document, so a hidden test's input
+    and expected output and an unrevealed solution never leave the server.
+    Hints are not secret - they are revealed one at a time in the browser.
+    """
+    visible = [test for test in exercise.tests if not test.hidden]
+    return {
+        "title": exercise.title,
+        "statement": exercise.statement,
+        "starter": exercise.starter,
+        "hints": list(exercise.hints),
+        "rules": describe_rules(exercise.rules),
+        "time_s": exercise.time_s,
+        "tests": [
+            {
+                "input": test.input,
+                "expected_output": test.expected_output,
+                "expected_error": test.expected_error,
+            }
+            for test in visible
+        ],
+        "n_hidden": len(exercise.tests) - len(visible),
+        "solution": exercise.solution if revealed else None,
+    }
+
+
+def session_strip_view(strip: dict, role: UserRole) -> dict:
+    """The exercise strip as this person may see it, out of
+    `query_session_strip`: one entry per exercise they may open, with its
+    title and their status on it, and a count of the locked ones after - whose
+    titles stay on the server, `student_session_view`'s rule. Staff pass the
+    pacing here as at the gate.
+
+    Status is derived, never stored: `solved` once any check passed, and it
+    stays solved; `attempted` with checks and no pass; `not_attempted` with
+    none. `checking` - a check queued or running - is beside it, not instead.
+    """
+    titles = strip["titles"]
+    visible = (
+        len(titles)
+        if role in EDITOR_ROLES
+        else _n_visible(strip["mode"], strip["unlocked_through"], len(titles))
+    )
+    checks = {check["n"]: check for check in strip["checks"]}
+    exercises = []
+    for n, title in enumerate(titles[:visible], start=1):
+        check = checks.get(n)
+        if check is None:
+            status = "not_attempted"
+        else:
+            status = "solved" if check["solved"] else "attempted"
+        exercises.append(
+            {
+                "n": n,
+                "title": title,
+                "status": status,
+                "checking": check is not None and check["checking"],
+            }
+        )
+    return {"exercises": exercises, "n_locked": len(titles) - visible}
+
+
+async def _session_strip_context(
+    request: Request,
+    db: AsyncConnection,
+    course_id: int,
+    session_id: int,
+    user: schema.User,
+    role: UserRole,
+    n: int,
+    wait: bool,
+) -> dict:
+    """`f-exercise-strip.jinja`'s context: the strip, the exercise the page is
+    on, and the URL it polls - which carries both, so the poll keeps the
+    highlight and a wait page keeps waiting."""
+    strip = await query_session_strip(db, session_id, user.id)
+    if strip is None:
+        raise HTTPException(status_code=404)
+    poll_url = request.url_for(
+        "get_fragment_session_strip", course_id=course_id, session_id=session_id
+    ).include_query_params(n=n, **({"wait": "1"} if wait else {}))
+    return {
+        "course_id": course_id,
+        "session_id": session_id,
+        "strip": session_strip_view(strip, role),
+        "n": n,
+        "strip_url": str(poll_url),
+        # A closed session's pacing and checks are final.
+        "polls": strip["closed_at"] is None,
+    }
+
+
+STAFF_SESSION_JOB_REFUSAL = (
+    "You are staff on this course, so Run and Check here are not recorded in "
+    "the session - its jobs are the students' work. Try the exercise in the "
+    "set's preview, which runs it the same way and records nothing."
+)
+
+
+def _session_preview_url(request: Request, course_id: int, state, n: int) -> str:
+    """The staff preview of exercise `n` of the version a session is on."""
+    return str(
+        request.url_for(
+            "get_exercise_preview",
+            course_id=course_id,
+            set_id=state.set_id,
+            version_id=state.version_id,
+            n=n,
+        )
+    )
+
+
+def _session_job_url(request: Request, course_id: int, session_id: int, job) -> str | None:
+    if job is None:
+        return None
+    return str(
+        request.url_for(
+            "get_fragment_session_job",
+            course_id=course_id,
+            session_id=session_id,
+            job_id=job.id,
+        )
+    )
+
+
+@app.get("/courses/{course_id}/sessions/{session_id}/{n:int}")
+async def get_session_exercise(
+    course_id: int,
+    session_id: int,
+    n: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    role: ExerciseSessionMember,
+):
+    """Exercise `n` of a session, as a student works on it.
+
+    Behind `require_session_exercise`, called here rather than declared as a
+    dependency so that its pacing refusal can be caught: an exercise the
+    teacher has not reached is the "wait for the teacher" page, whose strip
+    polls with `wait` and is answered with a redirect back here once it
+    unlocks. That page has no editor, so nothing is lost by the reload; the
+    exercise page itself never reloads, and its poll swaps only the strip.
+
+    The editor opens on the browser's draft when it has one (`exercise.js`)
+    and otherwise on the newest source this person sent from this exercise -
+    every Run and Check carries one - or the starter. Each tab shows its last
+    result. A closed session shows all of it, with no buttons.
+    """
+    course = await query_course(db, course_id)
+    session = await query_session_heading(db, session_id)
+    if course is None or session is None:
+        raise HTTPException(status_code=404)
+    context = {
+        "course": course,
+        "course_id": course_id,
+        "session_id": session_id,
+        "label": session["label"],
+        "n": n,
+        "user": user,
+    }
+    try:
+        access = await require_session_exercise(session_id, n, db, role)
+    except ExerciseLocked as locked:
+        await _register_participant(db, session_id, user, role)
+        context.update(
+            await _session_strip_context(
+                request, db, course_id, session_id, user, role, n, wait=locked.waiting
+            ),
+            message=locked.detail,
+            waiting=locked.waiting,
+        )
+        return templates.TemplateResponse(
+            request=request, name="exercise-wait.jinja", context=context
+        )
+    exercise = await query_exercise(db, access.state.version_id, n)
+    if exercise is None:
+        raise HTTPException(status_code=404)
+    await _register_participant(db, session_id, user, role)
+    staff = role in EDITOR_ROLES
+    last = await query_last_session_jobs(db, session_id, user.id, n)
+    # Written last, not created last: see `query_last_session_jobs`.
+    newest = max(last.values(), key=lambda job: job.submitted_at, default=None)
+    view = student_exercise_view(exercise, revealed=n in session["revealed"])
+    first_visible = view["tests"][0]["input"] if view["tests"] else ""
+    context.update(
+        await _session_strip_context(
+            request, db, course_id, session_id, user, role, n, wait=False
+        ),
+        exercise=view,
+        n_exercises=access.state.n_exercises,
+        closed=access.state.closed_at is not None,
+        staff=staff,
+        preview_url=_session_preview_url(request, course_id, access.state, n) if staff else None,
+        source=newest.source if newest is not None else view["starter"],
+        stdin=last["run"].stdin if "run" in last else first_visible,
+        # Keyed by the person too: a lab machine is shared, and the next
+        # student to sit at it must not open on somebody else's code.
+        draft_key=f"cocco:exercise:{user.id}:{session_id}:{n}",
+        check=await _exercise_job_context(
+            db,
+            last.get("check"),
+            _session_job_url(request, course_id, session_id, last.get("check")),
+            redact=not staff,
+            version_id=access.state.version_id,
+            exercise=exercise,
+        ),
+        run=await _exercise_job_context(
+            db,
+            last.get("run"),
+            _session_job_url(request, course_id, session_id, last.get("run")),
+            redact=not staff,
+            version_id=access.state.version_id,
+        ),
+    )
+    return templates.TemplateResponse(request=request, name="exercise.jinja", context=context)
+
+
+@app.get("/f/courses/{course_id}/sessions/{session_id}/strip")
+async def get_fragment_session_strip(
+    course_id: int,
+    session_id: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    role: ExerciseSessionMember,
+    n: int = 0,
+    wait: bool = False,
+):
+    """The strip, polled every three seconds: what changes is the pacing and
+    the asker's own checks, and swapping this tiny fragment is all the poll
+    does - never the editor.
+
+    With `wait`, the page polling is "wait for the teacher" on exercise `n`,
+    and once `n` opens - or the session closes, and there is nothing left to
+    wait for - the answer is `HX-Redirect` to it, which no editor is lost to.
+    An `n` the session no longer has (a switch to a shorter version) goes to
+    the session's landing instead.
+    """
+    if wait:
+        state = await query_exercise_session_state(db, session_id)
+        if state is None:
+            raise HTTPException(status_code=404)
+        target = None
+        if not 1 <= n <= state.n_exercises:
+            target = request.url_for(
+                "get_exercise_session", course_id=course_id, session_id=session_id
+            )
+        elif (
+            state.closed_at is not None
+            or exercise_lock_refusal(state, n, role, attempt=False) is None
+        ):
+            target = request.url_for(
+                "get_session_exercise", course_id=course_id, session_id=session_id, n=n
+            )
+        if target is not None:
+            return Response(status_code=204, headers={"HX-Redirect": str(target)})
+    context = await _session_strip_context(
+        request, db, course_id, session_id, user, role, n, wait
+    )
+    return templates.TemplateResponse(
+        request=request, name="f-exercise-strip.jinja", context=context
+    )
+
+
+async def _post_session_job(
+    kind: ExerciseJobKind,
+    course_id: int,
+    session_id: int,
+    n: int,
+    request: Request,
+    db: AsyncConnection,
+    user: schema.User,
+    role: UserRole,
+    source: str,
+    stdin: str,
+):
+    """Queue a Run or a Check of exercise `n` and answer with its polling
+    fragment; a refusal is a 200 with the alert, htmx's rule.
+
+    `_session_job_gate` - the pacing and closed-ness - is asked inside the
+    transaction that inserts the job, and holds the session's row until it
+    commits, so a close or a pacing move landing meanwhile waits for it rather
+    than letting it into a session it no longer belongs to. The job runs
+    against the version the session is on under that lock. The code is the
+    server's copy of the draft, which is what the page falls back on.
+
+    Course staff - administrators included - are refused, and pointed at the
+    set's preview, which runs the same jobs and records nothing: a session's
+    jobs are its students' work, so its progress needs no question about who
+    is staff. They can still open the page, past the pacing, to see it.
+    """
+    if role in EDITOR_ROLES:
+        state = await query_exercise_session_state(db, session_id)
+        if state is None:
+            raise HTTPException(status_code=404)
+        # Before the link is built: there is no preview of an exercise the
+        # version does not have.
+        _session_exercise_in_range(state, n)
+        return await _render_exercise_job(
+            request, db, None, None, STAFF_SESSION_JOB_REFUSAL,
+            link=_session_preview_url(request, course_id, state, n),
+        )
+    refusal = _exercise_job_refusal(source, stdin)
+    if refusal is not None:
+        return await _render_exercise_job(request, db, None, None, refusal)
+    state, refusal = await _session_job_gate(db, session_id, n, role)
+    if refusal is not None:
+        await db.rollback()
+        return await _render_exercise_job(request, db, None, None, refusal)
+    job_id = await insert_exercise_job(
+        db,
+        kind=kind,
+        user_id=user.id,
+        version_id=state.version_id,
+        session_id=session_id,
+        exercise_index=n,
+        source=source,
+        stdin=stdin if kind is ExerciseJobKind.run else None,
+    )
+    await db.commit()
+    job = await query_session_job(db, session_id, job_id, user.id)
+    return await _render_exercise_job(
+        request,
+        db,
+        job,
+        _session_job_url(request, course_id, session_id, job),
+        redact=True,
+        version_id=state.version_id,
+    )
+
+
+@app.post("/courses/{course_id}/sessions/{session_id}/{n:int}/run")
+async def post_session_run(
+    course_id: int,
+    session_id: int,
+    n: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    role: ExerciseSessionMember,
+    source: Annotated[str, Form()] = "",
+    stdin: Annotated[str, Form()] = "",
+):
+    return await _post_session_job(
+        ExerciseJobKind.run, course_id, session_id, n,
+        request, db, user, role, source, stdin,
+    )
+
+
+@app.post("/courses/{course_id}/sessions/{session_id}/{n:int}/check")
+async def post_session_check(
+    course_id: int,
+    session_id: int,
+    n: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    role: ExerciseSessionMember,
+    source: Annotated[str, Form()] = "",
+):
+    return await _post_session_job(
+        ExerciseJobKind.check, course_id, session_id, n,
+        request, db, user, role, source, "",
+    )
+
+
+@app.get("/f/courses/{course_id}/sessions/{session_id}/jobs/{job_id}")
+async def get_fragment_session_job(
+    course_id: int,
+    session_id: int,
+    job_id: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    role: ExerciseSessionMember,
+):
+    """A Run or a Check of a session, polled every half second until it is
+    done. The asker's own and nobody else's, staff included - the dashboard is
+    where staff read a student's work - and redacted for a student by
+    `exercise_check_rows`."""
+    job = await query_session_job(db, session_id, job_id, user.id)
+    state = await query_exercise_session_state(db, session_id)
+    if job is None or state is None:
+        raise HTTPException(status_code=404)
+    return await _render_exercise_job(
+        request,
+        db,
+        job,
+        _session_job_url(request, course_id, session_id, job),
+        redact=role not in EDITOR_ROLES,
+        version_id=state.version_id,
     )
 
 

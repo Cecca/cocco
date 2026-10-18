@@ -1,0 +1,48 @@
+{# The exercise strip of the student page, and of the wait page: one button
+   per exercise this person may open, coloured by their own status on it,
+   then the locked ones as blanks.
+
+   It polls itself every three seconds and is replaced whole (`outerHTML`):
+   the pacing and the status are all that change, and this is all that is
+   swapped - never the editor. On the wait page `strip_url` carries `wait`,
+   and the answer that ends the wait is an `HX-Redirect`, not a strip. In a
+   closed session nothing it shows can change, and it does not poll at all.
+
+   Context: `strip` (`session_strip_view`'s), `n` (the exercise the page is
+   on, 0 for none), `strip_url`, `polls`, `course_id`, `session_id`. #}
+
+{# Escaped explicitly: `Jinja2Templates` autoescapes only .html/.xml, so a
+   `.jinja` file is not, and what this prints is code and program output. #}
+{% autoescape true %}
+{% set STATUS = {
+  "solved": ("btn-success", "solved"),
+  "attempted": ("btn-warning", "attempted, not solved yet"),
+  "not_attempted": ("btn-ghost border border-base-300", "not attempted"),
+} %}
+
+<nav id="exercise-strip" class="flex flex-wrap items-center gap-2" aria-label="Exercises"
+     {% if polls %}
+     hx-get="{{ strip_url }}"
+     hx-trigger="every 3s"
+     hx-swap="outerHTML"
+     data-swap-guard
+     {% endif %}>
+  {% for exercise in strip.exercises %}
+  {% set colour, says = STATUS[exercise.status] %}
+  <a href="{{ url_for('get_session_exercise', course_id=course_id, session_id=session_id, n=exercise.n) }}"
+     title="{{ exercise.n }}. {{ exercise.title }} — {{ says }}{{ ', checking…' if exercise.checking else '' }}"
+     {% if exercise.n == n %}aria-current="page"{% endif %}
+     class="btn btn-sm font-mono {{ colour }} {{ 'ring-2 ring-primary ring-offset-2 ring-offset-base-100' if exercise.n == n else '' }}">
+    {{ "%02d" | format(exercise.n) }}
+    {% if exercise.checking %}<span class="loading loading-spinner loading-xs"></span>{% endif %}
+  </a>
+  {% endfor %}
+  {% for _ in range(strip.n_locked) %}
+  {% set locked_n = strip.exercises | length + loop.index %}
+  <span class="btn btn-sm btn-disabled font-mono {{ 'ring-2 ring-primary ring-offset-2 ring-offset-base-100' if locked_n == n else '' }}"
+        title="Locked — wait for your teacher" aria-disabled="true">
+    {{ "%02d" | format(locked_n) }}
+  </span>
+  {% endfor %}
+</nav>
+{% endautoescape %}

@@ -660,6 +660,14 @@ ExerciseJob = Table(
     ),
     Column("started_at", DateTime(timezone=True), nullable=True),
     Column("finished_at", DateTime(timezone=True), nullable=True),
+    # When `source` and `stdin` were last written: at the insert, or by the
+    # same button pressed again while the job was still queued, which rewrites
+    # them in place and keeps `enqueued` - its place in the queue - and the
+    # id. Neither of those therefore says which of a student's jobs holds the
+    # code they sent last, and that is the one the student page falls back on.
+    Column(
+        "submitted_at", DateTime(timezone=True), nullable=False, server_default=func.now()
+    ),
     CheckConstraint(
         "(kind = 'build') = (exercise_index IS NULL)",
         name="exercise_job_exercise_index_unless_build",
@@ -697,6 +705,17 @@ ExerciseJob = Table(
         "exercise_index",
         "user_id",
         postgresql_where=text("kind = 'check'"),
+    ),
+    # One person's jobs in one session, runs included: what the student page
+    # opens on (`query_last_session_jobs`) and what their strip polls. The
+    # index above leaves runs out on purpose, and six months of them are
+    # exactly what a lookup by person must not scan.
+    Index(
+        "ix_exercise_job_session_user",
+        "session_id",
+        "user_id",
+        "exercise_index",
+        postgresql_where=text("session_id IS NOT NULL"),
     ),
     # The judge's claim: the oldest queued job of a kind.
     Index("ix_exercise_job_queue", "status", "kind", "enqueued"),

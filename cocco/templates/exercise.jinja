@@ -1,0 +1,202 @@
+{% extends "base.jinja" %}
+{% block title %}{% autoescape true %}{{ exercise.title }}{% endautoescape %}{% endblock %}
+{% block head %}{% include "_exercise-editor-head.jinja" %}{% endblock %}
+
+{% set crumbs = [
+  {"label": "Courses", "href": url_for('index')},
+  {"label": course.title, "href": url_for('get_course', course_id=course_id)},
+  {"label": label, "href": url_for('get_exercise_session', course_id=course_id, session_id=session_id)},
+  {"label": "Exercise %02d" | format(n)},
+] %}
+
+{# One exercise of a session, as a student works on it.
+
+   `exercise` is `student_exercise_view`'s and never the compiled document:
+   hidden tests and an unrevealed solution are not in it to print. The strip
+   is the only thing that polls; the editor is never swapped. `check` and
+   `run` are each tab's last result, as `f-exercise-job.jinja`'s context.
+
+   The editor's content is the browser's draft when it has one - `exercise.js`,
+   under `draft_key` - and otherwise `source`, which the server sends: the
+   newest code this person ran or checked here, or the starter. A closed
+   session keeps no draft and opens on `source`, the last code sent: that is
+   what its results are about.
+
+   Staff can open the page past the pacing and type in it, and are offered no
+   Run or Check: those would be recorded as the session's work. #}
+{% block body %}
+{# Escaped explicitly: `Jinja2Templates` autoescapes only .html/.xml, so a
+   `.jinja` file is not, and what this prints is code and program output. #}
+{% autoescape true %}
+{% set can_attempt = not closed and not staff %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+
+  <div class="mb-6">{% include "f-exercise-strip.jinja" %}</div>
+
+  {% if closed %}
+  <div role="alert" class="alert text-sm mb-6">
+    <span>This session is closed. Your code and your results are here to review; nothing new is accepted.</span>
+  </div>
+  {% elif staff %}
+  <div role="alert" class="alert alert-info text-sm mb-6">
+    <span>
+      This is the student page, which you can open past the pacing because you
+      are staff. Run and Check are the students' here, recorded in the session;
+      to try the exercise yourself, use the
+      <a class="link font-semibold" href="{{ preview_url }}">set's preview</a>,
+      which records nothing.
+    </span>
+  </div>
+  {% endif %}
+
+  <div class="grid gap-6 lg:grid-cols-2">
+    <!-- ══ THE EXERCISE ═════════════════════════════════════════════ -->
+    <div class="card bg-base-100 border border-base-300 shadow-sm self-start">
+      <div class="card-body p-7">
+        <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
+          Exercise {{ "%02d" | format(n) }} of {{ n_exercises }}
+        </p>
+        <h1 class="font-serif text-3xl font-semibold tracking-tight">{{ exercise.title }}</h1>
+
+        <article class="prose prose-sm max-w-none mt-2">
+          {{ exercise.statement | markdown }}
+        </article>
+
+        <p class="text-xs text-base-content/55 mt-3">
+          Output check: {{ exercise.rules | join("; ") }}. What you pass to
+          <code>input()</code> as a prompt is not compared. Up to
+          {{ "%g" | format(exercise.time_s) }} s per test.
+        </p>
+
+        {% if exercise.hints %}
+        <div class="mt-4 flex flex-col gap-2" data-hints data-draft-key="{{ draft_key }}:hints">
+          {% for hint in exercise.hints %}
+          <div data-hint class="rounded-lg border border-base-300 bg-base-200/40 px-3 py-2">
+            <div class="text-sm font-semibold">Hint {{ loop.index }}</div>
+            <div class="prose prose-sm max-w-none mt-1">{{ hint | markdown }}</div>
+          </div>
+          {% endfor %}
+          <button type="button" data-hint-button class="btn btn-sm btn-ghost border border-base-300 self-start">
+            Show a hint
+          </button>
+        </div>
+        {% endif %}
+
+        {% if exercise.tests or exercise.n_hidden %}
+        <h2 class="font-bold mt-6">Tests</h2>
+        <div class="flex flex-col gap-3 mt-2">
+          {% for test in exercise.tests %}
+          <div class="rounded-xl border border-base-300 p-3">
+            <div class="text-xs font-mono font-semibold text-base-content/55">Example {{ loop.index }}</div>
+            <div class="grid gap-2 sm:grid-cols-2 mt-2">
+              <div>
+                <div class="text-[11px] uppercase tracking-wider text-base-content/45">Input</div>
+                <pre class="mt-1 max-h-40 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono whitespace-pre-wrap">{{ test.input or "(empty)" }}</pre>
+              </div>
+              <div>
+                <div class="text-[11px] uppercase tracking-wider text-base-content/45">
+                  {{ "Expected error" if test.expected_error else "Expected output" }}
+                </div>
+                <pre class="mt-1 max-h-40 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono whitespace-pre-wrap">{{ test.expected_error or test.expected_output or "(nothing)" }}</pre>
+              </div>
+            </div>
+          </div>
+          {% endfor %}
+          {% if exercise.n_hidden %}
+          <p class="text-sm text-base-content/55">
+            {% if exercise.tests %}Plus {% endif %}{{ exercise.n_hidden }} hidden
+            test{{ "" if exercise.n_hidden == 1 else "s" }}: Check tells you whether
+            {{ "it passes" if exercise.n_hidden == 1 else "they pass" }}, not what
+            {{ "it is" if exercise.n_hidden == 1 else "they are" }}.
+          </p>
+          {% endif %}
+        </div>
+        {% endif %}
+
+        {% if exercise.solution is not none %}
+        <h2 class="font-bold mt-6">Solution</h2>
+        <p class="text-[13px] text-base-content/55 mb-2">Your teacher has shown the solution to the class.</p>
+        <div class="max-h-[60vh] overflow-auto rounded-xl border border-base-300 bg-base-200/40">
+          {{ exercise.solution | highlight("python") }}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- ══ THE EDITOR ═════════════════════════════════════════════════ -->
+    {# Both buttons post this one form, so Check sends the same code Run
+       would; the stdin box is a Run's only. The tabs are radios, and their
+       value is posted along and ignored. #}
+    <div class="card bg-base-100 border border-base-300 shadow-sm self-start">
+      <div class="card-body p-7">
+        <form class="flex flex-col gap-3" onsubmit="return false">
+          <div class="flex items-center gap-2">
+            <label class="text-xs text-base-content/55" for="exercise-source">Your code</label>
+            {% if not closed %}
+            <button type="button" class="btn btn-xs btn-ghost border border-base-300 ml-auto"
+                    data-starter="{{ exercise.starter }}"
+                    onclick="if (confirm('Replace your code with the starter code?')) coccoSetCode('exercise-source', this.dataset.starter)">
+              Start over
+            </button>
+            {% endif %}
+          </div>
+          <div class="cocco-editor">
+            <textarea id="exercise-source" name="source" rows="16" spellcheck="false"
+                      data-editor {% if not closed %}data-draft-key="{{ draft_key }}"{% endif %}
+                      data-run="run-button" data-check="check-button"
+                      {% if closed %}readonly{% endif %}
+                      class="textarea w-full font-mono text-sm leading-relaxed">{{ source }}</textarea>
+          </div>
+
+          <div class="tabs tabs-border mt-2">
+            <input type="radio" name="tab" class="tab" aria-label="Check" checked>
+            <div class="tab-content pt-3">
+              <p class="text-xs text-base-content/55 mb-3">
+                Runs your code on every test and compares the output. Shift-Ctrl-Enter in the editor.
+              </p>
+              {% if can_attempt %}
+              <button type="button" id="check-button" data-swap-guard class="btn btn-sm btn-primary"
+                      hx-post="{{ url_for('post_session_check', course_id=course_id, session_id=session_id, n=n) }}"
+                      hx-target="#check-result"
+                      hx-swap="innerHTML">
+                ✓ Check
+              </button>
+              {% endif %}
+              <div id="check-result" class="mt-4">
+                {% with job=check.job, poll_url=check.poll_url, message=check.message, result=check.result, tests=check.tests, earlier_version=check.earlier_version %}
+                {% if job is not none %}{% include "f-exercise-job.jinja" %}{% endif %}
+                {% endwith %}
+              </div>
+            </div>
+
+            <input type="radio" name="tab" class="tab" aria-label="Run">
+            <div class="tab-content pt-3">
+              <label class="text-xs text-base-content/55" for="exercise-stdin">
+                Input, given to the program all at once. Ctrl-Enter in the editor.
+              </label>
+              <textarea id="exercise-stdin" name="stdin" rows="3" spellcheck="false"
+                        {% if not closed %}data-draft-key="{{ draft_key }}:stdin"{% endif %}
+                        {% if closed %}readonly{% endif %}
+                        class="textarea w-full font-mono text-sm mt-1">{{ stdin }}</textarea>
+              {% if can_attempt %}
+              <button type="button" id="run-button" data-swap-guard class="btn btn-sm mt-2"
+                      hx-post="{{ url_for('post_session_run', course_id=course_id, session_id=session_id, n=n) }}"
+                      hx-target="#run-result"
+                      hx-swap="innerHTML">
+                ▶ Run
+              </button>
+              {% endif %}
+              <div id="run-result" class="mt-4">
+                {% with job=run.job, poll_url=run.poll_url, message=run.message, result=run.result, tests=run.tests, earlier_version=run.earlier_version %}
+                {% if job is not none %}{% include "f-exercise-job.jinja" %}{% endif %}
+                {% endwith %}
+              </div>
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</main>
+{% endautoescape %}
+{% endblock %}
