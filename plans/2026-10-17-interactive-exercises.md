@@ -613,13 +613,75 @@ As built:
   both pass. The challenge push leaves that window open; here the import is the only write.
 - Tests: `cocco/test_exercise_transfer.py`.
 
-### [ ] 11. Verify end to end
+### [x] 11. Verify end to end
 
 `just dev`: import one of the prototype's sets, converted to English keywords, and open a live
 session. Drive three seeded students through it while watching the dashboard and the projector,
 fix an exercise mid-session and switch the session's version. Then a load script with 100
 simulated students pressing Check within 10 s against the real judge, measured against the p95
 target. Record the numbers here.
+
+**Run 2026-10-18** on step 0's laptop, not the lab's judge host: i7-1260P, 16 threads, isolate 2.5,
+PostgreSQL 17 in the compose container. One `cocco-web` worker and one `cocco-judge` with the
+default 8 workers. The Justfile has no `dev` recipe any more, so the two were started by hand
+against `cocco.dev.toml`. The scripts were throwaway httpx scripts (`e2e.py`, `load.py`) and are
+not in the repo. They act through the routes as htmx would and check the state in the database.
+
+The live session, with `sorgenti/stringhe.md` converted by a `sed` of the keyword table (8
+exercises), alice as the teacher, bob and charlie, and dave signing up through `Enroll!`:
+
+- The import built in **1.0 s**: ready, with one warning, "the starter already passes" on exercise
+  3. That warning is correct: that exercise's starter *is* the `error` demonstration.
+- A staff preview check took 0.28 s. Opening the session as live gave `unlocked_through = 1`. The
+  three first visits made three participants. Exercise 2 showed the wait page, and a Check posted
+  to it anyway was refused with the pacing sentence.
+- bob solved exercise 1. charlie got it wrong (expected against printed, per visible test) and then
+  right after *next*. dave only ran it, and his transcript echoed the prompt and the input. Each
+  job took about 0.27 s from click to done.
+  - The dashboard showed the three names with a 1 solved / 1 tried count.
+  - The projector showed the same counts with **no name on it**.
+  - A later wrong check by bob left exercise 1 solved.
+- After the reveal, exercise 1's solution was on charlie's page and exercise 2's was not.
+- Re-importing with exercise 2 retitled and an exercise appended built v3 and made it current.
+  The session stayed on v2 until switched.
+  - The switch confirmation listed "2. … → … (fixed)".
+  - After the switch, `unlocked_through` was still 2. bob's past checks kept `version_id` 2, and
+    his new check ran on v3.
+- A version that dropped exercise 2, while checks existed on it, was refused with the sentence
+  naming exercise 2. Nothing changed. A version that only dropped exercises nobody had checked
+  was accepted, as designed.
+- No error in either process's log.
+
+The load test used a 5-test exercise (3 visible, 2 hidden) on an open session. Each student was a
+separate signed-in client. It posted one correct Check at a uniformly random instant in the window,
+then polled the job fragment every 500 ms, as the page does. Click to verdict runs to the first poll
+that came back done. The server's own figure is `finished_at − enqueued`. Seconds:
+
+| run | click → verdict median / p95 / max | server enqueued → finished p95 | queue wait p95 | service p95 | host CPU |
+|---|---|---|---|---|---|
+| 100 in 10 s | 0.53 / **0.56** / 0.60 | 0.22 | 0.03 | 0.20 | 18 % |
+| 100 in 10 s, again | 0.53 / **0.55** / 0.56 | 0.21 | 0.03 | 0.19 | 18 % |
+| 100 in 1 s (burst) | 1.31 / 1.87 / 1.92 | 1.59 | 1.41 | 0.25 | 61 % |
+| 300 in 10 s | 1.23 / 2.02 / 2.25 | 1.63 | 1.32 | 0.36 | 64 % |
+
+- **The target is met by a factor of five**: p95 0.56 s against 3 s. As step 0 predicted, it is
+  one job's service time, about 0.2 s, plus the poll. The 500 ms poll is now most of what a student
+  waits. Shortening it is the cheapest further win if one is ever wanted. The judge is not the
+  bottleneck.
+- Jobs barely queue at the target load. The judge only builds a queue at 10× the rate (the burst)
+  or 3× the volume, and even then p95 stays under the target. Service time grows with load (0.20 →
+  0.36 s) as 8 workers share the CPU, but the host was never saturated. "Decided" therefore stands:
+  no box reuse.
+- **Still to do on the lab's judge host.** These are laptop numbers. Re-run `load.py` there before
+  the first live lesson, as step 0 promised.
+
+Two things found along the way, neither a bug:
+
+- The job fragment's poll ends because the done copy drops its trigger, not with a 286 (see
+  `_render_exercise_job`: the htmx 4 this app loads has no special case for 286). "Polling for a
+  job's result" above still says 286. Step 12 should describe what was built.
+- The plan's "`just dev`" no longer exists as a recipe. Step 12 should check what CLAUDE.md says
+  about it, since it still documents `just dev`.
 
 ### [ ] 12. Documentation
 
