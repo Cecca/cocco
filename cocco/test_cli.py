@@ -264,7 +264,7 @@ class FakeServer:
         self.statuses.append(response.status_code)
         return response
 
-    def upload(self, args, challenge_id, payload, headers) -> httpx.Response:
+    def upload(self, args, kind, challenge_id, payload, headers) -> httpx.Response:
         self.pushes += 1
         self.if_match = headers.get("If-Match")
         if self.if_match is not None and self.if_match != self.etag:
@@ -306,7 +306,7 @@ def checkout(server, tmp_path, monkeypatch) -> Path:
 def test_a_pull_records_where_the_directory_came_from(server, checkout):
     state = _read_state(checkout)
     assert state is not None
-    assert (state.url, state.challenge_id, state.version) == (URL, 12, "v1")
+    assert (state.url, state.id, state.version) == (URL, 12, "v1")
     assert set(state.files) == set(server.files)
     assert (checkout / STATE_DIR / ".gitignore").read_text() == "*\n"
 
@@ -442,4 +442,24 @@ def test_a_directory_that_was_never_pulled_is_adopted_by_a_push(server, tmp_path
     assert run("push", "12", "by-hand") == 0
     assert server.if_match is None
     state = _read_state(directory)
-    assert state is not None and (state.challenge_id, state.version) == (12, "v2")
+    assert state is not None and (state.id, state.version) == (12, "v2")
+
+
+def test_ls_still_lists_challenges_on_a_server_without_exercise_sets(
+    tmp_path, monkeypatch, capsys
+):
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/challenges":
+            return httpx.Response(200, json=[{
+                "course_id": 1, "course_title": "Algorithms", "challenge_id": 12,
+                "title": "Two Sum", "archived": False, "visible": True,
+                "visible_from": "2026-01-01T00:00:00+00:00",
+            }])
+        return httpx.Response(404, json={"detail": "Not Found"})
+
+    monkeypatch.setattr(cli, "_client", lambda args: httpx.Client(
+        base_url=URL, transport=httpx.MockTransport(respond)))
+    monkeypatch.setattr(cli, "CONFIG_PATH", tmp_path / "no-config.toml")
+    assert run("ls") == 0
+    out = capsys.readouterr().out
+    assert "12  Two Sum" in out and "exercise sets" not in out

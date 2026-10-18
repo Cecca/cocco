@@ -12,13 +12,24 @@ with whatever you edit things with, and pushes it back:
     cocco push
     cocco pull                    # later: bring in what was changed on the web
 
+An exercise set is pulled and pushed the same way, named with `--set`. It is
+one file, the source the server stores verbatim, so its directory holds
+`exercises.md` and nothing else, and a push is an import: it creates a new
+version, and `cocco push` waits for the judge to build it and prints what the
+build found:
+
+    cocco pull --set 5            # -> ./exercises-5-loops/exercises.md
+    cocco push                    # inside it: no --set needed any more
+
 **A pulled directory remembers where it came from**, in `.cocco/state.toml`: the
 server, the challenge, the version of it the directory last agreed with, and a
 fingerprint of every file as it was then. That record is what lets the web
 editor and a directory be used side by side:
 
 - a push sends the version as `If-Match`, so pushing over changes somebody made
-  on the web since is refused rather than silently undoing them;
+  on the web since is refused rather than silently undoing them. For a set the
+  version is the newest version's id - a version is immutable, so there is
+  nothing to digest;
 - a pull into the directory compares, per file, that record, the directory and
   the server (`reconcile`). A file changed only on the server is taken, a file
   changed only here is kept, and one changed on both sides is a conflict:
@@ -48,8 +59,10 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import tomllib
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +72,7 @@ import toml
 
 from cocco.transfer import (
     EVALUATOR_DIR,
+    EXERCISES_NAME,
     MANIFEST_NAME,
     STATEMENT_NAME,
     TESTS_DIR,
@@ -70,12 +84,45 @@ from cocco.transfer import (
 DEFAULT_URL = "http://localhost:8000"
 CONFIG_PATH = Path.home() / ".config" / "cocco" / "cli.toml"
 
-# What a challenge directory is allowed to contain. A push zips these and
-# nothing else, so a `.git`, an editor's swap file or a stray note in the
-# directory is simply not sent - rather than being sent and refused by the
-# server's "this file is not in the manifest" check.
-MEMBERS = (MANIFEST_NAME, STATEMENT_NAME)
-MEMBER_DIRS = (TESTS_DIR, EVALUATOR_DIR)
+
+
+@dataclass(frozen=True)
+class Kind:
+    """What a pulled directory holds, and everything that differs because of it.
+
+    `members` and `member_dirs` are what such a directory is allowed to
+    contain. A push sends these and nothing else, so a `.git`, an editor's swap
+    file or a stray note in the directory is simply not sent - rather than
+    being sent and refused by the server's "this file is not in the manifest"
+    check. `key` is the id's name in `.cocco/state.toml`, which is also how a
+    directory says which kind it is; `stub` and `suffix` name a download.
+    """
+
+    noun: str
+    key: str
+    api: str
+    members: tuple[str, ...]
+    member_dirs: tuple[str, ...]
+    stub: str
+    suffix: str
+
+
+CHALLENGE = Kind(
+    noun="challenge", key="challenge_id", api="/api/challenges",
+    members=(STATEMENT_NAME, MANIFEST_NAME), member_dirs=(TESTS_DIR, EVALUATOR_DIR),
+    stub="challenge", suffix=".zip",
+)
+EXERCISE_SET = Kind(
+    noun="exercise set", key="set_id", api="/api/exercises",
+    members=(EXERCISES_NAME,), member_dirs=(), stub="exercises", suffix=".md",
+)
+KINDS = (CHALLENGE, EXERCISE_SET)
+
+# How long `cocco push` of a set waits for its build, and how often it asks. A
+# build is a few dozen boxes, seconds on an idle judge; a minute without an
+# answer is a queue behind a regrade, or no judge at all.
+BUILD_WAIT_S = 60.0
+BUILD_POLL_S = 1.0
 
 # Where a pulled directory keeps what it knows about itself. Not a member, so
 # it is never pushed; and it ignores itself for git, because the version in it
@@ -103,7 +150,8 @@ class State:
     """
 
     url: str
-    challenge_id: int
+    kind: Kind
+    id: int
     version: str | None
     files: dict[str, str]
 
@@ -153,8 +201,24 @@ def _client(args) -> httpx.Client:
     )
 
 
+def _print_problems(problems: list[dict]) -> None:
+    for line in _problem_lines(problems):
+        print(line)
+
+
+def _problem_lines(problems: list[dict]) -> list[str]:
+    """An exercise file's problems, as the set page lists them."""
+    lines = []
+    for problem in problems:
+        lines.append(f"  {problem['level']}: {problem['where']}: {problem['text']}")
+        if problem.get("detail"):
+            lines.extend(f"      {line}" for line in problem["detail"].splitlines())
+    return lines
+
+
 def _check(response: httpx.Response) -> None:
-    """Turn a refusal into a sentence. The API answers JSON, so there is one."""
+    """Turn a refusal into a sentence. The API answers JSON, so there is one -
+    with an exercise file's problems under it, when it was refused for those."""
     if response.is_success:
         return
     if response.status_code == 401:
@@ -163,13 +227,16 @@ def _check(response: httpx.Response) -> None:
             "and set COCCO_TOKEN to it."
         )
     detail = None
+    problems: list[dict] = []
     try:
         body = response.json()
         if isinstance(body, dict):
             detail = body.get("detail")
+            problems = body.get("problems") or []
     except ValueError:
         pass
-    raise CliError(detail or f"{response.status_code} from the server.")
+    message = detail or f"{response.status_code} from the server."
+    raise CliError("\n".join([message, *_problem_lines(problems)]))
 
 
 # ---------------------------------------------------------------------------
@@ -186,22 +253,23 @@ def _read_state(directory: Path) -> State | None:
         raise CliError(f"{path}: {e}") from e
 
     url = table.get("url")
-    challenge_id = table.get("challenge_id")
+    kinds = [kind for kind in KINDS if kind.key in table]
+    ident = table.get(kinds[0].key) if len(kinds) == 1 else None
     version = table.get("version")
     files = table.get("files", {})
     if (
         not isinstance(url, str)
-        or not isinstance(challenge_id, int)
-        or isinstance(challenge_id, bool)
+        or not isinstance(ident, int)
+        or isinstance(ident, bool)
         or not (version is None or isinstance(version, str))
         or not isinstance(files, dict)
         or not all(isinstance(value, str) for value in files.values())
     ):
         raise CliError(
-            f"{path} is damaged. Delete {directory / STATE_DIR} and pull the "
-            "challenge again with --force."
+            f"{path} is damaged. Delete {directory / STATE_DIR} and pull it "
+            "again with --force."
         )
-    return State(url=url, challenge_id=challenge_id, version=version, files=files)
+    return State(url=url, kind=kinds[0], id=ident, version=version, files=files)
 
 
 def _state_of(directory: Path) -> State | None:
@@ -212,7 +280,7 @@ def _write_state(directory: Path, state: State) -> None:
     root = directory / STATE_DIR
     root.mkdir(exist_ok=True)
     (root / ".gitignore").write_text("*\n")
-    document: dict = {"url": state.url, "challenge_id": state.challenge_id}
+    document: dict = {"url": state.url, state.kind.key: state.id}
     if state.version is not None:
         document["version"] = state.version
     document["files"] = dict(sorted(state.files.items()))
@@ -224,13 +292,14 @@ def _write_state(directory: Path, state: State) -> None:
 
 
 def _check_state(
-    directory: Path, state: State, url: str, challenge_id: int, *, hint: str = ""
+    directory: Path, state: State, url: str, kind: Kind, ident: int, *, hint: str = ""
 ) -> None:
-    """Refuse to use a directory against a challenge or server it is not from."""
-    if state.challenge_id != challenge_id:
+    """Refuse to use a directory against a challenge, a set or a server it is
+    not from."""
+    if (state.kind, state.id) != (kind, ident):
         raise CliError(
-            f"{directory}/ was pulled from challenge {state.challenge_id}, not "
-            f"{challenge_id}.{hint}"
+            f"{directory}/ was pulled from {state.kind.noun} {state.id}, not "
+            f"{kind.noun} {ident}.{hint}"
         )
     if state.url != url:
         raise CliError(
@@ -239,14 +308,14 @@ def _check_state(
         )
 
 
-def _members(directory: Path) -> dict[str, Path]:
+def _members(directory: Path, kind: Kind) -> dict[str, Path]:
     """Every file a push would send, by its name in the archive."""
     found: dict[str, Path] = {}
-    for name in MEMBERS:
+    for name in kind.members:
         path = directory / name
         if path.is_file():
             found[name] = path
-    for subdirectory in MEMBER_DIRS:
+    for subdirectory in kind.member_dirs:
         root = directory / subdirectory
         if not root.is_dir():
             continue
@@ -280,8 +349,11 @@ def _fingerprint(name: str, path: Path) -> str:
     return digest.hexdigest()
 
 
-def _fingerprints(directory: Path) -> dict[str, str]:
-    return {name: _fingerprint(name, path) for name, path in _members(directory).items()}
+def _fingerprints(directory: Path, kind: Kind) -> dict[str, str]:
+    return {
+        name: _fingerprint(name, path)
+        for name, path in _members(directory, kind).items()
+    }
 
 
 def reconcile(
@@ -317,7 +389,7 @@ def reconcile(
 
 
 def _changed_here(directory: Path, state: State) -> list[str]:
-    local = _fingerprints(directory)
+    local = _fingerprints(directory, state.kind)
     return sorted(
         name
         for name in set(local) | set(state.files)
@@ -341,37 +413,83 @@ def _as_argument(path: Path) -> str:
 
 def cmd_ls(args) -> int:
     with _client(args) as client:
-        response = client.get("/api/challenges")
+        response = client.get(CHALLENGE.api)
         _check(response)
-        rows = response.json()
+        challenges = response.json()
+        response = client.get(EXERCISE_SET.api)
+        # A server from before exercise sets has no such route, and that is
+        # no reason to stop listing the challenges it does have.
+        sets = []
+        if response.status_code != 404:
+            _check(response)
+            sets = response.json()
 
-    if not rows:
+    if not challenges and not sets:
         print("Nothing you can edit. Ask to be enrolled as course staff.")
         return 0
 
-    width = max(len(str(row["challenge_id"])) for row in rows)
-    course = None
-    for row in rows:
-        if row["course_id"] != course:
-            course = row["course_id"]
-            print(f"\n{row['course_title']}")
-        # An archived challenge is still pushable - staff edit one exactly as
-        # before - so these are notes beside the title rather than anything
-        # missing from the list. The same goes double for an unpublished one:
-        # not having published it yet is the commonest reason to be pushing to
-        # it, so dropping those would hide the very ids this command exists to
-        # make discoverable.
-        notes = []
-        if row.get("archived"):
-            notes.append("archived")
-        if not row.get("visible", True):
-            notes.append(
-                "hidden" if row.get("visible_from") is None
-                else f"opens {_when(row['visible_from'])}"
-            )
-        suffix = f"  ({', '.join(notes)})" if notes else ""
-        print(f"  {row['challenge_id']:>{width}}  {row['title']}{suffix}")
+    # Both listings are ordered by course, the way the server orders them; a
+    # course with only one kind still gets its heading once.
+    courses: dict[int, tuple[str, list, list]] = {}
+    for row in challenges:
+        courses.setdefault(row["course_id"], (row["course_title"], [], []))[1].append(row)
+    for row in sets:
+        courses.setdefault(row["course_id"], (row["course_title"], [], []))[2].append(row)
+
+    width = max(
+        [len(str(row["challenge_id"])) for row in challenges]
+        + [len(str(row["set_id"])) for row in sets]
+    )
+    for _, (title, course_challenges, course_sets) in sorted(
+        courses.items(), key=lambda course: (course[1][0], course[0])
+    ):
+        print(f"\n{title}")
+        for row in course_challenges:
+            notes = _challenge_notes(row)
+            suffix = f"  ({', '.join(notes)})" if notes else ""
+            print(f"  {row['challenge_id']:>{width}}  {row['title']}{suffix}")
+        if course_sets:
+            print("  exercise sets (cocco pull --set ID):")
+        for row in course_sets:
+            notes = _set_notes(row)
+            suffix = f"  ({', '.join(notes)})" if notes else ""
+            print(f"  {row['set_id']:>{width}}  {row['title']}{suffix}")
     return 0
+
+
+def _challenge_notes(row: dict) -> list[str]:
+    # An archived challenge is still pushable - staff edit one exactly as
+    # before - so these are notes beside the title rather than anything
+    # missing from the list. The same goes double for an unpublished one:
+    # not having published it yet is the commonest reason to be pushing to
+    # it, so dropping those would hide the very ids this command exists to
+    # make discoverable.
+    notes = []
+    if row.get("archived"):
+        notes.append("archived")
+    if not row.get("visible", True):
+        notes.append(
+            "hidden" if row.get("visible_from") is None
+            else f"opens {_when(row['visible_from'])}"
+        )
+    return notes
+
+
+def _set_notes(row: dict) -> list[str]:
+    """What a pull of this set would hand out, when it is not simply the
+    version sessions are being opened on."""
+    notes = []
+    if row.get("archived"):
+        notes.append("archived")
+    status, latest = row["latest_status"], row["latest_number"]
+    if status == "ready":
+        return notes
+    notes.append(
+        f"v{latest} building" if status == "building" else f"v{latest} failed to build"
+    )
+    current = row.get("current_number")
+    notes.append("no version built yet" if current is None else f"v{current} current")
+    return notes
 
 
 def _when(iso: str) -> str:
@@ -406,24 +524,54 @@ def _extract(archive: zipfile.ZipFile, target: Path) -> None:
             shutil.copyfileobj(source, sink, _CHUNK)
 
 
-def _suggested_name(response: httpx.Response, challenge_id: int) -> str:
-    # The server names the download after the challenge; fall back to the id,
-    # which is the only thing we are certain of.
+def _suggested_name(response: httpx.Response, kind: Kind, ident: int) -> str:
+    # The server names the download after the challenge or the set; fall back
+    # to the id, which is the only thing we are certain of.
     disposition = response.headers.get("content-disposition", "")
     if 'filename="' in disposition:
         return disposition.split('filename="', 1)[1].split('"', 1)[0]
-    return f"challenge-{challenge_id}.zip"
+    return f"{kind.stub}-{ident}{kind.suffix}"
 
 
-def _pull_zip(args) -> int:
-    if args.challenge_id is None:
-        raise CliError("--zip needs a challenge id: cocco pull <id> --zip")
+def _version_note(response: httpx.Response) -> str | None:
+    """What a set's pull says when the file it hands out is not a version
+    sessions can be opened on. A challenge's export carries no such header."""
+    status = response.headers.get("x-cocco-version-status")
+    number = response.headers.get("x-cocco-version-number")
+    if status == "building":
+        return f"v{number} is still being built by the judge."
+    if status == "failed":
+        return (
+            f"v{number} failed to build, so the set still uses the last version "
+            f"that did. This is v{number}'s file: fix it and push again."
+        )
+    return None
+
+
+def _requested(args) -> tuple[Kind, int] | None:
+    """The challenge or set a pull names, if it names one."""
+    if args.set is not None:
+        if args.challenge_id is not None:
+            raise CliError("Name a challenge or an exercise set, not both.")
+        return EXERCISE_SET, args.set
+    if args.challenge_id is not None:
+        return CHALLENGE, args.challenge_id
+    return None
+
+
+def _pull_file(args) -> int:
+    requested = _requested(args)
+    if requested is None:
+        raise CliError(
+            "--zip needs an id: cocco pull <id> --zip, or cocco pull --set <id> --zip"
+        )
+    kind, ident = requested
     with _client(args) as client:
-        with client.stream("GET", f"/api/challenges/{args.challenge_id}") as response:
+        with client.stream("GET", f"{kind.api}/{ident}") as response:
             if not response.is_success:
                 response.read()
                 _check(response)
-            target = Path(args.output or _suggested_name(response, args.challenge_id))
+            target = Path(args.output or _suggested_name(response, kind, ident))
             if target.exists() and not args.force:
                 raise CliError(f"{target} exists. Pass --force to overwrite it.")
             with open(target, "wb") as sink:
@@ -444,24 +592,32 @@ def _backup_dir(target: Path) -> Path:
 
 
 def _apply(
-    archive: zipfile.ZipFile, target: Path, state: State | None, *, force: bool
+    fill: Callable[[Path], None],
+    target: Path,
+    kind: Kind,
+    state: State | None,
+    *,
+    force: bool,
 ) -> tuple[dict[str, str], Reconciliation, Path | None]:
-    """Bring `target` up to a pulled archive, file by file, as `reconcile` says.
+    """Bring `target` up to what was pulled, file by file, as `reconcile` says.
 
-    The archive is unpacked into `.cocco/incoming/` first - inside the target,
-    so every write after the decision is a rename on one filesystem, and a
-    refusal leaves the directory exactly as it was. Returns the server's
-    fingerprints (the new base), the decision, and where any discarded local
-    copies went.
+    `fill` writes the server's files into the directory it is given: a zip
+    unpacked for a challenge, the one file for a set. That directory is
+    `.cocco/incoming/` - inside the target, so every write after the decision
+    is a rename on one filesystem, and a refusal leaves the directory exactly
+    as it was. Returns the server's fingerprints (the new base), the decision,
+    and where any discarded local copies went.
     """
     staging = target / STATE_DIR / INCOMING_DIR
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
     try:
-        _extract(archive, staging)
-        incoming = _fingerprints(staging)
+        fill(staging)
+        incoming = _fingerprints(staging, kind)
         plan = reconcile(
-            None if state is None else state.files, _fingerprints(target), incoming
+            None if state is None else state.files,
+            _fingerprints(target, kind),
+            incoming,
         )
         if plan.conflicts and not force:
             raise CliError(
@@ -490,7 +646,7 @@ def _apply(
         # A challenge that lost its evaluator should not leave an empty
         # `evaluator/` behind to suggest otherwise. `rmdir` refuses a directory
         # with anything left in it, which is the point.
-        for subdirectory in MEMBER_DIRS:
+        for subdirectory in kind.member_dirs:
             try:
                 (target / subdirectory).rmdir()
             except OSError:
@@ -502,35 +658,38 @@ def _apply(
 
 def cmd_pull(args) -> int:
     if args.zip:
-        return _pull_zip(args)
+        return _pull_file(args)
 
     url = _resolve_url(args)
+    requested = _requested(args)
 
     # Which directory, when that is knowable before asking the server: `-o`, or
-    # the current one when no id was given or it holds the challenge named.
+    # the current one when nothing was named or it holds the one named.
     # `cocco pull 12` typed inside challenge 12's directory refreshes it rather
     # than nesting a second copy inside it.
     target: Path | None = None
     if args.output is not None:
         target = Path(args.output)
-    elif args.challenge_id is None:
+    elif requested is None:
         target = Path(".")
     else:
         here = _read_state(Path("."))
-        if here is not None and here.challenge_id == args.challenge_id:
+        if here is not None and (here.kind, here.id) == requested:
             target = Path(".")
 
     state = None if target is None else _state_of(target)
-    challenge_id = args.challenge_id
-    if challenge_id is None:
+    if requested is None:
         if state is None:
             raise CliError(
                 f"{target}/ was not pulled with cocco, so there is nothing to "
-                "refresh. Name a challenge: cocco pull <id>"
+                "refresh. Name a challenge or an exercise set: cocco pull <id>, "
+                "or cocco pull --set <id>"
             )
-        challenge_id = state.challenge_id
+        kind, ident = state.kind, state.id
+    else:
+        kind, ident = requested
     if target is not None and state is not None:
-        _check_state(target, state, url, challenge_id)
+        _check_state(target, state, url, kind, ident)
 
     headers = {}
     if state is not None and state.version is not None:
@@ -538,10 +697,13 @@ def cmd_pull(args) -> int:
 
     with tempfile.TemporaryFile() as handle:
         with _client(args) as client, client.stream(
-            "GET", f"/api/challenges/{challenge_id}", headers=headers
+            "GET", f"{kind.api}/{ident}", headers=headers
         ) as response:
+            note = _version_note(response)
             if response.status_code == 304 and target is not None and state is not None:
-                print(f"{target}/  already up to date with challenge {challenge_id}.")
+                print(f"{target}/  already up to date with {kind.noun} {ident}.")
+                if note is not None:
+                    print(f"  {note}")
                 changed = _changed_here(target, state)
                 if changed:
                     print("  changed here and not pushed: " + ", ".join(changed))
@@ -552,32 +714,47 @@ def cmd_pull(args) -> int:
             for chunk in response.iter_bytes():
                 handle.write(chunk)
             version = _unquote(response.headers.get("etag"))
-            suggested = _suggested_name(response, challenge_id)
+            suggested = _suggested_name(response, kind, ident)
         handle.seek(0)
 
         if target is None:
-            target = Path(suggested.removesuffix(".zip"))
+            target = Path(suggested.removesuffix(kind.suffix))
             state = _state_of(target)
             if state is not None:
-                _check_state(target, state, url, challenge_id)
+                _check_state(target, state, url, kind, ident)
         if target.exists() and not target.is_dir():
             raise CliError(f"{target} exists and is not a directory.")
         if state is None and target.is_dir() and any(target.iterdir()) and not args.force:
             raise CliError(f"{target}/ is not empty. Pass --force to write into it.")
         target.mkdir(parents=True, exist_ok=True)
 
-        with zipfile.ZipFile(handle) as archive:
-            incoming, plan, discarded = _apply(archive, target, state, force=args.force)
+        if kind is CHALLENGE:
+            with zipfile.ZipFile(handle) as archive:
+                incoming, plan, discarded = _apply(
+                    lambda staging: _extract(archive, staging),
+                    target, kind, state, force=args.force,
+                )
+        else:
+            def write(staging: Path) -> None:
+                with open(staging / EXERCISES_NAME, "wb") as sink:
+                    shutil.copyfileobj(handle, sink, _CHUNK)
+
+            incoming, plan, discarded = _apply(
+                write, target, kind, state, force=args.force
+            )
 
     _write_state(
         target,
-        State(url=url, challenge_id=challenge_id, version=version, files=incoming),
+        State(url=url, kind=kind, id=ident, version=version, files=incoming),
     )
 
-    count = sum(1 for name in incoming if name.startswith(f"{TESTS_DIR}/")) // 2
-    print(f"{target}/  ({count} test case{'' if count == 1 else 's'})")
+    if kind is CHALLENGE:
+        count = sum(1 for name in incoming if name.startswith(f"{TESTS_DIR}/")) // 2
+        print(f"{target}/  ({count} test case{'' if count == 1 else 's'})")
+    else:
+        print(f"{target}/")
     if state is None:
-        print(f"Edit {target / STATEMENT_NAME} and {target / MANIFEST_NAME}, then:")
+        print(f"Edit {' and '.join(str(target / name) for name in kind.members)}, then:")
         print(f"  cocco push {_as_argument(target)}")
     elif not (plan.take or plan.keep or plan.conflicts):
         print("  already up to date.")
@@ -592,6 +769,8 @@ def cmd_pull(args) -> int:
     if plan.conflicts:
         print("  your changes, replaced by the server's: " + ", ".join(plan.conflicts))
         print(f"  (your versions are in {discarded}/)")
+    if note is not None:
+        print(f"  {note}")
     return 0
 
 
@@ -604,7 +783,7 @@ def _pack(directory: Path, handle) -> dict[str, str]:
     if not (directory / MANIFEST_NAME).is_file():
         raise CliError(f"{directory}/{MANIFEST_NAME} is missing - is this a "
                        "challenge directory?")
-    members = _members(directory)
+    members = _members(directory, CHALLENGE)
     with zipfile.ZipFile(handle, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, path in members.items():
             archive.write(path, name)
@@ -630,41 +809,59 @@ def _push_arguments(values: list[str]) -> tuple[int | None, str]:
     return None, "."
 
 
-def _upload(args, challenge_id: int, payload, headers: dict) -> httpx.Response:
+def _push_target(args) -> tuple[Kind | None, int | None, str]:
+    """What a push names - a challenge, a set or neither - and the path.
+
+    With `--set` the id is the flag's, so the only positional left is the path,
+    and a lone `12` is a directory: nothing is guessed from the digits.
+    """
+    if args.set is None:
+        challenge_id, path = _push_arguments(args.arguments)
+        return (None if challenge_id is None else CHALLENGE), challenge_id, path
+    if len(args.arguments) > 1:
+        raise CliError("With --set, push takes at most a path.")
+    return EXERCISE_SET, args.set, (args.arguments[0] if args.arguments else ".")
+
+
+def _upload(args, kind: Kind, ident: int, payload, headers: dict) -> httpx.Response:
+    media_type = "application/zip" if kind is CHALLENGE else "text/markdown"
     with _client(args) as client:
         return client.post(
-            f"/api/challenges/{challenge_id}",
+            f"{kind.api}/{ident}",
             headers=headers,
-            files={"file": ("challenge.zip", payload, "application/zip")},
+            files={"file": (f"{kind.stub}{kind.suffix}", payload, media_type)},
         )
 
 
 def cmd_push(args) -> int:
-    given_id, path = _push_arguments(args.arguments)
+    given_kind, given_id, path = _push_target(args)
     source = Path(path)
     if not source.exists():
         raise CliError(f"{source} does not exist.")
 
     url = _resolve_url(args)
     state = _state_of(source)
-    challenge_id = given_id if given_id is not None else (
-        None if state is None else state.challenge_id
-    )
-    if challenge_id is None:
+    if given_kind is not None and given_id is not None:
+        kind, ident = given_kind, given_id
+    elif state is not None:
+        kind, ident = state.kind, state.id
+    else:
         raise CliError(
-            f"Which challenge? {source} was not pulled with cocco, so name it: "
-            f"cocco push <id> {_as_argument(source)}"
+            f"Which challenge or exercise set? {source} was not pulled with cocco, "
+            f"so name it: cocco push <id> {_as_argument(source)}, or "
+            f"cocco push --set <id> {_as_argument(source)}"
         )
 
     # Pushing a directory to a challenge or a server it was not pulled from is
     # how a challenge is copied, so it is allowed - but only when asked for,
     # and it is never conditional, since the version is another challenge's.
     tracked = (
-        state is not None and state.challenge_id == challenge_id and state.url == url
+        state is not None and (state.kind, state.id) == (kind, ident)
+        and state.url == url
     )
     if state is not None and not tracked and not args.force:
         _check_state(
-            source, state, url, challenge_id,
+            source, state, url, kind, ident,
             hint=" Pass --force to push it there anyway.",
         )
 
@@ -673,19 +870,28 @@ def cmd_push(args) -> int:
         headers["If-Match"] = f'"{state.version}"'
 
     pushed: dict[str, str] | None = None
-    if source.is_dir():
+    if source.is_dir() and kind is CHALLENGE:
         with tempfile.TemporaryFile() as scratch:
             pushed = _pack(source, scratch)
             scratch.seek(0)
-            response = _upload(args, challenge_id, scratch, headers)
+            response = _upload(args, kind, ident, scratch, headers)
+    elif source.is_dir():
+        exercises = source / EXERCISES_NAME
+        if not exercises.is_file():
+            raise CliError(
+                f"{exercises} is missing - is this an exercise set directory?"
+            )
+        pushed = _fingerprints(source, kind)
+        with open(exercises, "rb") as payload:
+            response = _upload(args, kind, ident, payload, headers)
     else:
         with open(source, "rb") as payload:
-            response = _upload(args, challenge_id, payload, headers)
+            response = _upload(args, kind, ident, payload, headers)
 
     if response.status_code == 412:
         refresh = "cocco pull" if source == Path(".") else f"cocco pull -o {source}"
         raise CliError(
-            f"Challenge {challenge_id} has changed on the server since {source}/ "
+            f"The {kind.noun} {ident} has changed on the server since {source}/ "
             "was last pulled or pushed - edited on the web, or pushed from "
             f"another copy. Nothing was written. Run `{refresh}` to bring those "
             "changes in (your own edits are kept unless the same file changed on "
@@ -700,9 +906,12 @@ def cmd_push(args) -> int:
     if pushed is not None and (state is None or tracked):
         _write_state(
             source,
-            State(url=url, challenge_id=challenge_id,
+            State(url=url, kind=kind, id=ident,
                   version=summary.get("version"), files=pushed),
         )
+
+    if kind is EXERCISE_SET:
+        return _report_set_push(args, ident, summary)
 
     testcases = summary["testcases"]
     print(f"{summary['title']} (challenge {summary['challenge_id']})")
@@ -718,6 +927,53 @@ def cmd_push(args) -> int:
     return 0
 
 
+def _report_set_push(args, ident: int, summary: dict) -> int:
+    """Say what a set's push made, waiting for its build unless told not to.
+
+    The build is where a solution that crashes or a starter that already
+    passes is found, so a push that returned at once would leave its author
+    to discover a broken version on the web. A failed build exits 1: the
+    version exists, and the directory agrees with it, but nothing can use it.
+    """
+    number = summary["number"]
+    print(f"{summary['title']} (exercise set {ident}, v{number})")
+    if not args.wait:
+        _print_problems(summary["problems"])
+        print("  the judge is building it; it becomes current once it is ready.")
+        return 0
+
+    deadline = time.monotonic() + BUILD_WAIT_S
+    path = f"{EXERCISE_SET.api}/{ident}/versions/{summary['version']}"
+    with _client(args) as client:
+        while True:
+            response = client.get(path)
+            _check(response)
+            built = response.json()
+            if built["status"] != "building":
+                break
+            if time.monotonic() >= deadline:
+                _print_problems(summary["problems"])
+                print(
+                    f"  still building after {BUILD_WAIT_S:.0f} s - is a judge "
+                    "running? `cocco pull` says how it ended, and so does the "
+                    "set's page."
+                )
+                return 0
+            time.sleep(BUILD_POLL_S)
+
+    _print_problems(built["problems"])
+    if built["status"] == "failed":
+        raise CliError(
+            f"v{number} failed to build, so the set still uses the last version "
+            "that did. Fix the errors above and push again."
+        )
+    print(
+        "  built: it is now the set's current version. Open sessions move to it "
+        "only from their own page."
+    )
+    return 0
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -729,22 +985,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token", help="an API token; prefer COCCO_TOKEN")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    listing = sub.add_parser("ls", help="the challenges you can edit")
+    listing = sub.add_parser("ls", help="the challenges and exercise sets you can edit")
     listing.set_defaults(run=cmd_ls)
 
     pull = sub.add_parser(
-        "pull", help="download a challenge as a directory, or refresh one"
+        "pull", help="download a challenge or an exercise set as a directory, "
+                     "or refresh one"
     )
     pull.add_argument(
         "challenge_id", type=int, nargs="?",
-        help="default: the challenge the directory was pulled from",
+        help="default: the challenge or set the directory was pulled from",
+    )
+    pull.add_argument(
+        "--set", type=int, metavar="SET_ID", help="pull this exercise set instead"
     )
     pull.add_argument(
         "-o", "--output",
         help="where to write it (default: this directory if it holds that "
-             "challenge, otherwise a new one named after it)",
+             "challenge or set, otherwise a new one named after it)",
     )
-    pull.add_argument("--zip", action="store_true", help="keep it as a zip file")
+    pull.add_argument(
+        "--zip", action="store_true",
+        help="keep it as a single file: a challenge's zip, or a set's .md",
+    )
     pull.add_argument(
         "--force", action="store_true",
         help="write into a directory cocco did not pull, or take the server's "
@@ -753,8 +1016,9 @@ def build_parser() -> argparse.ArgumentParser:
     pull.set_defaults(run=cmd_pull)
 
     push = sub.add_parser(
-        "push", help="upload a challenge directory or zip",
-        usage="cocco push [-h] [--force] [CHALLENGE_ID] [PATH]",
+        "push", help="upload a challenge or exercise set directory, or a file",
+        usage="cocco push [-h] [--force] [--set SET_ID] [--no-wait] "
+              "[CHALLENGE_ID] [PATH]",
     )
     push.add_argument(
         "arguments", nargs="*", metavar="ARG",
@@ -762,9 +1026,17 @@ def build_parser() -> argparse.ArgumentParser:
              "was pulled from, the path to the current directory",
     )
     push.add_argument(
+        "--set", type=int, metavar="SET_ID",
+        help="push to this exercise set; then only PATH may follow",
+    )
+    push.add_argument(
         "--force", action="store_true",
-        help="push even if the challenge changed on the server since the last "
-             "pull, or to a challenge the directory was not pulled from",
+        help="push even if it changed on the server since the last pull, or "
+             "to a challenge or set the directory was not pulled from",
+    )
+    push.add_argument(
+        "--no-wait", dest="wait", action="store_false",
+        help="for an exercise set: do not wait for the judge to build it",
     )
     push.set_defaults(run=cmd_push)
 

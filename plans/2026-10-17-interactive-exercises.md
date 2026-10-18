@@ -574,11 +574,44 @@ As built:
   staff go on editing an archived course.
 - `prune_run_jobs` prunes runs and session-less checks; a build and a session's check are kept.
 
-### [ ] 10. Transfer (may slip to a follow-up)
+### [x] 10. Transfer (may slip to a follow-up)
 
 `cocco pull`/`push` of a set as its `.md`, with the existing `.cocco/state.toml` / `ETag` /
 `If-Match` discipline. The `ETag` is the current version's id, because a version is immutable;
 a push is an import.
+
+As built:
+
+- **The `ETag` is the *newest* version's id, not the current one's**, and a pull hands out the
+  newest version's file. The two differ only while a re-import is building or after it failed,
+  and in both cases "current" would be wrong. A push answers with the version it created. If the
+  tag were the current version's, the next push would be a 412 until the build finished, and
+  forever after a failed build. A pull would also hand back the old file, and `reconcile` would
+  overwrite the author's fix with it as "changed only on the server". The pull's
+  `X-Cocco-Version-Status` / `-Number` headers, sent on a 304 too, let the CLI say that the file
+  it holds failed to build.
+- Routes: `GET /api/exercises` (the listing `cocco ls` prints under each course),
+  `GET`/`POST /api/exercises/{set_id}`, and `GET /api/exercises/{set_id}/versions/{version_id}`,
+  which a push polls. `require_api_exercise_set_editor` looks up the set's course
+  (`query_exercise_set_course`) and resolves the role from it. A missing set is the same 403 as a
+  set on someone else's course. `query_exercise_version_summary` serves all four routes.
+- A push goes through `_import_exercise_file`, which now also returns the new version's id. Its
+  default title is the newest version's, because the upload is always named `exercises.md`. Parse
+  errors are a 400 with `problems`, and the CLI prints them under the sentence. There is no
+  create: a new set is imported on the course page, as a new challenge is made in the editor.
+- CLI: a pulled set is a directory holding `exercises.md` (`transfer.EXERCISES_NAME`) and nothing
+  else. `cli.Kind` (`CHALLENGE`, `EXERCISE_SET`) carries everything that differs between the two
+  kinds. `State` records `kind` and `id`, written as `challenge_id` or `set_id` in
+  `state.toml`, so existing checkouts keep working. Sets are named with `--set ID` on `pull` and
+  `push`, and inside a pulled directory nothing has to be named.
+- `cocco push` of a set **waits for the build** (`BUILD_WAIT_S`, polling every `BUILD_POLL_S`)
+  and prints its problems. A failed build exits 1, and `--no-wait` skips the wait. An unchanged
+  file is pushed like any other, conditional as ever: pushing it again is how a build that failed
+  for reasons outside the file (no judge, a judge error) is retried.
+- **A set's push holds the set's row lock** (`lock_exercise_set_for_push`, `FOR NO KEY UPDATE`)
+  from the `If-Match` check to the import's commit, so two pushes based on the same version can't
+  both pass. The challenge push leaves that window open; here the import is the only write.
+- Tests: `cocco/test_exercise_transfer.py`.
 
 ### [ ] 11. Verify end to end
 

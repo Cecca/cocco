@@ -11,6 +11,7 @@ from datetime import datetime
 from sqlalchemy import (
     Connection,
     and_,
+    bindparam,
     case,
     delete,
     exists,
@@ -852,6 +853,125 @@ async def query_exercise_version_source(
     return (await conn.execute(stmt)).first()
 
 
+async def query_exercise_set_course(conn: AsyncConnection, set_id: int) -> int | None:
+    """The course a set belongs to, or None - what the transfer API resolves
+    the caller's role from, since its URL carries only the set."""
+    stmt = select(ExerciseSet.c.course_id).where(ExerciseSet.c.id == set_id)
+    return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def query_exercise_version_summary(
+    conn: AsyncConnection,
+    set_id: int,
+    version_id: int | None = None,
+    *,
+    with_source: bool = False,
+):
+    """One version of a set - the newest, whatever its status, when
+    `version_id` is None - as the transfer API reports it: its title, status,
+    problems, `number` within the set and whether it is the current one, and
+    its source only when asked: a push's check and the poll that waits for its
+    build have no use for the file.
+
+    The newest rather than the current, because that is what a push has to be
+    conditional on: a re-import that is still building, or that failed, is
+    still somebody's change, and a pull that handed out the current version
+    instead would quietly take a failed file's fixes away from its author.
+    """
+    earlier = ExerciseSetVersion.alias("earlier")
+    number = (
+        select(func.count())
+        .select_from(earlier)
+        .where(
+            earlier.c.set_id == set_id, earlier.c.id <= ExerciseSetVersion.c.id
+        )
+        .scalar_subquery()
+    )
+    columns = [
+        ExerciseSetVersion.c.id,
+        ExerciseSetVersion.c.title,
+        ExerciseSetVersion.c.status,
+        ExerciseSetVersion.c.problems,
+        number.label("number"),
+        (ExerciseSet.c.current_version_id == ExerciseSetVersion.c.id)
+        .is_(True)
+        .label("is_current"),
+    ]
+    if with_source:
+        columns.append(ExerciseSetVersion.c.source)
+    stmt = (
+        select(*columns)
+        .select_from(
+            ExerciseSetVersion.join(
+                ExerciseSet, ExerciseSet.c.id == ExerciseSetVersion.c.set_id
+            )
+        )
+        .where(ExerciseSetVersion.c.set_id == set_id)
+    )
+    if version_id is None:
+        stmt = stmt.order_by(ExerciseSetVersion.c.id.desc()).limit(1)
+    else:
+        stmt = stmt.where(ExerciseSetVersion.c.id == version_id)
+    return (await conn.execute(stmt)).first()
+
+
+async def query_editable_exercise_sets(
+    conn: AsyncConnection,
+    user_id: int,
+    editor_roles: Iterable[UserRole],
+    every_course: bool = False,
+):
+    """`query_editable_challenges` for exercise sets: every set the caller may
+    pull and push, with its course, its title (`_EXERCISE_SET_TITLE_SQL`) and
+    its newest version's number and status, which is what a push would be
+    conditional on.
+
+    `archived` is the set's or its course's, a note beside the title as it is
+    for a challenge and never a gate.
+    """
+    where = (
+        "true"
+        if every_course
+        else """exercise_set.course_id IN (
+            SELECT enrollment.course_id FROM enrollment
+            WHERE enrollment.user_id = :user_id AND enrollment.role IN :roles
+        )"""
+    )
+    # Not `_EXERCISE_VERSIONS_CTE`, which counts every version's problems and
+    # exercises - for an administrator, every version on the site - when all
+    # this needs is the newest and the current version's number and status.
+    query = text(f"""
+    WITH versions AS (
+        SELECT v.id, v.set_id, v.title, v.status,
+               row_number() OVER (PARTITION BY v.set_id ORDER BY v.id) AS number
+        FROM exercise_set_version v
+        JOIN exercise_set ON exercise_set.id = v.set_id
+        WHERE {where}
+    )
+    SELECT course.id AS course_id, course.title AS course_title,
+           exercise_set.id AS set_id,
+           {_EXERCISE_SET_TITLE_SQL} AS title,
+           (exercise_set.archived_at IS NOT NULL
+            OR course.archived_at IS NOT NULL) AS archived,
+           latest.number AS latest_number, latest.status AS latest_status,
+           current.number AS current_number
+    FROM exercise_set
+    JOIN course ON course.id = exercise_set.course_id
+    JOIN LATERAL (
+        SELECT * FROM versions WHERE versions.set_id = exercise_set.id
+        ORDER BY versions.id DESC LIMIT 1
+    ) latest ON true
+    LEFT JOIN versions current ON current.id = exercise_set.current_version_id
+    WHERE {where}
+    ORDER BY course.title, course.id, exercise_set.id
+    """)
+    params: dict = {}
+    if not every_course:
+        query = query.bindparams(bindparam("roles", expanding=True))
+        params = {"user_id": user_id, "roles": [role.value for role in editor_roles]}
+    return (await conn.execute(query, params)).mappings().all()
+
+
 async def query_exercise(
     conn: AsyncConnection, version_id: int, exercise_index: int
 ) -> schema.Exercise | None:
@@ -935,6 +1055,25 @@ async def lock_exercise_set(conn: AsyncConnection, set_id: int) -> int | None:
         .with_for_update(of=ExerciseSet)
     )
     return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def lock_exercise_set_for_push(conn: AsyncConnection, set_id: int) -> bool:
+    """Serialize pushes to a set, so that two of them based on the same
+    version cannot both pass `If-Match` and both import. False if there is no
+    such set. Does not commit: the lock is held until the import commits.
+
+    `FOR NO KEY UPDATE`, which conflicts with itself but not with the `KEY
+    SHARE` a foreign key takes, so a web import's version insert or a preview
+    job is not held up by it. Only the set's row: an import inserts a version
+    and touches no existing one, so it cannot close a cycle with a delete
+    (versions, then the set) or a finishing build (its version, then the set).
+    """
+    stmt = (
+        select(ExerciseSet.c.id)
+        .where(ExerciseSet.c.id == set_id)
+        .with_for_update(key_share=True)
+    )
+    return (await conn.execute(stmt)).first() is not None
 
 
 async def delete_exercise_set(conn: AsyncConnection, set_id: int) -> None:

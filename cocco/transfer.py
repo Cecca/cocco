@@ -40,6 +40,12 @@ STATEMENT_NAME = "README.md"
 TESTS_DIR = "tests"
 EVALUATOR_DIR = "evaluator"
 
+# An exercise set is one file, the source an import stores verbatim, so it has
+# no format of its own here: a pulled set is a directory holding this file and
+# nothing else. Its name is fixed, as `challenge.toml`'s is, so that a directory
+# says what it holds; the set's title is in the file's front matter.
+EXERCISES_NAME = "exercises.md"
+
 HEADER = """\
 # A cocco challenge. Edit these files, then push them back from this directory:
 #

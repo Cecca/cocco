@@ -148,6 +148,7 @@ from cocco.repository import (
     lock_course,
     lock_course_submissions,
     lock_exercise_set,
+    lock_exercise_set_for_push,
     lock_exercise_set_for_session,
     open_exercise_session_to_all,
     pace_exercise_session,
@@ -169,6 +170,7 @@ from cocco.repository import (
     query_course_role,
     query_courses,
     query_editable_challenges,
+    query_editable_exercise_sets,
     query_effective_archived_at,
     query_enrollment_key,
     query_evaluator_path,
@@ -177,9 +179,11 @@ from cocco.repository import (
     query_exercise_session_state,
     query_exercise_sessions,
     query_exercise_set,
+    query_exercise_set_course,
     query_exercise_sets,
     query_exercise_version,
     query_exercise_version_source,
+    query_exercise_version_summary,
     query_last_session_jobs,
     query_max_checked_exercise,
     query_ordered_challenge_ids,
@@ -3425,7 +3429,7 @@ async def _import_exercise_file(
     set_id: int | None,
     source: str,
     default_title: str,
-) -> tuple[int | None, list[schema.ExerciseProblem]]:
+) -> tuple[tuple[int, int] | None, list[schema.ExerciseProblem]]:
     """Parse a file and, if it parses, make it a version and queue its build.
 
     The parse is synchronous and is the import's own check: a file with an
@@ -3438,8 +3442,8 @@ async def _import_exercise_file(
     The set (on a first import), the version and the build job are one
     transaction, committed here, with the judge's wake-up inside it - so a
     judge never wakes to a version it cannot see, and a set never exists
-    without the version it was created for. Answers the set's id, None when
-    nothing was created.
+    without the version it was created for. Answers the set's id and the new
+    version's, None when nothing was created.
     """
     parsed = exercise_format.parse(source, default_title=default_title)
     if parsed.document is None:
@@ -3460,7 +3464,7 @@ async def _import_exercise_file(
         # like any other request for it.
         await db.rollback()
         raise HTTPException(status_code=404)
-    return set_id, parsed.problems
+    return (set_id, version_id), parsed.problems
 
 
 @app.post("/courses/{course_id}/exercises")
@@ -3489,9 +3493,10 @@ async def post_exercise_set_new(
     read = await _read_exercise_file(exercise_file)
     if isinstance(read, str):
         return refuse(read)
-    set_id, problems = await _import_exercise_file(db, user, course_id, None, *read)
-    if set_id is None:
+    imported, problems = await _import_exercise_file(db, user, course_id, None, *read)
+    if imported is None:
         return refuse("The file has errors, so nothing was imported.", problems)
+    set_id, _ = imported
     return Response(
         status_code=204,
         headers={
@@ -7817,3 +7822,215 @@ async def api_import_challenge(
             "evaluator": evaluator_name,
         }
     )
+
+
+# ── Exercise sets ────────────────────────────────────────────────────────────
+#
+# A set is already a file - the source an import stores verbatim - so there is
+# no zip and no manifest here: a pull is that text and a push is an import, the
+# same `_import_exercise_file` the set page's upload goes through. What carries
+# over from challenges is the discipline around it: JSON refusals with real
+# status codes, the `ETag` a pull records and the `If-Match` a push sends.
+#
+# The version is the newest version's **id**, not a digest. A version is
+# immutable - its source is written once, when it is created - so its id names
+# its contents exactly, and every way a set's file can change, the web upload
+# included, is a new row and a new id. There is nothing to derive.
+
+
+async def require_api_exercise_set_editor(
+    set_id: int, db: DBDep, user: ApiUser
+) -> int:
+    """`require_api_challenge_editor` for an exercise set: the course is looked
+    up from the set, and the role resolved from the course. Returns the course,
+    which an import needs.
+
+    A set that does not exist is the same 403 as one on somebody else's
+    course, as a challenge is, so the API does not say which ids are taken.
+    """
+    course_id = await query_exercise_set_course(db, set_id)
+    role = (
+        None if course_id is None
+        else await effective_course_role(db, user, course_id)
+    )
+    if course_id is None or role is None or role not in EDITOR_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail="Only this exercise set's course staff can do that.",
+        )
+    return course_id
+
+
+ApiExerciseSetEditor = Annotated[int, Depends(require_api_exercise_set_editor)]
+
+
+def _exercise_version_json(set_id: int, version) -> dict:
+    """What a push answers and the build's progress is polled as."""
+    return {
+        "set_id": set_id,
+        "version": str(version.id),
+        "number": version.number,
+        "title": version.title,
+        "status": ExerciseVersionStatus(version.status).value,
+        "current": bool(version.is_current),
+        # NULL while the version builds; the build writes a list.
+        "problems": version.problems or [],
+    }
+
+
+@app.get("/api/exercises")
+async def api_list_exercise_sets(db: DBDep, user: ApiUser):
+    """`api_list_challenges` for exercise sets."""
+    rows = await query_editable_exercise_sets(
+        db,
+        user_id=user.id,
+        editor_roles=EDITOR_ROLES,
+        every_course=await is_administrator(db, user.email),
+    )
+    return JSONResponse(
+        [
+            {
+                "course_id": row["course_id"],
+                "course_title": row["course_title"],
+                "set_id": row["set_id"],
+                "title": row["title"],
+                "archived": row["archived"],
+                # The newest version, which is what a pull hands out, and the
+                # current one, which is what sessions are opened on - two
+                # numbers exactly while a re-import is building or has failed.
+                "latest_number": row["latest_number"],
+                "latest_status": row["latest_status"],
+                "current_number": row["current_number"],
+            }
+            for row in rows
+        ]
+    )
+
+
+@app.get("/api/exercises/{set_id}")
+async def api_export_exercise_set(
+    set_id: int,
+    db: DBDep,
+    course_id: ApiExerciseSetEditor,
+    if_none_match: Annotated[str | None, Header()] = None,
+):
+    """The newest version's file, exactly as it was imported.
+
+    The newest and not the current: see `query_exercise_version_summary`. Its
+    status travels in `X-Cocco-Version-Status`, on a 304 as well, so a CLI can
+    say that the file it holds is one that failed to build.
+    """
+    version = await query_exercise_version_summary(db, set_id, with_source=True)
+    if version is None:
+        raise HTTPException(status_code=404)
+    headers = {
+        "ETag": _etag(str(version.id)),
+        "X-Cocco-Version-Number": str(version.number),
+        "X-Cocco-Version-Status": ExerciseVersionStatus(version.status).value,
+    }
+    if if_none_match is not None and _etag_matches(
+        if_none_match, str(version.id), weak=True
+    ):
+        return Response(status_code=304, headers=headers)
+    filename = f"exercises-{set_id}-{_slug(version.title, 'exercises')}.md"
+    return Response(
+        content=version.source,
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            **headers,
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.post("/api/exercises/{set_id}")
+async def api_import_exercise_set(
+    set_id: int,
+    db: DBDep,
+    user: ApiUser,
+    course_id: ApiExerciseSetEditor,
+    file: Annotated[UploadFile, File()],
+    if_match: Annotated[str | None, Header()] = None,
+):
+    """Import a pushed file as a new version of the set: the set page's upload
+    by another route, so it parses here, is refused with its problems if it
+    has errors, and otherwise becomes a `building` version with its build
+    queued. Like that upload, it becomes current only once the build is ready.
+
+    `If-Match` names the newest version the pusher has seen, and a push based
+    on an older one is a 412 - a file re-imported on the web since would
+    otherwise be silently replaced. Without the header the push is applied
+    unconditionally, which is `cocco push --force`.
+
+    The title defaults to the newest version's rather than to the uploaded
+    file's name, which is always `exercises.md`: a file whose front matter
+    names no title keeps the one the set already has.
+
+    Deliberately an update and never a create, as a challenge push is: a new
+    set is imported on its course page, and pushed to once it exists.
+    """
+    read = await _read_exercise_file(file)
+    if isinstance(read, str):
+        return JSONResponse({"detail": read}, status_code=400)
+    source, _ = read
+
+    # The check and the import are one transaction under the set's lock, so
+    # two pushes based on the same version cannot both pass it - unlike a
+    # challenge's push, where closing that window would take a lock every
+    # editor route agreed to take. Here the import is the only write there is.
+    if not await lock_exercise_set_for_push(db, set_id):
+        raise HTTPException(status_code=404)
+    latest = await query_exercise_version_summary(db, set_id)
+    if latest is None:
+        raise HTTPException(status_code=404)
+    if if_match is not None and not _etag_matches(
+        if_match, str(latest.id), weak=False
+    ):
+        await db.rollback()
+        return JSONResponse(
+            {
+                "detail": (
+                    "This exercise set has changed since the version this push "
+                    "was based on. Pull it again first."
+                )
+            },
+            status_code=412,
+        )
+    imported, problems = await _import_exercise_file(
+        db, user, course_id, set_id, source, latest.title
+    )
+    if imported is None:
+        return JSONResponse(
+            {
+                "detail": "The file has errors, so no version was created.",
+                "problems": [p.model_dump(mode="json") for p in problems],
+            },
+            status_code=400,
+        )
+
+    _, version_id = imported
+    version = await query_exercise_version_summary(db, set_id, version_id)
+    if version is None:
+        raise HTTPException(status_code=404)
+    return JSONResponse(
+        {
+            **_exercise_version_json(set_id, version),
+            # The parse's warnings, now: the build finds them again and stores
+            # them on the version, but a push that waits for nothing should
+            # still hear about them.
+            "problems": [p.model_dump(mode="json") for p in problems],
+        }
+    )
+
+
+@app.get("/api/exercises/{set_id}/versions/{version_id}")
+async def api_exercise_version(
+    set_id: int, version_id: int, db: DBDep, course_id: ApiExerciseSetEditor
+):
+    """One version's status and problems, which `cocco push` polls until the
+    build it queued has finished."""
+    version = await query_exercise_version_summary(db, set_id, version_id)
+    if version is None:
+        raise HTTPException(status_code=404)
+    return JSONResponse(_exercise_version_json(set_id, version))
