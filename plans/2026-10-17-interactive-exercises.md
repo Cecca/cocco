@@ -552,11 +552,27 @@ As built:
   the projector's polled fragment instead of the control panel. A revealed solution is shown
   with `?solution=n`, outside the poll, and only once it has been revealed.
 
-### [ ] 9. Deletion and archiving
+### [x] 9. Deletion and archiving
 
 `delete_course`'s cascade, session delete, the archived-course refusal on jobs, and a test that a
 judge finishing a job of a deleted course does not crash. Staff preview checks (`session_id`
 NULL) count towards nothing either, so `prune_run_jobs` should prune them with the runs.
+
+As built:
+
+- `delete_course` calls `delete_exercise_session` for each session of each set, then
+  `delete_exercise_set`, rather than spelling the cascade a second time. `post_course_delete`
+  first takes `lock_course_exercises`: the sessions, then the versions, then the sets, `FOR
+  UPDATE`, which is the order a queued job and a finishing build take them in. It keeps out a new
+  job, participant, reveal, preview or version while the deletes run. Nothing waits for the judge.
+- A session is deleted at `…/sessions/{session_id}/delete`, by course staff, from a danger zone
+  on its staff page that asks for its label typed out. It takes the session's row `FOR UPDATE`
+  (`query_exercise_session_state(lock="update")`) and lands on the set page. It is allowed in
+  any state, live included.
+- An archived course refuses every Run and Check, in a session and in a staff preview, with one
+  sentence (`ARCHIVED_EXERCISE_JOB_REFUSAL`). A build is not refused: importing is editing, and
+  staff go on editing an archived course.
+- `prune_run_jobs` prunes runs and session-less checks; a build and a session's check are kept.
 
 ### [ ] 10. Transfer (may slip to a follow-up)
 

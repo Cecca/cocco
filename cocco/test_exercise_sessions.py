@@ -12,7 +12,7 @@ import textwrap
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select, update
 
 from cocco import main
 from cocco import repository as repo
@@ -20,11 +20,16 @@ from cocco.exercises import format as exercise_format
 from cocco.conftest import sign_in_as
 from cocco.main import Forbidden
 from cocco.model import (
+    Course,
     ExerciseJob,
     ExerciseJobKind,
+    ExerciseJobStatus,
     ExerciseSession,
     ExerciseSessionMode,
+    ExerciseSessionParticipant,
     ExerciseSessionReveal,
+    ExerciseSet,
+    ExerciseSetVersion,
     ExerciseVersionStatus,
     UserRole,
 )
@@ -675,3 +680,134 @@ async def test_an_opening_and_a_set_delete_serialize(client, world, db, app_engi
         await deleter.commit()
         assert await task is None
         await opener.rollback()
+
+
+########################################################################
+# Deletion and archiving
+
+
+def _rows(db, table, *where) -> list:
+    with db.connect() as conn:
+        return conn.execute(select(table).where(*where)).all()
+
+
+def _populate(client, world, db, base) -> None:
+    """A student who came, checked and ran; a revealed solution; staff
+    previews and the set's build beside them."""
+    sign_in_as(client, STUDENT)
+    client.get(f"{base}/1")
+    client.post(f"{base}/1/check", data={"source": "print(42)"})
+    client.post(f"{base}/1/run", data={"source": "print(42)", "stdin": "1"})
+    sign_in_as(client, TEACHER)
+    assert client.post(f"{base}/reveal", data={"n": "1"}).status_code == 200
+
+
+async def test_deleting_a_session_takes_its_work_and_nothing_else(
+    client, world, db, ready, session
+):
+    set_id, version_id, preview = ready
+    session_id, base = session
+    other = _opened(client, world, set_id, label="Lab B")
+    other_base = f"/courses/{world['course']}/sessions/{other}"
+    _populate(client, world, db, base)
+    _populate(client, world, db, other_base)
+    client.post(f"{preview}/1/run", data={"source": "print(1)"})
+
+    response = client.post(f"{base}/delete", data={"confirm": " Lab A "})
+    assert response.status_code == 204, response.text
+    assert response.headers["HX-Redirect"].endswith(
+        f"/courses/{world['course']}/exercises/{set_id}"
+    )
+    assert _rows(db, ExerciseSession, ExerciseSession.c.id == session_id) == []
+    for table in (ExerciseJob, ExerciseSessionParticipant, ExerciseSessionReveal):
+        assert _rows(db, table, table.c.session_id == session_id) == []
+        assert _rows(db, table, table.c.session_id == other) != []
+    # The set, its build and the preview are the set's, not the session's.
+    assert _count(db, ExerciseJob, ExerciseJob.c.session_id.is_(None)) == 2
+    assert [v.id for v in _versions(db, set_id)] == [version_id]
+
+
+async def test_deleting_a_session_asks_for_its_label(client, world, db, session):
+    session_id, base = session
+    response = client.post(f"{base}/delete", data={"confirm": "Lab"})
+    assert response.status_code == 200
+    assert "Nothing was changed" in response.text
+    assert _session(db, session_id).label == "Lab A"
+    page = client.get(base).text
+    assert 'data-expected="Lab A"' in page
+
+
+async def test_deleting_a_session_is_staff_only(client, world, db, session):
+    session_id, base = session
+    sign_in_as(client, STUDENT)
+    assert client.post(f"{base}/delete", data={"confirm": "Lab A"}).status_code == 403
+    sign_in_as(client, OTHER_TEACHER)
+    other = f"/courses/{world['other']}/sessions/{session_id}/delete"
+    assert client.post(other, data={"confirm": "Lab A"}).status_code == 404
+    assert _session(db, session_id).label == "Lab A"
+
+
+async def test_deleting_a_course_takes_its_exercises_and_a_late_result_lands_nowhere(
+    client, world, db, ready, session
+):
+    """The course's cascade reaches the exercise tables, and a judge that was
+    running one of the course's jobs finishes it into zero rows rather than
+    into a foreign key violation - the reason results are a column."""
+    _, _, preview = ready
+    _, base = session
+    _populate(client, world, db, base)
+    client.post(f"{preview}/1/check", data={"source": "print(1)"})
+    _imported(client, world)  # a second set, still building
+    with db.begin() as conn:
+        running = conn.execute(
+            update(ExerciseJob)
+            .where(ExerciseJob.c.kind == ExerciseJobKind.check)
+            .values(status=ExerciseJobStatus.running, started_at=func.now())
+            .returning(ExerciseJob.c.id)
+        ).scalars().all()
+    assert len(running) == 2  # the student's and the preview's
+
+    sign_in_as(client, ADMIN)
+    response = client.post(
+        f"/courses/{world['course']}/delete", data={"confirm": "Programming 1"}
+    )
+    assert response.status_code == 204, response.text
+    for table in (
+        ExerciseJob,
+        ExerciseSessionParticipant,
+        ExerciseSessionReveal,
+        ExerciseSession,
+        ExerciseSetVersion,
+        ExerciseSet,
+    ):
+        assert _count(db, table) == 0, table.name
+
+    result = {"kind": "error", "message": "late"}
+    with db.begin() as conn:
+        for job_id in running:
+            repo.finish_exercise_job(conn, job_id, result)
+    assert _count(db, ExerciseJob) == 0
+
+
+async def test_an_archived_course_runs_no_exercise(client, world, db, ready, session):
+    """The third of archiving's enforcement points: no Run or Check in a
+    session, and no staff preview either. Reading still works."""
+    _, _, preview = ready
+    _, base = session
+    with db.begin() as conn:
+        conn.execute(
+            update(Course)
+            .where(Course.c.id == world["course"])
+            .values(archived_at=func.now())
+        )
+    response = client.post(f"{preview}/1/check", data={"source": "print(1)"})
+    assert response.status_code == 200
+    assert "This course is archived" in response.text
+
+    sign_in_as(client, STUDENT)
+    assert client.get(f"{base}/1").status_code == 200
+    for button in ("check", "run"):
+        response = client.post(f"{base}/1/{button}", data={"source": "print(1)"})
+        assert response.status_code == 200
+        assert "This course is archived" in response.text
+    assert _count(db, ExerciseJob, ExerciseJob.c.kind != ExerciseJobKind.build) == 0

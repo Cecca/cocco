@@ -24,6 +24,8 @@ from cocco.model import (
     ExerciseJob,
     ExerciseJobKind,
     ExerciseJobStatus,
+    ExerciseSession,
+    ExerciseSessionMode,
     ExerciseSet,
     ExerciseSetVersion,
     ExerciseVersionStatus,
@@ -515,17 +517,36 @@ async def test_a_failing_requeue_does_not_swallow_the_cancellation(
         await asyncio.wait_for(task, 5)
 
 
-def test_old_runs_are_pruned_and_nothing_else(db):
+def test_old_runs_and_previews_are_pruned_and_nothing_else(db):
+    """A run counts towards nothing, and neither does a staff preview's check
+    (no session). A session's check is progress, and a build is its version's
+    record: both are kept, however old."""
     user_id, set_id = _set(db)
     version_id = _version(db, set_id)
     long_ago = datetime.now(timezone.utc) - timedelta(days=200)
     jobs = {}
     with db.begin() as conn:
-        for name, kind, enqueued in [
-            ("old run", ExerciseJobKind.run, long_ago),
-            ("old check", ExerciseJobKind.check, long_ago),
-            ("new run", ExerciseJobKind.run, datetime.now(timezone.utc)),
+        session_id = conn.execute(
+            insert(ExerciseSession)
+            .values(
+                set_id=set_id,
+                version_id=version_id,
+                label="Lab A",
+                mode=ExerciseSessionMode.live,
+                unlocked_through=1,
+            )
+            .returning(ExerciseSession.c.id)
+        ).scalar_one()
+        for name, kind, session, enqueued in [
+            ("old run", ExerciseJobKind.run, session_id, long_ago),
+            ("old preview run", ExerciseJobKind.run, None, long_ago),
+            ("old preview check", ExerciseJobKind.check, None, long_ago),
+            ("old check", ExerciseJobKind.check, session_id, long_ago),
+            ("old build", ExerciseJobKind.build, None, long_ago),
+            ("new run", ExerciseJobKind.run, session_id, datetime.now(timezone.utc)),
+            ("new preview check", ExerciseJobKind.check, None, datetime.now(timezone.utc)),
         ]:
+            build = kind is ExerciseJobKind.build
             jobs[name] = conn.execute(
                 insert(ExerciseJob)
                 .values(
@@ -533,8 +554,9 @@ def test_old_runs_are_pruned_and_nothing_else(db):
                     status=ExerciseJobStatus.done,
                     user_id=user_id,
                     version_id=version_id,
-                    exercise_index=1,
-                    source="",
+                    session_id=session,
+                    exercise_index=None if build else 1,
+                    source=None if build else "",
                     result={"kind": "error", "message": ""},
                     enqueued=enqueued,
                     started_at=enqueued,
@@ -544,10 +566,12 @@ def test_old_runs_are_pruned_and_nothing_else(db):
             ).scalar_one()
 
     with db.begin() as conn:
-        assert repo.prune_run_jobs(conn, 10) == 1
+        assert repo.prune_run_jobs(conn, 10) == 3
     with db.connect() as conn:
         left = set(conn.execute(select(ExerciseJob.c.id)).scalars())
-    assert left == {jobs["old check"], jobs["new run"]}
+    assert left == {
+        jobs[name] for name in ("old check", "old build", "new run", "new preview check")
+    }
 
 
 def test_pruning_goes_in_batches(db, monkeypatch):

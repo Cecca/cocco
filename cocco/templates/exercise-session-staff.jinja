@@ -31,5 +31,76 @@
      every route behind a button answers with a fresh copy of it, alert
      included. #}
   {% include "f-exercise-session.jinja" %}
+
+  <!-- ══ DANGER ZONE ════════════════════════════════════════════════ -->
+  <div class="card bg-base-100 border border-error/40 shadow-sm mt-10">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg text-error">Danger zone</h2>
+      <div id="exercise-session-danger-result" class="empty:hidden mt-3"></div>
+
+      <div class="flex flex-wrap items-center justify-between gap-4 mt-4 rounded-xl border border-error/30 p-4">
+        <div class="min-w-0 flex-1">
+          <h3 class="font-semibold">Delete this session</h3>
+          <p class="text-[13px] text-base-content/55">
+            Every Run and Check its students made, who took part and which
+            solutions were revealed. The set and its other sessions stay.
+            There is no undo.
+          </p>
+        </div>
+        <button type="button" class="btn btn-sm btn-error font-semibold"
+                onclick="delete_exercise_session_modal.showModal()">
+          Delete session…
+        </button>
+      </div>
+    </div>
+  </div>
 </main>
+
+{# The set page's dialog, for a session; the label reaches the script through
+   `data-expected`, never a JS string literal. #}
+<dialog id="delete_exercise_session_modal" class="modal">
+  <div class="modal-box">
+    <h3 class="font-bold text-lg text-error">Delete {{ session.label }}?</h3>
+    <p class="py-3 text-sm text-base-content/70">
+      Every Run and Check made in this session is deleted for good, and its
+      dashboard with them.
+    </p>
+    <p class="text-sm text-base-content/70">
+      Type <span class="font-semibold">{{ session.label }}</span> below to confirm.
+    </p>
+    <input type="text" id="exercise-session-delete-confirm" name="confirm"
+           autocomplete="off" data-expected="{{ session.label }}"
+           aria-label="Type the session's label to confirm"
+           class="input w-full mt-3 font-mono" />
+    <div class="modal-action">
+      <form method="dialog">
+        <button class="btn btn-sm btn-ghost">Cancel</button>
+      </form>
+      <button type="button" id="exercise-session-delete-button" disabled
+              class="btn btn-sm btn-error"
+              hx-post="{{ url_for('post_exercise_session_delete', course_id=course_id, session_id=session.id) }}"
+              hx-include="#exercise-session-delete-confirm"
+              hx-target="#exercise-session-danger-result"
+              hx-swap="innerHTML"
+              onclick="delete_exercise_session_modal.close()">
+        Delete for good
+      </button>
+    </div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<script>
+  (() => {
+    const field = document.getElementById("exercise-session-delete-confirm");
+    const button = document.getElementById("exercise-session-delete-button");
+    const check = () => {
+      button.disabled = field.value.trim() !== field.dataset.expected.trim();
+    };
+    field.addEventListener("input", check);
+    document.getElementById("delete_exercise_session_modal")
+            .addEventListener("close", () => { field.value = ""; check(); });
+    check();
+  })();
+</script>
 {% endblock %}

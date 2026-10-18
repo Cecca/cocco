@@ -385,20 +385,31 @@ def requeue_exercise_job(conn: Connection, job_id: int, superseded: dict) -> boo
 
 # How long a run job is kept: a term, so a teacher can see what a student tried
 # before they dared press Check, and the same six months the logs are kept for.
-# Checks are never pruned - progress is derived from them.
+# A session's checks are never pruned - progress is derived from them.
 RUN_JOB_RETENTION = "6 months"
 
 
 def prune_run_jobs(conn: Connection, limit: int) -> int:
-    """Delete up to `limit` finished run jobs older than `RUN_JOB_RETENTION`,
-    and say how many. The judge calls it, in batches, when it is idle."""
+    """Delete up to `limit` finished jobs older than `RUN_JOB_RETENTION` that
+    count towards nothing, and say how many. The judge calls it, in batches,
+    when it is idle.
+
+    That is every run, and every staff preview's check: a preview has no
+    session (`session_id` NULL), so no progress query ever reads one. A build
+    is kept, being what its version's problems were found by."""
     result = conn.execute(
         delete(ExerciseJob).where(
             ExerciseJob.c.id.in_(
                 select(ExerciseJob.c.id)
                 .where(
                     ExerciseJob.c.status == ExerciseJobStatus.done,
-                    ExerciseJob.c.kind == ExerciseJobKind.run,
+                    or_(
+                        ExerciseJob.c.kind == ExerciseJobKind.run,
+                        and_(
+                            ExerciseJob.c.kind == ExerciseJobKind.check,
+                            ExerciseJob.c.session_id.is_(None),
+                        ),
+                    ),
                     ExerciseJob.c.enqueued
                     < func.now() - text(f"interval '{RUN_JOB_RETENTION}'"),
                 )
@@ -954,6 +965,31 @@ async def delete_exercise_set(conn: AsyncConnection, set_id: int) -> None:
         delete(ExerciseSetVersion).where(ExerciseSetVersion.c.set_id == set_id)
     )
     await conn.execute(delete(ExerciseSet).where(ExerciseSet.c.id == set_id))
+
+
+async def delete_exercise_session(conn: AsyncConnection, session_id: int) -> None:
+    """Delete a session: its jobs, its reveals, its participants, then the
+    session. Formative work with nothing to keep a record of, unlike a
+    challenge's submissions. Does not commit.
+
+    The caller has taken the session's row `FOR UPDATE`
+    (`query_exercise_session_state(lock="update")`): a job being queued holds
+    it `FOR SHARE`, and a participant or a reveal being written holds it
+    `FOR KEY SHARE` through its foreign key, so none of them can land between
+    these deletes and the last one. A judge finishing one of its jobs
+    meanwhile updates zero rows (`finish_exercise_job`), so nothing waits for
+    the judge.
+    """
+    await conn.execute(delete(ExerciseJob).where(ExerciseJob.c.session_id == session_id))
+    await conn.execute(
+        delete(ExerciseSessionReveal).where(ExerciseSessionReveal.c.session_id == session_id)
+    )
+    await conn.execute(
+        delete(ExerciseSessionParticipant).where(
+            ExerciseSessionParticipant.c.session_id == session_id
+        )
+    )
+    await conn.execute(delete(ExerciseSession).where(ExerciseSession.c.id == session_id))
 
 
 # --- Exercise sessions ---------------------------------------------------------
@@ -3065,6 +3101,41 @@ async def lock_course_submissions(conn: AsyncConnection, course_id: int) -> int:
     return sum(1 for status in rows if status == SubmissionStatus.running)
 
 
+async def lock_course_exercises(conn: AsyncConnection, course_id: int) -> None:
+    """Lock a course's exercise sessions, versions and sets for its delete.
+    Does not commit.
+
+    `lock_exercise_set` widened to a course, with the sessions in front - the
+    order every writer takes them in, so a delete queues up behind each of
+    them instead of deadlocking: a job being queued holds its session, then
+    its version through the foreign key; a finishing build writes its version,
+    then its set. Holding the sessions keeps out new jobs, participants and
+    reveals, the versions new previews, and the sets new versions.
+
+    `lock_exercise_set`'s window stays open, wider: a set or a session created
+    between these locks and the deletes is not covered by them. The deletes
+    still take it, since each statement sees what has committed, and in the
+    rare case it brings a row the deletes did not expect the course's foreign
+    keys refuse and the whole delete rolls back - nothing is left half-done.
+    No lock waits for the judge: a job it finishes on a deleted session or
+    version updates zero rows (`finish_exercise_job`).
+    """
+    set_ids = select(ExerciseSet.c.id).where(ExerciseSet.c.course_id == course_id)
+    await conn.execute(
+        select(ExerciseSession.c.id)
+        .where(ExerciseSession.c.set_id.in_(set_ids))
+        .with_for_update()
+    )
+    await conn.execute(
+        select(ExerciseSetVersion.c.id)
+        .where(ExerciseSetVersion.c.set_id.in_(set_ids))
+        .with_for_update()
+    )
+    await conn.execute(
+        select(ExerciseSet.c.id).where(ExerciseSet.c.course_id == course_id).with_for_update()
+    )
+
+
 async def delete_challenge(conn: AsyncConnection, challenge_id: int) -> None:
     """Delete a challenge and everything that hangs off it.
 
@@ -3115,11 +3186,30 @@ async def delete_course(conn: AsyncConnection, course_id: int) -> None:
     `query_ordered_challenge_ids` is the list, so this and the route that has
     to collect the files before it runs walk exactly the same set.
 
+    The exercise sets go the same way: `delete_exercise_session` for each of
+    their sessions, then `delete_exercise_set`, which is the plan's order -
+    jobs, reveals, participants, sessions, then the versions and the set. The
+    caller has taken `lock_course_exercises`.
+
     Nothing else in the schema references `course`: `administrator` is keyed on
     an address and has no foreign key here at all.
     """
     for challenge_id in await query_ordered_challenge_ids(conn, course_id):
         await delete_challenge(conn, challenge_id)
+    set_ids = (
+        await conn.execute(
+            select(ExerciseSet.c.id).where(ExerciseSet.c.course_id == course_id)
+        )
+    ).scalars().all()
+    for set_id in set_ids:
+        session_ids = (
+            await conn.execute(
+                select(ExerciseSession.c.id).where(ExerciseSession.c.set_id == set_id)
+            )
+        ).scalars().all()
+        for session_id in session_ids:
+            await delete_exercise_session(conn, session_id)
+        await delete_exercise_set(conn, set_id)
     await conn.execute(delete(Enrollment).where(Enrollment.c.course_id == course_id))
     await conn.execute(delete(Course).where(Course.c.id == course_id))
 

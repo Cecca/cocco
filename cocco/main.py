@@ -122,6 +122,7 @@ from cocco.repository import (
     delete_challenge,
     delete_course,
     delete_enrollment,
+    delete_exercise_session,
     delete_exercise_set,
     delete_testcase,
     delete_user_password,
@@ -138,6 +139,7 @@ from cocco.repository import (
     insert_exercise_set,
     insert_exercise_version,
     insert_self_enrollment,
+    lock_course_exercises,
     insert_submission,
     insert_testcase,
     insert_user,
@@ -3024,6 +3026,10 @@ async def post_course_delete(
     running = await lock_course_submissions(db, course_id)
     if running:
         return _danger_alert(request, _judge_busy_message(running, "course"))
+    # The exercises need no such refusal - a job the judge finishes on a
+    # deleted session updates zero rows - only the locks that keep a new job,
+    # preview or version from landing among the deletes.
+    await lock_course_exercises(db, course_id)
 
     # Read before the deletes, unlinked after the commit: the order
     # `post_testcase_delete` states. A failed commit can leave a file nothing
@@ -3919,6 +3925,12 @@ async def _post_exercise_preview_job(
     200 with the alert, htmx's rule.
     """
     await _ready_exercise(db, set_id, version_id, n)
+    # An archived course runs nothing, the staff's previews included: the
+    # rule `post_submission` keeps for a challenge, staff included there too.
+    if await query_course_archived_at(db, course_id) is not None:
+        return await _render_exercise_job(
+            request, db, None, None, ARCHIVED_EXERCISE_JOB_REFUSAL
+        )
     refusal = _exercise_job_refusal(source, stdin)
     if refusal is not None:
         return await _render_exercise_job(request, db, None, None, refusal)
@@ -4381,6 +4393,51 @@ async def get_exercise_session(
         context["session_id"] = session_id
         name = "exercise-session.jinja"
     return templates.TemplateResponse(request=request, name=name, context=context)
+
+
+@app.post("/courses/{course_id}/sessions/{session_id}/delete")
+async def post_exercise_session_delete(
+    course_id: int,
+    session_id: int,
+    request: Request,
+    db: DBDep,
+    role: ExerciseSessionEditor,
+    confirm: Annotated[str, Form()] = "",
+):
+    """Delete a session with everything in it: its students' Runs and Checks,
+    its participants and its reveals. The set and its versions stay, and so
+    do the set's other sessions.
+
+    Asks for the session's label typed out, the danger zones' rule, and lands
+    on the set page, the list the session has just left. Allowed whatever the
+    session's state, live included, and while the judge is running one of its
+    jobs: a result landing on a deleted job updates zero rows.
+    """
+    session = await query_exercise_session(db, session_id)
+    if session is None:
+        raise HTTPException(status_code=404)
+    if not _confirmation_matches(confirm, session["label"]):
+        return _danger_alert(
+            request,
+            "Type the session's label exactly as it is shown to delete it. "
+            "Nothing was changed.",
+        )
+    # `FOR UPDATE`, so a job, a participant or a reveal being written waits
+    # for the delete, or the delete for it; see `delete_exercise_session`.
+    state = await query_exercise_session_state(db, session_id, lock="update")
+    if state is None:
+        await db.rollback()
+        raise HTTPException(status_code=404)
+    await delete_exercise_session(db, session_id)
+    await db.commit()
+    return Response(
+        status_code=204,
+        headers={
+            "HX-Redirect": str(
+                request.url_for("get_exercise_set", course_id=course_id, set_id=state.set_id)
+            )
+        },
+    )
 
 
 async def _register_participant(
@@ -5006,6 +5063,12 @@ async def _session_strip_context(
     }
 
 
+ARCHIVED_EXERCISE_JOB_REFUSAL = (
+    "This course is archived. You can still read the exercises and look back "
+    "at your work, but nothing new is run."
+)
+
+
 STAFF_SESSION_JOB_REFUSAL = (
     "You are staff on this course, so Run and Check here are not recorded in "
     "the session - its jobs are the students' work. Try the exercise in the "
@@ -5205,7 +5268,15 @@ async def _post_session_job(
     set's preview, which runs the same jobs and records nothing: a session's
     jobs are its students' work, so its progress needs no question about who
     is staff. They can still open the page, past the pacing, to see it.
+
+    An archived course takes no job at all: this is the third of archiving's
+    enforcement points, beside `post_submission` and `post_course_enroll`.
+    Asked first, since it is the answer for staff and students alike.
     """
+    if await query_course_archived_at(db, course_id) is not None:
+        return await _render_exercise_job(
+            request, db, None, None, ARCHIVED_EXERCISE_JOB_REFUSAL
+        )
     if role in EDITOR_ROLES:
         state = await query_exercise_session_state(db, session_id)
         if state is None:
