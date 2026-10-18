@@ -15,10 +15,16 @@
       <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">Exercise session</p>
       <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ session.label }}</h1>
     </div>
-    <a href="{{ url_for('get_exercise_set', course_id=course_id, set_id=session.set_id) }}"
-       class="btn btn-sm btn-ghost border border-base-300 font-semibold">
-      ← Back to the set
-    </a>
+    <div class="flex flex-wrap gap-2">
+      <a href="{{ url_for('get_exercise_dashboard', course_id=course_id, session_id=session.id) }}"
+         class="btn btn-sm btn-primary font-semibold">Dashboard</a>
+      <a href="{{ url_for('get_exercise_projector', course_id=course_id, session_id=session.id) }}"
+         class="btn btn-sm btn-ghost border border-base-300 font-semibold">Projector</a>
+      <a href="{{ url_for('get_exercise_set', course_id=course_id, set_id=session.set_id) }}"
+         class="btn btn-sm btn-ghost border border-base-300 font-semibold">
+        ← Back to the set
+      </a>
+    </div>
   </div>
 
   {# The control panel. Everything a button here changes is inside it, and

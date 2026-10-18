@@ -163,7 +163,7 @@
               </button>
               {% endif %}
               <div id="check-result" class="mt-4">
-                {% with job=check.job, poll_url=check.poll_url, message=check.message, result=check.result, tests=check.tests, earlier_version=check.earlier_version %}
+                {% with job=check.job, poll_url=check.poll_url, message=check.message, result=check.result, tests=check.tests, redact=check.redact, earlier_version=check.earlier_version %}
                 {% if job is not none %}{% include "f-exercise-job.jinja" %}{% endif %}
                 {% endwith %}
               </div>
@@ -187,7 +187,7 @@
               </button>
               {% endif %}
               <div id="run-result" class="mt-4">
-                {% with job=run.job, poll_url=run.poll_url, message=run.message, result=run.result, tests=run.tests, earlier_version=run.earlier_version %}
+                {% with job=run.job, poll_url=run.poll_url, message=run.message, result=run.result, tests=run.tests, redact=run.redact, earlier_version=run.earlier_version %}
                 {% if job is not none %}{% include "f-exercise-job.jinja" %}{% endif %}
                 {% endwith %}
               </div>

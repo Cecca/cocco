@@ -1,0 +1,61 @@
+{# One cell of the dashboard opened up: a person's latest Check and latest
+   Run of one exercise, the code each sent and its result in full. Swapped
+   into `#drill-in`, outside the polled grid; it polls itself, `outerHTML`,
+   while a job of it is pending (`poll_url`), and the copy that has nothing
+   pending stops.
+
+   Each result is `f-exercise-job.jinja` with no `poll_url` of its own and
+   with `redact` off, read against the version its job ran on.
+
+   Context: `person` (`query_session_cohort_member`), `n`, `title`, `last`
+   (`query_last_session_jobs`), `jobs` (an `_exercise_job_context` per kind),
+   `poll_url`. #}
+
+{# Escaped explicitly: `Jinja2Templates` autoescapes only .html/.xml, so a
+   `.jinja` file is not, and what this prints is code and program output. #}
+{% autoescape true %}
+<div class="card bg-base-100 border border-base-300 shadow-sm"
+     {% if poll_url %}
+     hx-get="{{ poll_url }}"
+     hx-trigger="every 2s"
+     hx-swap="outerHTML"
+     data-swap-guard
+     {% endif %}>
+  <div class="card-body p-7 gap-4">
+    <div class="flex flex-wrap items-baseline gap-3">
+      <h2 class="font-bold text-lg">{{ person.nickname }}</h2>
+      <span class="text-xs text-base-content/45">{{ person.email }}</span>
+      <span class="ml-auto font-mono text-sm text-base-content/55">{{ n }}. {{ title }}</span>
+    </div>
+
+    {% if not last %}
+    <p class="text-sm text-base-content/55">No Run and no Check of this exercise yet.</p>
+    {% endif %}
+
+    <div class="grid gap-6 lg:grid-cols-2">
+      {% for kind, heading in [("check", "Latest Check"), ("run", "Latest Run")] %}
+      {% set job = last.get(kind) %}
+      {% if job is not none %}
+      <section class="flex flex-col gap-2 min-w-0">
+        <h3 class="font-semibold">{{ heading }}
+          <span class="text-xs font-normal text-base-content/45">· sent {{ job.submitted_at | datetime }}</span>
+        </h3>
+        <div class="max-h-[50vh] overflow-auto rounded-xl border border-base-300 bg-base-200/40">
+          {{ job.source | highlight("python") }}
+        </div>
+        {% if kind == "run" %}
+        <div class="text-[11px] uppercase tracking-wider text-base-content/45">Input</div>
+        <pre class="max-h-32 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono whitespace-pre-wrap">{{ job.stdin or "(empty)" }}</pre>
+        {% endif %}
+        {% with job = jobs[kind].job, poll_url = none, message = none, link = none,
+                result = jobs[kind].result, tests = jobs[kind].tests,
+                redact = jobs[kind].redact, earlier_version = jobs[kind].earlier_version %}
+        {% include "f-exercise-job.jinja" %}
+        {% endwith %}
+      </section>
+      {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+</div>
+{% endautoescape %}

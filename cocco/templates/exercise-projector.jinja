@@ -1,0 +1,45 @@
+{% extends "base.jinja" %}
+{% block title %}{% autoescape true %}Projector · {{ projector.label }}{% endautoescape %}{% endblock %}
+{# `exercise.js` for its `data-swap-guard` alone, as on the dashboard. #}
+{% block head %}<script defer src="{{ static_url('exercise.js') }}"></script>{% endblock %}
+
+{# The screen the class sees. It is handed `projector_view`'s document and
+   nothing else, so there is no name on it to show: a projected screen must
+   never say who is stuck.
+
+   The bars and the controls are `f-exercise-projector.jinja`, polled; a
+   revealed solution, opened with `?solution=n`, sits **outside** it, so the
+   poll does not close it. Context: `projector`, `solution` (None, or the
+   revealed exercise's `n`, `title` and `source`), `course`, `course_id`,
+   `session_id`, `message`, `ok`. #}
+{% block body %}
+{% autoescape true %}
+<main class="mx-auto max-w-6xl px-6 py-8">
+  <div class="flex flex-wrap items-start justify-between gap-4 mb-6">
+    <div>
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">{{ course.title }}</p>
+      <h1 class="font-serif text-4xl font-semibold tracking-tight mt-1">{{ projector.label }}</h1>
+    </div>
+    <a href="{{ url_for('get_exercise_dashboard', course_id=course_id, session_id=session_id) }}"
+       class="btn btn-sm btn-ghost border border-base-300 font-semibold">Dashboard</a>
+  </div>
+
+  {% include "f-exercise-projector.jinja" %}
+
+  {% if solution %}
+  <section class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+    <div class="card-body p-7">
+      <div class="flex items-center justify-between gap-4">
+        <h2 class="font-bold text-2xl">Solution · {{ solution.n }}. {{ solution.title }}</h2>
+        <a href="{{ url_for('get_exercise_projector', course_id=course_id, session_id=session_id) }}"
+           class="btn btn-sm btn-ghost border border-base-300">Hide</a>
+      </div>
+      <div class="mt-3 overflow-auto rounded-xl border border-base-300 bg-base-200/40 text-lg">
+        {{ solution.source | highlight("python") }}
+      </div>
+    </div>
+  </section>
+  {% endif %}
+</main>
+{% endautoescape %}
+{% endblock %}

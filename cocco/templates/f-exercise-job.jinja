@@ -8,7 +8,8 @@
    Context: `job` (`query_preview_job` or `query_session_job`, or None with
    `message` - and perhaps a `link` to go to instead - for a request that was
    refused before anything was queued),
-   `poll_url`, `result` (the parsed `schema.ExerciseJobResult` once done) and
+   `poll_url` (None for a page that polls for it instead - the dashboard's
+   drill-in), `redact`, `result` (the parsed `schema.ExerciseJobResult` once done) and
    `tests` (a check's rows, `exercise_check_rows`'s), and `earlier_version`
    (the job ran on a version the session has since left). A `redacted` row is a
    hidden test as a student may see it - the verdict and, on an error, the
@@ -80,7 +81,7 @@
 {%- endmacro %}
 
 <div class="flex flex-col gap-3"
-     {% if job is not none and job.status.value != "done" %}
+     {% if job is not none and job.status.value != "done" and poll_url %}
      hx-get="{{ poll_url }}"
      data-swap-guard
      hx-trigger="every 500ms"
@@ -89,8 +90,13 @@
 
   {% if earlier_version %}
   <p class="text-xs text-warning">
+    {% if redact %}
     This ran on an earlier version of the exercise, before your teacher updated
     it: the statement and tests may have changed since.
+    {% else %}
+    This ran on an earlier version of the exercise than the session is on now,
+    and is shown against that version's tests.
+    {% endif %}
   </p>
   {% endif %}
 

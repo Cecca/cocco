@@ -1172,11 +1172,7 @@ async def query_exercise_session(conn: AsyncConnection, session_id: int):
                 WHERE versions.id = s.version_id) AS version,
                (SELECT row_to_json(versions) FROM versions
                 WHERE versions.id = exercise_set.current_version_id) AS latest,
-               coalesce(
-                   (SELECT json_agg(r.exercise_index ORDER BY r.exercise_index)
-                    FROM exercise_session_reveal r WHERE r.session_id = s.id),
-                   '[]'::json
-               ) AS revealed,
+               {_SESSION_REVEALED_SQL} AS revealed,
                (SELECT max(j.exercise_index) FROM exercise_job j
                 WHERE j.session_id = s.id AND j.kind = 'check') AS max_checked
         FROM s JOIN exercise_set ON exercise_set.id = s.set_id
@@ -1395,20 +1391,58 @@ async def insert_session_participant(
     )
 
 
-# One student's check jobs in one session, an aggregate row per exercise: what
-# the strip colours each exercise by. Solved is sticky - any passing check, on
-# any version the session has been on - and `checking` is a check not yet done.
-# `passed` is read only off a finished check: an error result has no such key,
-# which the coalesce makes "not passed". Through `ix_exercise_job_check`.
-_SESSION_CHECKS_CTE = """
+def _session_checks_cte(one_user: bool) -> str:
+    """The check jobs of one session, an aggregate row per person and
+    exercise: what the strip colours each exercise by, and what the teacher's
+    two screens count. Solved is sticky - any passing check, on any version the
+    session has been on - and `checking` is a check not yet done. `passed` is
+    read only off a finished check: an error result has no such key, which the
+    coalesce makes "not passed". Through `ix_exercise_job_check`.
+
+    Each row carries itself as `doc`, the `{n, solved, checking}` object
+    `_exercise_status` reads, so the strip and the dashboard aggregate that
+    and never spell the object out for themselves. Spelled once for all of
+    them, so the strip a student sees and the cell the teacher sees for them
+    cannot disagree; `one_user` narrows it to `:user_id`, the strip's."""
+    narrow = "AND j.user_id = :user_id" if one_user else ""
+    return f"""
     checks AS (
-        SELECT j.exercise_index AS n,
-               bool_or(j.status = 'done'
-                       AND coalesce((j.result ->> 'passed')::boolean, false)) AS solved,
-               bool_or(j.status <> 'done') AS checking
-        FROM exercise_job j
-        WHERE j.session_id = :session_id AND j.user_id = :user_id AND j.kind = 'check'
-        GROUP BY j.exercise_index
+        SELECT agg.*,
+               json_build_object('n', agg.n, 'solved', agg.solved,
+                                 'checking', agg.checking) AS doc
+        FROM (
+            SELECT j.user_id, j.exercise_index AS n,
+                   bool_or(j.status = 'done'
+                           AND coalesce((j.result ->> 'passed')::boolean, false)) AS solved,
+                   bool_or(j.status <> 'done') AS checking
+            FROM exercise_job j
+            WHERE j.session_id = :session_id {narrow} AND j.kind = 'check'
+            GROUP BY j.user_id, j.exercise_index
+        ) agg
+    )
+    """
+
+
+# A session's cohort, after `_session_checks_cte`: the participants unioned
+# with anyone who has a check in it, `query_challenge_standings`'s rule - a
+# check from somebody whose participant row is missing (a visit that raced a
+# close) still counts. The dashboard's people and the projector's denominator.
+_SESSION_COHORT_CTE = """
+    cohort AS (
+        SELECT user_id FROM exercise_session_participant WHERE session_id = :session_id
+        UNION
+        SELECT user_id FROM checks
+    )
+"""
+
+
+# The exercises whose solution is revealed in a session, as a JSON array in
+# order. Takes a row `s` of `exercise_session`.
+_SESSION_REVEALED_SQL = """
+    coalesce(
+        (SELECT json_agg(r.exercise_index ORDER BY r.exercise_index)
+         FROM exercise_session_reveal r WHERE r.session_id = s.id),
+        '[]'::json
     )
 """
 
@@ -1445,11 +1479,11 @@ async def query_session_strip(conn: AsyncConnection, session_id: int, user_id: i
     """
     query = text(f"""
     WITH
-    {_SESSION_CHECKS_CTE},
+    {_session_checks_cte(one_user=True)},
     doc AS (
         SELECT s.mode, s.unlocked_through, s.closed_at,
                {_EXERCISE_TITLES_SQL} AS titles,
-               coalesce((SELECT json_agg(checks ORDER BY checks.n) FROM checks),
+               coalesce((SELECT json_agg(checks.doc ORDER BY checks.n) FROM checks),
                         '[]'::json) AS checks
         FROM exercise_session s
         JOIN exercise_set_version v ON v.id = s.version_id
@@ -1459,6 +1493,108 @@ async def query_session_strip(conn: AsyncConnection, session_id: int, user_id: i
     """)
     params = dict(session_id=session_id, user_id=user_id)
     return (await conn.execute(query, params)).scalar()
+
+
+
+async def query_session_progress(conn: AsyncConnection, session_id: int):
+    """The dashboard's document, in one round trip: the session's label and
+    pacing, the titles of the version it is on, the exercises whose solution
+    is revealed, and its cohort (`_SESSION_COHORT_CTE`) - each person with
+    their checks per exercise - or None.
+
+    Course staff do not come into it by being staff: they are never
+    registered as participants, and a session refuses their jobs. Somebody
+    who checked something as a student and was made staff afterwards is
+    still in it, since the checks are what the cohort is made of. Statuses
+    are derived from the checks by `session_progress_view`, the strip's own
+    derivation; this query only gathers them. Polled every few seconds, so it
+    reads no statement, no test and no source.
+    """
+    query = text(f"""
+    WITH
+    {_session_checks_cte(one_user=False)},
+    {_SESSION_COHORT_CTE},
+    people AS (
+        SELECT u.id, u.nickname, u.email,
+               coalesce((SELECT json_agg(checks.doc ORDER BY checks.n)
+                         FROM checks WHERE checks.user_id = u.id),
+                        '[]'::json) AS checks
+        FROM cohort JOIN "user" u ON u.id = cohort.user_id
+    ),
+    doc AS (
+        SELECT s.id, s.set_id, s.label, s.mode, s.unlocked_through, s.closed_at,
+               {_EXERCISE_TITLES_SQL} AS titles,
+               coalesce((SELECT json_agg(people ORDER BY lower(people.nickname), people.id)
+                         FROM people),
+                        '[]'::json) AS participants,
+               {_SESSION_REVEALED_SQL} AS revealed
+        FROM exercise_session s
+        JOIN exercise_set_version v ON v.id = s.version_id
+        WHERE s.id = :session_id
+    )
+    SELECT row_to_json(doc) FROM doc;
+    """)
+    return (await conn.execute(query, dict(session_id=session_id))).scalar()
+
+
+async def query_session_counts(conn: AsyncConnection, session_id: int):
+    """The projector's document: `query_session_progress` with nobody in it.
+    The session's label and pacing, the titles, the reveals, the size of the
+    cohort, and per exercise how many people have checked it, how many of
+    those solved it and whether a check is pending - or None.
+
+    Counts and not people, so the screen a class sees is never handed a
+    name to show - the rule `projector_view` keeps is kept here first - and so
+    the query a whole lesson's projector polls every three seconds builds no
+    per-person document only to count it. A row of `_session_checks_cte` is a
+    person who checked; `projector_view` turns these numbers into statuses
+    the way `_exercise_status` does for one row.
+    """
+    query = text(f"""
+    WITH
+    {_session_checks_cte(one_user=False)},
+    {_SESSION_COHORT_CTE},
+    per_exercise AS (
+        SELECT n, count(*) AS n_checked, count(*) FILTER (WHERE solved) AS n_solved,
+               bool_or(checking) AS checking
+        FROM checks
+        GROUP BY n
+    ),
+    doc AS (
+        SELECT s.id, s.label, s.mode, s.unlocked_through, s.closed_at,
+               {_EXERCISE_TITLES_SQL} AS titles,
+               {_SESSION_REVEALED_SQL} AS revealed,
+               (SELECT count(*) FROM cohort) AS n_participants,
+               coalesce((SELECT json_agg(per_exercise ORDER BY per_exercise.n)
+                         FROM per_exercise),
+                        '[]'::json) AS exercises
+        FROM exercise_session s
+        JOIN exercise_set_version v ON v.id = s.version_id
+        WHERE s.id = :session_id
+    )
+    SELECT row_to_json(doc) FROM doc;
+    """)
+    return (await conn.execute(query, dict(session_id=session_id))).scalar()
+
+
+async def query_session_cohort_member(conn: AsyncConnection, session_id: int, user_id: int):
+    """A person of a session's cohort - `_SESSION_COHORT_CTE`'s: a
+    participant, or anyone with a check in it - with their nickname and
+    address, or None. The dashboard's drill-in asks this first, so a user id
+    typed into its URL names one of the session's own people or nobody."""
+    participated = exists().where(
+        ExerciseSessionParticipant.c.session_id == session_id,
+        ExerciseSessionParticipant.c.user_id == User.c.id,
+    )
+    checked = exists().where(
+        ExerciseJob.c.session_id == session_id,
+        ExerciseJob.c.user_id == User.c.id,
+        ExerciseJob.c.kind == ExerciseJobKind.check,
+    )
+    stmt = select(User.c.id, User.c.nickname, User.c.email).where(
+        User.c.id == user_id, or_(participated, checked)
+    )
+    return (await conn.execute(stmt)).first()
 
 
 async def query_last_session_jobs(

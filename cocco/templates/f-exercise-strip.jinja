@@ -6,7 +6,8 @@
    the pacing and the status are all that change, and this is all that is
    swapped - never the editor. On the wait page `strip_url` carries `wait`,
    and the answer that ends the wait is an `HX-Redirect`, not a strip. In a
-   closed session nothing it shows can change, and it does not poll at all.
+   closed session only a check queued before the close can still change it,
+   and it stops polling once none is pending (`polls`).
 
    Context: `strip` (`session_strip_view`'s), `n` (the exercise the page is
    on, 0 for none), `strip_url`, `polls`, `course_id`, `session_id`. #}

@@ -1,0 +1,125 @@
+{# The projector's bars and controls: one bar per exercise the class can see -
+   solved, attempted, not attempted, out of the participants - with the
+   pacing buttons and, per exercise, its reveal button or, once revealed, a
+   link that shows the solution under this fragment.
+
+   One swap target that polls itself every three seconds, `outerHTML`. The
+   pacing and reveal forms carry `view=projector`, so the routes behind them
+   answer with this fragment and not the control panel's; each pacing button
+   carries the number this copy shows (`from`), the panel's compare-and-set,
+   and the poll keeps that number fresh. A closed session stops polling once
+   no check is pending, the dashboard's rule.
+
+   Every form shares the poll's request queue (`hx-sync`, `replace`): a press
+   aborts a poll in flight, and a poll that comes due while the press is out
+   waits for it, so a copy read before the press can never be swapped in
+   after its answer - which would put the old `from` back and make the next
+   press a refusal in front of the class. And every form is its own
+   `data-swap-guard`, so a refused press (a 404 on an exercise a version
+   switch took away) puts its line in the fragment and leaves the poll
+   running, rather than resolving to the polling element and freezing it.
+
+   Context: `projector` (`projector_view`'s - counts and titles, no names),
+   `course_id`, `session_id`, `message`, `ok`. #}
+
+{# Escaped explicitly: `Jinja2Templates` autoescapes only .html/.xml, so a
+   `.jinja` file is not. #}
+{% autoescape true %}
+{% set live = projector.mode == "live" %}
+{% set closed = projector.closed_at is not none %}
+{% set unlocked = projector.unlocked_through %}
+{% set total = projector.n_participants %}
+{% macro projector_post(route) -%}
+hx-post="{{ url_for(route, course_id=course_id, session_id=session_id) }}"
+hx-target="#exercise-projector"
+hx-swap="outerHTML"
+hx-sync="closest #exercise-projector:replace"
+data-swap-guard
+{%- endmacro %}
+<div id="exercise-projector" class="flex flex-col gap-6"
+     {% if not closed or projector.pending %}
+     hx-get="{{ url_for('get_fragment_exercise_projector', course_id=course_id, session_id=session_id) }}"
+     hx-trigger="every 3s"
+     hx-swap="outerHTML"
+     data-swap-guard
+     {% endif %}>
+
+  {% if message %}
+  <div role="alert" class="alert {{ 'alert-success' if ok else 'alert-error' }} py-2 text-sm">
+    <span>{{ message }}</span>
+  </div>
+  {% endif %}
+
+  <div class="flex flex-wrap items-center gap-3">
+    <span class="text-lg">
+      <span class="font-semibold text-2xl">{{ total }}</span>
+      participant{{ "" if total == 1 else "s" }}
+      {% if closed %}· closed{% elif live %}· {{ unlocked }} of {{ projector.n_exercises }} unlocked{% else %}· every exercise unlocked{% endif %}
+    </span>
+    {% if live and not closed %}
+    <div class="ml-auto flex flex-wrap gap-2">
+      {% for label, to, primary in [
+           ("← Previous", unlocked - 1, false),
+           ("Next →", unlocked + 1, true),
+           ("Unlock all", projector.n_exercises, false)] %}
+      <form {{ projector_post('post_exercise_session_pace') }}>
+        <input type="hidden" name="view" value="projector" />
+        <input type="hidden" name="from" value="{{ unlocked }}" />
+        <input type="hidden" name="to" value="{{ to }}" />
+        <button type="submit"
+                class="btn {{ 'btn-primary' if primary else 'btn-ghost border border-base-300' }}"
+                {% if to < 0 or to > projector.n_exercises or to == unlocked %}disabled{% endif %}>
+          {{ label }}
+        </button>
+      </form>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="flex items-center gap-4 text-sm text-base-content/70">
+    <span class="flex items-center gap-1"><span class="inline-block size-3 rounded-sm bg-success"></span>solved</span>
+    <span class="flex items-center gap-1"><span class="inline-block size-3 rounded-sm bg-warning"></span>tried, not there yet</span>
+    <span class="flex items-center gap-1"><span class="inline-block size-3 rounded-sm bg-base-300"></span>not tried</span>
+  </div>
+
+  <ol class="flex flex-col gap-4">
+    {% for exercise in projector.exercises %}
+    <li class="flex flex-col gap-1">
+      <div class="flex flex-wrap items-baseline gap-3">
+        <span class="font-mono text-xl font-semibold text-base-content/50">{{ "%02d" | format(exercise.n) }}</span>
+        <span class="text-xl font-semibold flex-1 min-w-0">{{ exercise.title }}</span>
+        <span class="font-mono text-lg">
+          <span class="text-success font-semibold">{{ exercise.solved }}</span>
+          · <span class="text-warning font-semibold">{{ exercise.attempted }}</span>
+          · <span class="text-base-content/55">{{ exercise.not_attempted }}</span>
+        </span>
+        {% if exercise.n in projector.revealed %}
+        <a href="{{ url_for('get_exercise_projector', course_id=course_id, session_id=session_id).include_query_params(solution=exercise.n) }}"
+           class="btn btn-sm btn-primary">Show solution</a>
+        {% else %}
+        <form {{ projector_post('post_exercise_session_reveal') }}>
+          <input type="hidden" name="view" value="projector" />
+          <input type="hidden" name="n" value="{{ exercise.n }}" />
+          <button type="submit" class="btn btn-sm btn-ghost border border-base-300">Reveal solution</button>
+        </form>
+        {% endif %}
+      </div>
+      <div class="flex h-6 w-full overflow-hidden rounded-md bg-base-300"
+           role="img"
+           aria-label="{{ exercise.solved }} solved, {{ exercise.attempted }} tried, {{ exercise.not_attempted }} not tried">
+        {% if total %}
+        <div class="bg-success" style="width: {{ 100 * exercise.solved / total }}%"></div>
+        <div class="bg-warning" style="width: {{ 100 * exercise.attempted / total }}%"></div>
+        {% endif %}
+      </div>
+    </li>
+    {% endfor %}
+  </ol>
+  {% if projector.n_locked %}
+  <p class="text-base-content/55">
+    {{ projector.n_locked }} more exercise{{ "" if projector.n_locked == 1 else "s" }} still locked.
+  </p>
+  {% endif %}
+</div>
+{% endautoescape %}

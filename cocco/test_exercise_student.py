@@ -316,9 +316,12 @@ async def test_a_revealed_solution_is_shown_under_the_statement(client, session)
 
 async def test_staff_routes_beside_the_exercise_are_not_taken_for_one(client, session):
     """`{n:int}`: `.../dashboard` is not exercise "dashboard" refused as an
-    unparseable number, it is a route of its own, or none."""
+    unparseable number, it is a route of its own - and a segment that is
+    neither is no route at all."""
     _, base = session
-    assert client.get(f"{base}/dashboard").status_code == 404
+    assert client.get(f"{base}/dashboard").status_code == 200
+    assert client.get(f"{base}/projector").status_code == 200
+    assert client.get(f"{base}/elsewhere").status_code == 404
 
 
 async def test_an_exercise_the_version_does_not_have_is_404(client, session):

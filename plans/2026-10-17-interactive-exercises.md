@@ -523,11 +523,34 @@ The per-exercise route is declared as `…/sessions/{session_id}/{n:int}`, with 
 below step 8's `…/dashboard` and `…/projector`: a plain `{n}` matches those too and answers 422,
 because a route does not fall through to the next one when validation fails.
 
-### [ ] 8. Dashboard and projector
+### [x] 8. Dashboard and projector
 
 The progress query, the named grid with drill-in (read against the version each check ran on),
 and the anonymous projector with the pacing and reveal controls. `…/dashboard` and `…/projector`
 are declared above step 7's `…/{n}` route, unless that route uses the `{n:int}` convertor.
+
+As built:
+
+- `query_session_progress` returns the cohort with each person's raw checks. The statuses and the
+  counts are derived in Python by `_exercise_status`, which the strip uses too. The check
+  aggregate is `_session_checks_cte(one_user=…)`, shared with the strip's query, so the student's
+  strip and the teacher's cell are worked out by the same code and cannot disagree.
+- `session_progress_view` feeds the dashboard. The projector has its own query,
+  `query_session_counts`, which returns per-exercise counts and never a person, so its 3 s poll
+  doesn't build a document of names only to count it. `projector_view` turns those counts into
+  statuses and cuts them at the pacing. The two queries share `_SESSION_COHORT_CTE`.
+- A closed session keeps polling (strip, grid, projector) until no check is pending, because
+  closing refuses new jobs but does not cancel queued ones.
+- The projector's forms carry `hx-sync="closest #exercise-projector:replace"`, so a stale poll
+  can't land after a press, and each has its own `data-swap-guard`, so a refused press doesn't
+  freeze the poll.
+- The drill-in is `/f/…/dashboard/{user_id}/{n:int}`. It answers only for someone in the session's
+  cohort (`query_session_cohort_member`), shows the latest Check and Run unredacted, and polls
+  itself while one of them is pending. `f-exercise-job.jinja` therefore polls only when it is
+  given a `poll_url`.
+- The projector's pacing and reveal buttons post `view=projector`, and those routes then answer with
+  the projector's polled fragment instead of the control panel. A revealed solution is shown
+  with `?solution=n`, outside the poll, and only once it has been revealed.
 
 ### [ ] 9. Deletion and archiving
 

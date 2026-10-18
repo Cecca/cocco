@@ -1,4 +1,5 @@
 import builtins
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -185,7 +186,10 @@ from cocco.repository import (
     query_preview_job,
     query_sample_testcase,
     query_session_heading,
+    query_session_cohort_member,
+    query_session_counts,
     query_session_job,
+    query_session_progress,
     query_session_strip,
     query_set_current_version,
     query_submission,
@@ -3857,6 +3861,7 @@ async def _exercise_job_context(
         "link": None,
         "result": None,
         "tests": [],
+        "redact": redact,
         "earlier_version": (
             job is not None and version_id is not None and job.version_id != version_id
         ),
@@ -4243,6 +4248,7 @@ async def _render_exercise_session_controls(
     session_id: int,
     message: str | None = None,
     ok: bool = False,
+    view: str = "panel",
 ):
     """The session's control panel: one swap target, alert folded in, which
     every staff route on the session answers with - `/admin`'s rule.
@@ -4250,7 +4256,13 @@ async def _render_exercise_session_controls(
     Not polled: a second teacher's page can go stale, which is why every
     pacing button carries what its page showed and the write is a
     compare-and-set on it (`pace_exercise_session`).
+
+    `view` is the page the form was on. The projector carries the pacing and
+    the reveal buttons too, inside its own polled fragment, and a press there
+    is answered with that fragment rather than with a panel it does not have.
     """
+    if view == "projector":
+        return await _render_exercise_projector(request, db, course_id, session_id, message, ok)
     session = await query_exercise_session(db, session_id)
     if session is None:
         raise HTTPException(status_code=404)
@@ -4431,6 +4443,7 @@ async def post_exercise_session_pace(
     role: ExerciseSessionEditor,
     from_: Annotated[int, Form(alias="from")] = -1,
     to: Annotated[int, Form()] = -1,
+    view: Annotated[str, Form()] = "panel",
 ):
     """Next, previous and unlock all: one route, since each is a move from
     the number the page showed to another. See `pace_exercise_session` for why
@@ -4438,7 +4451,9 @@ async def post_exercise_session_pace(
     moved = await pace_exercise_session(db, session_id, from_, to)
     await db.commit()
     if moved:
-        return await _render_exercise_session_controls(request, db, course_id, session_id)
+        return await _render_exercise_session_controls(
+            request, db, course_id, session_id, view=view
+        )
     # Say what actually stopped it: the state is read after the write, so it
     # is the state that refused it.
     state = await query_exercise_session_state(db, session_id)
@@ -4456,7 +4471,7 @@ async def post_exercise_session_pace(
             "have moved it. This is where it stands now."
         )
     return await _render_exercise_session_controls(
-        request, db, course_id, session_id, why + " Nothing was changed."
+        request, db, course_id, session_id, why + " Nothing was changed.", view=view
     )
 
 
@@ -4503,6 +4518,7 @@ async def post_exercise_session_reveal(
     db: DBDep,
     role: ExerciseSessionEditor,
     n: Annotated[int, Form()] = 0,
+    view: Annotated[str, Form()] = "panel",
 ):
     """Show exercise `n`'s solution to the session's class, under its
     statement. There is no hiding it again: the class has seen it. Allowed on
@@ -4511,7 +4527,9 @@ async def post_exercise_session_reveal(
     await db.commit()
     if not revealed:
         raise HTTPException(status_code=404)
-    return await _render_exercise_session_controls(request, db, course_id, session_id)
+    return await _render_exercise_session_controls(
+        request, db, course_id, session_id, view=view
+    )
 
 
 @app.post("/courses/{course_id}/sessions/{session_id}/switch")
@@ -4575,6 +4593,309 @@ async def post_exercise_session_switch(
 
 
 ########################################################################
+# The teacher's two screens of a session: the dashboard, with names, and the
+# projector, without. Course staff only, through `ExerciseSessionEditor`, and
+# both read `query_session_progress` - one document, polled every 3 s. They
+# have a segment of their own after the session, which `get_session_exercise`
+# would swallow were it not declared with `{n:int}`.
+
+
+def session_progress_view(progress: dict) -> dict:
+    """The dashboard's document out of `query_session_progress`: per
+    exercise, how many of the cohort are in each status; per person, their
+    status on every exercise of the version the session is on.
+
+    Every exercise is there, the locked ones included - this is staff's - and
+    `n_visible` says how far the students can see, so the grid can dim the
+    rest. A check on an exercise the version no longer has (none can exist:
+    the switch refuses that) would simply not be shown.
+    """
+    titles = progress["titles"]
+    people = []
+    for person in progress["participants"]:
+        checks = {check["n"]: check for check in person["checks"]}
+        people.append(
+            {
+                "id": person["id"],
+                "nickname": person["nickname"],
+                "email": person["email"],
+                "cells": [
+                    {"n": n, **_exercise_status(checks.get(n))}
+                    for n in range(1, len(titles) + 1)
+                ],
+            }
+        )
+    exercises = []
+    for n, title in enumerate(titles, start=1):
+        cells = [person["cells"][n - 1] for person in people]
+        counts = Counter(cell["status"] for cell in cells)
+        exercises.append(
+            {
+                "n": n,
+                "title": title,
+                "solved": counts["solved"],
+                "attempted": counts["attempted"],
+                "not_attempted": counts["not_attempted"],
+                "checking": sum(cell["checking"] for cell in cells),
+            }
+        )
+    return {
+        "label": progress["label"],
+        "mode": progress["mode"],
+        "closed_at": progress["closed_at"],
+        "unlocked_through": progress["unlocked_through"],
+        "n_visible": _n_visible(progress["mode"], progress["unlocked_through"], len(titles)),
+        "revealed": progress["revealed"],
+        "exercises": exercises,
+        "participants": people,
+        # Closing a session refuses new jobs and cancels none, so a check
+        # queued before the close still lands after it: the grid polls until
+        # there is none left.
+        "pending": any(
+            check["checking"]
+            for person in progress["participants"]
+            for check in person["checks"]
+        ),
+    }
+
+
+def projector_view(counts: dict) -> dict:
+    """The projector's document out of `query_session_counts`: per exercise
+    the students can see, how many of the cohort solved it, tried it and are
+    not there yet, and how many more are locked.
+
+    The statuses are `_exercise_status`'s, worked out from counts rather than
+    from one person's row: a person who checked an exercise has solved it or
+    attempted it, and everybody else in the cohort has not attempted it. Kept
+    in a function rather than in a template, `visible_outcomes`'s rule: the
+    titles past the pacing stay off the projected screen, as they stay off
+    the student's strip, and the query already brought no names to leave out.
+    """
+    titles = counts["titles"]
+    total = counts["n_participants"]
+    per_exercise = {row["n"]: row for row in counts["exercises"]}
+    visible = _n_visible(counts["mode"], counts["unlocked_through"], len(titles))
+    exercises = []
+    for n, title in enumerate(titles[:visible], start=1):
+        row = per_exercise.get(n, {"n_checked": 0, "n_solved": 0})
+        exercises.append(
+            {
+                "n": n,
+                "title": title,
+                "solved": row["n_solved"],
+                "attempted": row["n_checked"] - row["n_solved"],
+                "not_attempted": total - row["n_checked"],
+            }
+        )
+    return {
+        "label": counts["label"],
+        "mode": counts["mode"],
+        "closed_at": counts["closed_at"],
+        "unlocked_through": counts["unlocked_through"],
+        "n_exercises": len(titles),
+        "n_participants": total,
+        "revealed": counts["revealed"],
+        "exercises": exercises,
+        "n_locked": len(titles) - visible,
+        # `session_progress_view`'s reason: checks queued before a close
+        # still land after it, and the bars should show them.
+        "pending": any(row["checking"] for row in counts["exercises"]),
+    }
+
+
+async def _session_progress(db: AsyncConnection, session_id: int) -> dict:
+    progress = await query_session_progress(db, session_id)
+    if progress is None:
+        raise HTTPException(status_code=404)
+    return progress
+
+
+@app.get("/courses/{course_id}/sessions/{session_id}/dashboard")
+async def get_exercise_dashboard(
+    course_id: int,
+    session_id: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    role: ExerciseSessionEditor,
+):
+    """The class at a glance, with names: a grid of the cohort by the
+    exercises, each cell a person's status, and - beside it, outside the poll
+    - the code and results of the cell last clicked."""
+    course = await query_course(db, course_id)
+    session = await query_exercise_session(db, session_id)
+    if course is None or session is None:
+        raise HTTPException(status_code=404)
+    return templates.TemplateResponse(
+        request=request,
+        name="exercise-dashboard.jinja",
+        context={
+            "course": course,
+            "course_id": course_id,
+            "session": session,
+            "user": user,
+            "progress": session_progress_view(await _session_progress(db, session_id)),
+        },
+    )
+
+
+@app.get("/f/courses/{course_id}/sessions/{session_id}/dashboard")
+async def get_fragment_exercise_dashboard(
+    course_id: int, session_id: int, request: Request, db: DBDep, role: ExerciseSessionEditor
+):
+    """The dashboard's grid, polled every three seconds."""
+    return templates.TemplateResponse(
+        request=request,
+        name="f-exercise-dashboard.jinja",
+        context={
+            "course_id": course_id,
+            "session_id": session_id,
+            "progress": session_progress_view(await _session_progress(db, session_id)),
+        },
+    )
+
+
+@app.get("/f/courses/{course_id}/sessions/{session_id}/dashboard/{user_id}/{n:int}")
+async def get_fragment_exercise_drill_in(
+    course_id: int,
+    session_id: int,
+    user_id: int,
+    n: int,
+    request: Request,
+    db: DBDep,
+    role: ExerciseSessionEditor,
+):
+    """One cell of the dashboard opened up: that person's latest Check and
+    latest Run of exercise `n`, each with the code it sent and its result in
+    full - staff are not redacted for - and each read against the version it
+    *ran on*, which after a switch need not be the session's.
+
+    Only somebody of the session's cohort (`query_session_cohort_member`), so
+    the URL cannot be used to look anybody else up. It polls itself while a
+    job of it is pending, and stops once none is.
+    """
+    state = await query_exercise_session_state(db, session_id)
+    if state is None:
+        raise HTTPException(status_code=404)
+    _session_exercise_in_range(state, n)
+    person = await query_session_cohort_member(db, session_id, user_id)
+    if person is None:
+        raise HTTPException(status_code=404)
+    exercise = await query_exercise(db, state.version_id, n)
+    last = await query_last_session_jobs(db, session_id, user_id, n)
+    jobs = {}
+    for kind in ("check", "run"):
+        job = last.get(kind)
+        jobs[kind] = await _exercise_job_context(
+            db,
+            job,
+            None,
+            redact=False,
+            version_id=state.version_id,
+            exercise=exercise if kind == "check" else None,
+        )
+    pending = any(
+        job is not None and job.status is not ExerciseJobStatus.done for job in last.values()
+    )
+    return templates.TemplateResponse(
+        request=request,
+        name="f-exercise-drill-in.jinja",
+        context={
+            "course_id": course_id,
+            "session_id": session_id,
+            "person": person,
+            "n": n,
+            "title": exercise.title if exercise is not None else f"Exercise {n}",
+            "last": last,
+            "jobs": jobs,
+            "poll_url": str(request.url) if pending else None,
+        },
+    )
+
+
+async def _render_exercise_projector(
+    request: Request,
+    db: AsyncConnection,
+    course_id: int,
+    session_id: int,
+    message: str | None = None,
+    ok: bool = False,
+):
+    """The projector's fragment: the bars, the pacing and the reveal buttons,
+    one swap target that polls itself and that the pacing and reveal routes
+    answer with when the press came from the projector."""
+    return templates.TemplateResponse(
+        request=request,
+        name="f-exercise-projector.jinja",
+        context=await _projector_context(db, course_id, session_id, message, ok),
+    )
+
+
+async def _projector_context(
+    db: AsyncConnection,
+    course_id: int,
+    session_id: int,
+    message: str | None = None,
+    ok: bool = False,
+) -> dict:
+    counts = await query_session_counts(db, session_id)
+    if counts is None:
+        raise HTTPException(status_code=404)
+    return {
+        "course_id": course_id,
+        "session_id": session_id,
+        "projector": projector_view(counts),
+        "message": message,
+        "ok": ok,
+    }
+
+
+@app.get("/courses/{course_id}/sessions/{session_id}/projector")
+async def get_exercise_projector(
+    course_id: int,
+    session_id: int,
+    request: Request,
+    db: DBDep,
+    user: CurrentUser,
+    role: ExerciseSessionEditor,
+    solution: int = 0,
+):
+    """The screen the class sees: no names, one bar per exercise the class
+    can see, and the controls the teacher drives the lesson with.
+
+    `?solution=n` puts a revealed exercise's solution under the bars, outside
+    the polled fragment so the poll does not close it. An exercise whose
+    solution is not revealed shows none, whatever the URL says: a projected
+    solution is a revealed one.
+    """
+    course = await query_course(db, course_id)
+    if course is None:
+        raise HTTPException(status_code=404)
+    context = await _projector_context(db, course_id, session_id)
+    projector = context["projector"]
+    shown = None
+    if solution in projector["revealed"]:
+        state = await query_exercise_session_state(db, session_id)
+        if state is None:
+            raise HTTPException(status_code=404)
+        exercise = await query_exercise(db, state.version_id, solution)
+        if exercise is not None:
+            shown = {"n": solution, "title": exercise.title, "source": exercise.solution}
+    context.update(course=course, user=user, solution=shown)
+    return templates.TemplateResponse(
+        request=request, name="exercise-projector.jinja", context=context
+    )
+
+
+@app.get("/f/courses/{course_id}/sessions/{session_id}/projector")
+async def get_fragment_exercise_projector(
+    course_id: int, session_id: int, request: Request, db: DBDep, role: ExerciseSessionEditor
+):
+    """The projector's fragment, polled every three seconds."""
+    return await _render_exercise_projector(request, db, course_id, session_id)
+
+
+########################################################################
 # The student page: one exercise of a session, with the strip of all of them,
 # the statement and the editor; Run and Check are judge jobs. Members of the
 # course, through `require_session_exercise` and `session_job_refusal` - which
@@ -4634,22 +4955,22 @@ def session_strip_view(strip: dict, role: UserRole) -> dict:
         else _n_visible(strip["mode"], strip["unlocked_through"], len(titles))
     )
     checks = {check["n"]: check for check in strip["checks"]}
-    exercises = []
-    for n, title in enumerate(titles[:visible], start=1):
-        check = checks.get(n)
-        if check is None:
-            status = "not_attempted"
-        else:
-            status = "solved" if check["solved"] else "attempted"
-        exercises.append(
-            {
-                "n": n,
-                "title": title,
-                "status": status,
-                "checking": check is not None and check["checking"],
-            }
-        )
+    exercises = [
+        {"n": n, "title": title, **_exercise_status(checks.get(n))}
+        for n, title in enumerate(titles[:visible], start=1)
+    ]
     return {"exercises": exercises, "n_locked": len(titles) - visible}
+
+
+def _exercise_status(check: dict | None) -> dict:
+    """One person's status on one exercise, out of their aggregate row of
+    `_session_checks_cte` (None for no check): the strip's and the
+    dashboard's, spelled once so the two cannot disagree."""
+    if check is None:
+        status = "not_attempted"
+    else:
+        status = "solved" if check["solved"] else "attempted"
+    return {"status": status, "checking": check is not None and check["checking"]}
 
 
 async def _session_strip_context(
@@ -4677,8 +4998,11 @@ async def _session_strip_context(
         "strip": session_strip_view(strip, role),
         "n": n,
         "strip_url": str(poll_url),
-        # A closed session's pacing and checks are final.
-        "polls": strip["closed_at"] is None,
+        # A closed session's pacing is final, but not its checks: closing it
+        # cancels none, so one queued before the close is polled for until it
+        # is done.
+        "polls": strip["closed_at"] is None
+        or any(check["checking"] for check in strip["checks"]),
     }
 
 

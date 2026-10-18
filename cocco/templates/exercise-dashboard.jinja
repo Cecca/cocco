@@ -1,0 +1,45 @@
+{% extends "base.jinja" %}
+{% block title %}{% autoescape true %}Dashboard · {{ session.label }}{% endautoescape %}{% endblock %}
+{# `exercise.js` for its `data-swap-guard` alone: a poll answered with a 403
+   or a 404 freezes the grid with a line instead of swapping the error in. #}
+{% block head %}<script defer src="{{ static_url('exercise.js') }}"></script>{% endblock %}
+
+{% set crumbs = [
+  {"label": "Courses", "href": url_for('index')},
+  {"label": course.title, "href": url_for('get_course', course_id=course_id)},
+  {"label": session.set_title, "href": url_for('get_exercise_set', course_id=course_id, set_id=session.set_id)},
+  {"label": session.label, "href": url_for('get_exercise_session', course_id=course_id, session_id=session.id)},
+  {"label": "Dashboard"},
+] %}
+
+{# The class with names, for the teacher's own screen - never the projector,
+   which is `exercise-projector.jinja` and is handed no names at all.
+
+   The grid is `f-exercise-dashboard.jinja`, polled; the drill-in sits
+   **outside** it, in `#drill-in`, so the poll never closes what the teacher
+   opened. Context: `session` (`query_exercise_session`), `progress`
+   (`session_progress_view`), `course`, `course_id`. #}
+{% block body %}
+{% autoescape true %}
+<main class="mx-auto max-w-7xl px-6 py-8">
+  <div class="flex flex-wrap items-start justify-between gap-4 mb-6">
+    <div>
+      <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">Dashboard</p>
+      <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ session.label }}</h1>
+    </div>
+    <div class="flex gap-2">
+      <a href="{{ url_for('get_exercise_projector', course_id=course_id, session_id=session.id) }}"
+         class="btn btn-sm btn-ghost border border-base-300 font-semibold">Projector</a>
+      <a href="{{ url_for('get_exercise_session', course_id=course_id, session_id=session.id) }}"
+         class="btn btn-sm btn-ghost border border-base-300 font-semibold">← Controls</a>
+    </div>
+  </div>
+
+  {% with session_id = session.id %}
+  {% include "f-exercise-dashboard.jinja" %}
+  {% endwith %}
+
+  <div id="drill-in" class="mt-6"></div>
+</main>
+{% endautoescape %}
+{% endblock %}

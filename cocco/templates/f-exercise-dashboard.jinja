@@ -1,0 +1,90 @@
+{# The dashboard's grid: the cohort by the exercises, each cell a person's
+   status - the strip's colours - and a click on one opens that person's
+   latest code and results in `#drill-in`, which is outside this fragment.
+
+   Polled every three seconds and replaced whole (`outerHTML`). A closed
+   session stops polling once no check is pending: closing refuses new jobs
+   but cancels none, so one queued before the close still lands after it. Above the grid, per
+   exercise, the counts the projector draws as bars.
+
+   Context: `progress` (`session_progress_view`'s), `course_id`,
+   `session_id`. #}
+
+{# Escaped explicitly: `Jinja2Templates` autoescapes only .html/.xml, so a
+   `.jinja` file is not, and what this prints is people's names. #}
+{% autoescape true %}
+{% set STATUS = {
+  "solved": ("btn-success", "solved"),
+  "attempted": ("btn-warning", "attempted, not solved yet"),
+  "not_attempted": ("btn-ghost border border-base-300", "not attempted"),
+} %}
+{% set closed = progress.closed_at is not none %}
+<div id="exercise-dashboard" class="flex flex-col gap-4"
+     {% if not closed or progress.pending %}
+     hx-get="{{ url_for('get_fragment_exercise_dashboard', course_id=course_id, session_id=session_id) }}"
+     hx-trigger="every 3s"
+     hx-swap="outerHTML"
+     data-swap-guard
+     {% endif %}>
+
+  <p class="text-[13px] text-base-content/55">
+    {{ progress.participants | length }} participant{{ "" if progress.participants | length == 1 else "s" }}
+    {% if closed %}· closed{% elif progress.mode == "live" %}· live, {{ progress.n_visible }} of {{ progress.exercises | length }} unlocked{% else %}· open{% endif %}.
+    Participants are the students who opened the session, not everybody on the course.
+  </p>
+
+  {% if not progress.participants %}
+  <div class="rounded-xl border border-dashed border-base-300 p-8 text-center text-sm text-base-content/55">
+    Nobody has opened the session yet.
+  </div>
+  {% else %}
+  <div class="overflow-x-auto rounded-xl border border-base-300 bg-base-100">
+    <table class="table table-sm">
+      <thead>
+        <tr>
+          <th class="sticky left-0 bg-base-100">Student</th>
+          {% for exercise in progress.exercises %}
+          <th class="text-center font-mono {{ 'opacity-40' if exercise.n > progress.n_visible else '' }}"
+              title="{{ exercise.n }}. {{ exercise.title }}{{ ' — locked' if exercise.n > progress.n_visible else '' }}">
+            {{ "%02d" | format(exercise.n) }}
+          </th>
+          {% endfor %}
+        </tr>
+        <tr class="text-[11px] text-base-content/55">
+          <th class="sticky left-0 bg-base-100 font-normal">solved · tried</th>
+          {% for exercise in progress.exercises %}
+          <th class="text-center font-mono font-normal {{ 'opacity-40' if exercise.n > progress.n_visible else '' }}">
+            <span class="text-success">{{ exercise.solved }}</span>·<span class="text-warning">{{ exercise.attempted }}</span>
+          </th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for person in progress.participants %}
+        <tr>
+          <td class="sticky left-0 bg-base-100 whitespace-nowrap">
+            <span class="font-semibold">{{ person.nickname }}</span>
+            <span class="text-xs text-base-content/45 ml-1">{{ person.email }}</span>
+          </td>
+          {% for cell in person.cells %}
+          {% set colour, says = STATUS[cell.status] %}
+          <td class="text-center p-1">
+            <button type="button"
+                    class="btn btn-xs btn-square {{ colour }} {{ 'opacity-40' if cell.n > progress.n_visible and cell.status == 'not_attempted' else '' }}"
+                    title="{{ person.nickname }}, {{ cell.n }}. {{ progress.exercises[cell.n - 1].title }} — {{ says }}{{ ', checking…' if cell.checking else '' }}"
+                    hx-get="{{ url_for('get_fragment_exercise_drill_in', course_id=course_id, session_id=session_id, user_id=person.id, n=cell.n) }}"
+                    hx-target="#drill-in"
+                    hx-swap="innerHTML"
+                    data-swap-guard>
+              {% if cell.checking %}<span class="loading loading-spinner loading-xs"></span>{% endif %}
+            </button>
+          </td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+{% endautoescape %}
