@@ -13,8 +13,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Dependencies are managed with `uv` (Python 3.13). A `.envrc` / Nix `devShell` auto-creates `.venv` and activates it.
 
 - Install deps: `uv sync`
-- Start / stop PostgreSQL: `pg-start`, `pg-stop` (then `create-db cocco-dev` once)
-- Run the whole stack (app, judge, Postgres): `just dev`
+- Start / stop PostgreSQL: `pg-start`, `pg-stop` (then `create-db cocco-dev` once), or the `compose.yaml` container with `just start-dev-db` / `just stop-dev-db`
+- Run the stack: `just migrate`, then `just web` and `just judge` in two terminals. The Justfile exports `COCCO_CONFIG=cocco.dev.toml` unless it is already set.
 - Run the API alone: `COCCO_CONFIG=cocco.dev.toml uv run cocco-web --reload`
 - Run the judge alone: `COCCO_CONFIG=cocco.dev.toml uv run cocco-judge`
 - Apply a schema change: `just migration "what changed"` then `just migrate` — see "Migrations"
@@ -45,7 +45,7 @@ The web app and the judge are **separate processes** that must agree on three th
 
 **Configuration is split in two, and the line is one sentence: the file is settings, the environment is secrets.** `cocco/config.py` is where both halves are read — its own module rather than a corner of `auth.py`, because the judge reads it too and a database URL is none of sign-in's business. The file carries `[database] url`, `[storage] root`, `[judge] flake`, `[session]`, `[auth]`, `[site]` and `[dev]`; the secrets — `COCCO_SECRET_KEY`, `COCCO_GOOGLE_CLIENT_ID`, `COCCO_GOOGLE_CLIENT_SECRET`, `COCCO_GITHUB_CLIENT_ID`, `COCCO_GITHUB_CLIENT_SECRET` — have **no file spelling at all**, so there is no precedence to reason about and nothing secret in a file that gets copied, diffed and pasted into a bug report. `COCCO_CONFIG` is the exception that proves the rule: it names the file, so it is the one setting that cannot be written in one.
 
-There are **two files**, and which one you get is `COCCO_CONFIG`. `cocco.dev.toml` is **committed**: it is secret-free by construction, and `just dev` points at it. `cocco.toml` is gitignored and is a deployment's own; `cocco.example.toml` is its commented template. **A missing file is still not an error** — and now says more than it did, because `DEFAULT_DATABASE_URL` is the empty `postgresql+psycopg://`, which libpq resolves from `PGUSER`/`PGDATABASE`/`PGHOST`. That is deliberate and is what lets a file in git avoid naming the devShell's socket, whose path is `$PWD/.pg/sock`. It also means importing `cocco.main` needs no environment and no file at all, so the unit tests run outside the dev shell. A setting left in its old place — a `COCCO_DUMMY_AUTH` in the shell, a `secret_key` in the file — is **warned about, not ignored**: `_warn_about_removed_settings` names the old spelling and the new one, and only warns, because a stale variable must not stop the app from booting. `dummy_user` is the third kind and has its own sentence there: it did not move, it was **deleted**, so there is no "it is X now" to print — the answer is that `/login` asks. `[dev] dummy_auth` is what makes a fresh checkout usable at all, and `[auth] administrators` is where a deployment's first administrators are listed (a bootstrap — see "Authorization").
+There are **two files**, and which one you get is `COCCO_CONFIG`. `cocco.dev.toml` is **committed**: it is secret-free by construction, and the Justfile points at it. `cocco.toml` is gitignored and is a deployment's own; `cocco.example.toml` is its commented template. **A missing file is still not an error** — and now says more than it did, because `DEFAULT_DATABASE_URL` is the empty `postgresql+psycopg://`, which libpq resolves from `PGUSER`/`PGDATABASE`/`PGHOST`. That is deliberate and is what lets a file in git avoid naming the devShell's socket, whose path is `$PWD/.pg/sock`. It also means importing `cocco.main` needs no environment and no file at all, so the unit tests run outside the dev shell. A setting left in its old place — a `COCCO_DUMMY_AUTH` in the shell, a `secret_key` in the file — is **warned about, not ignored**: `_warn_about_removed_settings` names the old spelling and the new one, and only warns, because a stale variable must not stop the app from booting. `dummy_user` is the third kind and has its own sentence there: it did not move, it was **deleted**, so there is no "it is X now" to print — the answer is that `/login` asks. `[dev] dummy_auth` is what makes a fresh checkout usable at all, and `[auth] administrators` is where a deployment's first administrators are listed (a bootstrap — see "Authorization").
 
 ## Architecture
 
@@ -57,7 +57,7 @@ Three layers, loosely coupled:
 
    **The cache is filled once, at startup, and `nix` is never run while a submission is being graded.** `main()` calls `prewarm_runtimes(load_languages())` after the schema check and before `run_loop`, which is what its log line always claimed and never did. Resolution used to be lazy, per `(runtime, binary)` pair, on the first use of each language — so the first java upload paid for a JDK inside a graded run, and a flake that could not build one said so *then*. One build per **runtime**, not per binary: gcc answers for both `gcc` and `g++`, jdk for both `javac` and `java`. A `resolve_runtime` miss is therefore a `RuntimeUnavailable` and a bug — `languages.toml` is the single source both the prewarm and the lookup read, so the two can only disagree by mistake, and building a compiler halfway through somebody's submission is not a recovery.
 
-   **Which flake is `[judge] flake`**, and it is the one setting the web app never reads. It used to be a literal `.#` — the flake in the *working directory* — which is a coupling the judge could not state and an installed `cocco-judge` could not satisfy, since a command on PATH has no checkout to be started from. The default is still `"."`, so nothing changes for `just dev`; a deployment names an absolute path or a flake reference. It reaches `resolve_runtime` as the module-level `FLAKE_REF`, assigned once by `main()`, rather than as an argument threaded through `Language.run` → `run_submission` → `run_loop`: `Language` is a frozen dataclass built straight from `languages.toml` and has nowhere to carry it, and this is the same seam `main.DUMMY_AUTH` is. `languages.toml` itself stays deliberately *not* configurable — it is read out of the package by both processes, and pointing it elsewhere would only be one more way for them to disagree in silence.
+   **Which flake is `[judge] flake`**, and it is the one setting the web app never reads. It used to be a literal `.#` — the flake in the *working directory* — which is a coupling the judge could not state and an installed `cocco-judge` could not satisfy, since a command on PATH has no checkout to be started from. The default is still `"."`, so nothing changes for a checkout; a deployment names an absolute path or a flake reference. It reaches `resolve_runtime` as the module-level `FLAKE_REF`, assigned once by `main()`, rather than as an argument threaded through `Language.run` → `run_submission` → `run_loop`: `Language` is a frozen dataclass built straight from `languages.toml` and has nowhere to carry it, and this is the same seam `main.DUMMY_AUTH` is. `languages.toml` itself stays deliberately *not* configurable — it is read out of the package by both processes, and pointing it elsewhere would only be one more way for them to disagree in silence.
 
    **`[judge] gcroots` is another setting only the judge reads (`[judge] concurrency`, the number of worker tasks, is the third), and it exists because a resolved runtime was collectable.** `build_runtime` passes `--out-link <gcroots>/<runtime>`, which is what makes nix register an *indirect GC root* under `/nix/var/nix/gcroots/auto`. It used to pass `--no-link`: the store path was then held by nothing but a `Path` in `_RUNTIME_CACHE`, which nix cannot see, so a `nix-store --gc` on the judge host was free to collect the very interpreter a running judge was about to bind-mount into a box — surfacing as submissions dying on a missing file, with nothing in the log to say why. The default is `$XDG_STATE_HOME/cocco/gcroots`, so nothing needs configuring; it is deliberately **not** derived from `[storage] root`, which is the one directory the two processes share and may well be on NFS, while a GC root is local to the machine whose store it protects. It reaches `build_runtime` as `GCROOTS_DIR`, the same module-level seam `FLAKE_REF` is, but initialised to the default rather than to None so that a test resolving a runtime without going through `main()` still roots what it builds. Two things worth knowing: the directory is **per judge host and per deployment** — two judges sharing it with different `flake` refs would overwrite each other's links, and a collection in between could take a live runtime — and the roots are **self-healing**, because nix prunes a dangling auto-root and every judge start re-registers all of them.
 
@@ -69,6 +69,10 @@ Three layers, loosely coupled:
    - compiled + VM (e.g. java): both — `javac` outside isolate, `java` inside, with `additional_processes` added to the sandbox process budget for the JVM.
 
    Compiler args support `{source}`, `{output}`, `{workdir}`; interpreter args support `{executable}`, `{workdir}`, `{name}`. When adding a language, edit `languages.toml` and, if a new runtime is needed, add a package output in `flake.nix`.
+
+4. **`run_loop`**: `[judge] concurrency` worker tasks, plus `listen_for_work`. Each worker claims one job, runs it to the end and claims again. **A claim is `FOR UPDATE SKIP LOCKED`**, in `pull_queued_submission` and `pull_queued_exercise_job` alike. Without it, two claimers can take the same row, because the `UPDATE … WHERE id = (SELECT … LIMIT 1)` subquery is not re-evaluated when the second UPDATE waits on the first. Claims stay synchronous on the event loop: a claim is about a millisecond of blocking, and `SKIP LOCKED` never waits on a lock. The default concurrency is half the hardware threads the judge's CPU affinity allows. It is sized against the **CPU** because the CPU runs out first: a box is mostly an interpreter starting up, and on a 16-thread host the judge drained a queue about 9× faster with 8 workers and no faster with 16. The box pool (32) is what bounds the sandboxes running at once. Two judges on one host cannot share a database, because each numbers its boxes from 0; judges on separate hosts can.
+
+   **Priority is `QUEUES`, a tuple asked in order every time a worker is free: exercise run > exercise check > exercise build > challenge submission.** The priority is strict, so a regrade of 300 submissions waits behind a live lesson. That is the point: a student staring at Run is the most latency-sensitive person in the building. Each entry is one claim on one queue rather than one SQL query for "the most urgent of anything", because the challenge queue is another table. **The web app wakes the judge with `pg_notify`** (`notify_queue`, channel `QUEUE_CHANNEL`), sent inside the transaction that inserts a submission, a regrade or an exercise job. PostgreSQL delivers it at commit and drops it on a rollback, so a wake-up never arrives ahead of the row it is about. `Wakeup` hands a worker its ticket *before* the worker looks at the queue, so a notification that lands between the look and the sleep is not lost. The 5 s poll stays as the fallback, and losing the listening connection costs latency and nothing else. A cancelled judge (`SIGTERM`, Ctrl-C) puts its half-done work back on the queue. A **hard-killed** one leaves rows `running`, deliberately unrecovered at startup: several judges can share the database, and one judge's startup cannot tell an orphan from another judge's work in progress.
 
 ### Evaluators (`cocco/evaluators/`, run from `cocco/judge.py`)
 
@@ -88,7 +92,7 @@ The evaluator's sandbox budget is fixed in `judge.py` (`EVALUATOR_TIME_LIMIT_S`,
 
 ### Data model (`cocco/model.py`)
 
-SQLAlchemy Core `Table`s on a shared `MetaData` form the domain: `User` (with `UserRole` via `Enrollment`, and `Administrator` beside it — every `UserRole` is a *per-course* thing, so the site-wide power to create a course is its own table, keyed on the email so it can name someone who has never signed in), `Course` → `Challenge` → `TestCase` (inputs/expected outputs referenced by filesystem path, not stored in the DB — see `DESIGN.md` "Test case inputs"; `is_sample` marks the ones students may download, `is_active` the ones new submissions are graded on), `Submission` → `TestOutcome`. There is no queue table: a submission is queued when its `status` is `SubmissionStatus.queued`. `Challenge.ranking` (a `LeaderboardRanking`) is presentation-only — it picks the leaderboard the challenge page shows and the judge never reads it.
+SQLAlchemy Core `Table`s on a shared `MetaData` form the domain: `User` (with `UserRole` via `Enrollment`, and `Administrator` beside it — every `UserRole` is a *per-course* thing, so the site-wide power to create a course is its own table, keyed on the email so it can name someone who has never signed in), `Course` → `Challenge` → `TestCase` (inputs/expected outputs referenced by filesystem path, not stored in the DB — see `DESIGN.md` "Test case inputs"; `is_sample` marks the ones students may download, `is_active` the ones new submissions are graded on), `Submission` → `TestOutcome`. There is no queue table: a submission is queued when its `status` is `SubmissionStatus.queued`. `Challenge.ranking` (a `LeaderboardRanking`) is presentation-only — it picks the leaderboard the challenge page shows and the judge never reads it. Beside that domain, and sharing nothing with it above the execution layer, are the six `exercise_*` tables; see "Exercises".
 
 `User.blocked_at` / `blocked_reason` are the **blacklist**, and they are columns on the row rather than a table of their own — deliberately the opposite of `Administrator`, and for the opposite reason. That table is keyed on an address because it must name people who have never signed in; a block always names someone who already did something, so the account exists. Living on the row means `get_user` — which already reads it on every request — asks the question for free, and a block therefore takes effect on the blocked person's very next click. `_USER_COLUMNS` in `repository.py` is the one column list behind both `query_user` and `query_user_by_email`, spelled once because a list that carried `blocked_at` in one of them and not the other would let a blocked person in through whichever door forgot.
 
@@ -132,7 +136,7 @@ a web app and a judge pointed at different databases.
 That refusal is spelled **twice on the web side**, and the duplication is load-bearing. Uvicorn only
 turns a failed startup into a non-zero exit when there is one worker and no reloader; under
 `cocco-web --reload` the reload supervisor outlives the dead child, does not restart it and exits 0,
-so `just dev`'s `wait -n` would never fire and you would get a silently absent app. So `_check_schema`
+so a supervisor waiting on the process (a shell's `wait -n`, a systemd unit) would never see it fail and you would get a silently absent app. So `_check_schema`
 in `cocco/server.py` asks *before uvicorn exists*, which is what makes the refusal a plain non-zero
 exit under every combination of flags, and the copy in the startup hook covers every other ASGI
 runner and makes each worker verify for itself. `cocco/server.py` keeps its lazy-import discipline
@@ -294,7 +298,9 @@ the string. Both danger zones refuse — 200 with `f-edit-result.jinja`, htmx's 
 name and while a judge is mid-run; only the success is a 204.
 
 **Archiving is a visibility state, not a lock**, and that is what keeps the whole feature down to
-**two enforcement points**: `post_submission` and `post_course_enroll`. Hiding a challenge is the
+**three enforcement points**: `post_submission`, `post_course_enroll`, and the routes that queue an
+exercise Run or Check (`_post_session_job`, `_post_exercise_preview_job`; see "Exercises"). An
+exercise *build* is not refused, because importing is editing. Hiding a challenge is the
 one that *is* a lock, and it is enforced somewhere else entirely — in the two dependencies, not in
 any route; see "Visible is `challenge.visible_from`" below. An archived course or
 challenge stays readable for the people already enrolled — statement, their attempts, scores,
@@ -582,7 +588,7 @@ That absence is load-bearing, and two guards follow from it. **An administrator 
 — enforced inside `block_user`'s `WHERE` clause, not by a check before the write, so an
 appointment cannot land between the two — and **a blocked address is never appointed**. Either one
 alone would leave a way to make an administrator who cannot sign in and cannot be unmade. It is
-also what keeps `just dev` safe: the seeded administrator is the address a developer types into the
+also what keeps a development checkout safe: the seeded administrator is the address a developer types into the
 sign-in box, and blocking him is how a checkout locks itself out. The two
 escape hatches belong side by side: `DELETE FROM administrator WHERE email = '…';` and
 `UPDATE "user" SET blocked_at = NULL WHERE email = '…';`
@@ -702,8 +708,8 @@ the push's transaction, so a web edit landing inside that one request is still l
 can follow a plain link to an export URL, and safe on the mutating half for the reason every other
 POST here is, `same_site="lax"`. There is deliberately **no `DUMMY_AUTH` branch**, and there was
 one: it came first and signed every API call in as the configured address, which meant a bearer
-token presented to a `just dev` server was silently *ignored* — the one configuration in which the
-header this function is mostly about did nothing. The cost is that `cocco pull` against `just dev`
+token presented to a development server was silently *ignored* — the one configuration in which the
+header this function is mostly about did nothing. The cost is that `cocco pull` against a development server
 now needs a token like anywhere else: mint one on the profile page and put it in `COCCO_TOKEN`. A
 refusal is `ApiNotAuthenticated`, a plain `HTTPException(401)`, deliberately **not**
 `NotAuthenticated`: that class is not an `HTTPException` precisely so its handler can choose between
@@ -733,11 +739,196 @@ edit; `push` zips **only** `challenge.toml`, `README.md`, `tests/` and `evaluato
 an editor's swap file is never sent, and it checks every member's path on the way out of a zip even
 though that zip came from our own server.
 
+### Exercises (`cocco/exercises/`, the `exercise_*` tables)
+
+Short Python exercises, wooclap-style: a teacher runs a set live in class, sets the pace, and
+watches who has solved what. The feature is a port of the `esercizi-python` prototype, with the
+judge in place of Pyodide (DESIGN.md says why). It is **purely formative**: nothing is graded,
+exported or ranked, and "solved" is a verdict the server reached. **Exercises are not challenges.**
+They share `Language`, `isolate_run`, the box pool and the prewarmed runtimes, and nothing above
+that. Folding them into `challenge` would put a "but not for exercises" branch into every
+standings, leaderboard, transfer and regrade path. `plans/2026-10-17-interactive-exercises.md` is
+the long form of everything below, including the measurements.
+
+**The `.md` file is the source of truth, and every import of it is an immutable version.** There
+is no `exercise` table and no `exercise_test` table. `exercise_set_version` holds the source
+verbatim (solution included, staff-only) and the **compiled document** derived from it: the parse
+plus the expected outputs the judge computes, as one JSONB value whose shape is
+`schema.ExerciseDocument` (with a `format` number). The source is written at insert. The document,
+the problems and the status are written **once**, by the build that finishes the version
+(`building` → `ready` | `failed`), in one `UPDATE` guarded by `status = 'building'`. Two values
+written once and never updated cannot drift, and that replaces a rule anybody would have to
+remember. Three pointers hang off it:
+
+- `exercise_set.current_version_id` is the newest **ready** version. `finish_version_build` moves
+  it in the build's own transaction, and **only forward**, by id, because two quick imports are two
+  builds that may finish in either order. A failed re-import therefore breaks nothing.
+- A session **pins** `version_id` when it is opened.
+- A job records the version it ran against, so a result is always read against the tests it was
+  graded on.
+
+An exercise has no id: it is its **1-based position** in a version, the `{n}` in every URL.
+`exercise_set` and `exercise_set_version` point at each other, so the set's foreign key is
+`use_alter`, and a delete clears `current_version_id` before it can take the versions.
+
+**The format** is `cocco/exercises/format.py`, a port of the prototype's `formato.js` with
+**English keywords and one spelling each**. The front matter has `title:` / `description:`, each
+`# Heading` starts an exercise, and the fenced blocks are ` ```starter `, ` ```solution `,
+` ```input [hidden] `, ` ```output `, ` ```error ` and ` ```hint `, with `compare:` and `time:`
+lines. Its module docstring is the reference. The prototype's Italian keywords are **errors that
+name the English word, not aliases** (`_ITALIAN`). A ` ```soluzione ` block left unconverted would
+otherwise be "any other code block", which stays part of the statement and would put the solution
+on every student's screen. Parsing is synchronous, at import: a file that does not parse is a 200
+with its problems and creates no version.
+`compare.py` holds the comparison rules (`exact`, `spaces`, `case`, `numbers <tol>`, `order`).
+`hints.py` holds the one-line English explanation of each Python exception. Like `transfer.py`,
+`format.py`, `compare.py` and `hints.py` touch no database, FastAPI or judge, and are tested by
+import.
+
+**Nothing runs the student's file directly: `harness.py` does, inside the box.** The judge copies
+it in next to the program and runs `python harness.py <check|run> main.py`. It is not imported by
+cocco, so it stays plain stdlib. It exists because two semantics are about Python itself:
+
+- an `input("…")` prompt is dropped in `check` mode, and in `run` mode it is echoed together with
+  the line read;
+- `error: ValueError` passes on that exception or a subclass, which needs the MRO, and only the
+  raising process has it.
+
+It caps stdout, stderr and the traceback at 256 K characters each, always exits 0, and writes one
+JSON object, `schema.HarnessReport`, as the **last line** of the real stdout. **The isolate status
+says how the run ended; the report says what the program did.** A timeout or an OOM produces no
+report. A missing or unparseable report under status `OK` is something the *program* did
+(`os._exit`, closing fd 1), reported as "ended without reporting", and never a
+`judge_internal_error`. A program can forge the report by writing to fd 1, and that is accepted:
+the output is still compared in the judge, so a forgery can only fake the exception check, and
+nothing is graded. `_jsonb_safe` strips NULs and lone surrogates **as the report is parsed**, not
+on the way into the database. A solution's output becomes an expected output, so one boundary
+keeps what is compared and what is stored the same bytes.
+
+**Comparison happens in the judge process**, not in an evaluator box: the rules are declarative
+and the code applying them is ours, and a box per test would double a check's cost to buy nothing.
+It goes through `asyncio.to_thread`, because `order` with `numbers` is quadratic in the line count.
+
+**Three job kinds, one table, `exercise_job`, with the result as JSONB on the row.**
+
+- **build**: staff, one per version. It runs the solution twice on every input (to catch
+  non-determinism) and the starter once, then writes the document and the problems. Errors fail
+  the build: a crash, a timeout, or an exception where no `error` was declared. Warnings do not: a
+  starter that already passes, a non-deterministic solution, every test hidden.
+- **check**: a recorded attempt. Every test runs through the harness, concurrently, and the
+  result holds a verdict per test plus `passed`.
+- **run**: the student's own stdin, given up front (Run is not interactive), with nothing
+  compared. The transcript reads like a terminal because the harness echoes what was read.
+
+Because there are no child rows, a judge finishing a job whose session, set or course has just
+been deleted updates **zero rows** (`finish_exercise_job`) instead of violating a foreign key. That
+is why no delete here has to lock against the judge, unlike `lock_challenge_submissions`. **One
+queued job per button**: `insert_exercise_job` is an upsert on `uq_exercise_job_one_queued`,
+`(user_id, kind, session_id, version_id, exercise_index) WHERE status = 'queued' AND kind <>
+'build'`, `NULLS NOT DISTINCT` so that previews dedupe too. A second click *replaces* the queued
+job's source and stdin and keeps its id and its `enqueued`, so mashing a button builds no backlog,
+loses no place in the queue, and leaves a polling tab looking at the right row. A `running` job is
+outside the predicate and is never touched. That index is also why `requeue_exercise_job` tries
+inside a savepoint and finishes the job as superseded when a newer one holds its place.
+**Retention**: `prune_run_jobs` deletes finished runs and session-less (preview) checks older than
+`RUN_JOB_RETENTION`, six months like the logs. It runs from an idle worker at most hourly, in
+batches. A session's checks and every build are kept, because progress and problems are derived
+from them.
+
+**A preview is a job without a session.** Staff try a version at `…/exercises/{set_id}/versions/
+{version_id}/preview/{n}` as a student would. `session_id` is NULL, so no progress query ever sees
+it. Course staff are **refused** Run and Check *inside* a session (`STAFF_SESSION_JOB_REFUSAL`,
+with a link to the preview), so a session's jobs are only ever its students' work. Staff may still
+open its pages past the pacing.
+
+**Sessions carry pacing and progress; a set is only content.** `exercise_session` has a label, a
+`mode` (`live` or `open`), `unlocked_through`, `opened_at` and `closed_at`, and one set can run
+many sessions: lab group A on Monday, group B on Wednesday. In **live** mode a student may read and
+attempt `1..unlocked_through` and gets a "wait for the teacher" page past it, whose poll answers
+`HX-Redirect` once the exercise unlocks. **Open** has nothing locked and is the homework mode.
+**Closed** refuses every new job and still lets everyone read. Every session write is one
+conditional statement, `block_user`'s style. **All of pacing is `exercise_lock_refusal`**, called by
+the read gate (`require_session_exercise`, behind `require_exercise_session_member` and its
+`exercise_session_in_course` cross-check) and by the job gate (`_session_job_gate`). The job gate
+reads the session row `FOR SHARE` inside the transaction that inserts the job, so a close, a pace
+move or a version switch (all `UPDATE`s of that row) waits for the job to commit. A locked exercise
+is a `Forbidden` page, not a 404, for the scheduled challenge's reason.
+`exercise_session_participant` is written on a student's first visit and is the dashboard's
+denominator: who came, not who is enrolled. `exercise_session_reveal` shows one exercise's
+solution to the class. Code does not carry over between sessions. The draft lives in localStorage
+per session and exercise, and every job sends a copy to the server, which the page falls back on.
+
+**Switching a session's version is the one write that changes `exercise_session.version_id`**, and
+re-importing never does it by itself: a fixed file builds a new version, it becomes current, and
+staff press "switch to the latest version" (`post_exercise_session_switch`).
+
+- Exercises are matched **by position**. The switch therefore **refuses** a version with fewer
+  exercises than the session has checks for (`query_max_checked_exercise`, read under the row's
+  `FOR UPDATE`), and its confirmation lists every retitled exercise, since a reordered file is the
+  one mistake position-matching cannot see.
+- It is refused unless `version_id` is still the current version the confirmation showed.
+- `unlocked_through` is clamped to the new count, or set to it for an open session, and reveals
+  past the end are dropped.
+- Past checks keep their version and their result, so "solved" stays solved. Nothing is regraded.
+
+**Progress is derived, never stored.** On each exercise a student is *solved* (some check passed
+every test; this is **sticky**, surviving later wrong attempts and version switches), *attempted*,
+or *not attempted*, with *checking* shown beside the status while a check is pending.
+`_exercise_status` is the one function that decides it, for the student's strip and the teacher's
+grid alike. Both read the check aggregate `_session_checks_cte(one_user=…)`, so the two screens
+cannot disagree. The cohort is `_SESSION_COHORT_CTE`: participants, unioned with anyone who
+checked. **Two staff screens, deliberately separate pages.** The **dashboard** (`…/dashboard`,
+`query_session_progress`) shows names, a participants × exercises grid, and a drill-in to a
+student's latest Check and Run. The **projector** (`…/projector`, `query_session_counts`) never
+selects a person, only counts. It has the pacing and reveal controls, and the forms post
+`view=projector` so they answer with the projector's own fragment. A projected screen must never
+be able to show who is stuck, and that is a property of the query, not of the template.
+
+**The student never receives the compiled document.** `student_exercise_view` is the one function
+that cuts it down: statement, starter, hints, visible tests with their expected outputs, a count of
+hidden ones, and the solution only once revealed. It is `visible_outcomes`'s rule, kept in Python
+where it is testable. `exercise_check_rows` does the same for a check's result. A hidden test
+shows a student only its verdict and, on an error, the exception's type, which its hint explains.
+The line is withheld too: it is a channel the program controls, as are its output, its exit code
+and its running time. The page
+polls only the strip, every 3 s, and **never swaps the editor**. A job's fragment polls every 500
+ms while pending. **The poll ends because the done copy replaces the polling element and carries no
+trigger, not through a 286**: the htmx 4 this app loads has no special case for 286
+(`_render_exercise_job`). The editor is CodeMirror 5, vendored, because 6 needs a bundler.
+
+**Routes and authorization are course-keyed.** Sets live under `/courses/{course_id}/exercises/
+{set_id}/…` and sessions under `/courses/{course_id}/sessions/{session_id}/…`. The role always
+comes from `course_id` through `CourseEditor` / `CourseMember`, with an `*_in_course` cross-check
+(`exercise_set_in_course`, `exercise_session_in_course`), never by joining through the set. The
+per-exercise route is **`…/sessions/{session_id}/{n:int}`, and the convertor is load-bearing**: a
+plain `{n}` also matches `…/dashboard` and `…/projector` and answers 422 on them, because a route
+does not fall through to the next one on a failed validation. Everything is declared above
+`get_challenge`, with the course's other pages. **An archived course refuses every Run and Check**,
+in a session and in a preview, with `ARCHIVED_EXERCISE_JOB_REFUSAL`. That is archiving's third
+enforcement point. A blocked student is stopped by `get_user`, and their queued jobs still run,
+for `pull_queued_submission`'s reason.
+
+**Deletion is hand-ordered, like everything else here, with no `ON DELETE`.**
+`delete_exercise_session` deletes jobs, reveals, participants, then the session; it is allowed in
+any state, and staff confirm by typing the label. `delete_exercise_set` refuses a set that still
+has sessions. Otherwise it deletes the jobs **by `version_id`** (builds and previews have no
+session and would hold the versions down), clears `current_version_id`, then deletes the versions
+and the set. `delete_course` calls both, after `lock_course_exercises` has taken sessions, then
+versions, then sets `FOR UPDATE`, which is the order every writer takes them in.
+
+**Transfer**: `cocco pull --set ID` / `cocco push` move a set as one `exercises.md`
+(`transfer.EXERCISES_NAME`, `cli.Kind`), under the existing `.cocco/state.toml` discipline. The
+`ETag` is the **newest** version's id, not the current one's. Pinning it to the current version
+would make every push after a failed build a 412, and would hand a pull the old file, which
+`reconcile` would then write over the author's fix. A push is an import, holds
+`lock_exercise_set_for_push` from the `If-Match` check to the commit, and waits for the build
+unless given `--no-wait`.
+
 ### Logging (`cocco/logs.py`)
 
 **Call sites do not change; only the output does.** Every module logs through
 `logging.getLogger(__name__)` with `%`-style messages, and `[log] format = "json"` turns each record
-into one JSON object on stdout (`JsonFormatter`); `"text"`, the default, is what `just dev` reads. A
+into one JSON object on stdout (`JsonFormatter`); `"text"`, the default, is what a developer reads. A
 value worth filtering on is *also* passed through `extra=` — the judge's per-test `outcome`,
 `elapsed_s` and the final `score`; the sign-in refusals' `email`, `provider` and `reason`; the
 config warnings' `setting`. The module is `logs`, never `logging`, which would shadow the stdlib.
@@ -786,13 +977,13 @@ spelling adopts nginx's request id.
 
 - **Async everywhere in `judge.py`.** Subprocess calls use `asyncio.create_subprocess_exec`; tests are `async def` and rely on `asyncio_mode = "auto"` in `pyproject.toml`, so no `@pytest.mark.asyncio` is needed.
 - **Box ids are a shared resource.** Always go through `_IDS_POOL.acquire()` rather than hardcoding a box id; the pool defaults to 32 concurrent boxes.
-- **Large inputs live on disk.** Test case inputs/outputs are passed by path, not read into memory, and reach a box a chunk at a time. Preserve this when adding features — uploaded test files go through `Storage.save_stream`, never `await upload.read()`, and a file that leaves the app (the sample download, the export zip) is streamed rather than handed over whole.
+- **Large inputs live on disk.** Test case inputs/outputs are passed by path, not read into memory, and reach a box a chunk at a time. Preserve this when adding features — uploaded test files go through `Storage.save_stream`, never `await upload.read()`, and a file that leaves the app (the sample download, the export zip) is streamed rather than handed over whole. **Exercises are the deliberate exception, and nobody should "fix" it.** Their inputs are a few bytes an author typed into a Markdown file, so they live in the database, in a version's compiled document. The judge reads an exercise's tests in one query (`query_job_exercise`), and `Storage` plays no part in that feature at all.
 - **All file access goes through `Storage`.** `Storage.resolve` refuses any path that would land outside the storage root, and `safe_filename` reduces a user-supplied name to a bare, harmless one. Test case paths come from the database and ultimately from teacher input, so never join them onto a base directory by hand.
 - **Everything under the storage root is a gzip stream stored under its logical name**, and `cocco/storage.py` is the only module that knows it. A million-line input is the shape that compresses best and a course keeps hundreds of them; `write`, `read`, `open` and `save_stream` take and return plaintext and are the calls they always were, so the compression is *transparent* and `main.py`'s call sites mostly did not move. There is deliberately **no `.gz` suffix**: `testcase.input_path` is still the name the teacher uploaded and the name the transfer format uses, which is what leaves `resolve`, `exists`, `rename`, `delete`, `plan_testcases` and the rename route untouched — a suffix would have to be appended by every writer and stripped by every reader, and one that forgot would be silent. Three consequences. `save_stream` returns the **uncompressed** count, because that is what `MAX_TESTCASE_BYTES` is about, while `size` is bytes on disk. Deflating tens of megabytes is a second of CPU, so an async caller puts it on a thread — `post_testcase`, the push's `store`, the export's zip build — which is the rule `hash_password` is already here for. And a file leaving the app is a decompressing **stream**, never a `FileResponse`: `_stored_file_download` for the two downloads, `_zip_stored` for the export, since there is no file of the right bytes to point one at. There is no fallback for a plaintext root and deliberately so: `cocco-migrate compress-storage` converts one, `check_storage_format` refuses to start without the `.storage-format` marker (`check_schema_is_current`'s shape, in `cocco/server.py`, the startup hook and `judge.main`), and a read that meets a plain file raises `StorageFormatError` naming that command rather than letting `gzip` notice halfway through grading. The bundled evaluators in `cocco/evaluators/` are **source tree, not storage**, so they are plain — the one branch `prepare_evaluator` and `get_evaluator_download` each keep.
 - **`challenge.position` orders, `number` numbers.** The column is the sort key the course editor's arrows write, ordered by `position, id` everywhere so challenges nobody has reordered keep the order they were created in. What a page prints ("Challenge 03") is `number`, the *rank* of that key within the course, computed in `query_challenge` — the two are separate fields because a reorder leaves gaps and skipped numbers would be a bug. Moving one is `reorder_challenges`, a dense renumber of the whole course rather than the sentinel swap `swap_testcase_order` does: `position` defaults to 0, so every row of a course that predates the column starts out tied, and exchanging two zeroes moves nothing.
 - **A test case that has graded something is never deleted, only retired.** `delete_testcase` refuses (via `count_testcase_outcomes` in the route, with the `testoutcome.testcase_id` FK as the backstop) once any outcome points at it: detaching those outcomes would leave scores in the history with nothing to say what produced them. Clearing `is_active` is the supported move — the row, the files and the past outcomes all stay, but the judge stops running it and it stops being downloadable. `is_active` is checked in `pull_queued_submission`, in `query_challenge`'s `samples` CTE and in `query_sample_testcase`; the editor's `query_challenge_testcases` deliberately does not filter it, so a retired case can be reinstated.
 - **Regrading is the one place outcomes are deliberately destroyed.** `regrade_challenge` deletes every outcome of a challenge and puts every submission back to `queued`, so a fixed expected output can be applied without asking students to resubmit. Outcomes scored on *retired* test cases go too and never come back, since the judge only runs active ones — that is the difference between regrading and retiring, and it is why the confirmation dialog spells it out. Afterwards `count_testcase_outcomes` is zero for the challenge's test cases, so they are deletable again; nothing is left for a delete to strand. The route checks `count_running_submissions` first and refuses while a judge is mid-run, whose outcomes would otherwise land after the reset.
-- **Deleting a challenge is the one place a submission is destroyed, and the cascade is hand-written.** No foreign key in `model.py` declares an `ON DELETE`, deliberately — `testoutcome.testcase_id` having none is exactly what makes it the backstop that stops `delete_testcase` from stranding a score — so `delete_challenge` spells the order out once (testoutcome by `submission_id`, then by `testcase_id`, then submission, testcase, challenge) and the database's job is to raise if it is ever got wrong. Both outcome deletes and not one: both FK columns are nullable, so an outcome detached from its submission can still be the only thing holding a test case down. `delete_course` calls it per challenge rather than writing the cascade a second time, wider, then takes enrollments and the course. Every other rule in this app draws the opposite line — a block does not retract work, `delete_enrollment` takes one row, a graded test case is retired — and that line is about a course that still exists; there is nothing left for a score to be the record *of* once the challenge is gone. Files are read **before** the deletes (`query_challenge_file_paths`) and unlinked **after** the commit, `post_testcase_delete`'s order, so a failed commit can leave a file nothing points at but never a row pointing at a file that is gone; the directories then go through `Storage.delete_directory`, which is `rmdir` and never `rmtree`, so anything still in there is left to be looked at.
+- **Deleting a challenge is the one place a submission is destroyed, and the cascade is hand-written.** No foreign key in `model.py` declares an `ON DELETE`, deliberately — `testoutcome.testcase_id` having none is exactly what makes it the backstop that stops `delete_testcase` from stranding a score — so `delete_challenge` spells the order out once (testoutcome by `submission_id`, then by `testcase_id`, then submission, testcase, challenge) and the database's job is to raise if it is ever got wrong. Both outcome deletes and not one: both FK columns are nullable, so an outcome detached from its submission can still be the only thing holding a test case down. `delete_course` calls it per challenge rather than writing the cascade a second time, wider. It does the same with `delete_exercise_session` and `delete_exercise_set` for the course's exercises (see "Exercises"), and then takes enrollments and the course. Every other rule in this app draws the opposite line — a block does not retract work, `delete_enrollment` takes one row, a graded test case is retired — and that line is about a course that still exists; there is nothing left for a score to be the record *of* once the challenge is gone. Files are read **before** the deletes (`query_challenge_file_paths`) and unlinked **after** the commit, `post_testcase_delete`'s order, so a failed commit can leave a file nothing points at but never a row pointing at a file that is gone; the directories then go through `Storage.delete_directory`, which is `rmdir` and never `rmtree`, so anything still in there is left to be looked at.
 - **A delete locks the submissions it is about to destroy; a regrade only counts them.** `post_regrade` is happy with `count_running_submissions` because the race costs one stale score. A delete uses `lock_challenge_submissions` / `lock_course_submissions`, which take the rows `FOR UPDATE` and count in the same statement, because `run_from_queue` writes its outcomes inside `engine.begin()` with **no `except` around it**: a submission deleted mid-run makes `insert_test_outcomes` violate a foreign key, which fails that worker's job with a traceback in the log (it used to take the judge *process* down). The locks are taken on `submission` before anything touches `testoutcome`, which is the order the judge takes them in, so the two cannot deadlock.
 - **"Archived" is one `or`, spelled twice and never a third time.** A challenge is archived when it says so *or* when its course does; `_EFFECTIVE_ARCHIVED_SQL` says it for the raw page queries and `_effective_archived_at()` for the single-row reads a route makes, both in `repository.py`, each naming the other, with a test asserting they agree. Every page query exposes it as **`effective_archived_at`** — a separate name and never `AS archived_at`, which would put two columns of that name in the record and let `row_to_json` decide it last-one-wins — and every template reads that one. The single exception is the challenge editor's danger zone, which compares `challenge.archived_at` against it to say "its course is archived, so this is read-only whatever this button says"; anywhere else, reading the challenge's own column silently un-archives every challenge under an archived course. `query_courses` drops an archived course from the **non-enrolled half only**, since it cannot be joined and listing it would be an invitation to a shut door; `include_archived` is how an administrator, the only person who can unarchive one, still finds it. `pull_queued_submission` deliberately does not learn about any of this: skipping an archived challenge's queued rows would strand them as `queued` forever, exactly as it would for a blocked student's.
 - **"Visible" is `challenge.visible_from`, and it is `archived_at` inverted.** NULL is hidden, a past instant is visible, a future one is a challenge that **opens by itself** at that moment — three answers to one question, so one column. It keeps its neighbour's discipline and is spelled exactly twice, `_CHALLENGE_VISIBLE_SQL` for the raw page queries and `_challenge_visible()` for the single-row reads, each naming the other, with a test pinning them together. Two differences from archiving are load-bearing. It does **not cascade from the course**, which has no hidden state to cascade, so the Core expression needs only `challenge` in its FROM. And it is enforced in *one* place rather than at the routes: `require_challenge_visible` is called from `require_challenge_viewer` and `require_challenge_member`, the two gates that already answer "may this person read this challenge" — which is why `post_submission` has no visibility check of its own and needs none, its dependency running before its body. The two refusals differ on purpose: a **hidden** challenge is a bare 404, which tells the asker nothing and matches the course page they came from, while a **scheduled** one is a `Forbidden` naming the date, because its teaser card is on that page saying exactly that and a 404 there would read as a broken link. `insert_challenge` writes NULL, so **a new challenge is hidden** — it has no test cases and no evaluator, and listing it the instant it was created was advertising a page that could not be solved. `_COURSE_CHALLENGES_CTE` exposes it as **`is_visible`** (never `AS visible`, `effective_archived_at`'s reason) and its two callers take `include_hidden`, defaulting to the *student's* list so a caller who forgets cannot leak one. Unlike `archived`, it **is** a `challenge.toml` key, because it is a column a challenge form writes: absent means hidden, so a pulled draft pushed back stays a draft. `pull_queued_submission` does not learn about it either, for archiving's reason.

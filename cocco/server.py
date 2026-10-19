@@ -117,11 +117,11 @@ def _check_schema(config) -> None:
 
     This looks like a duplicate of the check in `cocco.main`'s startup, and it
     is not: uvicorn only turns a failed startup into a non-zero exit when there
-    is one worker and no reloader. Under `--reload` - which is what `just dev`
-    runs - the reload supervisor outlives the dead child, does not restart it
-    (it restarts on file changes, not on a child dying) and eventually exits 0,
-    so `just dev`'s `wait -n` never fires and what you get is a silently absent
-    web app. Under `--workers N` the process manager respawns the failing worker
+    is one worker and no reloader. Under `--reload` - the usual way to run it
+    while developing - the reload supervisor outlives the dead child, does not
+    restart it (it restarts on file changes, not on a child dying) and
+    eventually exits 0, so whatever waits on the process never sees it fail
+    and what you get is a silently absent web app. Under `--workers N` the process manager respawns the failing worker
     forever. Asking here, before uvicorn exists, is what makes the refusal a
     plain non-zero exit under every combination of flags; the copy in the app is
     what covers every other ASGI runner and makes each worker verify for itself.

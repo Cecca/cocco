@@ -2106,9 +2106,9 @@ async def get_api_user(request: Request, db: DBDep) -> schema.User:
 
     There is deliberately no `DUMMY_AUTH` branch, and there used to be: it came
     first and signed every API call in as the configured address, which meant a
-    bearer token presented to a `just dev` server was *ignored* - the one
+    bearer token presented to a development server was *ignored* - the one
     configuration where the header this function is mostly about did nothing.
-    The cost is that `cocco pull` against `just dev` now needs a token like
+    The cost is that `cocco pull` against a development server now needs a token like
     anywhere else: mint one on the profile page and put it in `COCCO_TOKEN`.
     """
     presented = parse_bearer(request.headers.get("Authorization"))
@@ -2961,7 +2961,8 @@ async def post_course_archive(course_id: int, request: Request, db: DBDep, user:
     """Archive a course: read-only for the people already on it, invisible and
     unjoinable to everybody else. Staff go on editing it - archiving is a
     visibility state, not a lock, which is what keeps the whole feature down to
-    two enforcement points (`post_submission` and `post_course_enroll`)."""
+    three enforcement points (`post_submission`, `post_course_enroll`, and the
+    routes that queue an exercise Run or Check)."""
     if not await course_exists(db, course_id):
         raise HTTPException(status_code=404)
     await set_course_archived(db, course_id, True)

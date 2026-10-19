@@ -11,7 +11,7 @@ evidence about this one.
 The database is **`cocco-test`, and the tests own it**. Host, port and user come
 out of the environment - so the devShell's socket and the compose container both
 work with no configuration - but `PGDATABASE` is deliberately *not* read: that
-names a developer's `just dev` data, and a deployment's `cocco.toml` names
+names a developer's own `cocco-dev` data, and a deployment's `cocco.toml` names
 something worse. `load_config` is not read either, for the same reason and more
 so. The tests empty this database between every test; it must therefore be one
 nobody minds losing.

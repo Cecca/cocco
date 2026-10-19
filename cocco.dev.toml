@@ -6,11 +6,11 @@
 # spelling at all. That is what makes a shared, committed configuration file
 # possible in the first place.
 #
-# `just dev` points COCCO_CONFIG at this file. To run against your own
+# The Justfile points COCCO_CONFIG at this file. To run against your own
 # settings instead - the real Google flow, another database - write them in
 # `cocco.toml`, which is gitignored, and start with
 #
-#   COCCO_CONFIG=cocco.toml just dev
+#   COCCO_CONFIG=cocco.toml just web   (and the same for `just judge`)
 
 [database]
 # Empty on purpose, and not a placeholder: libpq fills the user, database and
@@ -54,8 +54,8 @@ dummy_auth = true
 # re-runs every migration and reseeds the cast below, so it ends up exactly
 # where a fresh `just migrate` would, with the dummy data on top. Note that a
 # judge started earlier is left holding a schema that has been dropped and
-# rebuilt underneath it - `just dev` migrates first and starts the judge last,
-# so the ordinary path is fine; restart the stack if you reset under a live one.
+# rebuilt underneath it, so start `just judge` after the web app's reset boot,
+# or restart the judge if you reset under a live one.
 reset_db = false
 
 # There is no [auth] table on purpose. `allowed_domains` defaults to unipd.it,

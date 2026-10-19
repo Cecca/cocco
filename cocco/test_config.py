@@ -216,7 +216,7 @@ def test_the_judge_flake_is_read(tmp_path):
 @pytest.mark.parametrize("body", ["", "[judge]\n", '[judge]\nflake = ""\n'])
 def test_the_judge_flake_defaults_to_the_working_directory(tmp_path, body):
     """"." is what the ref was implicitly before it could be written down, so
-    a file that says nothing about it leaves `just dev` exactly as it was. An
+    a file that says nothing about it leaves a checkout exactly as it was. An
     explicit empty string is a typo, not a request for `nix build #python3`."""
     path = tmp_path / "cocco.toml"
     path.write_text(body)
@@ -233,7 +233,7 @@ def test_the_judge_gcroots_are_read(tmp_path):
 
 @pytest.mark.parametrize("body", ["", "[judge]\n", '[judge]\ngcroots = ""\n'])
 def test_the_judge_gcroots_default_under_xdg_state_home(tmp_path, monkeypatch, body):
-    """Nothing to configure for `just dev` or for an ordinary service: the
+    """Nothing to configure for a checkout or for an ordinary service: the
     default is durable, per user and per host, which is exactly the scope a GC
     root has. An explicit empty string is a typo, not a request to scatter
     symlinks over the filesystem root."""
@@ -500,7 +500,7 @@ def test_a_proxy_that_could_never_match_is_refused(tmp_path, value):
 
 
 def test_the_committed_dev_config_loads():
-    """`cocco.dev.toml` is tracked and `just dev` depends on it, so it is
+    """`cocco.dev.toml` is tracked and the Justfile depends on it, so it is
     parsed by a test rather than left to rot - and the assertion that it
     configures no OAuth client is the guard on what makes committing it
     possible at all: there is no secret in it.

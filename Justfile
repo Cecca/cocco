@@ -7,11 +7,11 @@ log_dir := ".logs"
 # Which configuration file both processes read: the database, the storage root
 # and the development shortcuts all come out of it, so this one variable is
 # what makes the web app and the judge agree. `cocco.dev.toml` is in git and
-# bypasses authentication, so `just dev` needs no Google credentials.
+# bypasses authentication, so `just web` needs no Google credentials.
 #
 # To run against your own settings - the real sign-in flow, another database -
 # write a `cocco.toml`, which is gitignored, and start with
-#   COCCO_CONFIG=cocco.toml just dev
+#   COCCO_CONFIG=cocco.toml just web
 export COCCO_CONFIG := env_var_or_default("COCCO_CONFIG", "cocco.dev.toml")
 
 # Start the development database

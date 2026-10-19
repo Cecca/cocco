@@ -9,7 +9,7 @@
 # The tests are the one exception to the sentence above: they read PGHOST,
 # PGPORT and PGUSER like everything else but deliberately *not* PGDATABASE,
 # naming their own `cocco-test` and creating it if it is not there, so a test
-# run cannot empty the database `just dev` is using:
+# run cannot empty the database `just web` and `just judge` are using:
 #
 #   export PGHOST=127.0.0.1
 #   export PGPORT=5432
@@ -34,7 +34,7 @@ services:
       # POSTGRES_PASSWORD and a PGPASSWORD instead if you would rather.
       POSTGRES_HOST_AUTH_METHOD: trust
       POSTGRES_USER: postgres
-      # The devShell exports PGDATABASE=cocco-dev, and `just dev`'s `create-db`
+      # The devShell exports PGDATABASE=cocco-dev, and the devShell's `create-db`
       # would make it anyway; this is just one less thing to happen on a first
       # start.
       POSTGRES_DB: cocco-dev

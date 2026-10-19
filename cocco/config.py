@@ -272,7 +272,7 @@ class DevConfig:
 class LogConfig:
     """How every process writes its log, which is stdout and nothing else.
 
-    Text is the default so `just dev` stays readable; a deployment asks for
+    Text is the default so a terminal in development stays readable; a deployment asks for
     one JSON object per line, which is what a collector can query. Where the
     lines go after stdout - journald, a container runtime, a file rotated by
     logrotate - is the collector's business, and so is how long they are kept.

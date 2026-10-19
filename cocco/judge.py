@@ -2162,9 +2162,9 @@ def main(argv: list[str] | None = None) -> None:
     # judge pointed at different databases. It asks once, at startup, and then
     # runs forever - so a `[dev] reset_db` boot of `cocco-web` underneath a live
     # judge leaves that judge on a schema that has been dropped and rebuilt.
-    # `just dev` migrates first and starts the judge last, which is the ordinary
-    # path; anything else is loud rather than wrong, because `run_from_queue`
-    # has no `except` around its transaction.
+    # Migrating first and starting the judge last is the ordinary path;
+    # anything else is loud rather than wrong, because `run_from_queue` has no
+    # `except` around its transaction.
     try:
         with engine.connect() as conn:
             check_schema_is_current(conn, process="cocco-judge")

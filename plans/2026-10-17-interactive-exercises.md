@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Interactive exercises, paced by the teacher
@@ -316,8 +316,10 @@ attempts keep their source. It is **not** in this plan.
   like the rest of the interface.
 - **Editor:** CodeMirror 5, vendored under `cocco/static/` as the prototype does it. Version 6
   needs a bundler, and this repo has none.
-- **Polling for a job's result:** the fragment polls every 500 ms while the job is pending and
-  stops with htmx's 286 once it is done.
+- **Polling for a job's result:** the fragment polls every 500 ms while the job is pending. It
+  stops once the job is done because the done copy replaces the polling element and carries no
+  trigger of its own, not through a 286: the htmx 4 this app loads has no special case for 286
+  (`_render_exercise_job`).
 
 ### Authorization and URLs are course-keyed
 
@@ -683,7 +685,7 @@ Two things found along the way, neither a bug:
 - The plan's "`just dev`" no longer exists as a recipe. Step 12 should check what CLAUDE.md says
   about it, since it still documents `just dev`.
 
-### [ ] 12. Documentation
+### [x] 12. Documentation
 
 - CLAUDE.md: a new "Exercises" section covering:
   - the source of truth and immutable versions;
@@ -697,6 +699,22 @@ Two things found along the way, neither a bug:
 - DESIGN.md: why the judge rather than Pyodide, why exercises are not challenges, and why there
   are compiled versions instead of exercise rows.
 - `cocco.example.toml`: `[judge] concurrency`.
+
+As built:
+
+- CLAUDE.md has the "Exercises" section, between "The transfer API" and "Logging". The judge's
+  workers, `SKIP LOCKED`, the `QUEUES` priority and `LISTEN`/`NOTIFY` are item 4 of "Execution
+  pipeline", because challenges use them too. The archiving paragraph now says **three**
+  enforcement points. "Large inputs live on disk" names the exercise exception, and the
+  challenge-delete convention says that `delete_course` also takes the exercises.
+- CLAUDE.md's Commands no longer offer `just dev`. They give `just migrate`, `just web` and
+  `just judge` (and `just start-dev-db`). Every other mention of the recipe was reworded too: in
+  CLAUDE.md, `cocco.dev.toml`, `cocco.example.toml`, `compose.yaml`, the Justfile header,
+  `server.py`, `judge.py`, `config.py`, `main.py`, `conftest.py` and `test_config.py`. Older plans
+  keep it, as the record of what was true when they were written.
+- DESIGN.md has "Interactive exercises", with the three whys.
+- `cocco.example.toml` already had `[judge] concurrency` from step 1. Nothing changed there.
+- The "Polling for a job's result" bullet above now describes what was built.
 
 ## Decided
 

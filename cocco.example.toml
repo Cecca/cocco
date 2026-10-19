@@ -1,7 +1,7 @@
 # Copy this to `cocco.toml` and edit it. Nothing here is required: cocco boots
 # with no file at all, and the login page then says no sign-in method is
 # configured. For development you want none of this - `cocco.dev.toml` is in
-# git and `just dev` reads it.
+# git and the Justfile reads it.
 #
 # The path is `cocco.toml` in the working directory, overridable with
 # COCCO_CONFIG. `cocco.toml` is gitignored.
@@ -76,7 +76,7 @@ root = "/var/lib/cocco/storage"
 # runs `nix build` to get it. This says which flake.
 #
 # The default is ".", the flake in the working directory, which is what it was
-# implicitly before it could be written down: right for `just dev`, and wrong
+# implicitly before it could be written down: right for a checkout, and wrong
 # for a `cocco-judge` on PATH, which has no checkout to be started from. Give
 # it an absolute path to a checkout, or a flake reference nix accepts:
 #
@@ -101,7 +101,7 @@ flake = "/opt/cocco"
 #
 # The default is $XDG_STATE_HOME/cocco/gcroots, falling back to
 # ~/.local/state/cocco/gcroots - durable, per user and per host, which is the
-# scope a GC root has. That is right for `just dev` and for an ordinary systemd
+# scope a GC root has. That is right for a checkout and for an ordinary systemd
 # unit with a real user; set this when the judge runs with no usable HOME, as
 # under `DynamicUser=yes`, and point it at the unit's own StateDirectory.
 #
