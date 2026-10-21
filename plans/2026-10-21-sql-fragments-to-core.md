@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 ---
 
 # Replace the SQL string fragments in `repository.py` with Core
@@ -90,7 +90,7 @@ Each step is one commit, and the suite passes at every commit.
 4. [x] **Exercise sessions.** `_exercise_titles`, `_session_revealed`, `_session_checks`, `_session_cohort`;
    `query_exercise_session`, `query_session_strip`, `query_session_progress`, `query_session_counts`. The last three
    are polled by a whole class, so compare `EXPLAIN ANALYZE` before and after on a seeded session.
-5. [ ] **Documentation.** In CLAUDE.md, rewrite the conventions that name the fragments: "Archived" and "Visible"
+5. [x] **Documentation.** In CLAUDE.md, rewrite the conventions that name the fragments: "Archived" and "Visible"
    are no longer "spelled exactly twice", and "The number on a challenge card" names `_COURSE_CHALLENGES_CTE`.
    Update the docstrings and comments that refer to removed names. Remove the snapshot harness.
 
@@ -120,3 +120,53 @@ Each step is one commit, and the suite passes at every commit.
   These also give a single definition, but each change needs a hand-written migration (autogenerate can't see
   views; see `.claude/rules/migrations.md`). Postgres also expands `challenge.*` when the view is created, so a
   column added to the table later silently never appears in the view.
+
+## Outcome (2026-10-21)
+
+Done on branch `sql-fragments-to-core`, one commit per step (step 0 has none: the harness was never committed). Each
+step was written by an implementation agent and approved by a separate review agent before it was committed.
+
+- **Step 0.** An untracked snapshot test seeded every case the fragments distinguish (archived course and challenge,
+  hidden / scheduled / visible challenges, running and queued submissions with NULL scores and retired cases,
+  several exercise set versions, a session with sticky solves, error results and an unregistered checker) and
+  recorded 24 queries across all viewer and parameter combinations. It loaded JSON through a decoder that rejects
+  duplicate keys. Every later step compared clean against the frozen baseline, which was never re-recorded.
+- **Step 1** (`de95eda`). `_submission_outcomes()` (a one-row CTE), `_score_columns()`, `_EMPTY_JSON_ARRAY`.
+- **Step 2** (`998fa47`). `_course_challenges()`, `_listed_challenges()` (the `include_hidden` filter, outside the CTE
+  so `number` is still ranked over the whole course), `_challenge_number()` shared with `query_challenge`. The tests
+  that pinned two spellings now test behaviour; a mutation run confirmed they fail if either rule is broken.
+  `query_challenge`'s samples became a filtered subquery instead of a site-wide grouped CTE.
+- **Step 3** (`ae18080`). `_exercise_versions(condition, *, counts=True)`, `_exercise_set_title()`,
+  `_version_number()` (now the only version numbering, also in `query_exercise_version_source`),
+  `_count_problems()`, `_latest_version()`. `query_editable_exercise_sets` moved to Core as well, because it used the
+  title fragment. Core now types its `latest_status` as the enum, so `api_list_exercise_sets` serialises `.value`.
+- **Step 4** (`7e7af82`). `_exercise_titles()`, `_session_revealed()` (now also used by `query_session_heading`),
+  `_session_checks()`, `_session_cohort()`, plus `_session_document()`, `_checks_of()`, `_json_object()`.
+  `kind = 'check'` is rendered as a literal everywhere (`_is_check()`). Under psycopg's automatic prepared statements
+  this keeps `ix_exercise_job_check`'s partial-index predicate provable, which was verified with a forced generic
+  plan. `EXPLAIN (ANALYZE, BUFFERS)` on a 90-person, 15-exercise session with about 23k jobs showed the same plans and
+  timings before and after (progress 13.1 → 11.9 ms, counts 4.9 → 4.9 ms, strip 0.2 ms). Reveals went from a
+  correlated SubPlan to a one-shot InitPlan.
+- **Step 5.** CLAUDE.md, `.claude/rules/exercises.md`, the `conftest.py` docstring and comments in `model.py`,
+  `main.py` and three templates no longer name removed fragments. The harness is deleted.
+
+Verification: the non-integration suite passes at every commit (965). `grep -nE '_[A-Z_]+_(CTE|SQL)\b' cocco/` finds
+nothing. The visual check with `just web` was **not** done; the suite renders every page involved, but a look at the
+course page, a challenge, a grading submission, an exercise set and a session's dashboard and projector is still
+worth doing before merge.
+
+No `text()` exception was needed. Queries that used no fragment stay `text()`, as planned.
+
+Deferred, deliberately out of scope:
+
+- `query_user_submissions` and `query_challenge_standings` still spell `_score_columns`' aggregates in `text()` (a
+  "keep in step" note sits on `_score_columns`). Using the helper means rewriting both in Core.
+- `query_exercise_sessions` still splices one of two literal `WHERE` strings into `text()`, and re-spells
+  `_n_exercises` as `jsonb_array_length(...)`.
+- `query_exercise_session`'s `max_checked` and `query_max_checked_exercise` compute the same thing.
+- `prune_run_jobs` compares `kind` with a bound parameter. That is harmless, because its `OR` can't use the partial
+  index anyway.
+- `query_session_progress` scans the whole `checks` CTE once per person (about 7 of its 12 ms on the seed above). This
+  predates the change; aggregating per user once and joining would remove it.
+- `_latest_version()` calls `.correlate(ExerciseSet)`, but SQLAlchemy doesn't enforce it. Used without
+  `exercise_set` in the outer FROM, it would silently pick the newest version site-wide.

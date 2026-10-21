@@ -859,8 +859,8 @@ async def test_submission_page_queries(example_database, app_engine):
 
 ########################################################################
 # Accounts, sign-in and the two site-wide powers: who exists, who administers
-# the site, and who is blocked. Plain Core rather than the raw SQL above, and
-# read back through the same helpers the routes use.
+# the site, and who is blocked. Plain rows rather than the JSON documents
+# above, and read back through the same helpers the routes use.
 
 
 @pytest.fixture

@@ -2,11 +2,11 @@
 on its own - a live PostgreSQL, or the nix-built language runtimes.
 
 **The tests run on PostgreSQL and nothing else**, because the app does. There is
-no SQLite route here any more: twelve of `repository.py`'s page queries are raw
-Postgres SQL and cannot execute anywhere else, foreign keys and `FOR UPDATE` are
-enforced by one of the two and silently ignored by the other, and `timestamptz`
-is a type only one of them has. A test that passed on the other database was not
-evidence about this one.
+no SQLite route here any more: `repository.py`'s page queries are built on
+Postgres - `json_agg`, `FILTER`, `LATERAL`, `DISTINCT ON` - and cannot execute
+anywhere else, foreign keys and `FOR UPDATE` are enforced by one of the two and
+silently ignored by the other, and `timestamptz` is a type only one of them has.
+A test that passed on the other database was not evidence about this one.
 
 The database is **`cocco-test`, and the tests own it**. Host, port and user come
 out of the environment - so the devShell's socket and the compose container both
