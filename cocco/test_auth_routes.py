@@ -942,7 +942,7 @@ async def test_the_gate_admits_every_role(app_engine, a_course):
     """Called directly, because the far side of the gate is a page query only
     Postgres can run. `EDITOR_ROLES` is a subset of "enrolled", so staff pass
     the membership check without a second one."""
-    from cocco.main import Forbidden, require_challenge_member, require_course_member
+    from cocco.web.access import Forbidden, require_challenge_member, require_course_member
 
     ours, _ = a_course
     for i, role in enumerate(UserRole):
@@ -972,7 +972,7 @@ async def test_an_administrator_is_inside_every_gate(app_engine, a_course):
     everywhere. Called directly, for the reason at the top of this file: the far
     side of the gate is a page query only Postgres can run.
     """
-    from cocco.main import (
+    from cocco.web.access import (
         require_challenge_member,
         require_course_editor,
         require_course_member,

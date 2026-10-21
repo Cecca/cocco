@@ -18,7 +18,7 @@ from cocco import main
 from cocco.repository import judging as repo
 from cocco.exercises import format as exercise_format
 from cocco.conftest import sign_in_as
-from cocco.main import Forbidden
+from cocco.web.access import Forbidden
 from cocco.model import (
     Course,
     ExerciseJob,
