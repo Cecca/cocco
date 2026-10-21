@@ -120,10 +120,10 @@ def _install_client(monkeypatch, provider: str, client):
     get None for GitHub - otherwise the login page would grow a button for a
     provider the test never set up.
     """
-    import cocco.main as main
+    import cocco.web.signin as signin
 
     monkeypatch.setattr(
-        main, "oauth_client", lambda name: client if name == provider else None
+        signin, "oauth_client", lambda name: client if name == provider else None
     )
 
 
@@ -185,10 +185,10 @@ def github(monkeypatch):
 @pytest.fixture
 def no_google(monkeypatch):
     """A server with no credentials at all, which must still serve pages."""
-    import cocco.main as main
+    import cocco.web.signin as signin
     from cocco.web import core
 
-    monkeypatch.setattr(main, "oauth_client", lambda name: None)
+    monkeypatch.setattr(signin, "oauth_client", lambda name: None)
     monkeypatch.setattr(
         core,
         "CONFIG",
