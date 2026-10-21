@@ -53,7 +53,9 @@ def test_the_server_does_not_import_the_app():
     """`cocco.server` sets COCCO_CONFIG and *then* hands uvicorn the import
     string "cocco.main:app". If importing it pulled `cocco.main` in, the
     configuration would already have been read by the time the flag was
-    parsed, and the flag would silently do nothing.
+    parsed, and the flag would silently do nothing. The same goes for
+    anything under `cocco.web`: `cocco.web.core` reads the configuration at
+    import, exactly as `cocco.main` used to.
 
     In a subprocess, because the question is about a *fresh* interpreter:
     half the test suite imports `cocco.main` at module level, and clearing it
@@ -61,6 +63,7 @@ def test_the_server_does_not_import_the_app():
     """
     probe = (
         "import sys, cocco.server; "
-        "sys.exit('cocco.main' in sys.modules)"
+        "sys.exit(any(m == 'cocco.main' or m == 'cocco.web' "
+        "or m.startswith('cocco.web.') for m in sys.modules))"
     )
     assert subprocess.run([sys.executable, "-c", probe]).returncode == 0

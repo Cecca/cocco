@@ -1,14 +1,16 @@
-from cocco.logs import AccessLogMiddleware
-from fastapi import (
-    FastAPI,
-)
-from fastapi.responses import (
-    HTMLResponse,
-)
+"""The composition root: `cocco.main:app`.
+
+Builds the app, registers the exception handlers and middlewares, mounts
+`/static`, includes the routers from `cocco.web` in route order and runs the
+startup check. The routes themselves live in `cocco/web/`, the queries in
+`cocco/repository/`.
+"""
+
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from starlette.middleware.sessions import SessionMiddleware
-import logging
 
-
+from cocco.logs import AccessLogMiddleware
 from cocco.web import (
     admin,
     api,
@@ -33,16 +35,8 @@ from cocco.web.access import (
     handle_forbidden,
     handle_not_authenticated,
 )
-from cocco.web.seed import (
-    prepare_database,
-)
-from cocco.web.templating import (
-    STATIC_DIR,
-    VersionedStaticFiles,
-)
-
-
-logger = logging.getLogger(__name__)
+from cocco.web.seed import prepare_database
+from cocco.web.templating import STATIC_DIR, VersionedStaticFiles
 
 # Root of the app
 app = FastAPI(default_response_class=HTMLResponse)
@@ -83,7 +77,8 @@ app.include_router(admin.router)
 
 # Route order is load-bearing: `/courses/{course_id}/{challenge_id}` matches any
 # single segment, so every other two-segment course page (the editor, people,
-# exercises, sessions) must be included or declared above `get_challenge`.
+# exercises, sessions) must be included above `challenges.router`. The
+# shadowing test in `test_main.py` checks it.
 app.include_router(courses.router)
 app.include_router(people.router)
 app.include_router(exercise_sets.router)
