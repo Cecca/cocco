@@ -11,11 +11,11 @@
    The number comes off the row and never off `loop.index`: a student's list is
    filtered - no hidden challenges - so counting the rows on the page would
    print a different "Challenge 03" to them than to staff. See
-   `_COURSE_CHALLENGES_CTE`.
+   `_course_challenges`.
 #}
 {# `effective_archived_at` and never `challenge.archived_at`: the second is the
    challenge's own state, and a card under an archived course has to grey
-   itself too. See `_EFFECTIVE_ARCHIVED_SQL` in `repository.py`.
+   itself too. See `_effective_archived_at` in `repository.py`.
 
    `is_visible` is its neighbour and greys the card for the other reason: this
    one is not open yet. Two states that look alike and are not - archived is

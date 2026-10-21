@@ -61,22 +61,21 @@ from cocco.model import (
 
 
 # A challenge is archived when it says so, or when its course does. That `or`
-# is the whole of "archiving a course archives its challenges", and it is
-# written here twice and nowhere else: once as SQL, because the page queries
-# are raw text, and once as a Core expression, because the routes that need the
-# answer for one row read the rule rather than re-deriving it. Both are named,
-# both point at each other, and a test asserts they agree.
+# is the whole of "archiving a course archives its challenges", and this is
+# the one place it is written: the page queries select it and the routes that
+# need the answer for one row read it, rather than re-deriving it.
 #
-# Nothing downstream - no route, no template - may spell it a third time, the
+# Nothing downstream - no route, no template - may spell it a second time, the
 # way nothing downstream spells `effective_course_role`'s promotion again. A
 # template that reads `challenge.archived_at` for a badge silently un-archives
 # every challenge under an archived course.
-_EFFECTIVE_ARCHIVED_SQL = "coalesce(challenge.archived_at, course.archived_at)"
-
-
 def _effective_archived_at():
-    """`_EFFECTIVE_ARCHIVED_SQL` as a Core expression. Only valid in a
-    statement that has both tables in its FROM."""
+    """When a challenge became read-only: its own `archived_at`, or its
+    course's. Only valid in a statement that has both tables in its FROM.
+
+    A page query exposes it as `effective_archived_at`, never `AS
+    archived_at`: `challenge.archived_at` rides along in the same record, and
+    two keys of one name in a `row_to_json` resolve last-one-wins."""
     return func.coalesce(Challenge.c.archived_at, Course.c.archived_at)
 
 
@@ -84,10 +83,9 @@ def _effective_archived_at():
 # NULL for a hidden one, a past instant for a live one and a future one for a
 # challenge that opens by itself at that moment.
 #
-# The neighbour of `_EFFECTIVE_ARCHIVED_SQL` above and written under the same
-# discipline: twice and nowhere else, once as SQL because the page queries are
-# raw text and once as a Core expression for the single-row reads a gate makes.
-# Nothing downstream may spell it a third time.
+# The neighbour of `_effective_archived_at` above and written under the same
+# discipline: once, here, and read by the page queries and the single-row
+# gates alike. Nothing downstream may spell it a second time.
 #
 # Two differences from its neighbour. It does not cascade from the course - a
 # course has no hidden state to cascade, so this needs only `challenge` in its
@@ -97,16 +95,27 @@ def _effective_archived_at():
 #
 # `now()` and never a Python clock, for the reason `model.py` gives for every
 # timestamp in the schema: the transaction's clock is the one that counts.
-_CHALLENGE_VISIBLE_SQL = (
-    "(challenge.visible_from IS NOT NULL AND challenge.visible_from <= now())"
-)
-
-
 def _challenge_visible():
-    """`_CHALLENGE_VISIBLE_SQL` as a Core expression."""
+    """Whether the class may see a challenge at all. A page query exposes it
+    as `is_visible`, never `AS visible`."""
     return and_(
         Challenge.c.visible_from.is_not(None),
         Challenge.c.visible_from <= func.now(),
+    )
+
+
+# A challenge's `number`, the "Challenge 03" a page prints: its rank within its
+# course in the order the course page lists it. Not `challenge.position`, which
+# is the sort key the course editor's arrows write and has gaps after a move.
+# `position, id` because `position` defaults to 0: challenges that have never
+# been reordered stay in the order they were created in.
+#
+# A window, so it ranks whatever rows it is selected over. Both callers select
+# it over every challenge of the course, before anything is filtered out.
+def _challenge_number():
+    return func.row_number().over(
+        partition_by=Challenge.c.course_id,
+        order_by=(Challenge.c.position, Challenge.c.id),
     )
 
 
@@ -2038,16 +2047,13 @@ async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int
     """The challenge itself, its course, its number within the course, the
     viewer's role in that course and its public sample test cases.
 
-    `number` is not `challenge.position`: the column is the sort key the course
-    editor's arrows write, and a swap leaves gaps in it. What the page prints
-    is the rank of that key within the course, which is why the two are
-    different fields here.
+    `number` is not `challenge.position`; see `_challenge_number`.
 
     Submissions are deliberately not part of this document: the challenge page
     loads them through `query_user_submissions` and keeps them fresh by polling.
 
     `effective_archived_at` is what decides whether the page shows a submit
-    form; see `_EFFECTIVE_ARCHIVED_SQL` for why it is not `challenge.archived_at`.
+    form; see `_effective_archived_at` for why it is not `challenge.archived_at`.
 
     `is_visible` is its neighbour and answers a different question - whether the
     class may see this at all. Only staff ever read a document whose `is_visible`
@@ -2056,43 +2062,50 @@ async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int
     which of the three states the challenge is in. `visible_from` itself rides
     along in `challenge.*`.
     """
-    query = text(f"""
-    WITH
-    samples AS (
-        SELECT challenge_id,
-               json_agg(json_build_object('id', id, 'execution_order', execution_order)
-                        ORDER BY execution_order) AS samples
-        FROM testcase
-        WHERE is_sample AND is_active
-        GROUP BY challenge_id
-    ),
-    numbers AS (
-        SELECT id,
-               row_number() OVER (PARTITION BY course_id ORDER BY position, id)
-                   AS number
-        FROM challenge
-    ),
-    cs AS (
-        SELECT challenge.*,
-               course.title AS course_title,
-               {_EFFECTIVE_ARCHIVED_SQL} AS effective_archived_at,
-               {_CHALLENGE_VISIBLE_SQL} AS is_visible,
-               numbers.number AS number,
-               enrollment.role AS viewer_role,
-               coalesce(samples.samples, '[]'::json) AS samples
-        FROM challenge
-        LEFT JOIN course ON course.id = challenge.course_id
-        LEFT JOIN numbers ON numbers.id = challenge.id
-        LEFT JOIN samples ON samples.challenge_id = challenge.id
-        LEFT JOIN enrollment ON enrollment.course_id = challenge.course_id
-                            AND enrollment.user_id = :user_id
-        WHERE challenge.id = :challenge_id
+    challenge = bindparam("challenge_id", challenge_id)
+    user = bindparam("user_id", user_id)
+    sample = (
+        select(TestCase.c.id, TestCase.c.execution_order)
+        .where(
+            TestCase.c.challenge_id == challenge,
+            TestCase.c.is_sample,
+            TestCase.c.is_active,
+        )
+        .subquery("sample")
     )
-    SELECT row_to_json(cs) FROM cs;
-    """)
-
-    res = await conn.execute(query, dict(challenge_id=challenge_id, user_id=user_id))
-    return res.scalar_one_or_none()
+    samples = select(
+        func.json_agg(
+            aggregate_order_by(sample.table_valued(), sample.c.execution_order)
+        )
+    ).scalar_subquery()
+    # Over every challenge, so the rank is the course's whatever this one is.
+    numbers = select(Challenge.c.id, _challenge_number().label("number")).cte("numbers")
+    cs = (
+        select(
+            Challenge,
+            Course.c.title.label("course_title"),
+            _effective_archived_at().label("effective_archived_at"),
+            _challenge_visible().label("is_visible"),
+            numbers.c.number,
+            Enrollment.c.role.label("viewer_role"),
+            func.coalesce(samples, _EMPTY_JSON_ARRAY).label("samples"),
+        )
+        .select_from(
+            Challenge.outerjoin(Course, Course.c.id == Challenge.c.course_id)
+            .outerjoin(numbers, numbers.c.id == Challenge.c.id)
+            .outerjoin(
+                Enrollment,
+                and_(
+                    Enrollment.c.course_id == Challenge.c.course_id,
+                    Enrollment.c.user_id == user,
+                ),
+            )
+        )
+        .where(Challenge.c.id == challenge)
+        .cte("cs")
+    )
+    stmt = select(func.row_to_json(cs.table_valued()))
+    return (await conn.execute(stmt)).scalar_one_or_none()
 
 
 # What each ranking criterion means, as (qualifier, ordering) pairs of literal
@@ -2845,10 +2858,10 @@ async def query_editable_challenges(
     same question. Ordered the way both editors order: `position, id` within a
     course, courses by title.
 
-    `archived_at` here is the *effective* one - `_effective_archived_at`'s
-    second caller, which is what earns it a name - so `cocco ls` marks a
-    challenge whose course was archived as well as one archived on its own. A
-    push to either is still accepted; see `api_import_challenge`.
+    `archived_at` here is the *effective* one - `_effective_archived_at` - so
+    `cocco ls` marks a challenge whose course was archived as well as one
+    archived on its own. A push to either is still accepted; see
+    `api_import_challenge`.
 
     `visible_from` and `is_visible` come back for the same reason and with the
     same force: a note beside the title, never anything missing from the list.
@@ -3124,9 +3137,8 @@ async def query_effective_archived_at(
     """When this challenge became read-only: its own `archived_at`, or its
     course's.
 
-    The single Python-side read of the rule - `post_submission` is its caller,
-    and `query_challenge` answers the same question in SQL for the page. Plain
-    Core, because one row is not a document.
+    The single-row read of `_effective_archived_at` - `post_submission` is its
+    caller, and `query_challenge` answers the same question for the page.
     """
     stmt = (
         select(_effective_archived_at())
@@ -3141,13 +3153,11 @@ async def query_effective_archived_at(
 async def query_challenge_visibility(
     conn: AsyncConnection, challenge_id: int
 ) -> tuple[datetime | None, bool]:
-    """When this challenge opens, and whether it has. `_challenge_visible`'s
-    second caller, which is what earns it a name.
+    """When this challenge opens, and whether it has (`_challenge_visible`).
 
-    `query_effective_archived_at`'s twin: the single Python-side read of the
-    rule, plain Core for its reason, with `query_challenge` answering the same
-    question in SQL for the page. Both
-    halves come back in one round trip because `require_challenge_visible`
+    `query_effective_archived_at`'s twin: the single-row read of the rule, with
+    `query_challenge` answering the same question for the page. Both halves
+    come back in one round trip because `require_challenge_visible`
     needs both - the boolean to decide, and the timestamp to say when to come
     back.
 
@@ -3740,75 +3750,90 @@ async def query_enrollment_key(conn: AsyncConnection, course_id: int) -> str | N
     return (await conn.execute(stmt)).scalar_one_or_none()
 
 
-# The challenges of one course, in the order the course page lists them, each
-# carrying what the card on that page has to decide its badge with:
-#
-# - `n_mine`, how many times the viewer submitted, which is what a student's
-#   "Submitted" badge means;
-# - `n_submitters`, how many distinct people did, which is the same badge as
-#   course staff see it - and what tells them which challenge the class has
-#   actually started.
-#
-# Takes :course_id and :user_id. The ordering is `position, id`: `position` is
-# what the arrows write, and the id breaks a tie, so challenges that have never
-# been reordered stay in the order they were created in.
-#
-# It carries `number` rather than leaving the template to count with
-# `loop.index`, and that is load-bearing now that the list can be filtered: a
-# student is shown neither the hidden challenges nor - in the editor's copy of
-# this list - anything staff have not published, so counting rows on the page
-# would print "Challenge 03" to a student in front of what staff call 04. The
-# window runs over every challenge of the course, inside the CTE, *before* any
-# caller filters it. It is the same rank `query_challenge` computes.
-_COURSE_CHALLENGES_CTE = f"""
-    submitted AS (
-        SELECT submission.challenge_id,
-               count(*) FILTER (WHERE submission.user_id = :user_id) AS n_mine,
-               count(DISTINCT submission.user_id) AS n_submitters
-        FROM submission
-        JOIN challenge ON challenge.id = submission.challenge_id
-        WHERE challenge.course_id = :course_id
-        GROUP BY submission.challenge_id
-    ),
-    -- LEFT JOIN and coalesce: a challenge nobody has submitted to has no row
-    -- in `submitted` at all, and it is still a challenge the page must list.
-    challenges AS (
-        SELECT challenge.*,
-               -- The *effective* one, so a card under an archived course greys
-               -- itself without the template having to know that a course can
-               -- archive a challenge. `challenge.archived_at` rides along in
-               -- the star and is the challenge's own state; only the challenge
-               -- editor's danger zone reads that one. A separate name and
-               -- never `AS archived_at`: that would put two columns of the
-               -- same name in the record, `row_to_json` would emit both keys,
-               -- and `json.loads` would resolve it last-one-wins.
-               {_EFFECTIVE_ARCHIVED_SQL} AS effective_archived_at,
-               -- Whether the class may see it at all, as against whether they
-               -- may still submit to it. A separate name for the same reason
-               -- as above, and `visible_from` itself rides along in the star:
-               -- a scheduled challenge's card has to print *when*.
-               {_CHALLENGE_VISIBLE_SQL} AS is_visible,
-               row_number() OVER (ORDER BY challenge.position, challenge.id)
-                   AS number,
-               coalesce(submitted.n_mine, 0) AS n_mine,
-               coalesce(submitted.n_submitters, 0) AS n_submitters
-        FROM challenge
-        LEFT JOIN course ON course.id = challenge.course_id
-        LEFT JOIN submitted ON submitted.challenge_id = challenge.id
-        WHERE challenge.course_id = :course_id
+def _course_challenges(course_id, user_id):
+    """The challenges of one course, as a CTE in which each carries what its
+    card on the course page decides its badges with:
+
+    - `effective_archived_at`, so a card under an archived course greys itself
+      without the template having to know that a course can archive a
+      challenge. `challenge.archived_at` rides along as the challenge's own
+      state, which only the challenge editor's danger zone reads;
+    - `is_visible`, whether the class may see it at all, as against whether
+      they may still submit to it. `visible_from` rides along too: a scheduled
+      challenge's card has to print *when*;
+    - `n_mine`, how many times the viewer submitted, which is what a student's
+      "Submitted" badge means;
+    - `n_submitters`, how many distinct people did, which is the same badge as
+      course staff see it - and what tells them which challenge the class has
+      actually started.
+
+    It carries `number` (`_challenge_number`) rather than leaving the template
+    to count with `loop.index`, and that is load-bearing now that the list can
+    be filtered: a student is shown neither the hidden challenges nor - in the
+    editor's copy of this list - anything staff have not published, so counting
+    rows on the page would print "Challenge 03" to a student in front of what
+    staff call 04. The window runs over every challenge of the course, inside
+    the CTE, *before* `_listed_challenges` filters it. It is the same rank
+    `query_challenge` computes.
+    """
+    submitted = (
+        select(
+            Submission.c.challenge_id,
+            func.count().filter(Submission.c.user_id == user_id).label("n_mine"),
+            func.count(Submission.c.user_id.distinct()).label("n_submitters"),
+        )
+        .join(Challenge, Challenge.c.id == Submission.c.challenge_id)
+        .where(Challenge.c.course_id == course_id)
+        .group_by(Submission.c.challenge_id)
+        .cte("submitted")
     )
-"""
+    # LEFT JOIN and coalesce: a challenge nobody has submitted to has no row
+    # in `submitted` at all, and it is still a challenge the page must list.
+    return (
+        select(
+            Challenge,
+            _effective_archived_at().label("effective_archived_at"),
+            _challenge_visible().label("is_visible"),
+            _challenge_number().label("number"),
+            func.coalesce(submitted.c.n_mine, 0).label("n_mine"),
+            func.coalesce(submitted.c.n_submitters, 0).label("n_submitters"),
+        )
+        .select_from(
+            Challenge.outerjoin(Course, Course.c.id == Challenge.c.course_id).outerjoin(
+                submitted, submitted.c.challenge_id == Challenge.c.id
+            )
+        )
+        .where(Challenge.c.course_id == course_id)
+        .cte("challenges")
+    )
 
 
-# Which of the CTE's rows this caller is allowed to be shown. Staff pass
-# `include_hidden` and get the lot, because that is the list they publish from;
-# everybody else gets the visible challenges *and* the scheduled ones, whose
-# card is a teaser with no link - so the class can see what is coming - and
-# never a hidden one, which they are not told exists.
-#
-# Applied outside the CTE rather than in its WHERE, so that `number` is already
-# ranked over the whole course by the time anything is dropped.
-_VISIBLE_TO_CALLER_SQL = "(:include_hidden OR visible_from IS NOT NULL)"
+def _listed_challenges(challenges, include_hidden: bool):
+    """`_course_challenges` as the JSON array a page lists, in course order,
+    with only the rows this caller may be shown. Staff pass `include_hidden`
+    and get the lot, because that is the list they publish from; everybody
+    else gets the visible challenges *and* the scheduled ones, whose card is a
+    teaser with no link - so the class can see what is coming - and never a
+    hidden one, which they are not told exists.
+
+    Filtered here, outside the CTE rather than in its WHERE, so that `number`
+    is already ranked over the whole course by the time anything is dropped.
+    """
+    stmt = select(
+        func.coalesce(
+            func.json_agg(
+                aggregate_order_by(
+                    challenges.table_valued(),
+                    challenges.c.position,
+                    challenges.c.id,
+                )
+            ),
+            _EMPTY_JSON_ARRAY,
+        )
+    )
+    if not include_hidden:
+        stmt = stmt.where(challenges.c.visible_from.is_not(None))
+    return stmt
 
 
 async def query_course_info(
@@ -3816,41 +3841,33 @@ async def query_course_info(
 ):
     """The course, its description and its challenges as the page lists them.
 
-    One document rather than a query per card: see `_COURSE_CHALLENGES_CTE` for
+    One document rather than a query per card: see `_course_challenges` for
     what each challenge carries. The course editor reads the same thing - it
     shows the same list, plus the arrows - so every reorder re-renders from
     here and cannot drift from what is stored.
 
     `include_hidden` is what makes the two lists differ, and it defaults to the
     safe answer: a caller who forgets it shows a student's list, never a
-    teacher's. See `_VISIBLE_TO_CALLER_SQL`.
+    teacher's. See `_listed_challenges`.
     """
-    query = text(f"""
-    WITH
-    {_COURSE_CHALLENGES_CTE},
-    c AS (
-        -- The subquery and its coalesce, rather than a join and a GROUP BY: a
-        -- course with no challenges yet is a real course - it is the one whose
-        -- page course staff open to create the first challenge - and it must
-        -- come back with an empty list, not as no row at all, which the route
-        -- would report as a 404.
-        SELECT
-            course.*,
-            coalesce(
-                (SELECT json_agg(challenges ORDER BY challenges.position, challenges.id)
-                 FROM challenges WHERE {_VISIBLE_TO_CALLER_SQL}),
-                '[]'::json
-            ) as challenges
-        FROM course
-        WHERE course.id = :course_id
+    course = bindparam("course_id", course_id)
+    challenges = _course_challenges(course, bindparam("user_id", user_id))
+    # A subquery, rather than a join and a GROUP BY: a course with no
+    # challenges yet is a real course - it is the one whose page course staff
+    # open to create the first challenge - and it must come back with an empty
+    # list, not as no row at all, which the route would report as a 404.
+    c = (
+        select(
+            Course,
+            _listed_challenges(challenges, include_hidden)
+            .scalar_subquery()
+            .label("challenges"),
+        )
+        .where(Course.c.id == course)
+        .cte("c")
     )
-    SELECT row_to_json(c) FROM c;
-    """)
-    res = await conn.execute(
-        query,
-        dict(course_id=course_id, user_id=user_id, include_hidden=include_hidden),
-    )
-    return res.scalar()
+    stmt = select(func.row_to_json(c.table_valued()))
+    return (await conn.execute(stmt)).scalar()
 
 
 async def query_course_challenges(
@@ -3859,18 +3876,8 @@ async def query_course_challenges(
     """Just the list `query_course_info` nests, for the fragment the reorder
     arrows swap: a move changes the order of the cards and nothing about the
     course itself."""
-    query = text(f"""
-    WITH
-    {_COURSE_CHALLENGES_CTE}
-    SELECT coalesce(
-        json_agg(challenges ORDER BY challenges.position, challenges.id),
-        '[]'::json
+    challenges = _course_challenges(
+        bindparam("course_id", course_id), bindparam("user_id", user_id)
     )
-    FROM challenges WHERE {_VISIBLE_TO_CALLER_SQL};
-    """)
-    res = await conn.execute(
-        query,
-        dict(course_id=course_id, user_id=user_id, include_hidden=include_hidden),
-    )
-    return res.scalar()
-
+    stmt = _listed_challenges(challenges, include_hidden)
+    return (await conn.execute(stmt)).scalar()

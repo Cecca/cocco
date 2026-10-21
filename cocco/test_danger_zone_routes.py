@@ -469,7 +469,7 @@ async def test_an_archived_challenge_refuses_a_submission(
 async def test_a_challenge_under_an_archived_course_refuses_a_submission(
     client, world, monkeypatch, app_engine
 ):
-    """The `or` that `_EFFECTIVE_ARCHIVED_SQL` spells: the challenge's own
+    """Archiving a course archives its challenges: the challenge's own
     column is still NULL here."""
     course, challenge = world["course"], world["challenge"]
     sign_in_as(client, ADMIN)

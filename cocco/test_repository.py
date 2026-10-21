@@ -1635,10 +1635,10 @@ async def test_an_archived_course_is_listed_only_to_the_people_on_it(example_dat
 
 
 async def test_a_challenge_under_an_archived_course_is_archived_in_effect(example_database, app_engine):
-    """The `or` that `_EFFECTIVE_ARCHIVED_SQL` and `_effective_archived_at`
-    spell twice. This is the test that pins the two spellings together: the
-    page queries answer in SQL, `query_effective_archived_at` in Core, and they
-    have to agree."""
+    """A challenge is archived when it says so or when its course does, and
+    every query that reports it - the single-row read, the challenge page and
+    the course's card list - says the same, while the challenge's own column
+    stays its own."""
     engine = app_engine
     async with engine.connect() as conn:
         carol = (await query_user_by_email(conn, "carol@unipd.it")).id
@@ -1669,11 +1669,10 @@ async def test_a_challenge_under_an_archived_course_is_archived_in_effect(exampl
         ).scalar_one()
         assert own is None
 
-        core = await query_effective_archived_at(conn, hello)
-        assert core is not None
+        assert await query_effective_archived_at(conn, hello) is not None
         page = await query_challenge(conn, user_id=carol, challenge_id=hello)
         assert page["effective_archived_at"] is not None
-        # The card's list answers the same way, from the shared CTE...
+        # The card's list answers the same way...
         cards = await query_course_challenges(conn, algorithms, user_id=carol)
         assert all(c["effective_archived_at"] is not None for c in cards)
         # ...and the challenge's own column rides along beside it, untouched,
@@ -1683,11 +1682,10 @@ async def test_a_challenge_under_an_archived_course_is_archived_in_effect(exampl
         assert by_title["Sum"]["archived_at"] is not None
 
 
-async def test_the_two_spellings_of_visible_agree(example_database, app_engine):
-    """`_CHALLENGE_VISIBLE_SQL` and `_challenge_visible` are one rule the module
-    has to spell twice - the page queries are raw text and the plain-Core reads
-    are what a single-row gate reads. This is the test that pins them
-    together, `test_a_challenge_under_an_archived_course_is_archived_in_effect`'s
+async def test_visible_from_decides_whether_a_challenge_is_visible(example_database, app_engine):
+    """NULL is hidden, a future instant is not visible yet and a past one is,
+    and the single-row read, the challenge page and the course's card list all
+    say so. `test_a_challenge_under_an_archived_course_is_archived_in_effect`'s
     counterpart for the other end of a challenge's life.
     """
     engine = app_engine
@@ -1713,12 +1711,12 @@ async def test_the_two_spellings_of_visible_agree(example_database, app_engine):
             )
             await conn.commit()
 
-            stored, core = await query_challenge_visibility(conn, hello)
-            assert core is expected
+            stored, visible = await query_challenge_visibility(conn, hello)
+            assert visible is expected
             assert stored == visible_from
             page = await query_challenge(conn, user_id=carol, challenge_id=hello)
             assert page["is_visible"] is expected
-            # ...and the card's list, from the shared CTE, is the third reading.
+            # ...and so does the card's list.
             cards = await query_course_challenges(
                 conn, algorithms, user_id=carol, include_hidden=True
             )

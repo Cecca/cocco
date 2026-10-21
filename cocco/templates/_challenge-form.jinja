@@ -109,7 +109,7 @@
       </p>
 
       {# `is_visible` is the server's answer, computed with the database's
-         clock - see `_CHALLENGE_VISIBLE_SQL`. The create page passes a plain
+         clock - see `_challenge_visible`. The create page passes a plain
          dict with neither key, so both fall back to false / none. #}
       {% set scheduled = challenge.visible_from and not challenge.is_visible %}
       <div class="flex flex-col gap-2 mt-3">

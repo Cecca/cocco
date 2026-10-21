@@ -347,9 +347,9 @@ Challenge = Table(
     Column("position", Integer, nullable=False, default=0, server_default=text("0")),
     # As on `course`, and the two are always read together: a challenge under
     # an archived course is archived in effect even with this column NULL. That
-    # `or` is spelled exactly twice, both times in `repository.py`
-    # (`_EFFECTIVE_ARCHIVED_SQL` and `_effective_archived_at`), and never in a
-    # route or a template - the way `effective_course_role` is spelled once.
+    # `or` is spelled exactly once, in `repository.py`'s
+    # `_effective_archived_at`, and never in a route or a template - the way
+    # `effective_course_role` is spelled once.
     # This column on its own is the challenge's *own* state, which only the
     # challenge editor's danger zone reads.
     Column("archived_at", DateTime(timezone=True), nullable=True),
@@ -364,9 +364,9 @@ Challenge = Table(
     # every existing row from `created_at` for exactly that reason.
     #
     # Unlike `archived_at` it does not cascade from the course, which has no
-    # hidden state to cascade. The rule is still spelled exactly twice, both
-    # times in `repository.py` (`_CHALLENGE_VISIBLE_SQL` and
-    # `_challenge_visible`), and never in a route or a template.
+    # hidden state to cascade. The rule is still spelled exactly once, in
+    # `repository.py`'s `_challenge_visible`, and never in a route or a
+    # template.
     Column("visible_from", DateTime(timezone=True), nullable=True),
     created_at(),
     # Note what this does not distinguish: `reorder_challenges` renumbers every

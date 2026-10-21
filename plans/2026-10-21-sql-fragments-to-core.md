@@ -81,7 +81,7 @@ Each step is one commit, and the suite passes at every commit.
    `archived_at` clash) breaks a page even when the tests pass. Compare parsed JSON, not text: key order may change.
 1. [x] **Submission outcomes.** `query_submission`, `query_submission_outcomes`. This step settles the Core style
    (`json_agg`, `row_to_json`, whole-row CTEs) on a small, well-tested pair, and adds `_score_columns`.
-2. [ ] **Challenges.** `query_challenge`, then `_course_challenges` with `query_course_info` and `query_course_challenges`.
+2. [x] **Challenges.** `query_challenge`, then `_course_challenges` with `query_course_info` and `query_course_challenges`.
    Delete `_EFFECTIVE_ARCHIVED_SQL`, `_CHALLENGE_VISIBLE_SQL` and `_VISIBLE_TO_CALLER_SQL`. `number` must still be
    ranked inside the CTE over the whole course, before the visibility filter, so a student sees the numbers staff
    see. Change the pinning tests to test behaviour only.

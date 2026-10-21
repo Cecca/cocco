@@ -6113,7 +6113,7 @@ async def post_challenge_archive(
 ):
     """Archive one challenge: still readable by the class, no longer accepting
     submissions. Archiving its *course* does the same to it without touching
-    this column - see `_EFFECTIVE_ARCHIVED_SQL`."""
+    this column - see `_effective_archived_at`."""
     await set_challenge_archived(db, challenge_id, True)
     await db.commit()
     return Response(
