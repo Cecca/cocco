@@ -13,8 +13,7 @@ import pytest
 from sqlalchemy import func, insert, select
 from sqlalchemy.exc import IntegrityError
 
-from cocco import main
-from cocco.web import exercise_sessions, exercise_sets
+from cocco.web import exercise_sessions, exercise_sets, exercise_student
 from cocco.repository import judging as repo
 from cocco.conftest import sign_in_as
 from cocco.exercises import format as exercise_format
@@ -124,7 +123,7 @@ SECRET_CHECK = ExerciseCheckResult(
 
 def test_the_student_view_has_no_hidden_test_and_no_unrevealed_solution():
     exercise = _exercise()
-    view = main.student_exercise_view(exercise, revealed=False)
+    view = exercise_student.student_exercise_view(exercise, revealed=False)
     assert set(view) == {
         "title", "statement", "starter", "hints", "rules", "time_s", "tests",
         "n_hidden", "solution",
@@ -137,7 +136,7 @@ def test_the_student_view_has_no_hidden_test_and_no_unrevealed_solution():
     assert view["hints"] == ["Multiply."]
     assert "5\n" not in repr(view)
 
-    revealed = main.student_exercise_view(exercise, revealed=True)
+    revealed = exercise_student.student_exercise_view(exercise, revealed=True)
     assert revealed["solution"] == exercise.solution
 
 
@@ -200,7 +199,7 @@ def test_the_strip_hides_the_titles_past_the_pacing():
             {"n": 3, "solved": True, "checking": False},
         ],
     }
-    view = main.session_strip_view(strip, UserRole.student)
+    view = exercise_student.session_strip_view(strip, UserRole.student)
     assert view == {
         "exercises": [
             {"n": 1, "title": "One", "status": "solved", "checking": True},
@@ -208,9 +207,9 @@ def test_the_strip_hides_the_titles_past_the_pacing():
         ],
         "n_locked": 1,
     }
-    staff = main.session_strip_view(strip, UserRole.teacher)
+    staff = exercise_student.session_strip_view(strip, UserRole.teacher)
     assert staff["n_locked"] == 0 and staff["exercises"][2]["title"] == "Three"
-    open_ = main.session_strip_view({**strip, "mode": "open", "checks": []}, UserRole.student)
+    open_ = exercise_student.session_strip_view({**strip, "mode": "open", "checks": []}, UserRole.student)
     assert [e["status"] for e in open_["exercises"]] == ["not_attempted"] * 3
 
 
