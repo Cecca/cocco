@@ -64,15 +64,21 @@ Core `Table`s on one `MetaData`: `User` (roles via `Enrollment`; `Administrator`
 
 **Every timestamp is `timestamptz` written by Postgres** (`server_default=func.now()`), never `datetime.now()`.
 
-### Queries (`cocco/repository.py`)
+### Queries (`cocco/repository/`)
 
-Every query lives here. Page-level queries build one nested JSON document with `json_agg` / `row_to_json`, returning a dict or list that templates walk with attribute syntax (`DESIGN.md` "Database design"). New page queries follow that shape rather than making several round trips. They are **Postgres-specific**. A shared rule or CTE is a small function returning a Core object (`_course_challenges`, `_session_checks`, …), its dependencies passed as arguments, never a string spliced into `text()`. Page queries that share nothing may still be `text()`; the leaderboard's `_LEADERBOARD_CRITERIA` is enum-keyed literal SQL by design. Judge-side helpers (`pull_queued_submission`, `insert_test_outcomes`, `mark_submission_done`) are plain Core on a *sync* `Connection`; web-side ones are `async` on an `AsyncConnection`.
+Every query lives in this package, one module per area: `rules` (shared Core fragments such as `_effective_archived_at`, `_challenge_visible`), `judging` (the judge's `repo`: sync helpers, plus the exercise jobs), `users`, `credentials` (passwords, tokens), `courses`, `challenges`, `exercise_sets`, `exercise_sessions`, and `lifecycle` (archiving and every hand-written deletion cascade). `__init__.py` re-exports nothing: import from the module that owns the area.
+
+Page-level queries Page-level queries build one nested JSON document with `json_agg` / `row_to_json`, returning a dict or list that templates walk with attribute syntax (`DESIGN.md` "Database design"). New page queries follow that shape rather than making several round trips. They are **Postgres-specific**. A shared rule or CTE is a small function returning a Core object (`_course_challenges`, `_session_checks`, …), its dependencies passed as arguments, never a string spliced into `text()`. Page queries that share nothing may still be `text()`; the leaderboard's `_LEADERBOARD_CRITERIA` is enum-keyed literal SQL by design. Judge-side helpers (`pull_queued_submission`, `insert_test_outcomes`, `mark_submission_done`) are plain Core on a *sync* `Connection`; web-side ones are `async` on an `AsyncConnection`.
 
 Insert helpers (`insert_enrollment`, `insert_submission`) don't commit; the caller owns the transaction. `get_db` yields a bare connection with no transaction, so a writing route must `await db.commit()`.
 
-### HTTP layer (`cocco/main.py`)
+### HTTP layer (`cocco/main.py`, `cocco/web/`)
 
-FastAPI app `cocco.main:app`; Jinja templates in `cocco/templates/`, Tailwind v4 + daisyUI v5 (`assets/styles.css` → `cocco/static/styles.css`), htmx.
+FastAPI app `cocco.main:app`. `main.py` is the composition root: it builds the app, adds the middlewares, mounts `/static`, registers the exception handlers and the startup hook, and calls `include_router` once per module of `cocco/web/`. The routes live there as `APIRouter` modules: `core` (config, engine, `Storage`, `get_db`, shared constants) and `templating` at the bottom; `access` (identity, refusals, gates) above every area; then `signin`, `home`, `admin`, `courses`, `people`, `exercise_sets`, `exercise_sessions`, `exercise_student`, `challenges`, `challenge_editor`, `testcases`, `profile`, `api`, plus `seed` (schema check and dev data). Imports run one way (e.g. `courses` → `home`, `testcases`); nothing under `web/` imports `cocco.main`. Loggers are `cocco.web.<module>`.
+
+**Seams.** `CONFIG`, `DUMMY_AUTH` and `storage` are read through `core` (`core.CONFIG`), `oauth_client` through `signin`; a test patches the module whose code looks the name up, and `main.py` re-exports nothing, so patching `main.X` reaches nothing.
+
+Jinja templates in `cocco/templates/`, Tailwind v4 + daisyUI v5 (`assets/styles.css` → `cocco/static/styles.css`), htmx.
 
 Pages return full documents. Anything live is an `f-*.jinja` fragment served from `/f/...` and polled with `hx-get` + `hx-trigger="load, every Ns"` (that's how a submission moves `queued` → `running` → score). An include-only partial gets a `_` prefix (e.g. `_statement.jinja`, shared by both challenge views).
 
@@ -83,7 +89,7 @@ Pages return full documents. Anything live is an `f-*.jinja` fragment served fro
 - A page with mutations has **one swap target**, and every route on it answers with the same fragment, alert included, so message and new state arrive in one swap: `/admin` → `#users` / `f-users.jinja`; people page → `#people` / `f-course-people.jinja`; profile → `#identity`.
 - Navigation after a mutation is `204` + `HX-Redirect`.
 
-**Route order is load-bearing.** `/courses/{course_id}` would swallow `/courses/new`, and `/courses/{course_id}/{challenge_id}` matches any single segment. So `/courses/new` is declared above `get_course`, and every other two-segment course page (`/edit`, `/people`, the course danger-zone routes, exercises and sessions) above `get_challenge`. `/admin` collides with nothing.
+**Route order is load-bearing.** `/courses/{course_id}` would swallow `/courses/new`, and `/courses/{course_id}/{challenge_id}` matches any single segment. So `/courses/new` is declared above `get_course`, and every other two-segment course page (`/edit`, `/people`, the course danger-zone routes, exercises and sessions) above `get_challenge`. Since the routes are spread over modules, the order is `include_router` order in `main.py` (`courses`, `people`, the exercise modules, then `challenges`); `test_no_route_is_shadowed_by_an_earlier_one` in `test_main.py` checks it. `/admin` collides with nothing.
 
 ### Authorization
 

@@ -1,7 +1,10 @@
 ---
 paths:
-  - "cocco/repository.py"
-  - "cocco/main.py"
+  - "cocco/repository/**"
+  - "cocco/web/challenges.py"
+  - "cocco/web/challenge_editor.py"
+  - "cocco/web/courses.py"
+  - "cocco/web/testcases.py"
   - "cocco/model.py"
   - "cocco/judge.py"
   - "cocco/transfer.py"
@@ -35,4 +38,4 @@ Moved from `CLAUDE.md`'s *Conventions*: ordering, test cases, regrading, deletio
 - **A block stops a person, it doesn't retract their work**: queued submissions are graded, and standings and leaderboards keep listing them. Nothing blocked is seeded (a blocked seeded admin would lock out a fresh checkout). **Removing an enrollment draws the same line**: `delete_enrollment` takes one row. Submissions and outcomes stay, because `query_challenge_standings`'s cohort already unions in everyone who submitted.
 - **Scores are per test case, in `[0, 1]`**; the headline is their mean ×100. That assumes higher-is-better, and nothing enforces the range.
 - **The leaderboard criterion is per challenge**: `challenge.ranking` drives `query_challenge_leaderboard`, selecting one of `_LEADERBOARD_CRITERIA`'s literal SQL variants by enum, never request text. `running_time` admits only submissions passing *every* test, ranked by summed time. `total_score` / `average_score` rank by score and admit partial credit. Each student appears once (best submission), and every row carries all three metrics plus `n_tests`.
-- **A hidden test case gives away nothing but its verdict.** `visible_outcomes` in `main.py` blanks `message`, `stdout`, `stderr` unless the case is a sample or the viewer is staff: stdout/stderr can echo the hidden input, and `message` comes from an evaluator that read the hidden input and expected output (`diff.py` prints the expected output). Verdict, score and resource usage are always shown, and compiler output is exempt. Redact in that function, not templates, so it stays unit-testable.
+- **A hidden test case gives away nothing but its verdict.** `visible_outcomes` in `cocco/web/challenges.py` blanks `message`, `stdout`, `stderr` unless the case is a sample or the viewer is staff: stdout/stderr can echo the hidden input, and `message` comes from an evaluator that read the hidden input and expected output (`diff.py` prints the expected output). Verdict, score and resource usage are always shown, and compiler output is exempt. Redact in that function, not templates, so it stays unit-testable.

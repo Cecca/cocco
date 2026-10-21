@@ -46,8 +46,8 @@ router = APIRouter()
 ########################################################################
 # The student page: one exercise of a session, with the strip of all of them,
 # the statement and the editor; Run and Check are judge jobs. Members of the
-# course, through `require_session_exercise` and `session_job_refusal` - which
-# are the whole of pacing - and, like every session route, **declared above
+# course, through `require_session_exercise` and `session_job_refusal` (both in
+# `exercise_sessions.py`) - which are the whole of pacing - and, like every session route, **declared above
 # `get_challenge`**. The exercise is `{n:int}`, with the convertor: a plain
 # `{n}` would also match the staff's `.../dashboard` and `.../projector` and
 # 422 on them, since a route does not fall through on a failed validation.

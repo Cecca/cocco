@@ -2,7 +2,7 @@
 
 Its own module for the reason `cocco/auth.py` is one - nothing here touches the
 network, a request or the database, so the whole of it is testable by import.
-The routes and the lookup live in `main.py` and `repository.py`.
+The routes and the lookup live in `web/profile.py` and `repository/credentials.py`.
 
 A token is the only credential in this app that is not a Google session, and it
 exists because a command line has no browser to run OIDC in. It is therefore

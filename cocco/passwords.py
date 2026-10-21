@@ -2,8 +2,8 @@
 
 Its own module for the reason `cocco/auth.py` and `cocco/tokens.py` are ones -
 nothing here touches the network, a request or the database, so the whole of it
-is testable by import. The routes live in `main.py`, the two statements in
-`repository.py`, and the switch that decides whether any of it is reachable is
+is testable by import. The routes live in `web/signin.py` and `web/profile.py`, the two statements in
+`repository/credentials.py`, and the switch that decides whether any of it is reachable is
 `[auth] password_login` in `cocco/config.py`.
 
 This is `tokens.py`'s deliberate opposite, and `hash_token`'s docstring already

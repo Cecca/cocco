@@ -1,8 +1,8 @@
 """The `cocco-web` console script: uvicorn, pointed at `cocco.main:app`.
 
 Its own module, and that is the whole design. `cocco.main` reads its
-configuration **at import** - `CONFIG`, the async engine, `Storage(...)`
-(which creates the storage root) and `load_languages()` are all module-level -
+configuration **at import**, through `cocco.web.core` - `CONFIG`, the async engine,
+`Storage(...)` (which creates the storage root) and `load_languages()` are all module-level -
 so a `--config` flag parsed from inside it would arrive after the file it
 names had already been read. Here the argument comes first and `COCCO_CONFIG`
 is in place before `cocco.main` is imported at all.

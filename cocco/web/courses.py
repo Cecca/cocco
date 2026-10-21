@@ -568,11 +568,10 @@ async def post_course_delete(
     # `post_testcase_delete` states. A failed commit can leave a file nothing
     # points at, but never a row pointing at a file that is gone.
     #
-    # `_testcase_dir` and `_evaluator_dir` are defined further down this file,
-    # with the challenge editor they belong to. That is fine - a name in a
-    # function body is resolved when the body runs - and moving this route down
-    # to be near them would put it below `get_challenge`, which is the one
-    # thing it may not be.
+    # `_testcase_dir` and `_evaluator_dir` are defined in `web/testcases.py`,
+    # with the test case and evaluator routes they belong to. Importing them
+    # here does not move this route: its place is set by `include_router`
+    # order in `main.py`, which must put `courses.router` above `challenges`.
     challenge_ids = await query_ordered_challenge_ids(db, course_id)
     paths: list[str] = []
     for challenge_id in challenge_ids:

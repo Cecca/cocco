@@ -47,7 +47,7 @@ DEFAULT_CONFIG_PATH = Path("cocco.toml")
 # psycopg reading its own standard variables.
 #
 # psycopg is named rather than left to SQLAlchemy's default because it is the
-# one driver with both a sync and an async face: `main.py` builds an async
+# one driver with both a sync and an async face: `web/core.py` builds an async
 # engine from this string and `judge.py` a sync one, and they must be able to
 # be the same string.
 DEFAULT_DATABASE_URL = "postgresql+psycopg://"
@@ -307,7 +307,7 @@ class AppConfig:
 def config_path() -> Path:
     """Which file to read. The one thing that cannot be written in one.
 
-    Spelled here rather than in each process, so `main.py` and `judge.py`
+    Spelled here rather than in each process, so `web/core.py` and `judge.py`
     cannot end up reading different files by default.
     """
     return Path(os.environ.get("COCCO_CONFIG") or DEFAULT_CONFIG_PATH)

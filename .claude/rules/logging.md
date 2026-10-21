@@ -2,6 +2,7 @@
 paths:
   - "cocco/logs.py"
   - "cocco/server.py"
+  - "cocco/main.py"
   - "cocco/test_logs.py"
   - "cocco/test_access_log.py"
   - "cocco/test_server.py"
@@ -35,7 +36,7 @@ read is the one refusal that is a bare `print`, having no log to go to. `--log-l
 three commands overrides the file for one run.
 
 **One `cocco.access` event per request**, from `AccessLogMiddleware`, a pure ASGI middleware
-registered *last* in `main.py` so it is outermost (`add_middleware` puts each new one outside the
+registered *last* in `cocco/main.py` so it is outermost (`add_middleware` puts each new one outside the
 others) — pure ASGI rather than `BaseHTTPMiddleware`, which would run the app in another task and lose
 the bound context. It carries the route **template** (FastAPI's `scope["route"]`, a mount's prefix +
 `/{path}`, None for a 404), `status`, `duration_ms`, `client_ip`, `user_id` from the

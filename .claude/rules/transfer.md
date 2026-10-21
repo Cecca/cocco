@@ -2,6 +2,7 @@
 paths:
   - "cocco/transfer.py"
   - "cocco/cli.py"
+  - "cocco/web/api.py"
   - "cocco/test_transfer.py"
   - "cocco/test_cli.py"
   - "cocco/test_api_routes.py"
@@ -30,7 +31,7 @@ order *is* the order.
 **`cocco/transfer.py` touches nothing** — no FastAPI, no `AsyncConnection`, no `Storage` — which is
 the seam that makes the format testable by import, the way `auth.py` keeps the interesting half of
 sign-in unit-testable. It owns the shape (`parse_manifest`, `dump_manifest`) and the one rule that
-must not be got wrong (`plan_testcases`); `main.py` owns the I/O. Written with `toml.dumps` and read
+must not be got wrong (`plan_testcases`); `cocco/web/api.py` owns the I/O. Written with `toml.dumps` and read
 with stdlib `tomllib`: hand-rolled escaping works until somebody names a challenge "Dijkstra's".
 Every path is checked against `safe_filename` and its directory *before anything is opened* — a
 `../`, an absolute path or a nested `tests/a/b.in` is a `ManifestError`, and `Storage.resolve` stays

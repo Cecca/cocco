@@ -2,7 +2,7 @@
 paths:
   - "cocco/model.py"
   - "cocco/schema.py"
-  - "cocco/repository.py"
+  - "cocco/repository/**"
   - "cocco/migrations/**"
 ---
 
@@ -10,7 +10,7 @@ paths:
 
 Moved from `CLAUDE.md`'s *Data model* section.
 
-`User.blocked_at` / `blocked_reason` are the **blacklist**, columns on the row (a block always names an existing account), so `get_user` sees it on every request and a block bites on the next click. `_USER_COLUMNS` in `repository.py` is the single column list behind `query_user` and `query_user_by_email`, so no door can forget `blocked_at`.
+`User.blocked_at` / `blocked_reason` are the **blacklist**, columns on the row (a block always names an existing account), so `get_user` sees it on every request and a block bites on the next click. `_USER_COLUMNS` in `cocco/repository/users.py` is the single column list behind `query_user` and `query_user_by_email`, so no door can forget `blocked_at`.
 
 **Every timestamp is `timestamptz` written by Postgres** (`server_default=func.now()`), never `datetime.now()`: web and judge have two clocks, `now()` has one (the transaction's). `created_at()` / `updated_at()` at the top of `model.py` are factories (a `Column` belongs to one `Table`): both on `user`, `course`, `enrollment`, `challenge`, `exercise_set`; `created_at` alone on `administrator`, `testcase`, `exercise_set_version`; `updated_at` alone on `exercise_session` (created = `opened_at`). `updated_at` is a blanket `onupdate` meaning only "row changed". `set_enrollment_role` sets it by hand, because `onupdate` doesn't fire for an upsert's DO UPDATE.
 

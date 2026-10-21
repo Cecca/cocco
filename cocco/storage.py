@@ -240,7 +240,7 @@ class Storage(object):
         """A stored file's (bytes on disk, mtime in ns), or None if it is missing.
 
         What a challenge's version is made of instead of the file's contents
-        (see `_challenge_version` in `main.py`): every write here replaces the
+        (see `_challenge_version` in `web/api.py`): every write here replaces the
         file and so moves its mtime, and a `stat` is what a version can afford
         to ask per test case where a read is not.
         """

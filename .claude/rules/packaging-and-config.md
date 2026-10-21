@@ -2,6 +2,7 @@
 paths:
   - "cocco/config.py"
   - "cocco/server.py"
+  - "cocco/main.py"
   - "cocco/judge.py"
   - "cocco/migrate.py"
   - "pyproject.toml"
@@ -15,7 +16,7 @@ Moved from `CLAUDE.md`. The short version stays there.
 
 **cocco is a package with four commands** (`[project.scripts]`): `cocco` (`cocco/cli.py`, the transfer CLI), `cocco-web` (`cocco/server.py`), `cocco-judge` (`cocco/judge.py:main`), `cocco-migrate` (`cocco/migrate.py`). `uv sync` installs it editable. Everything read at runtime — `templates/`, `static/`, `languages.toml`, `evaluators/`, `migrations/` — lives **inside `cocco/`** and is resolved from `Path(__file__).resolve().parent`, never the working directory, because an installed wheel has no repo root. There is deliberately **no `alembic.ini`** anywhere: plain `alembic` run from the checkout would pick it up and migrate whatever database *it* names instead of `cocco.toml`'s. `assets/` is tailwind input plus design-source icons; never read by Python, not shipped. `cocco/static/styles.css` is gitignored, so `[tool.hatch.build.targets.*] artifacts` names it explicitly, and it must be built before `uv build` or the wheel ships without a stylesheet.
 
-`cocco-web` is a **thin uvicorn wrapper in its own module**, not a function in `main.py`: `cocco.main` reads its config at import (`CONFIG`, the engine, `Storage(...)`, `load_languages()` are module-level), so a `--config` flag parsed inside it would arrive too late. `server.py` sets `COCCO_CONFIG` first, then hands uvicorn the import string `"cocco.main:app"` — the only form `--reload` and `--workers` accept. `cocco-judge`'s `main` is module-level and sync because an entry point cannot name an `async def` under `if __name__ == "__main__"`.
+`cocco-web` is a **thin uvicorn wrapper in its own module**, not a function in `main.py`: `cocco.main` reads its config at import, through `cocco.web.core` (`CONFIG`, the engine, `Storage(...)`, `load_languages()` are module-level there), so a `--config` flag parsed inside it would arrive too late. `server.py` sets `COCCO_CONFIG` first, then hands uvicorn the import string `"cocco.main:app"` — the only form `--reload` and `--workers` accept. `cocco-judge`'s `main` is module-level and sync because an entry point cannot name an `async def` under `if __name__ == "__main__"`.
 
 The web app and the judge are **separate processes** that must agree on the database, `[storage] root`, and the *installed package* (`languages.toml` maps extensions at both ends; a judge on an older version grades with an older `equality.py`). The first two come from the same config file — the judge takes only `--config`, no `--database`/`--storage`, because a flag can disagree with the file. Submitting only enqueues a row; nothing leaves `queued` without a judge on the same database.
 

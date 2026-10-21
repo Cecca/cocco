@@ -135,7 +135,7 @@ def _submission_outcomes(submission_id):
     Shared by the two queries below, which differ only in how much of the
     submission itself they carry: `is_sample` is what tells the page whether
     the free-text fields may be shown to a student (see `visible_outcomes` in
-    main.py). Callers select `*agg.c` and join it `ON true`.
+    `web/challenges.py`). Callers select `*agg.c` and join it `ON true`.
     """
     outcomes = (
         select(

@@ -2,7 +2,7 @@
 address.
 
 Nothing here talks to a provider, and nothing here knows which one asked. The
-OAuth clients and the routes live in `main.py`, where the request is; what is
+OAuth clients and the routes live in `web/signin.py`, where the request is; what is
 left is pure and unit-testable, except `get_or_create_user`, which is the one
 place the flow touches the schema - and which is keyed on the address alone, so
 somebody who signs in with Google today and with GitHub tomorrow lands on the

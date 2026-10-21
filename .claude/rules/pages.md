@@ -1,8 +1,8 @@
 ---
 paths:
-  - "cocco/main.py"
+  - "cocco/web/**"
   - "cocco/templates/**"
-  - "cocco/repository.py"
+  - "cocco/repository/**"
 ---
 
 # Pages and their routes

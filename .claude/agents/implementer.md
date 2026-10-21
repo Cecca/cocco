@@ -16,7 +16,7 @@ You implement exactly one step of a plan in the `cocco` repository. The design i
 ## While editing
 
 - Stay inside the step. Don't refactor neighbouring code, rename things, or "fix" something the rules call deliberate (e.g. exercises bypassing `Storage`). If you notice something worth changing outside the step, mention it in your report instead.
-- Match the surrounding code: comment density, naming, idiom. Queries go in `cocco/repository.py`, following the existing Core-helper and one-JSON-document-per-page shapes.
+- Match the surrounding code: comment density, naming, idiom. Queries go in `cocco/repository/` (the module owning the area: `courses`, `challenges`, `users`, …), following the existing Core-helper and one-JSON-document-per-page shapes.
 - Schema changes: `just migration "what changed"`, then review the generated revision against `.claude/rules/migrations.md` and `just migrate`.
 - Never edit `cocco/static/styles.css`; edit `assets/styles.css` and run `npm run build:css`.
 - No secrets in files or code, no `datetime.now()` timestamps, no `ON DELETE` on foreign keys, no hardcoded isolate box ids.

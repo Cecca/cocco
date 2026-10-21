@@ -118,7 +118,7 @@ _RUNTIME_CACHE: Dict[tuple[str, str], Path] = {}
 
 # Which flake the runtimes are built out of - `[judge] flake`, see `JudgeConfig`.
 # A module-level name rather than an argument threaded through `Language.run`,
-# `run_submission` and `run_loop`, for the reason `main.DUMMY_AUTH` is one:
+# `run_submission` and `run_loop`, for the reason `core.DUMMY_AUTH` is one:
 # `Language` is a frozen dataclass built straight from `languages.toml` and has
 # nowhere to carry it, and this is one value set once at startup and read from
 # the bottom of the call stack. `main()` assigns it; tests monkeypatch it.

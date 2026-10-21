@@ -2,7 +2,13 @@
 paths:
   - "cocco/storage.py"
   - "cocco/judge.py"
-  - "cocco/main.py"
+  - "cocco/web/core.py"
+  - "cocco/web/api.py"
+  - "cocco/web/challenge_editor.py"
+  - "cocco/web/challenges.py"
+  - "cocco/web/courses.py"
+  - "cocco/web/seed.py"
+  - "cocco/web/testcases.py"
   - "cocco/transfer.py"
   - "cocco/migrate.py"
 ---

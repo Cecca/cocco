@@ -7,11 +7,11 @@ can be pulled, edited with an editor, and pushed back.
 
 Nothing here touches FastAPI, the database or `Storage` - it takes and returns
 plain data, which is the seam that makes the *format* testable by import rather
-than only through a round trip. `main.py` owns the I/O; this owns the shape.
+than only through a round trip. `web/api.py` owns the I/O; this owns the shape.
 
 The zip is flat, and mirrors what is already on disk. A challenge's test files
 live in one directory with no per-test subdirectory (`_testcase_dir` in
-`main.py`), which is why an input and an output name are already required to be
+`web/testcases.py`), which is why an input and an output name are already required to be
 unique within a challenge; `tests/` keeps exactly that shape.
 
     challenge.toml     the configuration - this module
@@ -218,7 +218,7 @@ def challenge_version(
     a push's `If-Match` names.
 
     `files` is `(name in the archive, size, mtime in ns)` per stored file rather
-    than the file's bytes - `_challenge_version` in `main.py` says why. The
+    than the file's bytes - `_challenge_version` in `web/api.py` says why. The
     manifest is hashed without its header, so rewording the comment at the top
     of `challenge.toml` does not make every checkout look stale. Each part is
     length-prefixed, so no statement can be spelled to look like a file entry.
@@ -293,7 +293,7 @@ def parse_manifest(text: str) -> Manifest:
     """`challenge.toml` as a `Manifest`, or `ManifestError` saying why not.
 
     Structure and file names are checked here. The sandbox limits are *not*:
-    `_challenge_fields` in `main.py` is already the one place the create form
+    `_challenge_fields` in `web/challenge_editor.py` is already the one place the create form
     and the edit form agree on what a valid limit is, and the import route is
     its third caller rather than a second opinion.
     """

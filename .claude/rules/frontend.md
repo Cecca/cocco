@@ -4,7 +4,7 @@ paths:
   - "cocco/static/**"
   - "cocco/templates/base.jinja"
   - "package.json"
-  - "cocco/main.py"
+  - "cocco/web/templating.py"
 ---
 
 # CSS and static files

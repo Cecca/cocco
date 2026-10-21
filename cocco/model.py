@@ -148,7 +148,7 @@ def updated_at() -> Column:
 
     One write escapes it and has to say so itself: SQLAlchemy fires `onupdate`
     for an UPDATE and not for an `INSERT ... ON CONFLICT DO UPDATE`, which is
-    why `set_enrollment_role` in `repository.py` names this column in its `set_`.
+    why `set_enrollment_role` in `repository/courses.py` names this column in its `set_`.
     """
     return Column(
         "updated_at",
@@ -225,7 +225,7 @@ ApiToken = Table(
 
 # A password, for the deployments that turn `[auth] password_login` on. Its own
 # table and not a nullable column on `user`, for one reason above all the
-# others: `_USER_COLUMNS` in `repository.py` is read on every single request,
+# others: `_USER_COLUMNS` in `repository/users.py` is read on every single request,
 # and a credential has no business travelling with the identity that every
 # route already holds. Keyed on `user.id` for `ApiToken`'s reason - a password
 # belongs to an account that exists, unlike `Administrator`, which is keyed on
@@ -347,7 +347,7 @@ Challenge = Table(
     Column("position", Integer, nullable=False, default=0, server_default=text("0")),
     # As on `course`, and the two are always read together: a challenge under
     # an archived course is archived in effect even with this column NULL. That
-    # `or` is spelled exactly once, in `repository.py`'s
+    # `or` is spelled exactly once, in `repository/rules.py`'s
     # `_effective_archived_at`, and never in a route or a template - the way
     # `effective_course_role` is spelled once.
     # This column on its own is the challenge's *own* state, which only the
@@ -365,7 +365,7 @@ Challenge = Table(
     #
     # Unlike `archived_at` it does not cascade from the course, which has no
     # hidden state to cascade. The rule is still spelled exactly once, in
-    # `repository.py`'s `_challenge_visible`, and never in a route or a
+    # `repository/rules.py`'s `_challenge_visible`, and never in a route or a
     # template.
     Column("visible_from", DateTime(timezone=True), nullable=True),
     created_at(),

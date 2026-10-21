@@ -4,6 +4,9 @@ paths:
   - "cocco/passwords.py"
   - "cocco/tokens.py"
   - "cocco/config.py"
+  - "cocco/web/signin.py"
+  - "cocco/web/profile.py"
+  - "cocco/repository/credentials.py"
   - "cocco/test_auth.py"
   - "cocco/test_auth_routes.py"
   - "cocco/test_passwords.py"
@@ -66,7 +69,7 @@ rule: a path this app does not serve should not admit that it exists.
 `cocco/auth.py` never touches the network and does not know which provider asked: it is
 `is_allowed_email`, `safe_next_path`, `nickname_from_email`, `oauth_redirect_uri` (one function
 for both, so the two can only differ in the segment naming them) and `get_or_create_user`. Authlib
-and the routes live in `main.py`, which is what keeps the interesting half unit-testable —
+and the routes live in `cocco/web/signin.py` and `cocco/web/profile.py`, which is what keeps the interesting half unit-testable —
 `test_auth_routes.py` replaces the whole of both providers with `_FakeOAuthClient`, three methods
 including the `get` that is all of GitHub's API. The configuration is not here either: it is
 `cocco/config.py`, because the judge reads the same file and a database URL is none of sign-in's
@@ -158,7 +161,7 @@ the administrator of all of them, so `cocco.dev.toml` deliberately lists none an
 keeps the checkout usable — and seeds only him, so typing `alice@unipd.it` still shows what plain
 course staff may do instead of quietly promoting her.
 
-`main.DUMMY_AUTH` is derived from `CONFIG.dev` **once, at import, and stays a module-level name** —
+`core.DUMMY_AUTH` (`cocco/web/core.py`) is derived from `CONFIG.dev` **once, at import, and stays a module-level name** —
 `post_auth_dummy`, `_login_page` and `create_db_and_tables` read it rather than `CONFIG.dev`,
 because that is the seam six test files flip. A frozen dataclass field has no equivalent, so this
 is not a tidy-up waiting to happen.

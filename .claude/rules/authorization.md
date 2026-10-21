@@ -1,7 +1,14 @@
 ---
 paths:
-  - "cocco/main.py"
-  - "cocco/repository.py"
+  - "cocco/web/access.py"
+  - "cocco/web/admin.py"
+  - "cocco/web/people.py"
+  - "cocco/web/exercise_sets.py"
+  - "cocco/web/exercise_sessions.py"
+  - "cocco/web/profile.py"
+  - "cocco/web/api.py"
+  - "cocco/repository/courses.py"
+  - "cocco/repository/users.py"
   - "cocco/auth.py"
   - "cocco/templates/**"
 ---
