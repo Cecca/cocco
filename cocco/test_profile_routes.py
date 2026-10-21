@@ -172,11 +172,11 @@ async def test_a_missing_field_is_not_a_422(client, world):
 
 
 async def test_an_overlong_name_is_refused(client, world, app_engine):
-    import cocco.main as main
+    from cocco.web import profile
 
     response = client.post(
         f"/users/{world['alice']}/profile",
-        data={"nickname": "x" * (main.MAX_NICKNAME_CHARS + 1)},
+        data={"nickname": "x" * (profile.MAX_NICKNAME_CHARS + 1)},
     )
     assert response.status_code == 200
     assert "longer than" in response.text
