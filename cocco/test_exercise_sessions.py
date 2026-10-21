@@ -18,6 +18,8 @@ from cocco import main
 from cocco.repository import judging as repo
 from cocco.exercises import format as exercise_format
 from cocco.conftest import sign_in_as
+from cocco.repository.exercise_sets import lock_exercise_set
+from cocco.repository.lifecycle import delete_exercise_set
 from cocco.web.access import Forbidden
 from cocco.model import (
     Course,
@@ -659,7 +661,7 @@ async def test_an_opening_and_a_set_delete_serialize(client, world, db, app_engi
     async with app_engine.connect() as opener, app_engine.connect() as deleter:
         # The opening first: the delete waits, then counts its session.
         found = await main.lock_exercise_set_for_session(opener, set_id)
-        task = asyncio.create_task(main.lock_exercise_set(deleter, set_id))
+        task = asyncio.create_task(lock_exercise_set(deleter, set_id))
         await _waits(task)
         await main.insert_exercise_session(
             opener, set_id, found.current_version_id, "Lab A",
@@ -673,10 +675,10 @@ async def test_an_opening_and_a_set_delete_serialize(client, world, db, app_engi
     _build(db, _versions(db, second)[0].id)
     async with app_engine.connect() as opener, app_engine.connect() as deleter:
         # The delete first: the opening waits, then finds no set.
-        assert await main.lock_exercise_set(deleter, second) == 0
+        assert await lock_exercise_set(deleter, second) == 0
         task = asyncio.create_task(main.lock_exercise_set_for_session(opener, second))
         await _waits(task)
-        await main.delete_exercise_set(deleter, second)
+        await delete_exercise_set(deleter, second)
         await deleter.commit()
         assert await task is None
         await opener.rollback()

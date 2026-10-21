@@ -14,6 +14,7 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.exc import IntegrityError
 
 from cocco import main
+from cocco.web import exercise_sets
 from cocco.repository import judging as repo
 from cocco.conftest import sign_in_as
 from cocco.exercises import format as exercise_format
@@ -141,7 +142,7 @@ def test_the_student_view_has_no_hidden_test_and_no_unrevealed_solution():
 
 
 def test_a_hidden_test_is_only_its_verdict_and_its_exception():
-    rows = main.exercise_check_rows(SECRET_CHECK, _exercise(), redact=True)
+    rows = exercise_sets.exercise_check_rows(SECRET_CHECK, _exercise(), redact=True)
     visible, hidden = rows
     assert visible["redacted"] is False and visible["test"].input == "21\n"
     # No line and no time: both are numbers the program can choose.
@@ -157,7 +158,7 @@ def test_a_hidden_test_is_only_its_verdict_and_its_exception():
 
 
 def test_staff_see_a_hidden_test_in_full():
-    _, hidden = main.exercise_check_rows(SECRET_CHECK, _exercise(), redact=False)
+    _, hidden = exercise_sets.exercise_check_rows(SECRET_CHECK, _exercise(), redact=False)
     assert hidden["redacted"] is False
     assert hidden["result"].stdout == "the input was 5-SECRET\n"
     assert hidden["test"].input == "5\n"
@@ -167,7 +168,7 @@ def test_a_test_the_version_does_not_have_is_redacted():
     """Nothing says it is visible, so it is not shown as if it were."""
     exercise = _exercise()
     exercise.tests = exercise.tests[:0]
-    rows = main.exercise_check_rows(SECRET_CHECK, exercise, redact=True)
+    rows = exercise_sets.exercise_check_rows(SECRET_CHECK, exercise, redact=True)
     assert all(row["redacted"] for row in rows)
 
 
@@ -181,7 +182,7 @@ def test_a_diff_past_a_clipped_output_marks_only_what_is_there():
             )
         ],
     )
-    (row,) = main.exercise_check_rows(result, _exercise(), redact=True)
+    (row,) = exercise_sets.exercise_check_rows(result, _exercise(), redact=True)
     assert row["actual"] == [("1", False), ("2", True)]
     # Index 1 of "42\n" is the line after it: the expected output's own index.
     assert row["expected"] == [("42", False), ("", True)]

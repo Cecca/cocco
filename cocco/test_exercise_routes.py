@@ -765,12 +765,12 @@ async def test_an_import_into_a_set_deleted_meanwhile_is_404(client, world, db, 
     """The set vanished between the dependency's check and the insert: its
     foreign key refuses the version, and the answer is the 404 any later
     request would get - not a 500."""
-    import cocco.main as main
+    import cocco.web.exercise_sets as exercise_sets
 
     async def always(conn, set_id, course_id):
         return True
 
-    monkeypatch.setattr(main, "exercise_set_in_course", always)
+    monkeypatch.setattr(exercise_sets, "exercise_set_in_course", always)
     response = _import(client, world["course"], set_id=999)
     assert response.status_code == 404
     assert _count(db, ExerciseSetVersion) == 0
@@ -779,10 +779,10 @@ async def test_an_import_into_a_set_deleted_meanwhile_is_404(client, world, db, 
 async def test_a_preview_on_a_set_deleted_meanwhile_is_404(client, world, db, ready, monkeypatch):
     """The same race for a preview: the version was read, then deleted, and
     the job's foreign key refuses it."""
-    import cocco.main as main
+    import cocco.web.exercise_sets as exercise_sets
 
     _, _, base = ready
-    real = main.query_exercise_version
+    real = exercise_sets.query_exercise_version
 
     async def read_then_delete(conn, set_id, version_id):
         version = await real(conn, set_id, version_id)
@@ -792,6 +792,6 @@ async def test_a_preview_on_a_set_deleted_meanwhile_is_404(client, world, db, re
             other.execute(ExerciseSetVersion.delete())
         return version
 
-    monkeypatch.setattr(main, "query_exercise_version", read_then_delete)
+    monkeypatch.setattr(exercise_sets, "query_exercise_version", read_then_delete)
     response = client.post(f"{base}/1/run", data={"source": "print(1)"})
     assert response.status_code == 404
