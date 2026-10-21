@@ -16,7 +16,7 @@ from sqlalchemy import insert, select, text
 
 import cocco.judge as cj
 from cocco import model as cm
-from cocco.repository import _rest, challenges, judging as repo
+from cocco.repository import challenges, exercise_sets, judging as repo
 from cocco.avatar import generate_identicon
 from cocco.conftest import TEST_DATABASE
 from cocco.exercises.compare import Rules
@@ -164,7 +164,7 @@ async def _enqueue(app_engine, kind: ExerciseJobKind, user_id: int, version_id: 
         job.setdefault("exercise_index", 1)
         job.setdefault("source", "")
     async with app_engine.connect() as conn:
-        job_id = await _rest.insert_exercise_job(
+        job_id = await exercise_sets.insert_exercise_job(
             conn, kind=kind, user_id=user_id, version_id=version_id, **job
         )
         await conn.commit()

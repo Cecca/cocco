@@ -360,7 +360,7 @@ async def test_pushes_to_one_set_take_its_lock_in_turn(app_engine, exercise_set)
     from sqlalchemy import text
     from sqlalchemy.exc import DBAPIError
 
-    from cocco.repository._rest import lock_exercise_set_for_push
+    from cocco.repository.exercise_sets import lock_exercise_set_for_push
 
     async with app_engine.connect() as first, app_engine.connect() as second:
         assert await lock_exercise_set_for_push(first, exercise_set)

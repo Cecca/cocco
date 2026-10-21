@@ -73,7 +73,7 @@ from cocco.repository.challenges import (
     query_user_submissions,
     regrade_challenge,
 )
-from cocco.repository._rest import (
+from cocco.repository.lifecycle import (
     delete_challenge,
     delete_course,
     lock_challenge_submissions,
