@@ -2,8 +2,11 @@
 or a running app - the routes themselves are exercised by hand for now."""
 
 
+import re
+
 import pytest
 from fastapi.testclient import TestClient
+from starlette.routing import Match
 
 from cocco.judge import load_languages
 from cocco.main import app, render_markdown, render_source, static_url, visible_outcomes
@@ -152,3 +155,39 @@ def test_unversioned_static_is_revalidated(url):
     be revalidated - and `?nv=1` is the near-miss that a substring test for
     "v=" would wrongly cache for a year."""
     assert _client.get(url).headers["cache-control"] == "no-cache"
+
+
+def _concrete_path(path: str) -> str:
+    """The route's path with `1` in place of every parameter. `1` satisfies `str`,
+    `int`, `float` and `path` converters, which are the only ones in use."""
+    return re.sub(r"\{[^}]+\}", "1", path)
+
+
+def test_no_route_is_shadowed_by_an_earlier_one():
+    """Route order is load-bearing (`/courses/new` above `/courses/{course_id}`,
+    every two-segment course page above `/courses/{course_id}/{challenge_id}`).
+    For each route and method, Starlette's own matching must pick that route
+    first. Skipped: entries with no `methods` (the `/static` Mount), which have
+    no method to dispatch on."""
+    routes = app.routes
+    failures = []
+    checked = 0
+    for route in routes:
+        methods = getattr(route, "methods", None)
+        if not methods:
+            continue
+        path = _concrete_path(route.path)
+        for method in sorted(methods):
+            scope = {"type": "http", "path": path, "method": method, "root_path": ""}
+            winner = next(
+                (r for r in routes if r.matches(scope)[0] == Match.FULL), None
+            )
+            checked += 1
+            if winner is not route:
+                failures.append(
+                    f"{method} {route.path} ({route.name}) is shadowed by "
+                    f"{getattr(winner, 'path', None)} ({getattr(winner, 'name', None)}) "
+                    f"for {path}"
+                )
+    assert checked > 100
+    assert not failures, "\n".join(failures)
