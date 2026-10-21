@@ -1,5 +1,5 @@
 ---
-status: draft
+status: done
 ---
 
 # General refactor: split `main.py` and `repository.py`
@@ -191,7 +191,7 @@ the code or the example configs filters on `cocco.main` (only `logs.py`'s docstr
 Each step is one commit, and `uv run pytest` passes at every commit (`-m "not integration"` for the web steps; the
 whole suite, integration included, for steps 1 and 2, which touch the judge's imports).
 
-0. [ ] **Guards.** Two checks, both committed, both passing on today's code:
+0. [x] **Guards.** Two checks, both committed, both passing on today's code:
    - **Route shadowing test** (permanent, in `test_main.py`): for every route in `app.routes`, build a concrete URL
      by substituting `1` for each path parameter, and assert that the *first* route matching that method and path
      is the route itself. That is the general form of "`/courses/new` above `get_course`, every two-segment course
@@ -201,21 +201,21 @@ whole suite, integration included, for steps 1 and 2, which touch the judge's im
      once after the step, with identical `ast.dump` apart from decorators and the attribute reads listed under
      "Seams". Run it after every step. Also dump `[(r.methods, r.path, r.name) for r in app.routes]` at
      `65ec41c` and diff it against each step's: the list must be identical, order included.
-1. [ ] **`repository` becomes a package.** `git mv cocco/repository.py cocco/repository/__init__.py` would keep
+1. [x] **`repository` becomes a package.** `git mv cocco/repository.py cocco/repository/__init__.py` would keep
    history but leave a facade, so instead: create the package with `rules.py` and `judging.py` first, move those
    definitions, keep everything else in a temporary `cocco/repository/_rest.py`, and point every importer at the
    right module. Judge to `judging as repo`. Run the integration tests.
-2. [ ] **Carve `_rest.py`** into `users.py`, `credentials.py`, `courses.py`, `challenges.py`, `exercise_sets.py`,
+2. [x] **Carve `_rest.py`** into `users.py`, `credentials.py`, `courses.py`, `challenges.py`, `exercise_sets.py`,
    `exercise_sessions.py`, `lifecycle.py`, one commit per two or three modules, each updating `main.py`'s,
    `auth.py`'s and the tests' imports. `_rest.py` is gone by the end. `test_repository.py` imports from the new
    modules; consider splitting it to match (`test_repository_courses.py`, …) only if it reads better, as a
    separate commit.
-3. [ ] **`web/core.py`, `web/templating.py`, `web/seed.py`.** Move the module-level state, filters and seed data.
+3. [x] **`web/core.py`, `web/templating.py`, `web/seed.py`.** Move the module-level state, filters and seed data.
    `main.py` imports them. Switch every reader of `CONFIG`, `DUMMY_AUTH`, `storage` to `core.<name>`, and the tests
    and `conftest.make_client` to patch `core` (`app.dependency_overrides[core.get_db]`). Fix the two `Path(__file__)`s.
-4. [ ] **`web/access.py`.** Move the identity, refusals and gates. `main.py` registers the three exception handlers
+4. [x] **`web/access.py`.** Move the identity, refusals and gates. `main.py` registers the three exception handlers
    with `add_exception_handler`. `test_auth_routes.py`'s `from cocco.main import Forbidden, require_...` moves too.
-5. [ ] **Routers, one area per commit**, in route order so each commit's `include_router` lands after the previous
+5. [x] **Routers, one area per commit**, in route order so each commit's `include_router` lands after the previous
    one and before what is still in `main.py`: `signin`, `home`, `admin`, `courses`, `people`, `exercise_sets`,
    `exercise_sessions`, `exercise_student`, `challenges`, `challenge_editor`, `testcases`, `profile`, `api`. Each
    commit retargets the tests that reach into that area (`main.session_job_refusal`, `main.projector_view`, …,
@@ -223,10 +223,10 @@ whole suite, integration included, for steps 1 and 2, which touch the judge's im
    `/courses/new` goes at the top of `courses.py` with the route-order comment it has today; the comment explaining
    why two-segment course pages come before `get_challenge` moves to `main.py`, next to the `include_router` calls
    that now enforce it.
-6. [ ] **`main.py` is the composition root.** What is left: `app`, middlewares, mount, handlers, startup, routers.
+6. [x] **`main.py` is the composition root.** What is left: `app`, middlewares, mount, handlers, startup, routers.
    Remove the imports nothing uses. Extend `test_entrypoints.py` so `server.py` importing `cocco.web.core` fails
    as importing `cocco.main` does (it reads the config at import too).
-7. [ ] **Documentation.**
+7. [x] **Documentation.**
    - `.claude/rules/*.md` `paths:` frontmatter: replace `cocco/main.py` / `cocco/repository.py` with the modules each
      guide is about (e.g. `pages.md` → `cocco/web/**`, `cocco/repository/**`; `authorization.md` →
      `cocco/web/access.py`, `cocco/web/people.py`, `cocco/web/profile.py`, …; `storage.md` → the modules reading
@@ -238,6 +238,69 @@ whole suite, integration included, for steps 1 and 2, which touch the judge's im
    - Comments and docstrings naming `repository.py` / `main.py` (`model.py`, `passwords.py`, `tokens.py`,
      `logs.py`, `conftest.py`, `server.py`). Leave migration revisions alone: they are history.
    - Set this plan's status to `done` with an outcome section.
+
+## Outcome (2026-10-22)
+
+Done in 22 commits, `58eea3c` (guard) to `4b2edb1` (docs), plus this update. Each step was implemented by the
+`implementer` subagent and reviewed in the main session before the next one started.
+
+**Result.** `cocco/main.py` is 110 lines (the composition root). `cocco/web/` has 18 modules, the largest
+`exercise_sessions.py` at 948 lines. `cocco/repository/` has 9, the largest `challenges.py` at 878. Neither
+`__init__.py` re-exports anything. The wheel contains both subpackages (`packages = ["cocco"]` is enough).
+
+**Verification.**
+- `uv run pytest`: 999 passed, integration included. That is the baseline 997 plus the shadowing test and the
+  template/static directory test.
+- Move check (scratchpad AST script, run after every step): every top-level statement of the old `main.py` and
+  `repository.py` exists exactly once, identical apart from decorators and seam reads. The exceptions are all
+  intended:
+  - `STATIC_DIR` / `TEMPLATES_DIR` (`.parent.parent`);
+  - the two module docstrings and the one docstring of `_submission_outcomes` that step 7 retargeted;
+  - per-module `logger`s.
+- Comments were compared as a sorted multiset at each step. The only additions are the route-order comment beside
+  the `include_router` calls and step 7's location fixes.
+- Route table: identical to `65ec41c` except that `GET`/`POST /courses/new` now register after the `/admin` routes
+  (see below).
+- The three repository-function patches were each broken on purpose and the test failed, so they reach their
+  routes.
+- `cocco-web` against `cocco-dev` with dummy auth served all of these with 200:
+  - home, `/f/courses`, `/admin`, `/courses/new`;
+  - a course page, its editor and its people page;
+  - a challenge page and its editor;
+  - a profile and `/static`.
+  The judge-side flow was covered by the integration tests rather than by hand.
+
+**Deviations from the plan.**
+- **`/courses/new` moved in the route table.** It used to sit between the home page and `/admin`. Putting it at the
+  top of `courses.py`, as planned, makes it register after `/admin`. Nothing collides, and the shadowing test
+  passes, so the "identical, order included" check holds everywhere else.
+- **Some helpers moved to break import cycles** that a pure line-range split would have created. Each lives with its
+  concept:
+  - `_slug` → `web/core.py`. The API and exercise-set downloads both use it.
+  - `_testcase_dir`, `_render_testcases`, `_evaluator_context` → `web/testcases.py`, beside `_evaluator_dir`. Courses,
+    the challenge editor and the API use them.
+  - `_exercise_status` → `web/exercise_sessions.py`. The dashboard uses it.
+  - `ARCHIVED_EXERCISE_JOB_REFUSAL` → `web/exercise_sets.py`. Preview jobs and session jobs both use it.
+  - `_n_exercises` → `repository/exercise_sets.py`. `_exercise_versions` uses it.
+- **The module graph has more one-way edges than the plan listed.** It is still acyclic, and no module imports
+  another inside a function. `CLAUDE.md` and the `.claude/rules` frontmatter describe the result.
+  - `web`: `courses` → `home`, `testcases`; `challenge_editor` → `courses`, `testcases`; `exercise_sets` → `courses`;
+    `exercise_sessions` → `exercise_sets`, `courses`; `exercise_student` → `exercise_sessions`, `exercise_sets`;
+    `profile` → `signin`; `api` → `challenge_editor`, `testcases`, `exercise_sets`.
+  - `repository`: `lifecycle` imports `courses` (`delete_course` needs `query_ordered_challenge_ids`), so it is not
+    "only `rules`". `credentials` → `users`; `exercise_sessions` → `exercise_sets`; `challenges` and `exercise_sets`
+    → `judging`.
+- **`insert_session_participant` is patched on `cocco.web.exercise_sessions`**, not `exercise_student`.
+  `_register_participant` lives there and looks the name up.
+- **`MAX_UPLOAD_BYTES` stayed in `core`.** It is shared by submissions and the evaluator limit.
+
+**Left for later.**
+- `.claude/rules/auth.md` and `authorization.md` still name `create_db_and_tables`, a function that predates this
+  refactor and no longer exists (it is `prepare_database` in `web/seed.py`).
+- `ruff check --select F cocco/` reports 221 errors, almost all F811 on the tests' `world` fixtures. They existed
+  before this refactor.
+- The generated import blocks in `cocco/repository/*` are one line per `from`, where the old file used one name per
+  line. This is cosmetic.
 
 ## Verification
 
