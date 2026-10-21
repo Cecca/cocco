@@ -26,8 +26,19 @@ from cocco.repository.judging import (
     QUEUE_CHANNEL,
     pull_queued_submission,
 )
-from cocco.repository._rest import (
+from cocco.repository.users import (
     block_user,
+    insert_administrators,
+    insert_user,
+    is_administrator,
+    query_user,
+    query_user_by_email,
+    query_user_profile,
+    query_users,
+    record_sign_in,
+    unblock_user,
+)
+from cocco.repository._rest import (
     challenge_in_course,
     count_running_submissions,
     count_testcase_outcomes,
@@ -35,14 +46,11 @@ from cocco.repository._rest import (
     delete_challenge,
     delete_course,
     delete_enrollment,
-    insert_administrators,
     insert_challenge,
     insert_course,
     insert_enrollment,
     insert_self_enrollment,
     insert_submission,
-    insert_user,
-    is_administrator,
     lock_challenge_submissions,
     lock_course_submissions,
     query_challenge,
@@ -65,19 +73,13 @@ from cocco.repository._rest import (
     query_sample_testcase,
     query_submission,
     query_submission_outcomes,
-    query_user,
-    query_user_by_email,
-    query_user_profile,
     query_user_role,
     query_user_submissions,
-    query_users,
-    record_sign_in,
     regrade_challenge,
     reorder_challenges,
     set_challenge_archived,
     set_course_archived,
     set_enrollment_role,
-    unblock_user,
 )
 from cocco import schema
 from cocco.schema import SubmissionRunData

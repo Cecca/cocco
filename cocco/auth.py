@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 
 from cocco import schema
 from cocco.avatar import generate_identicon
-from cocco.repository._rest import insert_user, query_user_by_email
+from cocco.repository.users import insert_user, query_user_by_email
 
 logger = logging.getLogger(__name__)
 

@@ -35,12 +35,8 @@ from cocco.model import (
     Enrollment,
     UserRole,
 )
-from cocco.repository._rest import (
-    block_user,
-    query_course_role,
-    query_enrollment_key,
-    query_user_by_email,
-)
+from cocco.repository.users import block_user, query_user_by_email
+from cocco.repository._rest import query_course_role, query_enrollment_key
 
 # A signed-in visitor asking for the cheapest thing there is: an avatar is a
 # plain SELECT behind `CurrentUser`, so it answers "am I signed in?" without

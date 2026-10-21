@@ -26,7 +26,7 @@ from sqlalchemy import insert, select
 
 from cocco.model import User, UserPassword
 from cocco.passwords import MIN_PASSWORD_LENGTH, hash_password
-from cocco.repository._rest import block_user, record_sign_in
+from cocco.repository.users import block_user, record_sign_in
 
 GOOD = "a perfectly fine password"
 OTHER = "another perfectly fine password"
