@@ -4,33 +4,18 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated
-import markdown as md
-from markupsafe import Markup
-from pygments import highlight as pygments_highlight
-from pygments.formatters import HtmlFormatter
-from pygments.lexers import TextLexer, get_lexer_by_name
-from pygments.util import ClassNotFound
-from sqlalchemy import func, insert, select
+from sqlalchemy import select
 from cocco.avatar import MAX_AVATAR_BYTES, generate_identicon, sniff_image_mime
 from cocco.evaluators import BUNDLED, DEFAULT_EVALUATOR, bundled_path
 from cocco.exercises import format as exercise_format
 from cocco.exercises.compare import describe_rules
-from cocco.exercises.hints import error_hint
-from cocco.judge import extension_to_language, load_languages
-from cocco.storage import Storage, check_storage_format, safe_filename
+from cocco.storage import safe_filename
 from cocco.model import (
-    Challenge,
-    Course,
     ExerciseJobKind,
     ExerciseJobStatus,
     ExerciseSessionMode,
     ExerciseVersionStatus,
     LeaderboardRanking,
-    OutcomeEnum,
-    Submission,
-    SubmissionStatus,
-    TestCase,
-    TestOutcome,
     User,
     UserRole,
 )
@@ -42,13 +27,7 @@ from cocco.auth import (
     oauth_redirect_uri,
     safe_next_path,
 )
-from cocco.config import config_path, load_config
 from cocco.logs import AccessLogMiddleware
-from cocco.migrate import (
-    check_schema_is_current,
-    reset_schema,
-    upgrade_to_head,
-)
 from cocco.tokens import hash_token, mint_token, parse_bearer
 from cocco.passwords import (
     MIN_PASSWORD_LENGTH,
@@ -90,12 +69,9 @@ from fastapi.responses import (
     JSONResponse,
     RedirectResponse,
     Response,
-    StreamingResponse,
 )
-from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
@@ -103,16 +79,13 @@ import hmac
 import io
 import logging
 import os
-import re
 import tempfile
 import zipfile
 from pathlib import Path
-from urllib.parse import parse_qs
 
 from cocco.repository.users import (
     block_user,
     insert_administrators,
-    insert_user,
     is_administrator,
     query_user,
     query_user_by_email,
@@ -238,34 +211,31 @@ from cocco.repository.lifecycle import (
     set_course_archived,
 )
 
+from cocco.web import core
+from cocco.web.core import (
+    DBDep,
+    EDITOR_ROLES,
+    EXTENSION_TO_LANGUAGE,
+    MAX_UPLOAD_BYTES,
+    _slug,
+    _stored_file_download,
+    _zip_stored,
+)
+from cocco.web.seed import (
+    DUMMY_ADMIN,
+    DUMMY_STUDENTS,
+    DUMMY_TEACHERS,
+    prepare_database,
+)
+from cocco.web.templating import (
+    STATIC_DIR,
+    VersionedStaticFiles,
+    render_datetime,
+    templates,
+)
+
 
 logger = logging.getLogger(__name__)
-
-# Everything the app is configured with: the database, the storage root, the
-# allowed domains, the session cookie and the development shortcuts. A missing
-# file is fine - the app boots on the defaults, and the login page says that
-# no sign-in method is configured.
-CONFIG = load_config(config_path())
-
-# The development cast, and the addresses `post_auth_dummy` is there to be
-# typed. Matteo and Alice both teach every seeded course; what separates them is
-# that Matteo is a site administrator - a row in `administrator`, not a role on
-# any enrollment - so he may create courses and is staff on courses nobody
-# enrolled him on. Bob and Charlie are students.
-DUMMY_ADMIN = "matteo.ceccarello@unipd.it"
-DUMMY_TEACHERS = ["alice@unipd.it"]
-DUMMY_STAFF = [DUMMY_ADMIN, *DUMMY_TEACHERS]
-DUMMY_STUDENTS = ["bob@unipd.it", "charlie@unipd.it"]
-
-# Development shortcut: no provider and no credentials. `/login` grows a box, and
-# whatever address is typed into it is signed in - so it is `post_auth_dummy`
-# that branches on this, and `get_user` no longer does. On anything public it is
-# equivalent to publishing every account's password.
-#
-# Derived from the config once, here, and thereafter *this name* is the app's
-# switch, read rather than `CONFIG.dev`: it is the seam the route tests flip,
-# and a frozen dataclass field has no equivalent. Do not "tidy" it away.
-DUMMY_AUTH = CONFIG.dev.dummy_auth
 
 # Root of the app
 app = FastAPI(default_response_class=HTMLResponse)
@@ -274,10 +244,10 @@ app = FastAPI(default_response_class=HTMLResponse)
 # user is re-read from the database on every request.
 app.add_middleware(
     SessionMiddleware,
-    secret_key=CONFIG.session.secret_key,
-    session_cookie=CONFIG.session.cookie_name,
-    max_age=CONFIG.session.max_age,
-    https_only=CONFIG.session.https_only,
+    secret_key=core.CONFIG.session.secret_key,
+    session_cookie=core.CONFIG.session.cookie_name,
+    max_age=core.CONFIG.session.max_age,
+    https_only=core.CONFIG.session.https_only,
     # Not "strict": the return from a provider is a top-level cross-site
     # navigation, and under "strict" the cookie carrying the OAuth `state`
     # would not be sent to the callback, so every sign-in would fail as a state
@@ -291,8 +261,8 @@ app.add_middleware(
 # proxy is handled in here rather than by uvicorn.
 app.add_middleware(
     AccessLogMiddleware,
-    proxy_headers=CONFIG.proxy_headers,
-    trusted_proxies=CONFIG.trusted_proxies,
+    proxy_headers=core.CONFIG.proxy_headers,
+    trusted_proxies=core.CONFIG.trusted_proxies,
 )
 
 # Registered at import, but nothing is fetched here: Authlib pulls Google's
@@ -302,12 +272,12 @@ app.add_middleware(
 # when its own two environment variables are set, which is the whole of what
 # turns one on.
 oauth = OAuth()
-if CONFIG.auth.google is not None:
+if core.CONFIG.auth.google is not None:
     oauth.register(
         name="google",
-        client_id=CONFIG.auth.google.client_id,
-        client_secret=CONFIG.auth.google.client_secret,
-        server_metadata_url=CONFIG.auth.google.server_metadata_url,
+        client_id=core.CONFIG.auth.google.client_id,
+        client_secret=core.CONFIG.auth.google.client_secret,
+        server_metadata_url=core.CONFIG.auth.google.server_metadata_url,
         client_kwargs={
             # `profile` is deliberately not asked for: the nickname is derived
             # from the address, so the name and the picture would be data we
@@ -319,11 +289,11 @@ if CONFIG.auth.google is not None:
     )
 
 
-if CONFIG.auth.github is not None:
+if core.CONFIG.auth.github is not None:
     oauth.register(
         name="github",
-        client_id=CONFIG.auth.github.client_id,
-        client_secret=CONFIG.auth.github.client_secret,
+        client_id=core.CONFIG.auth.github.client_id,
+        client_secret=core.CONFIG.auth.github.client_secret,
         authorize_url="https://github.com/login/oauth/authorize",
         access_token_url="https://github.com/login/oauth/access_token",
         api_base_url="https://api.github.com/",
@@ -348,103 +318,8 @@ def oauth_client(provider: str):
     """
     return oauth.create_client(provider)
 
-# Static files. Resolved against the package rather than the working directory,
-# the rule `load_languages` already follows for `languages.toml` - and inside
-# `cocco/` rather than beside it, so an installed `cocco-web` has them too.
-STATIC_DIR = Path(__file__).resolve().parent / "static"
-
-# The templates, by the same rule. Both of these used to be bare relative
-# strings handed to Starlette and Jinja, which meant the app ran from the
-# repository root and nowhere else - and, worse for `static`, meant the mount
-# and `static_url` below could name two different directories.
-TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
-
-
-class VersionedStaticFiles(StaticFiles):
-    """`StaticFiles` with a `Cache-Control`, chosen by whether the URL carries a
-    `?v=`.
-
-    Starlette sets a `last-modified` and an `etag` and no freshness directive at
-    all, so a browser falls back to heuristic caching - which for a file that
-    was created recently is worth nothing. Every reload therefore revalidated
-    the navbar mark, and the navbar painted an empty box until the 304 came
-    back. That is the flicker.
-
-    A year of `immutable` is only safe on a URL that changes when the file does,
-    which is what `static_url` stamps on; a URL typed by hand has no version to
-    change and so gets `no-cache` - it may be held in cache, but never used
-    without asking. The two halves have to stay together: the header is the
-    point of the version, and the version is what makes the header safe."""
-
-    def file_response(self, full_path, stat_result, scope, status_code=200):
-        response = super().file_response(full_path, stat_result, scope, status_code)
-        # The `v` *key*, not the substring "v=", which `?nv=1` also contains.
-        versioned = "v" in parse_qs(scope.get("query_string", b"").decode("latin-1"))
-        # Set after `super()`, so this covers the 304 too: `NotModifiedResponse`
-        # keeps `cache-control` among the few headers it carries over.
-        response.headers["Cache-Control"] = (
-            "public, max-age=31536000, immutable" if versioned else "no-cache"
-        )
-        return response
-
-
 app.mount("/static", VersionedStaticFiles(directory=STATIC_DIR), name="static")
 
-# The database. The judge builds a *sync* engine from this same URL, which is
-# why the driver in it has to be one with both faces - see DEFAULT_DATABASE_URL.
-engine = create_async_engine(CONFIG.database.url)
-
-templates = Jinja2Templates(directory=TEMPLATES_DIR)
-
-# Test case inputs and expected outputs live on the filesystem, not in the
-# database (see DESIGN.md). The judge resolves the same paths against the same
-# root, and the two agree because they read it out of the same file.
-storage = Storage(CONFIG.storage.root)
-
-# How a stored file is handed to somebody outside. Everything under the storage
-# root is compressed and nothing the other end reads is, so a download is a
-# decompressing stream rather than a `FileResponse`: there is no file holding
-# the right bytes to point one at, and a million-line test case must not be
-# inflated into memory to make one. The generator is deliberately *sync* -
-# Starlette iterates one of those on a thread, which is what keeps the inflate
-# off the event loop.
-def _stored_file_download(relative: str, filename: str) -> StreamingResponse:
-    def chunks():
-        with storage.reader(relative) as fp:
-            while chunk := fp.read(1 << 16):
-                yield chunk
-
-    return StreamingResponse(
-        chunks(),
-        # text/plain whatever the name says, so a file named .html can never be
-        # served as a page on this origin.
-        media_type="text/plain",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-
-
-def _zip_stored(zf: zipfile.ZipFile, relative: str, arcname: str) -> None:
-    """Copy a stored file into an open zip, decompressing on the way.
-
-    `zf.write` would put the gzip bytes in under a plain name: what leaves here
-    is the transfer format, which is plaintext at both ends and is a directory
-    somebody edits. Through `zf.open(..., "w")` rather than `writestr`, so a
-    million-line test case is still never held in memory.
-    """
-    with storage.reader(relative) as source, zf.open(arcname, "w") as sink:
-        while chunk := source.read(1 << 20):
-            sink.write(chunk)
-
-
-# Uploads are mapped to a language by their extension, so the challenge page
-# needs no language picker. `languages.toml` is the same file the judge loads -
-# literally, since `load_languages` resolves it against the checkout rather
-# than the working directory - and so is the mapping: an evaluator script is
-# recognised by exactly the rule a submitted solution is.
-LANGUAGES = load_languages()
-EXTENSION_TO_LANGUAGE = extension_to_language(LANGUAGES)
-
-MAX_UPLOAD_BYTES = 1 << 20
 
 # An evaluator is a source file, not test data, so it lives under the same
 # ceiling as a submitted solution rather than the test case one.
@@ -472,581 +347,8 @@ MAX_EXERCISE_FILE_BYTES = 256 << 10
 # a ceiling, and it is a script's rather than test data's.
 MAX_EXERCISE_CODE_BYTES = 64 << 10
 
-# Course staff. `role` lives on `enrollment`, so these are per-course, not
-# site-wide. Everyone else - i.e. students and the unenrolled - is read-only.
-# A site administrator is staff on every course without appearing here: that is
-# resolved in `effective_course_role`, not by widening this set.
-EDITOR_ROLES = {UserRole.teacher, UserRole.collaborator}
-# The same set as it comes back from `row_to_json`, i.e. plain strings
-EDITOR_ROLE_NAMES = {role.value for role in EDITOR_ROLES}
-
-
-# `codehilite` is what puts a fenced block through Pygments; `fenced_code` hands
-# every fence to it once it is registered, and it picks up indented blocks itself,
-# so a statement has one code-block shape and not two. The configuration is three
-# deliberate choices:
-#   css_class - `cocco-code`, the scope `assets/styles.css` writes the token
-#     colours under. The default is `codehilite`, which matches nothing here.
-#   guess_lang - off. A fence with no language stays plain: guessing is slow, and
-#     on the three lines of *sample input* a statement usually fences it would
-#     colour data as if it were code.
-#   linenums - off. Line numbers belong on a submission, where a compiler error
-#     names one. They are also what makes `render_source`'s output a
-#     `.cocco-codetable`; without them a fence is the plain `<div><pre><code>` the
-#     `.cocco-code pre` rule already fits.
-# An unknown fence language cannot raise: `CodeHilite.hilite` falls back to the
-# `text` lexer, which is the same `TextLexer` fallback `render_source` spells by
-# hand, so ```pseudocode renders plain rather than 500ing a challenge page.
-_MARKDOWN_EXTENSIONS = ["fenced_code", "tables", "codehilite"]
-_MARKDOWN_EXTENSION_CONFIGS = {
-    "codehilite": {"css_class": "cocco-code", "guess_lang": False, "linenums": False},
-}
-
-
-def render_markdown(text: str | None) -> Markup:
-    html = md.markdown(
-        text or "",
-        extensions=_MARKDOWN_EXTENSIONS,
-        extension_configs=_MARKDOWN_EXTENSION_CONFIGS,
-    )
-    return Markup(html)
-
-# Line numbers in their own table column so that selecting the code does not
-# select them too (see `.linenos` in assets/styles.css). `cocco-code` is the
-# class the token styles are scoped under.
-_SOURCE_FORMATTER = HtmlFormatter(cssclass="cocco-code", linenos="table", wrapcode=True)
-
-
-def render_source(source: str, language: str) -> Markup:
-    """A submission's source, highlighted. `language` is the name from
-    `languages.toml`, which for every language we support happens to be a
-    Pygments alias too; anything else falls back to unhighlighted text."""
-    try:
-        lexer = get_lexer_by_name(language)
-    except ClassNotFound:
-        lexer = TextLexer()
-    return Markup(pygments_highlight(source, lexer, _SOURCE_FORMATTER))
-
-
-def render_datetime(value):
-    """A timestamp as a sentence, in this server's own zone.
-
-    Two shapes arrive here, because the page queries answer in JSON: a real
-    `datetime` from a plain Core read, and an ISO-8601 *string* from `json_agg`
-    / `row_to_json`. Both are now offset-carrying, in whatever zone the Postgres
-    session happens to be set to - which is the host's for the devShell's
-    cluster and UTC for the container in `compose.yaml`. `astimezone()` with no
-    argument pins the reading to the app server's local clock, so the two
-    databases print the same sentence, and it is the same sentence the naive
-    `datetime.now()` this schema used to store already produced.
-    """
-    from babel.dates import format_datetime
-    from datetime import datetime
-    if isinstance(value, str):
-        value = datetime.fromisoformat(value)
-    if value.tzinfo is not None:
-        value = value.astimezone()
-    return format_datetime(value, locale="en")
-
-def render_datetime_local(value) -> str:
-    """A timestamp as an `<input type="datetime-local">` value.
-
-    `render_datetime`'s twin, and it has to be: that filter prints the sentence
-    a badge shows and this one fills the box a teacher types into, so if the two
-    disagreed about which clock they were on, a challenge would open an hour
-    away from where it said it would. Hence the same two shapes accepted - a
-    real `datetime` from a plain Core read, an ISO-8601 string from `row_to_json`
-    - and the same `astimezone()` with no argument, pinning it to the app
-    server's local clock.
-
-    The seconds are dropped because the input's default `step` has no place for
-    them, and an empty string for NULL, which is an empty box.
-    """
-    from datetime import datetime
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        value = datetime.fromisoformat(value)
-    if value.tzinfo is not None:
-        value = value.astimezone()
-    return value.strftime("%Y-%m-%dT%H:%M")
-
-def render_score(value) -> str:
-    """Per-test scores are in [0, 1]; the UI shows their mean out of 100."""
-    if value is None:
-        return "—"
-    return f"{round(float(value) * 100)}"
-
-def render_duration(value) -> str:
-    if value is None:
-        return "—"
-    value = float(value)
-    if value < 1:
-        return f"{value * 1000:.0f} ms"
-    return f"{value:.2f} s"
-
-templates.env.filters["markdown"] = render_markdown
-templates.env.filters["highlight"] = render_source
-templates.env.filters["datetime"] = render_datetime
-templates.env.filters["datetime_local"] = render_datetime_local
-templates.env.filters["score"] = render_score
-templates.env.filters["duration"] = render_duration
-
-# A global rather than a context key: `_course-card.jinja` is included from two
-# places and only needs to know whether a `role` string means course staff.
-templates.env.globals["EDITOR_ROLE_NAMES"] = EDITOR_ROLE_NAMES
-
-# Every role there is, in the order the people page offers them - strings,
-# because that is what `row_to_json` gives the template to compare against.
-# A global for the same reason: the fragment that builds the selector is served
-# from four routes, and the list of roles is not any of their business.
-USER_ROLE_NAMES = [role.value for role in UserRole]
-templates.env.globals["USER_ROLE_NAMES"] = USER_ROLE_NAMES
-
-
-def static_url(path: str) -> str:
-    """`/static/<path>` with the file's mtime as `?v=`, which is what opts it
-    into `VersionedStaticFiles`' year of `immutable`.
-
-    The `stat` happens per render rather than once at import, and that is
-    load-bearing: `npm run watch:css` rewrites `cocco/static/styles.css` without
-    touching a `.py`, so a version fixed at import would pin a year-long
-    `max-age` to a file that has since changed, with nothing left to invalidate
-    it. Three files and one `stat` each is not worth caching around.
-
-    A missing file falls back to the bare path - `cocco/static/styles.css` is
-    a build artifact and is simply absent until the first `npm run build:css`.
-
-    The URL is built by hand rather than through `url_for`, matching what the
-    templates already did, and so ignores `root_path`. It takes literals from
-    templates and never anything a user typed."""
-    try:
-        version = int((STATIC_DIR / path).stat().st_mtime)
-    except OSError:
-        return f"/static/{path}"
-    return f"/static/{path}?v={version:x}"
-
-
-templates.env.globals["static_url"] = static_url
-templates.env.globals["error_hint"] = error_hint
-
-
-async def prepare_database(reset=False):
-    """Check the schema, and only under `[dev] reset_db` build one.
-
-    The schema is not created on boot any more - `cocco-migrate` owns it, and
-    this refuses to start against a database that is behind, naming the command
-    that fixes it. A server that quietly runs DDL is a server that can migrate a
-    deployment nobody meant to migrate.
-
-    `[dev] reset_db` is the one exception, because a reset is somebody asking
-    for exactly that. It does not use `metadata.drop_all`: that drops the tables
-    and the ENUM types with them, but `alembic_version` is not in
-    `metadata` and would survive, so the `upgrade head` after it would find a
-    database already claiming to be at head and do nothing - leaving an empty
-    database that *passes* the check below and 500s on the first query. See
-    `reset_schema`.
-    """
-    # Beside the schema check below and for the same reason, on the other half
-    # of what a deployment has to bring forward: every file under the storage
-    # root is compressed, and a root that predates that would fail one download
-    # and one submission at a time instead of saying so once, here.
-    check_storage_format(CONFIG.storage.root)
-
-    if reset:
-        async with engine.begin() as conn:
-            await conn.run_sync(reset_schema)
-        # A separate transaction: the drop is committed before alembic starts
-        # its own work on the same connection.
-        async with engine.begin() as conn:
-            await conn.run_sync(upgrade_to_head)
-
-    async with engine.begin() as conn:
-        # Before anything is written, so that a database which is behind is
-        # found out rather than inserted into. After a reset too, where it costs
-        # one query and is the only thing proving the reset landed at head.
-        await conn.run_sync(check_schema_is_current, process="cocco-web")
-        if reset:
-            await _populate_dummy_data(conn)
-        # The configured administrators, replayed on every boot: this is how a
-        # brand new deployment gets its first one, since there is no
-        # administrator to appoint another. It only ever adds - see
-        # `insert_administrators` - so a database that has moved on is left
-        # alone, and deleting a line from `cocco.toml` demotes nobody.
-        await insert_administrators(conn, CONFIG.auth.administrators)
-        if DUMMY_AUTH:
-            # `cocco.dev.toml` deliberately names no administrator - a file
-            # every checkout shares should not make one person the
-            # administrator of all of them - and the promise of dummy auth is
-            # that the checkout is usable as it stands. Only DUMMY_ADMIN, so
-            # that typing `alice@unipd.it` into the sign-in box still shows what
-            # plain course staff see rather than quietly promoting her.
-            await insert_administrators(conn, [DUMMY_ADMIN])
-
-
-async def _seed_user(conn: AsyncConnection, email: str, nickname: str) -> int:
-    image, image_mime = generate_identicon(nickname)
-    return await insert_user(conn, email, nickname, image, image_mime)
-
-
-async def _populate_dummy_data(conn: AsyncConnection):
-    import textwrap
-
-    user_ids = {
-        email: await _seed_user(conn, email, email.split("@", 1)[0])
-        for email in DUMMY_STAFF + DUMMY_STUDENTS
-    }
-    # The student whose attempts the seeded submission history belongs to.
-    student_id = user_ids["bob@unipd.it"]
-
-    course_titles = ["Algorithms 101", "Data Structures"]
-    first_challenge_id: int | None = None
-    last_challenge_id: int | None = None
-    first_course_id: int | None = None
-    shortest_route = textwrap.dedent("""\
-        You are given a weighted, undirected graph of **city connections**.
-        Compute the length of the shortest route between a source city and a
-        destination city. If no route exists, return `-1`.
-
-        ### Input
-
-        First line: `n m` — number of cities and roads. Next `m` lines:
-        `u v w`. Final line: `src dst`.
-
-        ### Example
-
-        ```
-        5 6
-        0 1 4
-        0 2 1
-        2 1 2
-        1 3 1
-        2 3 5
-        3 4 3
-        0 4
-        ```
-
-        The expected output is `7`.
-
-        ### Constraints
-
-        - 1 ≤ n ≤ 10⁴,  0 ≤ m ≤ 10⁵
-        - 0 ≤ w ≤ 10³ · parallel edges allowed
-        """)
-    for course_title in course_titles:
-        course_id = (
-            await conn.execute(
-                insert(Course)
-                .values(title=course_title, description=textwrap.dedent("""\
-                        Introduction to Algorithms. This course focuses on
-
-                        - Honing algorithm design skills
-                        - Introduce students to basic implementation techniques
-                        """))
-                .returning(Course.c.id)
-            )
-        ).scalar_one()
-        if first_course_id is None:
-            first_course_id = course_id
-        # Matteo and Alice both teach; Bob and Charlie are students. `role` is
-        # per course, so this is one row per person per course. What makes
-        # Matteo an administrator is not written here but in `administrator`,
-        # by the bootstrap in `prepare_database`.
-        await insert_enrollment(
-            conn, user_ids[DUMMY_ADMIN], course_id, UserRole.teacher
-        )
-        for email in DUMMY_TEACHERS:
-            await insert_enrollment(
-                conn, user_ids[email], course_id, UserRole.teacher
-            )
-        for email in DUMMY_STUDENTS:
-            await insert_enrollment(
-                conn, user_ids[email], course_id, UserRole.student
-            )
-        for n in range(3):
-            first = first_challenge_id is None
-            challenge_id = (
-                await conn.execute(
-                    insert(Challenge)
-                    .values(
-                        title=(
-                            "Shortest Route Planner"
-                            if first
-                            else f"{course_title} - Challenge {n + 1}"
-                        ),
-                        description=(
-                            shortest_route
-                            if first
-                            else f"challenge {n + 1} of {course_title}"
-                        ),
-                        course_id=course_id,
-                        # Listed in the order they are created here; course
-                        # staff reorder them with the arrows in the editor.
-                        position=n,
-                        # A CPython interpreter alone needs well over a few MB,
-                        # so these have to be realistic or every run is killed.
-                        max_memory_bytes=256 << 20,
-                        max_time_s=5.0,
-                        max_threads=1,
-                        # No evaluator of its own: graded by the bundled
-                        # default, exact match.
-                        evaluator_path=None,
-                        # Published. `insert_challenge` leaves this NULL - a new
-                        # challenge is hidden - so a seed that did not say so
-                        # would hand Bob and Charlie an empty course.
-                        visible_from=func.now(),
-                    )
-                    .returning(Challenge.c.id)
-                )
-            ).scalar_one()
-            if first_challenge_id is None:
-                first_challenge_id = challenge_id
-            last_challenge_id = challenge_id
-
-    assert first_challenge_id is not None
-
-    # One archived challenge inside a live course, and one archived course, so
-    # both halves of archiving are visible in a fresh checkout without anybody
-    # having to click. Alice is deliberately *not* enrolled on the archived
-    # course: `[dev] dummy_user = "alice@unipd.it"` is then the view in which
-    # an archived course is simply not listed, while Matteo - an administrator,
-    # and so the only person who can unarchive one - finds it under "Other
-    # courses", and Bob and Charlie see it in "Your courses", greyed and
-    # read-only.
-    from datetime import timedelta, timezone
-
-    assert last_challenge_id is not None
-    assert first_course_id is not None
-    await set_challenge_archived(conn, last_challenge_id, True)
-    archived_course_id = (
-        await conn.execute(
-            insert(Course)
-            .values(
-                title="Algorithms 101 (2024)",
-                description=(
-                    "Last year's edition, kept for the record. Enrolled "
-                    "students can still read it and look back over their "
-                    "submissions."
-                ),
-                archived_at=datetime.now(timezone.utc),
-            )
-            .returning(Course.c.id)
-        )
-    ).scalar_one()
-    await insert_enrollment(
-        conn, user_ids[DUMMY_ADMIN], archived_course_id, UserRole.teacher
-    )
-    for email in DUMMY_STUDENTS:
-        await insert_enrollment(
-            conn, user_ids[email], archived_course_id, UserRole.student
-        )
-    await conn.execute(
-        insert(Challenge).values(
-            title="Shortest Route Planner (2024)",
-            description=shortest_route,
-            course_id=archived_course_id,
-            position=0,
-            max_memory_bytes=256 << 20,
-            max_time_s=5.0,
-            max_threads=1,
-            evaluator_path=None,
-            visible_from=func.now(),
-        )
-    )
-
-    # The two halves of visibility, on the first course, for archiving's reason:
-    # a fresh checkout should show both without anybody having to click. One
-    # challenge nobody but staff can see, and one that opens next week - which
-    # Bob and Charlie find on their course page as a card with a date on it and
-    # nothing to click.
-    await conn.execute(
-        insert(Challenge).values(
-            title="Maximum Flow (draft)",
-            description="Still being written. Students cannot see this one.",
-            course_id=first_course_id,
-            position=3,
-            max_memory_bytes=256 << 20,
-            max_time_s=5.0,
-            max_threads=1,
-            evaluator_path=None,
-            visible_from=None,
-        )
-    )
-    await conn.execute(
-        insert(Challenge).values(
-            title="Minimum Spanning Tree",
-            description="Opens next week. Until then this is all anybody sees.",
-            course_id=first_course_id,
-            position=4,
-            max_memory_bytes=256 << 20,
-            max_time_s=5.0,
-            max_threads=1,
-            evaluator_path=None,
-            visible_from=datetime.now(timezone.utc) + timedelta(days=7),
-        )
-    )
-
-    # The first three are public samples, downloadable from the challenge page;
-    # the rest are hidden. The last one is retired, so the editor shows both
-    # states without anyone having to click first. Contents go on the
-    # filesystem, not in the database (DESIGN.md, "Test case inputs"), so they
-    # are written through `storage`.
-    cases = [
-        ("5 6\n0 1 4\n0 2 1\n2 1 2\n1 3 1\n2 3 5\n3 4 3\n0 4\n", "7\n", True, True),
-        ("4 2\n0 1 5\n2 3 7\n0 3\n", "-1\n", True, True),
-        (
-            "6 9\n0 1 7\n0 2 9\n0 5 14\n1 2 10\n1 3 15\n2 3 11\n2 5 2\n"
-            "3 4 6\n5 4 9\n0 4\n",
-            "20\n",
-            True,
-            True,
-        ),
-        ("2 1\n0 1 3\n1 0\n", "3\n", False, True),
-        ("3 3\n0 1 2\n1 2 2\n0 2 10\n0 2\n", "4\n", False, False),
-    ]
-    testcase_id: int | None = None
-    for order, (test_input, expected, is_sample, is_active) in enumerate(cases):
-        input_path = f"challenge_{first_challenge_id}/in_{order}.txt"
-        output_path = f"challenge_{first_challenge_id}/out_{order}.txt"
-        storage.write(input_path, test_input)
-        storage.write(output_path, expected)
-        tc_id = (
-            await conn.execute(
-                insert(TestCase)
-                .values(
-                    challenge_id=first_challenge_id,
-                    execution_order=order,
-                    input_path=input_path,
-                    expected_output_path=output_path,
-                    is_sample=is_sample,
-                    is_active=is_active,
-                )
-                .returning(TestCase.c.id)
-            )
-        ).scalar_one()
-        if testcase_id is None:
-            testcase_id = tc_id
-
-    assert testcase_id is not None
-
-    # A plausible solution to the seeded challenge, so the submission page has
-    # something worth highlighting in development.
-    seeded_source = textwrap.dedent("""\
-        import heapq
-        import sys
-
-
-        def shortest_route(n, edges, src, dst):
-            \"\"\"Dijkstra over an undirected graph with non-negative weights.\"\"\"
-            graph = [[] for _ in range(n)]
-            for u, v, w in edges:
-                graph[u].append((v, w))
-                graph[v].append((u, w))
-
-            dist = [float("inf")] * n
-            dist[src] = 0
-            queue = [(0, src)]
-            while queue:
-                d, u = heapq.heappop(queue)
-                if u == dst:
-                    return d
-                if d > dist[u]:
-                    continue  # a stale entry, already improved on
-                for v, w in graph[u]:
-                    if d + w < dist[v]:
-                        dist[v] = d + w
-                        heapq.heappush(queue, (dist[v], v))
-            return -1
-
-
-        def main():
-            data = sys.stdin.read().split()
-            n, m = int(data[0]), int(data[1])
-            edges = [
-                (int(data[2 + 3 * i]), int(data[3 + 3 * i]), int(data[4 + 3 * i]))
-                for i in range(m)
-            ]
-            src, dst = int(data[2 + 3 * m]), int(data[3 + 3 * m])
-            print(shortest_route(n, edges, src, dst))
-
-
-        if __name__ == "__main__":
-            main()
-        """)
-
-    async def _seed_submission(
-        author_id: int,
-        filename: str,
-        outcome: OutcomeEnum,
-        score: float,
-        elapsed_s: float | None,
-    ) -> None:
-        submission_id = (
-            await conn.execute(
-                insert(Submission)
-                .values(
-                    user_id=author_id,
-                    challenge_id=first_challenge_id,
-                    status=SubmissionStatus.done,
-                    language="python",
-                    filename=filename,
-                    source=seeded_source,
-                )
-                .returning(Submission.c.id)
-            )
-        ).scalar_one()
-        await conn.execute(
-            insert(TestOutcome).values(
-                submission_id=submission_id,
-                testcase_id=testcase_id,
-                outcome=outcome,
-                score=score,
-                elapsed_s=elapsed_s,
-                peak_memory_bytes=12 << 20,
-                message="ok" if outcome == OutcomeEnum.success else str(outcome.value),
-                stdout="7\n" if outcome == OutcomeEnum.success else "",
-                stderr="" if outcome == OutcomeEnum.success else "RuntimeError: boom",
-            )
-        )
-
-    # A history of attempts for one student, so the submission page and the
-    # per-student staff view have something to show.
-    await _seed_submission(
-        student_id, "first_try.py", OutcomeEnum.runtime_error, 0.0, None
-    )
-    await _seed_submission(student_id, "route_bfs.py", OutcomeEnum.success, 0.75, 0.412)
-    await _seed_submission(
-        student_id, "shortest_route.py", OutcomeEnum.success, 1.0, 0.238
-    )
-    await _seed_submission(
-        user_ids["charlie@unipd.it"], "charlie.py", OutcomeEnum.success, 0.5, 0.310
-    )
-
-    # A few classmates, so the leaderboard has something to rank. They are not
-    # enrolled: `query_challenge_standings` builds its cohort as the enrolled
-    # students plus anyone who submitted, so they show up regardless.
-    for nickname, filename, elapsed_s in [
-        ("bianchi", "dijkstra.py", 0.121),
-        ("rossi", "heapq_solution.py", 0.164),
-        ("ferrari", "route.py", 0.199),
-        ("romano", "planner.py", 0.402),
-    ]:
-        classmate_id = await _seed_user(conn, f"{nickname}@studenti.unipd.it", nickname)
-        await _seed_submission(
-            classmate_id, filename, OutcomeEnum.success, 1.0, elapsed_s
-        )
-
-
-
-
 ########################################################################
 # dependency injection
-async def get_db():
-    async with engine.connect() as conn:
-        yield conn
-
-DBDep = Annotated[AsyncConnection, Depends(get_db)]
-
 class NotAuthenticated(Exception):
     """Raised by `get_user` when there is no session behind a request.
 
@@ -1238,8 +540,8 @@ def _base_url(request: Request) -> str:
     deployment knows the public name - and a proxy that terminates TLS makes
     `request.base_url` say `http`, which a provider would refuse as a mismatch.
     """
-    if CONFIG.base_url:
-        return CONFIG.base_url
+    if core.CONFIG.base_url:
+        return core.CONFIG.base_url
     return str(request.base_url).rstrip("/")
 
 
@@ -1271,11 +573,11 @@ def _login_page(
             # create. `[auth] password_login` and nothing else, the way
             # `dummy_auth` below works: the routes 404 without it, because a
             # hidden form is presentation and never the check.
-            "password_login": CONFIG.auth.password_login,
+            "password_login": core.CONFIG.auth.password_login,
             "min_password_length": MIN_PASSWORD_LENGTH,
-            "allowed_domains": CONFIG.auth.allowed_domains,
+            "allowed_domains": core.CONFIG.auth.allowed_domains,
             # Draws the development sign-in box. See `post_auth_dummy`.
-            "dummy_auth": DUMMY_AUTH,
+            "dummy_auth": core.DUMMY_AUTH,
             # The seeded cast, so the box can say who there is to be. Passed
             # from here rather than spelled in the template, which is what stops
             # it drifting from the addresses `_populate_dummy_data` writes.
@@ -1330,13 +632,13 @@ async def _complete_sign_in(
     address outside the domains never becomes a row, and the claim happens
     before the blacklist refusal so that a blocked account still refuses.
     """
-    if not is_allowed_email(email, CONFIG.auth.allowed_domains):
+    if not is_allowed_email(email, core.CONFIG.auth.allowed_domains):
         logger.info(
             "refused a sign-in from outside the allowed domains: %s",
             email,
             extra={"email": email, "provider": provider, "reason": "domain"},
         )
-        domains = ", ".join("@" + d for d in CONFIG.auth.allowed_domains)
+        domains = ", ".join("@" + d for d in core.CONFIG.auth.allowed_domains)
         return _login_page(
             request,
             next_path=next_path,
@@ -1488,7 +790,7 @@ async def _github_email(client, token) -> str:
         )
 
     for address in verified:
-        if is_allowed_email(address, CONFIG.auth.allowed_domains):
+        if is_allowed_email(address, core.CONFIG.auth.allowed_domains):
             return address
     return verified[0]
 
@@ -1534,7 +836,7 @@ def _configured_oauth_providers() -> list[_OAuthProvider]:
     return [
         descriptor
         for name, descriptor in OAUTH_PROVIDERS.items()
-        if getattr(CONFIG.auth, name) is not None
+        if getattr(core.CONFIG.auth, name) is not None
     ]
 
 
@@ -1582,7 +884,7 @@ async def post_auth_dummy(
     `post_administrator`'s are: a missing one is a 422 with no page on it, and
     there is a person in front of this box who deserves a sentence.
     """
-    if not DUMMY_AUTH:
+    if not core.DUMMY_AUTH:
         raise HTTPException(status_code=404)
 
     next_path = safe_next_path(next)
@@ -1621,7 +923,7 @@ async def post_auth_dummy(
 
 
 def _require_password_login() -> None:
-    if not CONFIG.auth.password_login:
+    if not core.CONFIG.auth.password_login:
         raise HTTPException(status_code=404)
 
 
@@ -1775,7 +1077,7 @@ async def get_auth_provider(request: Request, provider: str, next: str = "/"):
     _prune_stale_oauth_state(request)
 
     params = {}
-    google = CONFIG.auth.google
+    google = core.CONFIG.auth.google
     if provider == "google" and google is not None and google.hd:
         # A hint for the account chooser, never a check: `hd` is absent for
         # consumer accounts, and the gate is `is_allowed_email` on the address.
@@ -2236,7 +1538,7 @@ async def on_startup():
     # Resetting drops the schema and reseeds the dummy data, so it must not
     # happen on an ordinary boot: `cocco-web --reload` reloads on every file
     # change and each one would wipe every submission made while testing.
-    await prepare_database(reset=CONFIG.dev.reset_db)
+    await prepare_database(reset=core.CONFIG.dev.reset_db)
 
 
 @app.get("/")
@@ -2397,7 +1699,7 @@ async def _render_users(
             "ok": ok,
             # Draws the per-row reset button. Off unless the deployment has
             # passwords at all, in which case there is nothing to reset.
-            "password_login": CONFIG.auth.password_login,
+            "password_login": core.CONFIG.auth.password_login,
             # The one thing on this page no query can produce: a freshly issued
             # password, on the single response that made it. `f-tokens.jinja`
             # shows a minted token the same way and for the same reason - only
@@ -2422,7 +1724,7 @@ async def get_admin(request: Request, db: DBDep, user: Admin, q: str = ""):
             "user": user,
             "message": None,
             "ok": False,
-            "password_login": CONFIG.auth.password_login,
+            "password_login": core.CONFIG.auth.password_login,
             "issued": None,
         },
     )
@@ -2464,8 +1766,8 @@ async def post_administrator(
     except ValueError as err:
         return await _render_users(request, db, user, q, message=str(err))
 
-    if not is_allowed_email(email, CONFIG.auth.allowed_domains):
-        domains = ", ".join("@" + d for d in CONFIG.auth.allowed_domains)
+    if not is_allowed_email(email, core.CONFIG.auth.allowed_domains):
+        domains = ", ".join("@" + d for d in core.CONFIG.auth.allowed_domains)
         return await _render_users(
             request,
             db,
@@ -3066,10 +2368,10 @@ async def post_course_delete(
     await db.commit()
 
     for path in paths:
-        storage.delete(path)
+        core.storage.delete(path)
     for challenge_id in challenge_ids:
-        storage.delete_directory(_testcase_dir(challenge_id))
-        storage.delete_directory(_evaluator_dir(challenge_id))
+        core.storage.delete_directory(_testcase_dir(challenge_id))
+        core.storage.delete_directory(_evaluator_dir(challenge_id))
 
     return Response(
         status_code=204, headers={"HX-Redirect": str(request.url_for("index"))}
@@ -3201,8 +2503,8 @@ async def post_course_person(
             request, db, course_id, user, q, message=str(err)
         )
 
-    if not is_allowed_email(email, CONFIG.auth.allowed_domains):
-        domains = ", ".join("@" + d for d in CONFIG.auth.allowed_domains)
+    if not is_allowed_email(email, core.CONFIG.auth.allowed_domains):
+        domains = ", ".join("@" + d for d in core.CONFIG.auth.allowed_domains)
         return await _render_course_people(
             request,
             db,
@@ -5577,7 +4879,7 @@ async def get_sample_file(
     relative = (
         testcase.input_path if kind == "input" else testcase.expected_output_path
     )
-    if not storage.exists(relative):
+    if not core.storage.exists(relative):
         raise HTTPException(status_code=404)
     return _stored_file_download(
         relative, f"sample{testcase.execution_order + 1}_{kind}.txt"
@@ -6200,9 +5502,9 @@ async def post_challenge_delete(
     await db.commit()
 
     for path in paths:
-        storage.delete(path)
-    storage.delete_directory(_testcase_dir(challenge_id))
-    storage.delete_directory(_evaluator_dir(challenge_id))
+        core.storage.delete(path)
+    core.storage.delete_directory(_testcase_dir(challenge_id))
+    core.storage.delete_directory(_evaluator_dir(challenge_id))
 
     return Response(
         status_code=204,
@@ -6306,11 +5608,11 @@ async def _replace_evaluator(
     cannot leave the database naming a script that is no longer on disk.
     """
     previous = await query_evaluator_path(db, challenge_id)
-    storage.save_stream(new_path, io.BytesIO(contents))
+    core.storage.save_stream(new_path, io.BytesIO(contents))
     await update_challenge(db, challenge_id, evaluator_path=new_path)
     await db.commit()
     if previous is not None and previous != new_path:
-        storage.delete(previous)
+        core.storage.delete(previous)
 
 
 @app.post("/courses/{course_id}/{challenge_id}/evaluator")
@@ -6412,7 +5714,7 @@ async def post_evaluator_reset(
     await update_challenge(db, challenge_id, evaluator_path=None)
     await db.commit()
     if previous is not None:
-        storage.delete(previous)
+        core.storage.delete(previous)
     return await _render_evaluator(
         request,
         db,
@@ -6446,7 +5748,7 @@ async def get_evaluator_download(
         # text/plain whatever the extension says, so a script named .html can
         # never be served as a page on this origin.
         return FileResponse(path, media_type="text/plain", filename=path.name)
-    if not storage.exists(relative):
+    if not core.storage.exists(relative):
         raise HTTPException(status_code=404)
     return _stored_file_download(relative, Path(relative).name)
 
@@ -6503,7 +5805,7 @@ async def post_testcase(
     directory = _testcase_dir(challenge_id)
     input_path = f"{directory}/{input_name}"
     output_path = f"{directory}/{output_name}"
-    if storage.exists(input_path) or storage.exists(output_path):
+    if core.storage.exists(input_path) or core.storage.exists(output_path):
         return await _render_testcases(
             request, db, course_id, challenge_id,
             "A file with that name already exists for this challenge.", ok=False,
@@ -6513,9 +5815,9 @@ async def post_testcase(
     # On a thread, because they are compressed on the way down and deflating
     # tens of megabytes on the event loop would stop every polled fragment in
     # the site for its duration - the rule `hash_password` is here for.
-    await run_in_threadpool(storage.save_stream, input_path, input_file.file)
+    await run_in_threadpool(core.storage.save_stream, input_path, input_file.file)
     await run_in_threadpool(
-        storage.save_stream, output_path, expected_output_file.file
+        core.storage.save_stream, output_path, expected_output_file.file
     )
 
     await insert_testcase(
@@ -6575,8 +5877,8 @@ async def post_testcase_delete(
 
     # Only after the row is gone, so a failed commit cannot leave the database
     # pointing at files that no longer exist.
-    storage.delete(testcase.input_path)
-    storage.delete(testcase.expected_output_path)
+    core.storage.delete(testcase.input_path)
+    core.storage.delete(testcase.expected_output_path)
     return await _render_testcases(
         request, db, course_id, challenge_id, "Test case deleted.", ok=True
     )
@@ -6613,11 +5915,11 @@ async def post_testcase_rename(
     new_path = f"{_testcase_dir(challenge_id)}/{new_name}"
     if new_path == old_path:
         return await _render_testcases(request, db, course_id, challenge_id)
-    if storage.exists(new_path):
+    if core.storage.exists(new_path):
         return await fail(f"{new_name} already exists for this challenge.")
 
     try:
-        storage.rename(old_path, new_path)
+        core.storage.rename(old_path, new_path)
     except (OSError, ValueError) as e:
         return await fail(f"Could not rename: {e}")
 
@@ -6828,10 +6130,10 @@ async def get_profile(
             # tokens above and behind the same switch the login page is: with
             # `[auth] password_login` off the feature does not exist, and the
             # routes 404 rather than merely not being drawn.
-            "password_login": CONFIG.auth.password_login,
+            "password_login": core.CONFIG.auth.password_login,
             "password": (
                 await query_password_state(db, user_id)
-                if is_owner and CONFIG.auth.password_login
+                if is_owner and core.CONFIG.auth.password_login
                 else None
             ),
             "min_password_length": MIN_PASSWORD_LENGTH,
@@ -7221,16 +6523,6 @@ async def user_avatar(user_id: int, db: DBDep, user: CurrentUser):
 # challenge looks like as files is testable without a database or a request.
 
 
-def _slug(text: str, fallback: str = "challenge") -> str:
-    """A file-name-safe stub of a title, for the download's name only.
-
-    Nothing is ever looked up by it: the challenge a push lands on is the one
-    in the URL. It exists so a directory full of pulled challenges can be read.
-    """
-    stub = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return stub[:60] or fallback
-
-
 def _existing_testcases(rows) -> list[ExistingTestCase]:
     """`query_challenge_testcases`' rows, reduced to what a plan needs.
 
@@ -7378,7 +6670,7 @@ def _challenge_version(snapshot: _ChallengeSnapshot) -> str:
     """
     stamps = []
     for stored, name in snapshot.stored_files():
-        size, mtime_ns = storage.stamp(stored) or (-1, -1)
+        size, mtime_ns = core.storage.stamp(stored) or (-1, -1)
         stamps.append((name, size, mtime_ns))
     return transfer.challenge_version(snapshot.manifest, snapshot.statement, stamps)
 
@@ -7444,7 +6736,7 @@ async def api_export_challenge(
     # rather than a traceback halfway through a half-written download.
     for row in rows:
         for path in (row.input_path, row.expected_output_path):
-            if not storage.exists(path):
+            if not core.storage.exists(path):
                 raise HTTPException(
                     status_code=409,
                     detail=(
@@ -7452,7 +6744,7 @@ async def api_export_challenge(
                         "from storage. The test case's row survived its file."
                     ),
                 )
-    if evaluator_path is not None and not storage.exists(evaluator_path):
+    if evaluator_path is not None and not core.storage.exists(evaluator_path):
         raise HTTPException(
             status_code=409,
             detail=(
@@ -7711,7 +7003,7 @@ async def api_import_challenge(
                 # once, and `post_testcase`'s rule applies a hundredfold here.
                 def save() -> None:
                     with archive.open(member) as source:
-                        storage.save_stream(path, source)
+                        core.storage.save_stream(path, source)
 
                 await run_in_threadpool(save)
                 written.add(path)
@@ -7786,7 +7078,7 @@ async def api_import_challenge(
             previous_evaluator = await query_evaluator_path(db, challenge_id)
             if evaluator_source is not None and evaluator_name is not None:
                 new_evaluator = f"{_evaluator_dir(challenge_id)}/{evaluator_name}"
-                storage.save_stream(new_evaluator, io.BytesIO(evaluator_source))
+                core.storage.save_stream(new_evaluator, io.BytesIO(evaluator_source))
                 await update_challenge(db, challenge_id, evaluator_path=new_evaluator)
                 if previous_evaluator not in (None, new_evaluator):
                     superseded.append(str(previous_evaluator))
@@ -7810,7 +7102,7 @@ async def api_import_challenge(
                 superseded.append(f"{directory}/{name}")
         for path in superseded:
             if path not in written:
-                storage.delete(path)
+                core.storage.delete(path)
     finally:
         upload.close()
         os.unlink(upload.name)

@@ -236,14 +236,15 @@ def make_client(app_engine, monkeypatch):
     engine rather than this one.
     """
     import cocco.main as main
+    from cocco.web import core
 
     def _make(*, as_: str | None = None, dummy_auth: bool = True):
         async def _get_db():
             async with app_engine.connect() as conn:
                 yield conn
 
-        main.app.dependency_overrides[main.get_db] = _get_db
-        monkeypatch.setattr(main, "DUMMY_AUTH", dummy_auth)
+        main.app.dependency_overrides[core.get_db] = _get_db
+        monkeypatch.setattr(core, "DUMMY_AUTH", dummy_auth)
         client = TestClient(main.app)
         if as_ is not None:
             sign_in_as(client, as_)

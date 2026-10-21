@@ -47,14 +47,14 @@ def _signed_in(client) -> bool:
 def passwords(monkeypatch):
     """Turn `[auth] password_login` on, the way `google` turns Google on:
     `dataclasses.replace` on the frozen config, no filesystem involved."""
-    import cocco.main as main
+    from cocco.web import core
 
     monkeypatch.setattr(
-        main,
+        core,
         "CONFIG",
         replace(
-            main.CONFIG,
-            auth=replace(main.CONFIG.auth, password_login=True),
+            core.CONFIG,
+            auth=replace(core.CONFIG.auth, password_login=True),
         ),
     )
 

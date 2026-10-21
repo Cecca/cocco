@@ -29,10 +29,10 @@ BIG_INPUT = "".join(f"{i} {i * 2}\n" for i in range(20000))
 async def world(app_engine, tmp_path, monkeypatch):
     """One course, one challenge, and a storage root really on disk - the point
     of these tests is what lands in it."""
-    import cocco.main as main
+    from cocco.web import core
 
     storage = Storage(tmp_path / "storage")
-    monkeypatch.setattr(main, "storage", storage)
+    monkeypatch.setattr(core, "storage", storage)
 
     ids: dict = {"storage": storage}
     async with app_engine.connect() as conn:

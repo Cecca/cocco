@@ -167,10 +167,10 @@ async def world(app_engine, storage):
 def storage(tmp_path, monkeypatch):
     """A storage root of this test's own, so a delete that unlinks files does
     it under `tmp_path` rather than in the developer's real store."""
-    import cocco.main as main
+    from cocco.web import core
 
     replacement = Storage(tmp_path / "store")
-    monkeypatch.setattr(main, "storage", replacement)
+    monkeypatch.setattr(core, "storage", replacement)
     return replacement
 
 

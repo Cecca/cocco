@@ -53,13 +53,13 @@ async def world(app_engine, tmp_path, monkeypatch):
     a second course nobody is on, to be the thing staff of the first must not
     reach through. Charlie is on neither, Matteo administers the site.
 
-    The test data really is on disk - `main.storage` is pointed at a tmp_path -
+    The test data really is on disk - `core.storage` is pointed at a tmp_path -
     because an export that did not read the files would prove nothing.
     """
-    import cocco.main as main
+    from cocco.web import core
 
     storage = Storage(tmp_path / "storage")
-    monkeypatch.setattr(main, "storage", storage)
+    monkeypatch.setattr(core, "storage", storage)
 
     ids: dict = {"storage": storage}
     async with app_engine.connect() as conn:

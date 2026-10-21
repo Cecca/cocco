@@ -226,12 +226,12 @@ async def test_a_mutation_keeps_the_filter(client, db):
 def passwords(monkeypatch):
     from dataclasses import replace
 
-    import cocco.main as main
+    from cocco.web import core
 
     monkeypatch.setattr(
-        main,
+        core,
         "CONFIG",
-        replace(main.CONFIG, auth=replace(main.CONFIG.auth, password_login=True)),
+        replace(core.CONFIG, auth=replace(core.CONFIG.auth, password_login=True)),
     )
 
 

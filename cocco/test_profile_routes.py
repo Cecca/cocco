@@ -328,12 +328,12 @@ def passwords(monkeypatch):
     """`[auth] password_login` on, as `test_password_routes.py` turns it on."""
     from dataclasses import replace
 
-    import cocco.main as main
+    from cocco.web import core
 
     monkeypatch.setattr(
-        main,
+        core,
         "CONFIG",
-        replace(main.CONFIG, auth=replace(main.CONFIG.auth, password_login=True)),
+        replace(core.CONFIG, auth=replace(core.CONFIG.auth, password_login=True)),
     )
 
 

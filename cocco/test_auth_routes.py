@@ -134,18 +134,18 @@ def google(monkeypatch):
     `dataclasses.replace` on the frozen config is what makes "configured" and
     "unconfigured" a one-line toggle without touching the filesystem.
     """
-    import cocco.main as main
+    from cocco.web import core
 
     def _install(claims=None, error=None, hd="unipd.it"):
         client = _FakeOAuthClient(claims, error)
         _install_client(monkeypatch, "google", client)
         monkeypatch.setattr(
-            main,
+            core,
             "CONFIG",
             replace(
-                main.CONFIG,
+                core.CONFIG,
                 auth=replace(
-                    main.CONFIG.auth,
+                    core.CONFIG.auth,
                     google=GoogleConfig("an-id", "a-secret", hd=hd),
                     github=None,
                 ),
@@ -160,18 +160,18 @@ def google(monkeypatch):
 def github(monkeypatch):
     """The same toggle for GitHub, whose credentials are the whole of its
     configuration - there is no `hd` and no metadata document."""
-    import cocco.main as main
+    from cocco.web import core
 
     def _install(emails=None, error=None):
         client = _FakeOAuthClient(error=error, emails=emails)
         _install_client(monkeypatch, "github", client)
         monkeypatch.setattr(
-            main,
+            core,
             "CONFIG",
             replace(
-                main.CONFIG,
+                core.CONFIG,
                 auth=replace(
-                    main.CONFIG.auth,
+                    core.CONFIG.auth,
                     google=None,
                     github=GithubConfig("an-id", "a-secret"),
                 ),
@@ -186,12 +186,13 @@ def github(monkeypatch):
 def no_google(monkeypatch):
     """A server with no credentials at all, which must still serve pages."""
     import cocco.main as main
+    from cocco.web import core
 
     monkeypatch.setattr(main, "oauth_client", lambda name: None)
     monkeypatch.setattr(
-        main,
+        core,
         "CONFIG",
-        replace(main.CONFIG, auth=replace(main.CONFIG.auth, google=None, github=None)),
+        replace(core.CONFIG, auth=replace(core.CONFIG.auth, google=None, github=None)),
     )
 
 
@@ -203,9 +204,9 @@ def _set_dummy_auth(client, monkeypatch, enabled: bool, user: str | None = None)
     it. So the tests below that assert *who* somebody is name a user here, and
     the ones about the box itself do not.
     """
-    import cocco.main as main
+    from cocco.web import core
 
-    monkeypatch.setattr(main, "DUMMY_AUTH", enabled)
+    monkeypatch.setattr(core, "DUMMY_AUTH", enabled)
     if user is not None:
         response = client.post(
             "/auth/dummy", data={"email": user}, follow_redirects=False
@@ -544,24 +545,24 @@ async def test_a_callback_with_no_session_lands_on_the_root(client, google):
 async def test_signing_in_replaces_any_prior_session(client, google):
     """Session fixation: whatever the cookie held before, it holds only the new
     identity afterwards."""
-    import cocco.main as main
+    from cocco.web import core
 
     google(claims=VERIFIED)
     client.get("/auth/google?next=/courses/9", follow_redirects=False)
     client.get("/auth/google/callback?code=x", follow_redirects=False)
 
-    cookie = client.cookies.get(main.CONFIG.session.cookie_name)
+    cookie = client.cookies.get(core.CONFIG.session.cookie_name)
     assert cookie
     # `login_next` and Authlib's spent state are gone with the rest of it.
     assert client.get(BEHIND_THE_WALL, follow_redirects=False).status_code != 303
 
 
 async def test_logout_clears_the_session(client, google):
-    import cocco.main as main
+    from cocco.web import core
 
     google(claims=VERIFIED)
     client.get("/auth/google/callback?code=x", follow_redirects=False)
-    assert client.cookies.get(main.CONFIG.session.cookie_name)
+    assert client.cookies.get(core.CONFIG.session.cookie_name)
 
     response = client.post("/logout", follow_redirects=False)
     assert response.status_code == 303
@@ -622,7 +623,7 @@ async def test_a_block_takes_effect_on_the_next_request(client, google, app_engi
 async def test_a_block_is_not_a_logout(client, google, app_engine):
     """The session is left alone: clearing it would send them to a login page
     that explains nothing, while the block page explains everything."""
-    import cocco.main as main
+    from cocco.web import core
 
     google(claims=VERIFIED)
     client.get("/auth/google/callback?code=x", follow_redirects=False)
@@ -630,7 +631,7 @@ async def test_a_block_is_not_a_logout(client, google, app_engine):
 
     for _ in range(2):
         assert client.get(BEHIND_THE_WALL, follow_redirects=False).status_code == 403
-    assert client.cookies.get(main.CONFIG.session.cookie_name)
+    assert client.cookies.get(core.CONFIG.session.cookie_name)
 
 
 async def test_a_blocked_htmx_request_is_not_sent_to_the_login_page(
@@ -654,7 +655,7 @@ async def test_a_blocked_user_cannot_sign_in(client, google, app_engine):
     """Refused at the callback too, so the sentence arrives on the page they
     are already looking at rather than after a sign-in that dies on the first
     click."""
-    import cocco.main as main
+    from cocco.web import core
 
     google(claims=VERIFIED)
     client.get("/auth/google/callback?code=x", follow_redirects=False)
@@ -665,7 +666,7 @@ async def test_a_blocked_user_cannot_sign_in(client, google, app_engine):
     assert response.status_code == 403
     assert "spamming the judge" in response.text
     # And no session came out of it.
-    assert not client.cookies.get(main.CONFIG.session.cookie_name)
+    assert not client.cookies.get(core.CONFIG.session.cookie_name)
     assert client.get(BEHIND_THE_WALL, follow_redirects=False).status_code == 303
 
 
@@ -715,17 +716,18 @@ async def test_dummy_auth_is_blocked_too(client, monkeypatch, app_engine, no_goo
 async def test_the_login_page_offers_the_box_only_under_dummy_auth(
     client, monkeypatch, no_google
 ):
-    import cocco.main as main
+    from cocco.web import core
+    from cocco.web.seed import DUMMY_ADMIN
 
-    monkeypatch.setattr(main, "DUMMY_AUTH", False)
+    monkeypatch.setattr(core, "DUMMY_AUTH", False)
     assert "/auth/dummy" not in client.get("/login").text
 
-    monkeypatch.setattr(main, "DUMMY_AUTH", True)
+    monkeypatch.setattr(core, "DUMMY_AUTH", True)
     response = client.get("/login")
     assert response.status_code == 200
     assert "/auth/dummy" in response.text
-    # The cast it names comes from `main`, so it cannot drift from the seed.
-    assert main.DUMMY_ADMIN in response.text
+    # The cast it names comes from `seed`, so it cannot drift from the seed.
+    assert DUMMY_ADMIN in response.text
 
 
 async def test_the_box_signs_in_and_creates_the_account(
@@ -823,9 +825,9 @@ async def test_the_box_refuses_a_blocked_account(
 async def test_the_box_is_not_there_at_all_without_dummy_auth(client, monkeypatch):
     """A hidden form is presentation and never the check: the route itself
     refuses, and with a 404, so a deployment does not admit it exists."""
-    import cocco.main as main
+    from cocco.web import core
 
-    monkeypatch.setattr(main, "DUMMY_AUTH", False)
+    monkeypatch.setattr(core, "DUMMY_AUTH", False)
     response = client.post(
         "/auth/dummy", data={"email": "alice@unipd.it"}, follow_redirects=False
     )

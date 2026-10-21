@@ -9,7 +9,14 @@ from fastapi.testclient import TestClient
 from starlette.routing import Match
 
 from cocco.judge import load_languages
-from cocco.main import app, render_markdown, render_source, static_url, visible_outcomes
+from cocco.main import app, visible_outcomes
+from cocco.web.templating import (
+    STATIC_DIR,
+    TEMPLATES_DIR,
+    render_markdown,
+    render_source,
+    static_url,
+)
 
 
 def _outcome(is_sample: bool, **overrides):
@@ -191,3 +198,13 @@ def test_no_route_is_shadowed_by_an_earlier_one():
                 )
     assert checked > 100
     assert not failures, "\n".join(failures)
+
+
+def test_template_and_static_directories_exist():
+    # A wrong `Path(__file__)` hop only shows at the first render, so check both
+    # directories hold what the app serves from them. `styles.css` is a build
+    # artifact and may be absent, so a committed static file stands in for it.
+    assert (TEMPLATES_DIR / "base.jinja").is_file()
+    assert STATIC_DIR.is_dir()
+    assert (STATIC_DIR / "favicon.ico").is_file()
+    assert STATIC_DIR == TEMPLATES_DIR.parent / "static"
