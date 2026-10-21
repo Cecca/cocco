@@ -11,10 +11,10 @@ import re
 import pytest
 from sqlalchemy import insert
 
-from cocco import main
 from cocco.conftest import sign_in_as
 from cocco.model import Enrollment, ExerciseSessionParticipant, User, UserRole
 from cocco.schema import ExerciseCheckResult, ExerciseRunResult
+from cocco.web import exercise_sessions
 from cocco.test_exercise_routes import (  # noqa: F401 - fixtures
     ADMIN,
     OTHER_TEACHER,
@@ -76,7 +76,7 @@ def _person(id_, nickname, *checks):
 
 
 def test_the_progress_view_counts_every_status():
-    view = main.session_progress_view(
+    view = exercise_sessions.session_progress_view(
         _progress(
             [
                 _person(1, "bob", (1, True, False)),
@@ -115,7 +115,7 @@ def _counts(exercises, n_participants, titles=("Double", "Shout"), mode="live", 
 
 
 def test_the_projector_view_counts_every_status_up_to_the_pacing():
-    view = main.projector_view(
+    view = exercise_sessions.projector_view(
         _counts(
             [(1, 2, 1, False), (2, 1, 0, True)],
             n_participants=3,
@@ -133,15 +133,15 @@ def test_the_projector_view_counts_every_status_up_to_the_pacing():
 
 
 def test_an_exercise_nobody_checked_is_not_attempted_by_all():
-    view = main.projector_view(_counts([], n_participants=4, mode="open", unlocked_through=2))
+    view = exercise_sessions.projector_view(_counts([], n_participants=4, mode="open", unlocked_through=2))
     assert len(view["exercises"]) == 2 and view["n_locked"] == 0
     assert [e["not_attempted"] for e in view["exercises"]] == [4, 4]
     assert not view["pending"]
 
 
 def test_the_progress_view_is_pending_while_any_check_is():
-    assert main.session_progress_view(_progress([_person(1, "bob", (2, False, True))]))["pending"]
-    assert not main.session_progress_view(_progress([_person(1, "bob", (1, True, False))]))[
+    assert exercise_sessions.session_progress_view(_progress([_person(1, "bob", (2, False, True))]))["pending"]
+    assert not exercise_sessions.session_progress_view(_progress([_person(1, "bob", (1, True, False))]))[
         "pending"
     ]
 

@@ -14,7 +14,7 @@ from sqlalchemy import func, insert, select
 from sqlalchemy.exc import IntegrityError
 
 from cocco import main
-from cocco.web import exercise_sets
+from cocco.web import exercise_sessions, exercise_sets
 from cocco.repository import judging as repo
 from cocco.conftest import sign_in_as
 from cocco.exercises import format as exercise_format
@@ -273,7 +273,7 @@ async def test_a_participant_whose_session_vanished_still_gets_an_answer(
     async def gone(*args):
         raise IntegrityError("INSERT", {}, Exception("fk"))
 
-    monkeypatch.setattr(main, "insert_session_participant", gone)
+    monkeypatch.setattr(exercise_sessions, "insert_session_participant", gone)
     sign_in_as(client, STUDENT)
     assert client.get(f"{base}/1").status_code == 200
 

@@ -14,12 +14,21 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, insert, select, update
 
-from cocco import main
 from cocco.repository import judging as repo
 from cocco.exercises import format as exercise_format
 from cocco.conftest import sign_in_as
+from cocco.repository.exercise_sessions import (
+    close_exercise_session,
+    insert_exercise_session,
+    lock_exercise_set_for_session,
+    query_exercise_session,
+    query_exercise_session_state,
+    reveal_exercise_solution,
+    switch_exercise_session_version,
+)
 from cocco.repository.exercise_sets import lock_exercise_set
 from cocco.repository.lifecycle import delete_exercise_set
+from cocco.web import exercise_sessions
 from cocco.web.access import Forbidden
 from cocco.model import (
     Course,
@@ -472,31 +481,31 @@ async def test_the_read_gate_follows_the_pacing(client, db, app_engine, session)
     version does not have is a 404 for everybody."""
     session_id, base = session
     async with app_engine.connect() as conn:
-        allowed = await main.require_session_exercise(session_id, 1, conn, UserRole.student)
+        allowed = await exercise_sessions.require_session_exercise(session_id, 1, conn, UserRole.student)
         assert allowed.n == 1 and allowed.state.unlocked_through == 1
         with pytest.raises(Forbidden, match="Exercise 2 is not unlocked yet"):
-            await main.require_session_exercise(session_id, 2, conn, UserRole.student)
-        await main.require_session_exercise(session_id, 2, conn, UserRole.teacher)
+            await exercise_sessions.require_session_exercise(session_id, 2, conn, UserRole.student)
+        await exercise_sessions.require_session_exercise(session_id, 2, conn, UserRole.teacher)
         for n in (0, 3):
             with pytest.raises(HTTPException) as refused:
-                await main.require_session_exercise(session_id, n, conn, UserRole.teacher)
+                await exercise_sessions.require_session_exercise(session_id, n, conn, UserRole.teacher)
             assert refused.value.status_code == 404
         with pytest.raises(HTTPException) as refused:
-            await main.require_session_exercise(999, 1, conn, UserRole.teacher)
+            await exercise_sessions.require_session_exercise(999, 1, conn, UserRole.teacher)
         assert refused.value.status_code == 404
 
     client.post(f"{base}/open")
     async with app_engine.connect() as conn:
-        await main.require_session_exercise(session_id, 2, conn, UserRole.student)
+        await exercise_sessions.require_session_exercise(session_id, 2, conn, UserRole.student)
 
 
 async def test_a_closed_session_is_read_but_takes_no_jobs(client, db, app_engine, session):
     session_id, base = session
     client.post(f"{base}/close")
     async with app_engine.connect() as conn:
-        await main.require_session_exercise(session_id, 1, conn, UserRole.student)
+        await exercise_sessions.require_session_exercise(session_id, 1, conn, UserRole.student)
         for role in (UserRole.student, UserRole.teacher):
-            refusal = await main.session_job_refusal(conn, session_id, 1, role)
+            refusal = await exercise_sessions.session_job_refusal(conn, session_id, 1, role)
             assert refusal is not None and "closed" in refusal
         await conn.rollback()
 
@@ -504,12 +513,12 @@ async def test_a_closed_session_is_read_but_takes_no_jobs(client, db, app_engine
 async def test_the_job_gate_follows_the_pacing(client, db, app_engine, session):
     session_id, base = session
     async with app_engine.connect() as conn:
-        assert await main.session_job_refusal(conn, session_id, 1, UserRole.student) is None
-        refusal = await main.session_job_refusal(conn, session_id, 2, UserRole.student)
+        assert await exercise_sessions.session_job_refusal(conn, session_id, 1, UserRole.student) is None
+        refusal = await exercise_sessions.session_job_refusal(conn, session_id, 2, UserRole.student)
         assert "not unlocked yet" in refusal
-        assert await main.session_job_refusal(conn, session_id, 2, UserRole.teacher) is None
+        assert await exercise_sessions.session_job_refusal(conn, session_id, 2, UserRole.teacher) is None
         with pytest.raises(HTTPException):
-            await main.session_job_refusal(conn, session_id, 3, UserRole.student)
+            await exercise_sessions.session_job_refusal(conn, session_id, 3, UserRole.student)
         await conn.rollback()
 
 
@@ -521,8 +530,8 @@ async def test_the_job_gate_holds_the_session_until_the_job_commits(
     that closed after it was let in."""
     session_id, _ = session
     async with app_engine.connect() as gate, app_engine.connect() as closer:
-        assert await main.session_job_refusal(gate, session_id, 1, UserRole.student) is None
-        closing = asyncio.create_task(main.close_exercise_session(closer, session_id))
+        assert await exercise_sessions.session_job_refusal(gate, session_id, 1, UserRole.student) is None
+        closing = asyncio.create_task(close_exercise_session(closer, session_id))
         await asyncio.sleep(0.2)
         assert not closing.done()
         await gate.commit()
@@ -534,8 +543,8 @@ async def test_the_student_view_carries_only_what_it_shows(client, db, app_engin
     session_id, base = session
     client.post(f"{base}/reveal", data={"n": "2"})
     async with app_engine.connect() as conn:
-        document = await main.query_exercise_session(conn, session_id)
-    view = main.student_session_view(document)
+        document = await query_exercise_session(conn, session_id)
+    view = exercise_sessions.student_session_view(document)
     assert set(view) == {"label", "mode", "closed_at", "title", "titles", "n_locked"}
     assert (view["titles"], view["n_locked"]) == (["Double"], 1)
 
@@ -600,15 +609,15 @@ async def test_a_job_gate_behind_a_switch_reads_the_new_version(
     session_id, _ = session
     longer = _reimport(client, world, db, set_id, LONGER)
     async with app_engine.connect() as switcher, app_engine.connect() as gate:
-        await main.query_exercise_session_state(switcher, session_id, lock="update")
-        await main.switch_exercise_session_version(switcher, session_id, longer, 3)
+        await query_exercise_session_state(switcher, session_id, lock="update")
+        await switch_exercise_session_version(switcher, session_id, longer, 3)
         task = asyncio.create_task(
-            main.session_job_refusal(gate, session_id, 1, UserRole.student)
+            exercise_sessions.session_job_refusal(gate, session_id, 1, UserRole.student)
         )
         await _waits(task)
         await switcher.commit()
         assert await task is None
-        state = await main.query_exercise_session_state(gate, session_id)
+        state = await query_exercise_session_state(gate, session_id)
         assert (state.version_id, state.n_exercises) == (longer, 3)
         await gate.rollback()
 
@@ -620,9 +629,9 @@ async def test_a_reveal_behind_a_switch_is_checked_against_the_new_version(
     session_id, _ = session
     shorter = _reimport(client, world, db, set_id, SHORTER)
     async with app_engine.connect() as switcher, app_engine.connect() as revealer:
-        await main.query_exercise_session_state(switcher, session_id, lock="update")
-        await main.switch_exercise_session_version(switcher, session_id, shorter, 1)
-        task = asyncio.create_task(main.reveal_exercise_solution(revealer, session_id, 2))
+        await query_exercise_session_state(switcher, session_id, lock="update")
+        await switch_exercise_session_version(switcher, session_id, shorter, 1)
+        task = asyncio.create_task(reveal_exercise_solution(revealer, session_id, 2))
         await _waits(task)
         await switcher.commit()
         assert await task is False
@@ -643,7 +652,7 @@ async def test_an_opening_behind_the_first_build_opens_on_it(client, world, db, 
             document.model_dump(mode="json"),
         )
         async with app_engine.connect() as opener:
-            task = asyncio.create_task(main.lock_exercise_set_for_session(opener, set_id))
+            task = asyncio.create_task(lock_exercise_set_for_session(opener, set_id))
             await _waits(task)
             builder.commit()
             found = await task
@@ -660,10 +669,10 @@ async def test_an_opening_and_a_set_delete_serialize(client, world, db, app_engi
     _build(db, version_id)
     async with app_engine.connect() as opener, app_engine.connect() as deleter:
         # The opening first: the delete waits, then counts its session.
-        found = await main.lock_exercise_set_for_session(opener, set_id)
+        found = await lock_exercise_set_for_session(opener, set_id)
         task = asyncio.create_task(lock_exercise_set(deleter, set_id))
         await _waits(task)
-        await main.insert_exercise_session(
+        await insert_exercise_session(
             opener, set_id, found.current_version_id, "Lab A",
             ExerciseSessionMode.live, 1,
         )
@@ -676,7 +685,7 @@ async def test_an_opening_and_a_set_delete_serialize(client, world, db, app_engi
     async with app_engine.connect() as opener, app_engine.connect() as deleter:
         # The delete first: the opening waits, then finds no set.
         assert await lock_exercise_set(deleter, second) == 0
-        task = asyncio.create_task(main.lock_exercise_set_for_session(opener, second))
+        task = asyncio.create_task(lock_exercise_set_for_session(opener, second))
         await _waits(task)
         await delete_exercise_set(deleter, second)
         await deleter.commit()
