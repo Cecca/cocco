@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     Connection,
     and_,
     bindparam,
@@ -16,6 +17,7 @@ from sqlalchemy import (
     column,
     delete,
     exists,
+    false,
     func,
     insert,
     literal,
@@ -1394,15 +1396,21 @@ async def query_exercise_session_state(
     return ExerciseSessionState(**row._mapping, n_exercises=n_exercises or 0)
 
 
-# One version's exercise titles, as a JSON array in order. Takes a row `v` of
-# `exercise_set_version`; a version that is not built has none.
-_EXERCISE_TITLES_SQL = """
-    coalesce(
-        (SELECT json_agg(e ->> 'title' ORDER BY i)
-         FROM jsonb_array_elements(v.document -> 'exercises') WITH ORDINALITY AS x(e, i)),
-        '[]'::json
+def _exercise_titles(document):
+    """A version's exercise titles, as a JSON array in order: a scalar
+    subquery over `document`, a version's `document` column. A version that
+    is not built has none."""
+    exercise = (
+        func.jsonb_array_elements(document["exercises"])
+        .table_valued(column("value", JSONB), with_ordinality="i")
+        .render_derived(name="x")
     )
-"""
+    titles = select(
+        func.json_agg(
+            aggregate_order_by(exercise.c.value["title"].astext, exercise.c.i)
+        )
+    ).scalar_subquery()
+    return func.coalesce(titles, _EMPTY_JSON_ARRAY)
 
 
 async def query_exercise_session(conn: AsyncConnection, session_id: int):
@@ -1415,35 +1423,67 @@ async def query_exercise_session(conn: AsyncConnection, session_id: int):
     worked out from, and `max_checked` is what it refuses on; the route
     decides both again under the lock before it writes.
     """
-    query = text(f"""
-    WITH
-    s AS (SELECT * FROM exercise_session WHERE id = :session_id),
-    versions AS (
-        SELECT v.id, v.title, v.status,
-               row_number() OVER (ORDER BY v.id) AS number,
-               {_EXERCISE_TITLES_SQL} AS titles
-        FROM exercise_set_version v
-        WHERE v.set_id = (SELECT set_id FROM s)
-    ),
-    doc AS (
-        SELECT s.id, s.set_id, s.label, s.mode, s.unlocked_through,
-               s.opened_at, s.closed_at, exercise_set.course_id,
-               -- The set's name, which is its current version's - a session
-               -- exists only on a ready version, so there always is one.
-               (SELECT title FROM versions
-                WHERE versions.id = exercise_set.current_version_id) AS set_title,
-               (SELECT row_to_json(versions) FROM versions
-                WHERE versions.id = s.version_id) AS version,
-               (SELECT row_to_json(versions) FROM versions
-                WHERE versions.id = exercise_set.current_version_id) AS latest,
-               {_SESSION_REVEALED_SQL} AS revealed,
-               (SELECT max(j.exercise_index) FROM exercise_job j
-                WHERE j.session_id = s.id AND j.kind = 'check') AS max_checked
-        FROM s JOIN exercise_set ON exercise_set.id = s.set_id
+    session = bindparam("session_id", session_id)
+    session_set = (
+        select(ExerciseSession.c.set_id)
+        .where(ExerciseSession.c.id == session)
+        .scalar_subquery()
     )
-    SELECT row_to_json(doc) FROM doc;
-    """)
-    return (await conn.execute(query, dict(session_id=session_id))).scalar()
+    versions = (
+        select(
+            ExerciseSetVersion.c.id,
+            ExerciseSetVersion.c.title,
+            ExerciseSetVersion.c.status,
+            _version_number(ExerciseSetVersion).label("number"),
+            _exercise_titles(ExerciseSetVersion.c.document).label("titles"),
+        )
+        .where(ExerciseSetVersion.c.set_id == session_set)
+        .cte("versions")
+    )
+
+    def version(version_id):
+        return (
+            select(func.row_to_json(versions.table_valued()))
+            .where(versions.c.id == version_id)
+            .scalar_subquery()
+        )
+
+    max_checked = (
+        select(func.max(ExerciseJob.c.exercise_index))
+        .where(ExerciseJob.c.session_id == session, _is_check())
+        .scalar_subquery()
+    )
+    doc = (
+        select(
+            ExerciseSession.c.id,
+            ExerciseSession.c.set_id,
+            ExerciseSession.c.label,
+            ExerciseSession.c.mode,
+            ExerciseSession.c.unlocked_through,
+            ExerciseSession.c.opened_at,
+            ExerciseSession.c.closed_at,
+            ExerciseSet.c.course_id,
+            # The set's name, which is its current version's - a session
+            # exists only on a ready version, so there always is one.
+            select(versions.c.title)
+            .where(versions.c.id == ExerciseSet.c.current_version_id)
+            .scalar_subquery()
+            .label("set_title"),
+            version(ExerciseSession.c.version_id).label("version"),
+            version(ExerciseSet.c.current_version_id).label("latest"),
+            _session_revealed(session).label("revealed"),
+            max_checked.label("max_checked"),
+        )
+        .select_from(
+            ExerciseSession.join(
+                ExerciseSet, ExerciseSet.c.id == ExerciseSession.c.set_id
+            )
+        )
+        .where(ExerciseSession.c.id == session)
+        .cte("doc")
+    )
+    stmt = select(func.row_to_json(doc.table_valued()))
+    return (await conn.execute(stmt)).scalar()
 
 
 async def query_exercise_sessions(
@@ -1592,7 +1632,7 @@ async def query_max_checked_exercise(conn: AsyncConnection, session_id: int) -> 
     queued on an exercise it has just counted as absent."""
     stmt = select(func.max(ExerciseJob.c.exercise_index)).where(
         ExerciseJob.c.session_id == session_id,
-        ExerciseJob.c.kind == ExerciseJobKind.check,
+        _is_check(),
     )
     return (await conn.execute(stmt)).scalar_one()
 
@@ -1655,60 +1695,124 @@ async def insert_session_participant(
     )
 
 
-def _session_checks_cte(one_user: bool) -> str:
-    """The check jobs of one session, an aggregate row per person and
-    exercise: what the strip colours each exercise by, and what the teacher's
-    two screens count. Solved is sticky - any passing check, on any version the
-    session has been on - and `checking` is a check not yet done. `passed` is
-    read only off a finished check: an error result has no such key, which the
-    coalesce makes "not passed". Through `ix_exercise_job_check`.
+def _is_check():
+    """`exercise_job.kind = 'check'`, with the kind written into the SQL
+    rather than bound: it is the predicate of the partial index
+    `ix_exercise_job_check`. A generic plan - which psycopg's prepared
+    statements make possible after a few executions of a polled query - can
+    only use that index when it sees the constant. Postgres would most likely
+    keep re-planning with the bound value instead, so the literal is less a
+    rescue than a guarantee: index use that does not depend on the planner's
+    choice, and no re-planning to pay for it."""
+    return ExerciseJob.c.kind == literal(
+        ExerciseJobKind.check, ExerciseJob.c.kind.type, literal_execute=True
+    )
+
+
+def _json_object(**fields):
+    """`json_build_object('key', value, ...)`, with the keys - which are
+    Python identifiers, never request data - written into the SQL: a bound
+    key would reach the variadic `"any"` with no type to resolve."""
+    args = []
+    for key, value in fields.items():
+        args += [literal_column(f"'{key}'"), value]
+    return func.json_build_object(*args)
+
+
+def _session_checks(session_id, user_id=None):
+    """The check jobs of one session, as a CTE `checks` with an aggregate row
+    per person and exercise: what the strip colours each exercise by, and what
+    the teacher's two screens count. Solved is sticky - any passing check, on
+    any version the session has been on - and `checking` is a check not yet
+    done. `passed` is read only off a finished check: an error result has no
+    such key, which the coalesce makes "not passed". Through
+    `ix_exercise_job_check`.
 
     Each row carries itself as `doc`, the `{n, solved, checking}` object
     `_exercise_status` reads, so the strip and the dashboard aggregate that
-    and never spell the object out for themselves. Spelled once for all of
+    and never spell the object out for themselves. Written once for all of
     them, so the strip a student sees and the cell the teacher sees for them
-    cannot disagree; `one_user` narrows it to `:user_id`, the strip's."""
-    narrow = "AND j.user_id = :user_id" if one_user else ""
-    return f"""
-    checks AS (
-        SELECT agg.*,
-               json_build_object('n', agg.n, 'solved', agg.solved,
-                                 'checking', agg.checking) AS doc
-        FROM (
-            SELECT j.user_id, j.exercise_index AS n,
-                   bool_or(j.status = 'done'
-                           AND coalesce((j.result ->> 'passed')::boolean, false)) AS solved,
-                   bool_or(j.status <> 'done') AS checking
-            FROM exercise_job j
-            WHERE j.session_id = :session_id {narrow} AND j.kind = 'check'
-            GROUP BY j.user_id, j.exercise_index
-        ) agg
+    cannot disagree; `user_id` narrows it to one person, the strip's."""
+    done = ExerciseJob.c.status == ExerciseJobStatus.done
+    passed = ExerciseJob.c.result["passed"].astext.cast(Boolean)
+    conditions = [ExerciseJob.c.session_id == session_id, _is_check()]
+    if user_id is not None:
+        conditions.append(ExerciseJob.c.user_id == user_id)
+    agg = (
+        select(
+            ExerciseJob.c.user_id,
+            ExerciseJob.c.exercise_index.label("n"),
+            func.bool_or(and_(done, func.coalesce(passed, false()))).label("solved"),
+            func.bool_or(~done).label("checking"),
+        )
+        .where(*conditions)
+        .group_by(ExerciseJob.c.user_id, ExerciseJob.c.exercise_index)
+        .subquery("agg")
     )
-    """
+    return select(
+        agg,
+        _json_object(n=agg.c.n, solved=agg.c.solved, checking=agg.c.checking).label(
+            "doc"
+        ),
+    ).cte("checks")
 
 
-# A session's cohort, after `_session_checks_cte`: the participants unioned
-# with anyone who has a check in it, `query_challenge_standings`'s rule - a
-# check from somebody whose participant row is missing (a visit that raced a
-# close) still counts. The dashboard's people and the projector's denominator.
-_SESSION_COHORT_CTE = """
-    cohort AS (
-        SELECT user_id FROM exercise_session_participant WHERE session_id = :session_id
-        UNION
-        SELECT user_id FROM checks
+def _session_cohort(checks, session_id):
+    """A session's cohort, as a CTE `cohort` of user ids: the participants
+    unioned with anyone who has a row in `checks` (`_session_checks`),
+    `query_challenge_standings`'s rule - a check from somebody whose
+    participant row is missing (a visit that raced a close) still counts. The
+    dashboard's people and the projector's denominator."""
+    participants = select(ExerciseSessionParticipant.c.user_id).where(
+        ExerciseSessionParticipant.c.session_id == session_id
     )
-"""
+    return participants.union(select(checks.c.user_id)).cte("cohort")
 
 
-# The exercises whose solution is revealed in a session, as a JSON array in
-# order. Takes a row `s` of `exercise_session`.
-_SESSION_REVEALED_SQL = """
-    coalesce(
-        (SELECT json_agg(r.exercise_index ORDER BY r.exercise_index)
-         FROM exercise_session_reveal r WHERE r.session_id = s.id),
-        '[]'::json
+def _session_revealed(session_id):
+    """The exercises whose solution is revealed in a session, as a JSON array
+    in order: a scalar subquery."""
+    revealed = select(
+        func.json_agg(
+            aggregate_order_by(
+                ExerciseSessionReveal.c.exercise_index,
+                ExerciseSessionReveal.c.exercise_index,
+            )
+        )
+    ).where(ExerciseSessionReveal.c.session_id == session_id)
+    return func.coalesce(revealed.scalar_subquery(), _EMPTY_JSON_ARRAY)
+
+
+def _checks_of(checks, *conditions):
+    """The `doc`s of the rows of `checks` matching `conditions`, as a JSON
+    array in exercise order: a scalar subquery."""
+    docs = select(func.json_agg(aggregate_order_by(checks.c.doc, checks.c.n))).where(
+        *conditions
     )
-"""
+    return func.coalesce(docs.scalar_subquery(), _EMPTY_JSON_ARRAY)
+
+
+def _session_document(session, *columns):
+    """`row_to_json` of one session, joined to the version it is on, with the
+    pacing every session document starts with and `columns` after it."""
+    doc = (
+        select(
+            ExerciseSession.c.mode,
+            ExerciseSession.c.unlocked_through,
+            ExerciseSession.c.closed_at,
+            _exercise_titles(ExerciseSetVersion.c.document).label("titles"),
+            *columns,
+        )
+        .select_from(
+            ExerciseSession.join(
+                ExerciseSetVersion,
+                ExerciseSetVersion.c.id == ExerciseSession.c.version_id,
+            )
+        )
+        .where(ExerciseSession.c.id == session)
+        .cte("doc")
+    )
+    return select(func.row_to_json(doc.table_valued()))
 
 
 async def query_session_heading(conn: AsyncConnection, session_id: int):
@@ -1718,19 +1822,14 @@ async def query_session_heading(conn: AsyncConnection, session_id: int):
     Not `query_exercise_session`, which is the staff page's and aggregates
     every version of the set to offer a switch; this page is loaded by every
     student in the room."""
-    revealed = (
-        select(func.array_agg(ExerciseSessionReveal.c.exercise_index))
-        .where(ExerciseSessionReveal.c.session_id == ExerciseSession.c.id)
-        .scalar_subquery()
-    )
-    stmt = select(ExerciseSession.c.label, revealed.label("revealed")).where(
-        ExerciseSession.c.id == session_id
-    )
+    session = bindparam("session_id", session_id)
+    stmt = select(
+        ExerciseSession.c.label, _session_revealed(session).label("revealed")
+    ).where(ExerciseSession.c.id == session)
     row = (await conn.execute(stmt)).first()
     if row is None:
         return None
-    # `array_agg` of no rows is NULL.
-    return {"label": row.label, "revealed": set(row.revealed or ())}
+    return {"label": row.label, "revealed": set(row.revealed)}
 
 
 async def query_session_strip(conn: AsyncConnection, session_id: int, user_id: int):
@@ -1741,29 +1840,16 @@ async def query_session_strip(conn: AsyncConnection, session_id: int, user_id: i
     trip and reads no statement, no test and no source. Every title is in it;
     what the asker may see of them is `session_strip_view`'s to decide.
     """
-    query = text(f"""
-    WITH
-    {_session_checks_cte(one_user=True)},
-    doc AS (
-        SELECT s.mode, s.unlocked_through, s.closed_at,
-               {_EXERCISE_TITLES_SQL} AS titles,
-               coalesce((SELECT json_agg(checks.doc ORDER BY checks.n) FROM checks),
-                        '[]'::json) AS checks
-        FROM exercise_session s
-        JOIN exercise_set_version v ON v.id = s.version_id
-        WHERE s.id = :session_id
-    )
-    SELECT row_to_json(doc) FROM doc;
-    """)
-    params = dict(session_id=session_id, user_id=user_id)
-    return (await conn.execute(query, params)).scalar()
-
+    session = bindparam("session_id", session_id)
+    checks = _session_checks(session, bindparam("user_id", user_id))
+    stmt = _session_document(session, _checks_of(checks).label("checks"))
+    return (await conn.execute(stmt)).scalar()
 
 
 async def query_session_progress(conn: AsyncConnection, session_id: int):
     """The dashboard's document, in one round trip: the session's label and
     pacing, the titles of the version it is on, the exercises whose solution
-    is revealed, and its cohort (`_SESSION_COHORT_CTE`) - each person with
+    is revealed, and its cohort (`_session_cohort`) - each person with
     their checks per exercise - or None.
 
     Course staff do not come into it by being staff: they are never
@@ -1774,31 +1860,35 @@ async def query_session_progress(conn: AsyncConnection, session_id: int):
     derivation; this query only gathers them. Polled every few seconds, so it
     reads no statement, no test and no source.
     """
-    query = text(f"""
-    WITH
-    {_session_checks_cte(one_user=False)},
-    {_SESSION_COHORT_CTE},
-    people AS (
-        SELECT u.id, u.nickname, u.email,
-               coalesce((SELECT json_agg(checks.doc ORDER BY checks.n)
-                         FROM checks WHERE checks.user_id = u.id),
-                        '[]'::json) AS checks
-        FROM cohort JOIN "user" u ON u.id = cohort.user_id
-    ),
-    doc AS (
-        SELECT s.id, s.set_id, s.label, s.mode, s.unlocked_through, s.closed_at,
-               {_EXERCISE_TITLES_SQL} AS titles,
-               coalesce((SELECT json_agg(people ORDER BY lower(people.nickname), people.id)
-                         FROM people),
-                        '[]'::json) AS participants,
-               {_SESSION_REVEALED_SQL} AS revealed
-        FROM exercise_session s
-        JOIN exercise_set_version v ON v.id = s.version_id
-        WHERE s.id = :session_id
+    session = bindparam("session_id", session_id)
+    checks = _session_checks(session)
+    cohort = _session_cohort(checks, session)
+    people = (
+        select(
+            User.c.id,
+            User.c.nickname,
+            User.c.email,
+            _checks_of(checks, checks.c.user_id == User.c.id).label("checks"),
+        )
+        .select_from(cohort.join(User, User.c.id == cohort.c.user_id))
+        .cte("people")
     )
-    SELECT row_to_json(doc) FROM doc;
-    """)
-    return (await conn.execute(query, dict(session_id=session_id))).scalar()
+    participants = select(
+        func.json_agg(
+            aggregate_order_by(
+                people.table_valued(), func.lower(people.c.nickname), people.c.id
+            )
+        )
+    ).scalar_subquery()
+    stmt = _session_document(
+        session,
+        ExerciseSession.c.id,
+        ExerciseSession.c.set_id,
+        ExerciseSession.c.label,
+        func.coalesce(participants, _EMPTY_JSON_ARRAY).label("participants"),
+        _session_revealed(session).label("revealed"),
+    )
+    return (await conn.execute(stmt)).scalar()
 
 
 async def query_session_counts(conn: AsyncConnection, session_id: int):
@@ -1810,39 +1900,42 @@ async def query_session_counts(conn: AsyncConnection, session_id: int):
     Counts and not people, so the screen a class sees is never handed a
     name to show - the rule `projector_view` keeps is kept here first - and so
     the query a whole lesson's projector polls every three seconds builds no
-    per-person document only to count it. A row of `_session_checks_cte` is a
+    per-person document only to count it. A row of `_session_checks` is a
     person who checked; `projector_view` turns these numbers into statuses
     the way `_exercise_status` does for one row.
     """
-    query = text(f"""
-    WITH
-    {_session_checks_cte(one_user=False)},
-    {_SESSION_COHORT_CTE},
-    per_exercise AS (
-        SELECT n, count(*) AS n_checked, count(*) FILTER (WHERE solved) AS n_solved,
-               bool_or(checking) AS checking
-        FROM checks
-        GROUP BY n
-    ),
-    doc AS (
-        SELECT s.id, s.label, s.mode, s.unlocked_through, s.closed_at,
-               {_EXERCISE_TITLES_SQL} AS titles,
-               {_SESSION_REVEALED_SQL} AS revealed,
-               (SELECT count(*) FROM cohort) AS n_participants,
-               coalesce((SELECT json_agg(per_exercise ORDER BY per_exercise.n)
-                         FROM per_exercise),
-                        '[]'::json) AS exercises
-        FROM exercise_session s
-        JOIN exercise_set_version v ON v.id = s.version_id
-        WHERE s.id = :session_id
+    session = bindparam("session_id", session_id)
+    checks = _session_checks(session)
+    cohort = _session_cohort(checks, session)
+    per_exercise = (
+        select(
+            checks.c.n,
+            func.count().label("n_checked"),
+            func.count().filter(checks.c.solved).label("n_solved"),
+            func.bool_or(checks.c.checking).label("checking"),
+        )
+        .group_by(checks.c.n)
+        .cte("per_exercise")
     )
-    SELECT row_to_json(doc) FROM doc;
-    """)
-    return (await conn.execute(query, dict(session_id=session_id))).scalar()
+    exercises = select(
+        func.json_agg(aggregate_order_by(per_exercise.table_valued(), per_exercise.c.n))
+    ).scalar_subquery()
+    stmt = _session_document(
+        session,
+        ExerciseSession.c.id,
+        ExerciseSession.c.label,
+        _session_revealed(session).label("revealed"),
+        select(func.count())
+        .select_from(cohort)
+        .scalar_subquery()
+        .label("n_participants"),
+        func.coalesce(exercises, _EMPTY_JSON_ARRAY).label("exercises"),
+    )
+    return (await conn.execute(stmt)).scalar()
 
 
 async def query_session_cohort_member(conn: AsyncConnection, session_id: int, user_id: int):
-    """A person of a session's cohort - `_SESSION_COHORT_CTE`'s: a
+    """A person of a session's cohort - `_session_cohort`'s: a
     participant, or anyone with a check in it - with their nickname and
     address, or None. The dashboard's drill-in asks this first, so a user id
     typed into its URL names one of the session's own people or nobody."""
@@ -1853,7 +1946,7 @@ async def query_session_cohort_member(conn: AsyncConnection, session_id: int, us
     checked = exists().where(
         ExerciseJob.c.session_id == session_id,
         ExerciseJob.c.user_id == User.c.id,
-        ExerciseJob.c.kind == ExerciseJobKind.check,
+        _is_check(),
     )
     stmt = select(User.c.id, User.c.nickname, User.c.email).where(
         User.c.id == user_id, or_(participated, checked)

@@ -142,8 +142,8 @@ staff press "switch to the latest version" (`post_exercise_session_switch`).
 every test; this is **sticky**, surviving later wrong attempts and version switches), *attempted*,
 or *not attempted*, with *checking* shown beside the status while a check is pending.
 `_exercise_status` is the one function that decides it, for the student's strip and the teacher's
-grid alike. Both read the check aggregate `_session_checks_cte(one_user=…)`, so the two screens
-cannot disagree. The cohort is `_SESSION_COHORT_CTE`: participants, unioned with anyone who
+grid alike. Both read the check aggregate `_session_checks(session_id, user_id=…)`, so the two screens
+cannot disagree. The cohort is `_session_cohort`: participants, unioned with anyone who
 checked. **Two staff screens, deliberately separate pages.** The **dashboard** (`…/dashboard`,
 `query_session_progress`) shows names, a participants × exercises grid, and a drill-in to a
 student's latest Check and Run. The **projector** (`…/projector`, `query_session_counts`) never

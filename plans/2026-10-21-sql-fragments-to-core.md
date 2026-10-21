@@ -87,7 +87,7 @@ Each step is one commit, and the suite passes at every commit.
    see. Change the pinning tests to test behaviour only.
 3. [x] **Exercise sets.** `_exercise_versions`, `_exercise_set_title`; `query_exercise_sets`, `query_exercise_set`,
    then `query_exercise_version_summary` for the shared numbering.
-4. [ ] **Exercise sessions.** `_exercise_titles`, `_session_revealed`, `_session_checks`, `_session_cohort`;
+4. [x] **Exercise sessions.** `_exercise_titles`, `_session_revealed`, `_session_checks`, `_session_cohort`;
    `query_exercise_session`, `query_session_strip`, `query_session_progress`, `query_session_counts`. The last three
    are polled by a whole class, so compare `EXPLAIN ANALYZE` before and after on a seeded session.
 5. [ ] **Documentation.** In CLAUDE.md, rewrite the conventions that name the fragments: "Archived" and "Visible"

@@ -5027,7 +5027,7 @@ def session_strip_view(strip: dict, role: UserRole) -> dict:
 
 def _exercise_status(check: dict | None) -> dict:
     """One person's status on one exercise, out of their aggregate row of
-    `_session_checks_cte` (None for no check): the strip's and the
+    `_session_checks` (None for no check): the strip's and the
     dashboard's, spelled once so the two cannot disagree."""
     if check is None:
         status = "not_attempted"
