@@ -24,7 +24,7 @@ from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
-from cocco import repository as repo
+from cocco.repository import judging as repo
 from cocco.config import (
     BOX_POOL_SIZE,
     DEFAULT_FLAKE_REF,

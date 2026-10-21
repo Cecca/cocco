@@ -22,8 +22,11 @@ from cocco.model import (
 )
 from cocco.model import LeaderboardRanking, UserRole
 from cocco.auth import get_or_create_user
-from cocco.repository import (
+from cocco.repository.judging import (
     QUEUE_CHANNEL,
+    pull_queued_submission,
+)
+from cocco.repository._rest import (
     block_user,
     challenge_in_course,
     count_running_submissions,
@@ -42,7 +45,6 @@ from cocco.repository import (
     is_administrator,
     lock_challenge_submissions,
     lock_course_submissions,
-    pull_queued_submission,
     query_challenge,
     query_challenge_file_paths,
     query_challenge_leaderboard,

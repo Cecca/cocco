@@ -35,7 +35,7 @@ from cocco.model import (
     Enrollment,
     UserRole,
 )
-from cocco.repository import (
+from cocco.repository._rest import (
     block_user,
     query_course_role,
     query_enrollment_key,

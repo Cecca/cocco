@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, insert, select, update
 
 from cocco import main
-from cocco import repository as repo
+from cocco.repository import judging as repo
 from cocco.exercises import format as exercise_format
 from cocco.conftest import sign_in_as
 from cocco.main import Forbidden

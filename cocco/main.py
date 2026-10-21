@@ -109,7 +109,7 @@ import zipfile
 from pathlib import Path
 from urllib.parse import parse_qs
 
-from cocco.repository import (
+from cocco.repository._rest import (
     ExerciseSessionState,
     claim_user_password,
     block_user,
