@@ -9,7 +9,8 @@ from fastapi.testclient import TestClient
 from starlette.routing import Match
 
 from cocco.judge import load_languages
-from cocco.main import app, visible_outcomes
+from cocco.main import app
+from cocco.web.challenges import visible_outcomes
 from cocco.web.templating import (
     STATIC_DIR,
     TEMPLATES_DIR,
