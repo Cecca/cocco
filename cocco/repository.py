@@ -18,11 +18,14 @@ from sqlalchemy import (
     func,
     insert,
     literal,
+    literal_column,
     or_,
     select,
     text,
+    true,
     update,
 )
+from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -46,6 +49,7 @@ from cocco.model import (
     ExerciseSetVersion,
     ExerciseVersionStatus,
     LeaderboardRanking,
+    OutcomeEnum,
     Submission,
     SubmissionStatus,
     TestCase,
@@ -104,6 +108,12 @@ def _challenge_visible():
         Challenge.c.visible_from.is_not(None),
         Challenge.c.visible_from <= func.now(),
     )
+
+
+# What a page query's `coalesce` falls back on when a `json_agg` had no rows to
+# aggregate - which makes it NULL, not an empty array - so a template can loop
+# over the field without asking whether it is there.
+_EMPTY_JSON_ARRAY = literal_column("'[]'::json")
 
 
 # The channel the web app tells the judge about new work on. `notify_queue` is
@@ -1885,32 +1895,63 @@ async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_
     return res.scalar_one_or_none()
 
 
-# The outcomes of one submission, joined to the test cases they were scored on.
-# Shared by the two queries below, which differ only in how much of the
-# submission itself they carry: `is_sample` is what tells the page whether the
-# free-text fields may be shown to a student (see `visible_outcomes` in main.py).
-_SUBMISSION_OUTCOMES_CTE = """
-    outcomes AS (
-        SELECT testoutcome.*,
-               testcase.execution_order,
-               testcase.is_sample,
-               testcase.is_active
-        FROM testoutcome
-        JOIN testcase ON testcase.id = testoutcome.testcase_id
-        WHERE testoutcome.submission_id = :submission_id
-    ),
-    -- Aggregated with no GROUP BY, so this is one row even when the submission
-    -- has no outcomes yet and can be CROSS JOINed unconditionally below.
-    agg AS (
-        SELECT coalesce(json_agg(outcomes ORDER BY execution_order, id),
-                        '[]'::json) AS outcomes,
-               avg(coalesce(score, 0)) AS score,
-               sum(elapsed_s) AS elapsed_s,
-               count(*) FILTER (WHERE outcome = 'success') AS n_passed,
-               count(*) AS n_tests
-        FROM outcomes
+def _score_columns(outcomes):
+    """A submission's headline numbers, as aggregates over rows of
+    `testoutcome` - `outcomes` is that table or anything with its columns:
+    the mean score, the total running time, how many tests passed and how many
+    there were. Labelled, for a `select`. A missing score counts as zero, and
+    the mean assumes a higher-is-better evaluator.
+
+    `query_user_submissions` and `query_challenge_standings` spell the same
+    four aggregates in their own `text()`; keep them in step.
+    """
+    return [
+        func.avg(func.coalesce(outcomes.c.score, 0)).label("score"),
+        func.sum(outcomes.c.elapsed_s).label("elapsed_s"),
+        func.count()
+        .filter(outcomes.c.outcome == OutcomeEnum.success)
+        .label("n_passed"),
+        func.count().label("n_tests"),
+    ]
+
+
+def _submission_outcomes(submission_id):
+    """The outcomes of one submission, joined to the test cases they were
+    scored on, as a CTE of exactly one row: the outcomes as a JSON array in
+    execution order, beside `_score_columns`.
+
+    Shared by the two queries below, which differ only in how much of the
+    submission itself they carry: `is_sample` is what tells the page whether
+    the free-text fields may be shown to a student (see `visible_outcomes` in
+    main.py). Callers select `*agg.c` and join it `ON true`.
+    """
+    outcomes = (
+        select(
+            TestOutcome,
+            TestCase.c.execution_order,
+            TestCase.c.is_sample,
+            TestCase.c.is_active,
+        )
+        .join(TestCase, TestCase.c.id == TestOutcome.c.testcase_id)
+        .where(TestOutcome.c.submission_id == submission_id)
+        .cte("outcomes")
     )
-"""
+    # Aggregated with no GROUP BY, so this is one row even when the submission
+    # has no outcomes yet and can be joined `ON true` unconditionally.
+    agg = select(
+        func.coalesce(
+            func.json_agg(
+                aggregate_order_by(
+                    outcomes.table_valued(),
+                    outcomes.c.execution_order,
+                    outcomes.c.id,
+                )
+            ),
+            _EMPTY_JSON_ARRAY,
+        ).label("outcomes"),
+        *_score_columns(outcomes),
+    ).cte("agg")
+    return agg
 
 
 async def query_submission(conn: AsyncConnection, submission_id: int):
@@ -1924,43 +1965,48 @@ async def query_submission(conn: AsyncConnection, submission_id: int):
     challenge, computed exactly as `query_user_submissions` does it, so the "#3"
     on this page is the "#3" of the table the viewer clicked.
     """
-    query = text(f"""
-    WITH
-    {_SUBMISSION_OUTCOMES_CTE},
-    attempts AS (
-        SELECT id,
-               row_number() OVER (ORDER BY enqueued) AS attempt
-        FROM submission
-        WHERE (user_id, challenge_id) = (
-            SELECT user_id, challenge_id FROM submission WHERE id = :submission_id
+    submission = bindparam("submission_id", submission_id)
+    agg = _submission_outcomes(submission)
+    # Every submission by the same author to the same challenge as this one.
+    this = Submission.alias("this")
+    attempts = (
+        select(
+            Submission.c.id,
+            func.row_number().over(order_by=Submission.c.enqueued).label("attempt"),
         )
-    ),
-    s AS (
-        SELECT submission.*,
-               "user".nickname AS author_nickname,
-               "user".email AS author_email,
-               challenge.title AS challenge_title,
-               challenge.course_id AS course_id,
-               course.title AS course_title,
-               attempts.attempt,
-               agg.outcomes,
-               agg.score,
-               agg.elapsed_s,
-               agg.n_passed,
-               agg.n_tests
-        FROM submission
-        JOIN "user" ON "user".id = submission.user_id
-        JOIN challenge ON challenge.id = submission.challenge_id
-        LEFT JOIN course ON course.id = challenge.course_id
-        LEFT JOIN attempts ON attempts.id = submission.id
-        CROSS JOIN agg
-        WHERE submission.id = :submission_id
+        .join(
+            this,
+            and_(
+                this.c.user_id == Submission.c.user_id,
+                this.c.challenge_id == Submission.c.challenge_id,
+            ),
+        )
+        .where(this.c.id == submission)
+        .cte("attempts")
     )
-    SELECT row_to_json(s) FROM s;
-    """)
-
-    res = await conn.execute(query, dict(submission_id=submission_id))
-    return res.scalar_one_or_none()
+    s = (
+        select(
+            Submission,
+            User.c.nickname.label("author_nickname"),
+            User.c.email.label("author_email"),
+            Challenge.c.title.label("challenge_title"),
+            Challenge.c.course_id,
+            Course.c.title.label("course_title"),
+            attempts.c.attempt,
+            *agg.c,
+        )
+        .select_from(
+            Submission.join(User, User.c.id == Submission.c.user_id)
+            .join(Challenge, Challenge.c.id == Submission.c.challenge_id)
+            .outerjoin(Course, Course.c.id == Challenge.c.course_id)
+            .outerjoin(attempts, attempts.c.id == Submission.c.id)
+            .join(agg, true())
+        )
+        .where(Submission.c.id == submission)
+        .cte("s")
+    )
+    stmt = select(func.row_to_json(s.table_valued()))
+    return (await conn.execute(stmt)).scalar_one_or_none()
 
 
 async def query_submission_outcomes(conn: AsyncConnection, submission_id: int):
@@ -1970,28 +2016,22 @@ async def query_submission_outcomes(conn: AsyncConnection, submission_id: int):
     `user_id` and `challenge_id` come along because the fragment route has to
     authorize the viewer just like the page does.
     """
-    query = text(f"""
-    WITH
-    {_SUBMISSION_OUTCOMES_CTE},
-    s AS (
-        SELECT submission.id,
-               submission.user_id,
-               submission.challenge_id,
-               submission.status,
-               agg.outcomes,
-               agg.score,
-               agg.elapsed_s,
-               agg.n_passed,
-               agg.n_tests
-        FROM submission
-        CROSS JOIN agg
-        WHERE submission.id = :submission_id
+    submission = bindparam("submission_id", submission_id)
+    agg = _submission_outcomes(submission)
+    s = (
+        select(
+            Submission.c.id,
+            Submission.c.user_id,
+            Submission.c.challenge_id,
+            Submission.c.status,
+            *agg.c,
+        )
+        .select_from(Submission.join(agg, true()))
+        .where(Submission.c.id == submission)
+        .cte("s")
     )
-    SELECT row_to_json(s) FROM s;
-    """)
-
-    res = await conn.execute(query, dict(submission_id=submission_id))
-    return res.scalar_one_or_none()
+    stmt = select(func.row_to_json(s.table_valued()))
+    return (await conn.execute(stmt)).scalar_one_or_none()
 
 
 async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int):

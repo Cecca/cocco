@@ -1,5 +1,5 @@
 ---
-status: pending
+status: in-progress
 ---
 
 # Replace the SQL string fragments in `repository.py` with Core
@@ -44,7 +44,7 @@ Core object, and whatever it depended on becomes an argument:
 | `_SESSION_REVEALED_SQL` | `_session_revealed(session_id)`, a scalar subquery (`query_session_heading` already builds the `array_agg` form in Core) |
 | `_session_checks_cte(one_user)` | `_session_checks(session_id, user_id=None) -> CTE` |
 | `_SESSION_COHORT_CTE` | `_session_cohort(checks, session_id) -> CTE` |
-| `_SUBMISSION_OUTCOMES_CTE` | `_submission_outcomes(submission_id) -> (outcomes, agg)` |
+| `_SUBMISSION_OUTCOMES_CTE` | `_submission_outcomes(submission_id) -> agg` (one-row CTE) |
 
 Core equivalents for the Postgres constructs these queries use:
 
@@ -75,22 +75,22 @@ Not fragments, but the same work makes them easy:
 
 Each step is one commit, and the suite passes at every commit.
 
-0. **Snapshot harness.** Add a throwaway test, kept out of the commit history or deleted at the end, that seeds the
+0. [x] **Snapshot harness.** Add a throwaway test, kept out of the commit history or deleted at the end, that seeds the
    database, calls each affected query, and compares the JSON with a snapshot taken before the change. Templates
    read keys by name, so a renamed key, a missing key or a duplicate one (the `effective_archived_at` /
    `archived_at` clash) breaks a page even when the tests pass. Compare parsed JSON, not text: key order may change.
-1. **Submission outcomes.** `query_submission`, `query_submission_outcomes`. This step settles the Core style
+1. [x] **Submission outcomes.** `query_submission`, `query_submission_outcomes`. This step settles the Core style
    (`json_agg`, `row_to_json`, whole-row CTEs) on a small, well-tested pair, and adds `_score_columns`.
-2. **Challenges.** `query_challenge`, then `_course_challenges` with `query_course_info` and `query_course_challenges`.
+2. [ ] **Challenges.** `query_challenge`, then `_course_challenges` with `query_course_info` and `query_course_challenges`.
    Delete `_EFFECTIVE_ARCHIVED_SQL`, `_CHALLENGE_VISIBLE_SQL` and `_VISIBLE_TO_CALLER_SQL`. `number` must still be
    ranked inside the CTE over the whole course, before the visibility filter, so a student sees the numbers staff
    see. Change the pinning tests to test behaviour only.
-3. **Exercise sets.** `_exercise_versions`, `_exercise_set_title`; `query_exercise_sets`, `query_exercise_set`,
+3. [ ] **Exercise sets.** `_exercise_versions`, `_exercise_set_title`; `query_exercise_sets`, `query_exercise_set`,
    then `query_exercise_version_summary` for the shared numbering.
-4. **Exercise sessions.** `_exercise_titles`, `_session_revealed`, `_session_checks`, `_session_cohort`;
+4. [ ] **Exercise sessions.** `_exercise_titles`, `_session_revealed`, `_session_checks`, `_session_cohort`;
    `query_exercise_session`, `query_session_strip`, `query_session_progress`, `query_session_counts`. The last three
    are polled by a whole class, so compare `EXPLAIN ANALYZE` before and after on a seeded session.
-5. **Documentation.** In CLAUDE.md, rewrite the conventions that name the fragments: "Archived" and "Visible"
+5. [ ] **Documentation.** In CLAUDE.md, rewrite the conventions that name the fragments: "Archived" and "Visible"
    are no longer "spelled exactly twice", and "The number on a challenge card" names `_COURSE_CHALLENGES_CTE`.
    Update the docstrings and comments that refer to removed names. Remove the snapshot harness.
 
