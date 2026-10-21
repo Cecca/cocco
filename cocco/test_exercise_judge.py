@@ -16,7 +16,7 @@ from sqlalchemy import insert, select, text
 
 import cocco.judge as cj
 from cocco import model as cm
-from cocco.repository import _rest, judging as repo
+from cocco.repository import _rest, challenges, judging as repo
 from cocco.avatar import generate_identicon
 from cocco.conftest import TEST_DATABASE
 from cocco.exercises.compare import Rules
@@ -332,7 +332,7 @@ async def test_the_judge_takes_run_then_check_then_build_then_submission(
             .returning(cm.Challenge.c.id)
         ).scalar_one()
     async with app_engine.connect() as conn:
-        await _rest.insert_submission(
+        await challenges.insert_submission(
             conn, user_id=user_id, challenge_id=challenge_id,
             language="python", filename="a.py", source="",
         )

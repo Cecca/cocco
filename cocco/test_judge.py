@@ -11,7 +11,7 @@ from sqlalchemy import insert, select, text
 import cocco.judge as cj
 from cocco import model as cm
 from cocco.avatar import generate_identicon
-from cocco.repository._rest import insert_submission
+from cocco.repository.challenges import insert_submission
 from cocco.storage import Storage
 
 
