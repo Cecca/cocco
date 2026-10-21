@@ -85,7 +85,7 @@ Each step is one commit, and the suite passes at every commit.
    Delete `_EFFECTIVE_ARCHIVED_SQL`, `_CHALLENGE_VISIBLE_SQL` and `_VISIBLE_TO_CALLER_SQL`. `number` must still be
    ranked inside the CTE over the whole course, before the visibility filter, so a student sees the numbers staff
    see. Change the pinning tests to test behaviour only.
-3. [ ] **Exercise sets.** `_exercise_versions`, `_exercise_set_title`; `query_exercise_sets`, `query_exercise_set`,
+3. [x] **Exercise sets.** `_exercise_versions`, `_exercise_set_title`; `query_exercise_sets`, `query_exercise_set`,
    then `query_exercise_version_summary` for the shared numbering.
 4. [ ] **Exercise sessions.** `_exercise_titles`, `_session_revealed`, `_session_checks`, `_session_cohort`;
    `query_exercise_session`, `query_session_strip`, `query_session_progress`, `query_session_counts`. The last three

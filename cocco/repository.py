@@ -13,6 +13,7 @@ from sqlalchemy import (
     and_,
     bindparam,
     case,
+    column,
     delete,
     exists,
     func,
@@ -25,7 +26,7 @@ from sqlalchemy import (
     true,
     update,
 )
-from sqlalchemy.dialects.postgresql import aggregate_order_by
+from sqlalchemy.dialects.postgresql import JSONB, aggregate_order_by
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
@@ -733,65 +734,127 @@ async def insert_exercise_version(
     return (await conn.execute(stmt)).scalar_one()
 
 
-# Each version of the set, newest first, with what the set page shows about it:
-# its status, how many problems of each level it has and - once built - how
-# many exercises. `number` is its rank within the set, oldest first, so "v3"
-# means the third import of *this* set whatever the ids are. The problems
-# themselves are not listed, only counted: the page prints the latest version's
-# in full and nobody else's, and the fragment carrying this is polled.
-_EXERCISE_VERSIONS_CTE = """
-    versions AS (
-        SELECT v.id, v.set_id, v.title, v.status, v.created_at,
-               row_number() OVER (PARTITION BY v.set_id ORDER BY v.id) AS number,
-               jsonb_array_length(v.document -> 'exercises') AS n_exercises,
-               (SELECT count(*) FROM jsonb_array_elements(v.problems) p
-                WHERE p ->> 'level' = 'error') AS n_errors,
-               (SELECT count(*) FROM jsonb_array_elements(v.problems) p
-                WHERE p ->> 'level' = 'warning') AS n_warnings
-        FROM exercise_set_version v
-        JOIN exercise_set ON exercise_set.id = v.set_id
-        WHERE {where}
+def _version_number(version):
+    """A version's `number` within its set, oldest first, so "v3" means the
+    third import of *this* set whatever the ids are. A window over `version`,
+    a table or alias of `exercise_set_version`: select it over every version
+    of the set, before picking any of them out."""
+    return func.row_number().over(partition_by=version.c.set_id, order_by=version.c.id)
+
+
+def _count_problems(version, level: str):
+    """How many of a version's build problems are at `level`, as a scalar
+    subquery correlated to `version`."""
+    problem = func.jsonb_array_elements(version.c.problems).table_valued(
+        column("value", JSONB), name="p"
     )
-"""
+    return (
+        select(func.count())
+        .select_from(problem)
+        .where(problem.c.value["level"].astext == level)
+        .scalar_subquery()
+    )
 
 
-# A set's title, which is its current version's: a failed re-import must not
-# rename the set it failed to change, on the course page or in the delete
-# dialog. The latest version's only while there is no current one - a set whose
-# first build has not succeeded yet still needs a name. Takes the `current` and
-# `latest` rows of `_EXERCISE_VERSIONS_CTE`.
-_EXERCISE_SET_TITLE_SQL = "coalesce(current.title, latest.title)"
+def _exercise_versions(condition, *, counts: bool = True):
+    """The versions of every set matching `condition` - a Core boolean over
+    `exercise_set` and `exercise_set_version` - as a CTE named `versions`:
+    each version's status and `number` (`_version_number`) and, with `counts`,
+    what the set page shows about it - how many problems of each level it has
+    and, once built, how many exercises.
+
+    The problems themselves are not listed, only counted: the set page prints
+    the latest version's in full and nobody else's, and the fragment carrying
+    this is polled. A listing that needs only numbers and statuses passes
+    `counts=False` rather than count every version's problems - for an
+    administrator, every version on the site.
+    """
+    columns = [
+        ExerciseSetVersion.c.id,
+        ExerciseSetVersion.c.set_id,
+        ExerciseSetVersion.c.title,
+        ExerciseSetVersion.c.status,
+        ExerciseSetVersion.c.created_at,
+        _version_number(ExerciseSetVersion).label("number"),
+    ]
+    if counts:
+        columns += [
+            _n_exercises(ExerciseSetVersion).label("n_exercises"),
+            _count_problems(ExerciseSetVersion, "error").label("n_errors"),
+            _count_problems(ExerciseSetVersion, "warning").label("n_warnings"),
+        ]
+    return (
+        select(*columns)
+        .join(ExerciseSet, ExerciseSet.c.id == ExerciseSetVersion.c.set_id)
+        .where(condition)
+        .cte("versions")
+    )
+
+
+def _latest_version(versions):
+    """The newest row of `versions` for each `exercise_set` in the enclosing
+    FROM, as a LATERAL subquery named `latest` - to be joined `ON true`.
+
+    Correlated to `exercise_set` explicitly, to say what it reads from the
+    enclosing statement. SQLAlchemy does not enforce that: in a statement
+    without `exercise_set` in its FROM it would put the table in the
+    subquery's own FROM and read the newest version on the whole site."""
+    return (
+        select(versions)
+        .where(versions.c.set_id == ExerciseSet.c.id)
+        .order_by(versions.c.id.desc())
+        .limit(1)
+        .correlate(ExerciseSet)
+        .lateral("latest")
+    )
+
+
+def _exercise_set_title(current, latest):
+    """A set's title, which is its current version's: a failed re-import must
+    not rename the set it failed to change, on the course page or in the delete
+    dialog. The latest version's only while there is no current one - a set
+    whose first build has not succeeded yet still needs a name. Takes the
+    `current` and `latest` rows of `_exercise_versions`."""
+    return func.coalesce(current.c.title, latest.c.title)
 
 
 async def query_exercise_sets(conn: AsyncConnection, course_id: int):
     """The exercise sets of a course, as its page lists them for staff.
 
     The title and the exercise count are the current version's - see
-    `_EXERCISE_SET_TITLE_SQL` - and the status badge is the latest's, which is
+    `_exercise_set_title` - and the status badge is the latest's, which is
     what tells its author a re-import is building or broke.
     """
-    query = text(f"""
-    WITH
-    {_EXERCISE_VERSIONS_CTE.format(where="exercise_set.course_id = :course_id")},
-    sets AS (
-        SELECT exercise_set.id, exercise_set.archived_at,
-               exercise_set.current_version_id,
-               {_EXERCISE_SET_TITLE_SQL} AS title,
-               latest.status AS latest_status,
-               latest.number AS latest_number,
-               current.number AS current_number,
-               current.n_exercises
-        FROM exercise_set
-        JOIN LATERAL (
-            SELECT * FROM versions WHERE versions.set_id = exercise_set.id
-            ORDER BY versions.id DESC LIMIT 1
-        ) latest ON true
-        LEFT JOIN versions current ON current.id = exercise_set.current_version_id
-        WHERE exercise_set.course_id = :course_id
+    course = bindparam("course_id", course_id)
+    versions = _exercise_versions(ExerciseSet.c.course_id == course)
+    latest = _latest_version(versions)
+    current = versions.alias("current")
+    sets = (
+        select(
+            ExerciseSet.c.id,
+            ExerciseSet.c.archived_at,
+            ExerciseSet.c.current_version_id,
+            _exercise_set_title(current, latest).label("title"),
+            latest.c.status.label("latest_status"),
+            latest.c.number.label("latest_number"),
+            current.c.number.label("current_number"),
+            current.c.n_exercises,
+        )
+        .select_from(
+            ExerciseSet.join(latest, true()).outerjoin(
+                current, current.c.id == ExerciseSet.c.current_version_id
+            )
+        )
+        .where(ExerciseSet.c.course_id == course)
+        .cte("sets")
     )
-    SELECT coalesce(json_agg(sets ORDER BY sets.id), '[]'::json) FROM sets;
-    """)
-    return (await conn.execute(query, dict(course_id=course_id))).scalar()
+    stmt = select(
+        func.coalesce(
+            func.json_agg(aggregate_order_by(sets.table_valued(), sets.c.id)),
+            _EMPTY_JSON_ARRAY,
+        )
+    )
+    return (await conn.execute(stmt)).scalar()
 
 
 async def query_exercise_set(conn: AsyncConnection, set_id: int):
@@ -802,36 +865,47 @@ async def query_exercise_set(conn: AsyncConnection, set_id: int):
     No version's source or document: the page that polls this shows statuses,
     and the preview reads a document through `query_exercise_version`.
     """
-    query = text(f"""
-    WITH
-    {_EXERCISE_VERSIONS_CTE.format(where="v.set_id = :set_id")},
-    latest AS (
-        SELECT versions.*, v.problems
-        FROM versions JOIN exercise_set_version v USING (id)
-        ORDER BY versions.id DESC LIMIT 1
-    ),
-    s AS (
-        SELECT exercise_set.*,
-               {_EXERCISE_SET_TITLE_SQL} AS title,
-               row_to_json(latest) AS latest,
-               -- Any, not only the latest: two imports in quick succession are
-               -- two builds, and the older one finishing is news too.
-               EXISTS (SELECT 1 FROM versions WHERE status = 'building')
-                   AS any_building,
-               coalesce(
-                   (SELECT json_agg(versions ORDER BY versions.id DESC) FROM versions),
-                   '[]'::json
-               ) AS versions,
-               (SELECT count(*) FROM exercise_session
-                WHERE exercise_session.set_id = exercise_set.id) AS n_sessions
-        FROM exercise_set
-        JOIN latest ON true
-        LEFT JOIN versions current ON current.id = exercise_set.current_version_id
-        WHERE exercise_set.id = :set_id
+    exercise_set = bindparam("set_id", set_id)
+    versions = _exercise_versions(ExerciseSetVersion.c.set_id == exercise_set)
+    latest = (
+        select(versions, ExerciseSetVersion.c.problems)
+        .join(ExerciseSetVersion, ExerciseSetVersion.c.id == versions.c.id)
+        .order_by(versions.c.id.desc())
+        .limit(1)
+        .cte("latest")
     )
-    SELECT row_to_json(s) FROM s;
-    """)
-    return (await conn.execute(query, dict(set_id=set_id))).scalar()
+    current = versions.alias("current")
+    every_version = select(
+        func.json_agg(aggregate_order_by(versions.table_valued(), versions.c.id.desc()))
+    ).scalar_subquery()
+    n_sessions = (
+        select(func.count())
+        .where(ExerciseSession.c.set_id == ExerciseSet.c.id)
+        .scalar_subquery()
+    )
+    s = (
+        select(
+            ExerciseSet,
+            _exercise_set_title(current, latest).label("title"),
+            func.row_to_json(latest.table_valued()).label("latest"),
+            # Any, not only the latest: two imports in quick succession are
+            # two builds, and the older one finishing is news too.
+            exists()
+            .where(versions.c.status == ExerciseVersionStatus.building)
+            .label("any_building"),
+            func.coalesce(every_version, _EMPTY_JSON_ARRAY).label("versions"),
+            n_sessions.label("n_sessions"),
+        )
+        .select_from(
+            ExerciseSet.join(latest, true()).outerjoin(
+                current, current.c.id == ExerciseSet.c.current_version_id
+            )
+        )
+        .where(ExerciseSet.c.id == exercise_set)
+        .cte("s")
+    )
+    stmt = select(func.row_to_json(s.table_valued()))
+    return (await conn.execute(stmt)).scalar()
 
 
 async def query_exercise_version(conn: AsyncConnection, set_id: int, version_id: int):
@@ -854,20 +928,25 @@ async def query_exercise_version_source(
 ):
     """A version's file as it was imported, with its title and its `number`
     within the set to name the download by."""
-    earlier = ExerciseSetVersion.alias("earlier")
-    number = (
-        select(func.count())
-        .select_from(earlier)
-        .where(earlier.c.set_id == set_id, earlier.c.id <= version_id)
-        .scalar_subquery()
+    exercise_set = bindparam("set_id", set_id)
+    # Numbered over every version of the set, and only the ids carried through
+    # the window: the one source wanted is joined on afterwards.
+    numbers = (
+        select(
+            ExerciseSetVersion.c.id,
+            _version_number(ExerciseSetVersion).label("number"),
+        )
+        .where(ExerciseSetVersion.c.set_id == exercise_set)
+        .subquery("numbers")
     )
-    stmt = select(
-        ExerciseSetVersion.c.source,
-        ExerciseSetVersion.c.title,
-        number.label("number"),
-    ).where(
-        ExerciseSetVersion.c.id == version_id,
-        ExerciseSetVersion.c.set_id == set_id,
+    stmt = (
+        select(
+            ExerciseSetVersion.c.source,
+            ExerciseSetVersion.c.title,
+            numbers.c.number,
+        )
+        .join(numbers, numbers.c.id == ExerciseSetVersion.c.id)
+        .where(ExerciseSetVersion.c.id == version_id)
     )
     return (await conn.execute(stmt)).first()
 
@@ -897,35 +976,31 @@ async def query_exercise_version_summary(
     still somebody's change, and a pull that handed out the current version
     instead would quietly take a failed file's fixes away from its author.
     """
-    earlier = ExerciseSetVersion.alias("earlier")
-    number = (
-        select(func.count())
-        .select_from(earlier)
-        .where(
-            earlier.c.set_id == set_id, earlier.c.id <= ExerciseSetVersion.c.id
+    exercise_set = bindparam("set_id", set_id)
+    numbers = (
+        select(
+            ExerciseSetVersion.c.id,
+            _version_number(ExerciseSetVersion).label("number"),
         )
-        .scalar_subquery()
+        .where(ExerciseSetVersion.c.set_id == exercise_set)
+        .subquery("numbers")
     )
     columns = [
         ExerciseSetVersion.c.id,
         ExerciseSetVersion.c.title,
         ExerciseSetVersion.c.status,
         ExerciseSetVersion.c.problems,
-        number.label("number"),
+        numbers.c.number,
         (ExerciseSet.c.current_version_id == ExerciseSetVersion.c.id)
         .is_(True)
         .label("is_current"),
     ]
     if with_source:
         columns.append(ExerciseSetVersion.c.source)
-    stmt = (
-        select(*columns)
-        .select_from(
-            ExerciseSetVersion.join(
-                ExerciseSet, ExerciseSet.c.id == ExerciseSetVersion.c.set_id
-            )
+    stmt = select(*columns).select_from(
+        ExerciseSetVersion.join(numbers, numbers.c.id == ExerciseSetVersion.c.id).join(
+            ExerciseSet, ExerciseSet.c.id == ExerciseSetVersion.c.set_id
         )
-        .where(ExerciseSetVersion.c.set_id == set_id)
     )
     if version_id is None:
         stmt = stmt.order_by(ExerciseSetVersion.c.id.desc()).limit(1)
@@ -941,54 +1016,49 @@ async def query_editable_exercise_sets(
     every_course: bool = False,
 ):
     """`query_editable_challenges` for exercise sets: every set the caller may
-    pull and push, with its course, its title (`_EXERCISE_SET_TITLE_SQL`) and
+    pull and push, with its course, its title (`_exercise_set_title`) and
     its newest version's number and status, which is what a push would be
     conditional on.
 
     `archived` is the set's or its course's, a note beside the title as it is
     for a challenge and never a gate.
     """
-    where = (
-        "true"
+    editable = (
+        true()
         if every_course
-        else """exercise_set.course_id IN (
-            SELECT enrollment.course_id FROM enrollment
-            WHERE enrollment.user_id = :user_id AND enrollment.role IN :roles
-        )"""
+        else ExerciseSet.c.course_id.in_(
+            select(Enrollment.c.course_id).where(
+                Enrollment.c.user_id == user_id,
+                Enrollment.c.role.in_(list(editor_roles)),
+            )
+        )
     )
-    # Not `_EXERCISE_VERSIONS_CTE`, which counts every version's problems and
-    # exercises - for an administrator, every version on the site - when all
-    # this needs is the newest and the current version's number and status.
-    query = text(f"""
-    WITH versions AS (
-        SELECT v.id, v.set_id, v.title, v.status,
-               row_number() OVER (PARTITION BY v.set_id ORDER BY v.id) AS number
-        FROM exercise_set_version v
-        JOIN exercise_set ON exercise_set.id = v.set_id
-        WHERE {where}
+    versions = _exercise_versions(editable, counts=False)
+    latest = _latest_version(versions)
+    current = versions.alias("current")
+    stmt = (
+        select(
+            Course.c.id.label("course_id"),
+            Course.c.title.label("course_title"),
+            ExerciseSet.c.id.label("set_id"),
+            _exercise_set_title(current, latest).label("title"),
+            or_(
+                ExerciseSet.c.archived_at.is_not(None),
+                Course.c.archived_at.is_not(None),
+            ).label("archived"),
+            latest.c.number.label("latest_number"),
+            latest.c.status.label("latest_status"),
+            current.c.number.label("current_number"),
+        )
+        .select_from(
+            ExerciseSet.join(Course, Course.c.id == ExerciseSet.c.course_id)
+            .join(latest, true())
+            .outerjoin(current, current.c.id == ExerciseSet.c.current_version_id)
+        )
+        .where(editable)
+        .order_by(Course.c.title, Course.c.id, ExerciseSet.c.id)
     )
-    SELECT course.id AS course_id, course.title AS course_title,
-           exercise_set.id AS set_id,
-           {_EXERCISE_SET_TITLE_SQL} AS title,
-           (exercise_set.archived_at IS NOT NULL
-            OR course.archived_at IS NOT NULL) AS archived,
-           latest.number AS latest_number, latest.status AS latest_status,
-           current.number AS current_number
-    FROM exercise_set
-    JOIN course ON course.id = exercise_set.course_id
-    JOIN LATERAL (
-        SELECT * FROM versions WHERE versions.set_id = exercise_set.id
-        ORDER BY versions.id DESC LIMIT 1
-    ) latest ON true
-    LEFT JOIN versions current ON current.id = exercise_set.current_version_id
-    WHERE {where}
-    ORDER BY course.title, course.id, exercise_set.id
-    """)
-    params: dict = {}
-    if not every_course:
-        query = query.bindparams(bindparam("roles", expanding=True))
-        params = {"user_id": user_id, "roles": [role.value for role in editor_roles]}
-    return (await conn.execute(query, params)).mappings().all()
+    return (await conn.execute(stmt)).mappings().all()
 
 
 async def query_exercise(

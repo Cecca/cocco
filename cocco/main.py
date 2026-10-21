@@ -7900,7 +7900,7 @@ async def api_list_exercise_sets(db: DBDep, user: ApiUser):
                 # current one, which is what sessions are opened on - two
                 # numbers exactly while a re-import is building or has failed.
                 "latest_number": row["latest_number"],
-                "latest_status": row["latest_status"],
+                "latest_status": row["latest_status"].value,
                 "current_number": row["current_number"],
             }
             for row in rows
