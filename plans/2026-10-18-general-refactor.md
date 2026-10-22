@@ -295,8 +295,6 @@ Done in 22 commits, `58eea3c` (guard) to `4b2edb1` (docs), plus this update. Eac
 - **`MAX_UPLOAD_BYTES` stayed in `core`.** It is shared by submissions and the evaluator limit.
 
 **Left for later.**
-- `.claude/rules/auth.md` and `authorization.md` still name `create_db_and_tables`, a function that predates this
-  refactor and no longer exists (it is `prepare_database` in `web/seed.py`).
 - `ruff check --select F cocco/` reports 221 errors, almost all F811 on the tests' `world` fixtures. They existed
   before this refactor.
 - The generated import blocks in `cocco/repository/*` are one line per `from`, where the old file used one name per

@@ -6,6 +6,7 @@ paths:
   - "cocco/config.py"
   - "cocco/web/signin.py"
   - "cocco/web/profile.py"
+  - "cocco/web/seed.py"
   - "cocco/repository/credentials.py"
   - "cocco/test_auth.py"
   - "cocco/test_auth_routes.py"
@@ -155,13 +156,13 @@ The seeded cast is `matteo.ceccarello@unipd.it` and `alice@unipd.it` (`teacher` 
 and `bob@unipd.it` and `charlie@unipd.it` (students); `_login_page` passes those names to the
 template so the box can print them and they cannot drift from `_populate_dummy_data`. Matteo and
 Alice differ in one thing only: he is a **site administrator**, a row in `administrator` rather
-than a role anywhere, which is why a fresh checkout can create a course. `create_db_and_tables`
-seeds him whenever dummy auth is on — a file every checkout shares should not name one person as
+than a role anywhere, which is why a fresh checkout can create a course. `prepare_database`
+(`cocco/web/seed.py`) seeds him on every boot while dummy auth is on — a file every checkout shares should not name one person as
 the administrator of all of them, so `cocco.dev.toml` deliberately lists none and this is what
 keeps the checkout usable — and seeds only him, so typing `alice@unipd.it` still shows what plain
 course staff may do instead of quietly promoting her.
 
 `core.DUMMY_AUTH` (`cocco/web/core.py`) is derived from `CONFIG.dev` **once, at import, and stays a module-level name** —
-`post_auth_dummy`, `_login_page` and `create_db_and_tables` read it rather than `CONFIG.dev`,
+`post_auth_dummy`, `_login_page` and `prepare_database` read it rather than `CONFIG.dev`,
 because that is the seam six test files flip. A frozen dataclass field has no equivalent, so this
 is not a tidy-up waiting to happen.
