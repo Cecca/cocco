@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Compile inside isolate
@@ -279,3 +279,34 @@ paths: gcc-wrapper-15.2.0 (so `#embed` exists), openjdk-21. isolate 2.5; the hos
   the deployment notes, if there ever are any.
 - **The web app.** It never compiles; it stores sources and hands them to the judge.
 - **Per-language compile budgets** in `languages.toml`. One budget until a language shows it needs another.
+
+## Outcome (2026-10-23)
+
+Landed as planned, one commit per step; `uv run pytest` is 1013 passed (integration included).
+
+1. **Spike** (`db89146`): findings above. Two corrections to the Design: `COMPILE_ENV` is empty (the nix wrappers need
+   nothing), and `#include "/dev/zero"` is an OOM, not a time-out, so it became the OOM test and the time-out test is a
+   C++ file of ten slow `constexpr` evaluations.
+2. **`isolate_run(collect=, collect_into=)`** (`3aaef38`): `_collect_from_box`, matching over the box's own listing with
+   `fnmatchcase`; bare patterns only (`/`, `..`, NUL are a `ValueError`); `O_NOFOLLOW | O_NONBLOCK` and `fstat` on the
+   descriptor; `_stdout`/`_stderr` refused; total over `fsize_kb` raises `RuntimeError` before anything is written.
+   Added in review: the destination is opened `O_NOFOLLOW` too, and the copy keeps execute bits but drops setuid and
+   group/world write (`0o755 | 0o600`). Seven tests.
+3. **`Language.compile` in a box** (`5e377ed`): the `COMPILE_*` constants beside the evaluator's, read at call time;
+   box-relative placeholders; `_compile_artifacts` beside `_run_artifacts`. Outcome order `TO`, `oom`, `RE`, `SG`/`XX`
+   (`XX` logged at `error`), then a missing artifact; the judge's reason is appended to the compiler's stderr, which is
+   where both `run_submission` and `prepare_evaluator` already show it, so neither caller changed. No existing test
+   needed changing. Two tests: no artifact (`-fsyntax-only`), OOM.
+4. **Tests for the hole** (`db60897`): six integration tests through `run_submission`, as listed in step 4; the
+   time-out one patches `COMPILE_TIME_LIMIT_S` to 2 s and a 2-box pool, passes in about 3 s, 3/3 runs.
+5. **Docs** (`1e694bd`): `DESIGN.md`, `.claude/rules/judge.md` (collect in layer 2, "in a box" in layer 3, a compile
+   budget paragraph, the "nothing runs or is read on the host" convention, and a note that a host whose isolate config
+   binds `/etc` reopens the hole), `isolate_run`'s docstring. `CLAUDE.md` needed nothing.
+6. **Audit**: `cocco-dev` only (9 submissions, all python; no uploaded evaluators; 617 exercise job sources): no hits.
+   **Not done for any other database** — run the step 6 queries against production before deploying.
+7. **C exercises plan** (`83f0083`): its in-box compile design and environment spike now point here; it reuses the
+   `COMPILE_*` budget instead of `EXERCISE_COMPILE_*`, and keeps its own `RunOutcome.exitsig` step and the run-side
+   spike (signal deaths, `SIGXFSZ`, the harness link).
+
+Left open: the deployment note on isolate's config (what a box can see is isolate's, not cocco's), if deployment notes
+ever exist.
