@@ -40,11 +40,13 @@ Python is hardwired everywhere else:
 | `exercise.jinja`, `f-exercise-drill-in.jinja`, `exercise-projector.jinja` | `highlight("python")` |
 | `f-exercise-job.jinja` | "traceback" wording, `error_hint(type, line)` |
 
-And one thing that matters more for C than it did for challenges: **`Language.compile` runs the compiler on the
-judge host, outside isolate.** For a challenge that is one upload at a time from an enrolled student. For an
-exercise it is every Check of every student in a room, on code typed a minute ago, and the diagnostics go straight
-back to the student. `#include "/etc/passwd"` (or any file the judge user can read) compiles to an error message
-that quotes the file's first lines. Exercises must not compile on the host.
+And one thing that matters more for C than it did for challenges: a compiler opens whatever the source names, so
+compiling on the judge host leaks files (`#include "/etc/passwd"` quotes them in the diagnostics). For an exercise
+that is every Check of every student in a room, on code typed a minute ago, with the diagnostics going straight
+back to the student. **That hole is closed for challenges by `2026-10-23-compile-inside-isolate.md`, which has
+landed** (`5e377ed`, `3aaef38`): `isolate_run` can collect files back out of a box and `Language.compile` runs in
+one. This plan does not introduce that mechanism; it uses it. Exercises must not compile on the host, and `CRunner`
+compiles through `isolate_run` as below.
 
 ## Design decisions
 
@@ -97,23 +99,43 @@ of `languages.toml` but carries its own flags (below), because an exercise wants
 
 ### C compiles inside an isolate box
 
-`CRunner.prepare` calls `isolate_run` with the gcc runtime's `gcc` as the executable, `main.c` (and `harness.c`,
-below) as `box_files`, and the flags as arguments. The box sees `/nix/store` (already `--dir`) and nothing of the
-host, so `#include "/etc/passwd"` is "no such file". Diagnostics are reported against `main.c`, the name the
-student knows, because the box is gcc's working directory.
+`CRunner.prepare` calls `isolate_run` (the primitive that landed with the compile-in-isolate plan; read its
+docstring and "Spike findings (step 1)" there rather than anything restated here) with the gcc runtime's `gcc`
+(`resolve_runtime`) as the executable, `main.c` and `harness.c` (below) as `box_files`, the flags as arguments, and
+`collect=["main"]`, `collect_into=<the preparation's subdirectory of the job's workdir>`. The box is gcc's working
+directory, so diagnostics say `main.c:LINE`, the name the student knows, and `#include "/etc/passwd"` is "no such
+file".
 
-`isolate_run` today hands back stdout and stderr only, and cleans the box. It gains one explicit parameter,
-`collect: list[str]`: box-relative names copied out to a directory the caller passes before `_cleanup_box`. Named,
-never guessed, in keeping with `c85a93d` and the docstring that forbids guessing. A name the program did not
-produce is simply absent, which is how `prepare` sees a failed link.
+What landed, and where it differs from what this plan first assumed:
 
-Limits for the compile, as module constants beside `EXERCISE_MEM_LIMIT_KB`: `EXERCISE_COMPILE_TIME_S = 10`,
-`EXERCISE_COMPILE_MEM_KB = 512 * 1024`, `EXERCISE_COMPILE_PROCESSES = 8` (gcc runs `cc1`, `as`, `collect2`, `ld`),
-and the same `fsize`. A compile that times out or runs out of memory is a `CompileFailure` with that message, not a
-judge error: a student can write a header that takes the compiler forever.
+- The parameter is `collect: List[str] | None` plus a required-with-it `collect_into: Path`, and the entries are
+  **top-level glob patterns**, not bare names (`"main"` is a pattern that happens to match one file). A `/` or `..`
+  in one is a `ValueError`.
+- Only regular files come out and none is followed: a symlink named `main` is skipped and logged, not copied. A
+  program that leaves `main` as a symlink therefore looks the same as a failed link: absent.
+- Collection is over `fsize_kb`: more collected bytes than that is a **`RuntimeError`** (a judge error), not a
+  truncation. With `COMPILE_FSIZE_KB` the binary cannot reach it on its own, but `prepare` must not turn that
+  `RuntimeError` into a `CompileFailure`.
+- Absent is not an error: `prepare` sees a failed compile as `main` not being in `collect_into`, decided together
+  with the status.
+- `RunOutcome` has **no `exitsig` yet**; step 2 below adds it for the run side.
 
-The nix gcc is a wrapper script that may want `PATH` or `NIX_*` variables isolate does not pass. **Step 1 is a
-spike that settles this** before anything is built on it.
+**Limits and outcome mapping are the challenge compile's, reused.** The compile budget is `COMPILE_TIME_LIMIT_S`
+(10 s CPU), `COMPILE_MEM_LIMIT_KB` (1 GB), `COMPILE_PROCESSES` (16) and `COMPILE_FSIZE_KB` (64 MB), with
+`COMPILE_ENV` (empty) as the environment; there are no `EXERCISE_COMPILE_*` constants. The compile plan's spike
+found gcc needs 4 processes and a few hundred MB at most, so this plan's earlier smaller numbers (8 processes,
+512 MB) would be a tuning for a cost that is not there, and a second set of constants is a second place for the two
+paths to disagree; an exercise compile is no cheaper to sandbox than a challenge one. Revisit only on a concrete
+reason (none is known): if exercises ever need a shorter budget, say so here with the reason, as a constant defined
+beside `COMPILE_*`. The nix gcc needs no environment and no `-pipe` (spike). The outcome order is the compile
+plan's: `TO`, then `oom` (before the status, since gcc reports an OOM-killed `cc1` as `RE`), then `RE`, then
+`SG` / `XX`, then a missing artifact; each of those is a `CompileFailure` whose message is the compiler's stderr
+plus the reason, the same wording as `Language.compile` (`COMPILE_TIME_LIMIT_S` etc. are read at call time, so tests
+patch them). `XX` is also logged at `error`. A student can write a header that takes the compiler forever; that is a
+`CompileFailure`, not a judge error. Whether to call `Language.compile` itself rather than `isolate_run` is for
+step 6 to decide: it already does all of the above for `c`, but its flags are the challenge's, and `CRunner` wants
+its own and two sources, so expect to call `isolate_run` and reuse only the mapping (factor it out of
+`Language.compile` if copying it would be the alternative).
 
 Flags: `-std=c17 -Og -Wall -Wextra -fdiagnostics-color=never -o main main.c harness.c -lm`. `-Og` rather than `-O2` so that undefined behaviour in a beginner's loop is less likely to be
 "optimized" into something nobody can explain on a projector, while keeping the warnings that need optimization
@@ -242,11 +264,15 @@ challenge judge path, `Language`, `languages.toml`: untouched.
 
 Each step leaves the suite green. The integration ones need isolate and nix.
 
-1. **Spike: gcc inside a box.** A throwaway test calling `isolate_run` with the nix gcc on a hello-world, to learn
-   what environment and process count the wrapper needs, and how isolate reports `SIGXFSZ` and `exitsig` in meta.
-   Record the answers in this plan before step 3.
-2. **`isolate_run(collect=…)` and `RunOutcome.exitsig`.** Unit-tested on a box that writes a file; a test that a
-   name not produced is absent and that nothing else is copied out.
+1. **Spike, reduced to what is exercise-specific.** The environment, process and memory questions for gcc in a box
+   are answered in the compile plan's "Spike findings (step 1)" (empty environment, 4 processes, `/tmp` fine). What
+   remains is the run side: how isolate reports a signal death and `SIGXFSZ` in `--meta` for a C binary (the
+   `exitsig` field; the compile spike saw `status:SG`, `exitsig:9` for an OOM-killed javac), whether `-Og` with
+   `-Wall -Wextra` and `harness.c` links under the real flags, and what `-lm` costs. A throwaway test; record the
+   answers in this plan before step 3.
+2. **`RunOutcome.exitsig`.** `isolate_run(collect=…)` already exists; this step only reads `exitsig` from the meta
+   file into `RunOutcome` (an optional field with a default, so the existing constructions are untouched).
+   Unit-tested on synthetic meta.
 3. **`format.py`: `language:`, the C fence prefix, signal names in `error`.** Tests in `test_exercise_format.py`:
    default is python, unknown language is an error listing both, `python solution` in a C file is an error, a bad
    signal name is an error, `linguaggio` names `language`. Update the module docstring.
@@ -255,7 +281,7 @@ Each step leaves the suite green. The integration ones need isolate and nix.
 5. **Runner interface, Python only.** Move `run_in_harness` / `read_execution` behind `PythonRunner`; switch
    `check_exercise`, `run_exercise_job`, `build_exercise`, `build_version` to it. A pure refactor: the existing
    `test_exercise_judge.py` must pass untouched.
-6. **`CRunner` and `harness.c`.** Compile in a box, run, `read_native_execution`. Unit tests on synthetic
+6. **`CRunner` and `harness.c`.** Compile in a box (`isolate_run(collect=["main"], …)` with the `COMPILE_*` budget), run, `read_native_execution`. Unit tests on synthetic
    `RunOutcome`s for every row of the table. Integration tests: hello world passes; a compile error is a check with
    `tests=[]` and diagnostics naming `main.c:LINE`; warnings survive a successful compile; segfault after printing
    keeps the printed lines (the constructor); `error: SIGFPE` passes on `1/0`; a failed `assert` is `SIGABRT` with
@@ -284,6 +310,4 @@ Each step leaves the suite green. The integration ones need isolate and nix.
   time, needs the memory limit revisited, and changes what a "signal" is. Worth a follow-up plan once the base works.
 - **C++.** With the runner interface, `cpp` is a third value sharing `CRunner` with different flags and a different
   source name. Deliberately left out so this plan stays one language.
-- **Compile on the host for challenges.** The `#include` leak applies to challenge uploads too, wherever compiler
-  output is shown to the student. Out of scope here, but `isolate_run(collect=…)` is the piece that fix would need;
-  it belongs beside `2026-10-17-judge-guessing-of-filenames.md`.
+- **Compile on the host for challenges.** Settled elsewhere: `2026-10-23-compile-inside-isolate.md` has landed.
