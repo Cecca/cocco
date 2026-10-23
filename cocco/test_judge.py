@@ -1221,3 +1221,161 @@ async def test_collect_refuses_patterns_that_could_leave_the_box(tmp_path):
             await cj.isolate_run(python, None, [], collect=[bad], collect_into=tmp_path)
     with pytest.raises(ValueError):
         await cj.isolate_run(python, None, [], collect=["x"])
+
+
+# The compiler runs in a box, so what a source asks it to read is the box's
+# files, never the judge's. Each test goes through `run_submission` and looks
+# at everything a student would be shown.
+
+
+async def _run_hole(
+    language: str, filename: str, source: str, evaluator: tuple[str, str] | None = None
+):
+    import cocco.schema as cs
+
+    storage = Storage(Path("/tmp/cocco-storage"))
+    storage.write("test-hole/stdin.txt", "")
+    storage.write("test-hole/expected.txt", "")
+    run_data = cs.SubmissionRunData(
+        submission_id=1,
+        language=language,
+        filename=filename,
+        source=source,
+        max_threads=1,
+        max_memory_bytes=256 * 1024 * 1024,
+        max_time_s=10.0,
+        test_cases=[
+            cs.TestCase(
+                execution_order=0,
+                input_path="test-hole/stdin.txt",
+                expected_output_path="test-hole/expected.txt",
+            )
+        ],
+        evaluator_path=(
+            _write_evaluator(storage, *evaluator) if evaluator else None
+        ),
+    )
+    return await cj.run_submission(storage, run_data)
+
+
+def _everything_shown(res) -> str:
+    return "\n".join(
+        str(v)
+        for o in res
+        for v in (o.message, getattr(o, "stdout", None), getattr(o, "stderr", None))
+    )
+
+
+def _host_passwd_line() -> str:
+    passwd = Path("/etc/passwd")
+    if not passwd.exists():
+        pytest.skip("the host has no /etc/passwd")
+    return passwd.read_text().splitlines()[0]
+
+
+@pytest.mark.integration
+async def test_a_c_include_of_a_host_file_does_not_compile():
+    import cocco.schema as cs
+
+    line = _host_passwd_line()
+    res = await _run_hole(
+        "c", "hole.c", '#include "/etc/passwd"\nint main() { return 0; }\n'
+    )
+    assert res[0].outcome == cs.OutcomeEnum.compile_failure
+    assert line not in _everything_shown(res)
+
+
+@pytest.mark.integration
+async def test_a_c_incbin_of_a_host_file_does_not_leak():
+    import cocco.schema as cs
+
+    line = _host_passwd_line()
+    res = await _run_hole(
+        "c",
+        "hole.c",
+        textwrap.dedent("""\
+        #include <stdio.h>
+        __asm__(".globl leaked\\nleaked:\\n.incbin \\"/etc/passwd\\"\\n.byte 0");
+        extern const char leaked[];
+        int main() { puts(leaked); return 0; }
+        """),
+    )
+    assert res[0].outcome == cs.OutcomeEnum.compile_failure
+    assert line not in _everything_shown(res)
+
+
+@pytest.mark.integration
+async def test_a_cpp_include_of_proc_environ_shows_nothing_of_the_judges(monkeypatch):
+    monkeypatch.setenv("COCCO_TEST_MARKER", "marker-7f3a91c2")
+    res = await _run_hole(
+        "cpp",
+        "hole.cpp",
+        textwrap.dedent("""\
+        #include <cstdio>
+        static const char env[] = {
+        #include "/proc/self/environ"
+        , 0 };
+        int main() { fwrite(env, 1, sizeof env, stdout); return 0; }
+        """),
+    )
+    assert "marker-7f3a91c2" not in _everything_shown(res)
+
+
+@pytest.mark.integration
+async def test_javac_does_not_read_the_judges_working_directory(tmp_path, monkeypatch):
+    import cocco.schema as cs
+
+    (tmp_path / "Secret.java").write_text("public class Secret { static int n = 1; }\n")
+    monkeypatch.chdir(tmp_path)
+    res = await _run_hole(
+        "java",
+        "Main.java",
+        textwrap.dedent("""\
+        public class Main {
+            public static void main(String[] args) { System.out.println(Secret.n); }
+        }
+        """),
+    )
+    assert res[0].outcome == cs.OutcomeEnum.compile_failure
+
+
+@pytest.mark.integration
+async def test_a_compile_that_does_not_finish_is_a_compile_failure(monkeypatch):
+    import cocco.schema as cs
+
+    # Each constant runs gcc's constexpr evaluator to its own ops limit (about
+    # 3.4 s), so the compile as a whole outlasts the patched budget.
+    constants = "\n".join(
+        f"constexpr long long v{n} = f({n});" for n in range(10)
+    )
+    source = textwrap.dedent("""\
+        constexpr long long f(long long k) {
+            long long s = 0;
+            for (long long a = 0; a < 4000; a++)
+                for (long long b = 0; b < 1500; b++)
+                    s += (a ^ b ^ k) & 3;
+            return s;
+        }
+        """) + constants + "\nint main() { return 0; }\n"
+    pool = cj.BoxPool(2)
+    monkeypatch.setattr(cj, "_IDS_POOL", pool)
+    monkeypatch.setattr(cj, "COMPILE_TIME_LIMIT_S", 2.0)
+    res = await asyncio.wait_for(_run_hole("cpp", "hole.cpp", source), 30)
+    assert res[0].outcome == cs.OutcomeEnum.compile_failure
+    assert "took longer than 2 s" in (res[0].message or "")
+    assert pool._queue.qsize() == 2
+
+
+@pytest.mark.integration
+async def test_an_evaluator_that_includes_a_host_file_is_an_evaluator_error():
+    import cocco.schema as cs
+
+    line = _host_passwd_line()
+    res = await _run_hole(
+        "python",
+        "solution.py",
+        "print('hi')",
+        evaluator=("leaky.c", '#include "/etc/passwd"\nint main() { return 0; }\n'),
+    )
+    assert res[0].outcome == cs.OutcomeEnum.evaluator_error
+    assert line not in _everything_shown(res)
