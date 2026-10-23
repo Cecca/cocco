@@ -644,7 +644,9 @@ class Language:
       `binary` is the compiler, `run_binary` is the VM used at execution time
       with args from `run_args`.
 
-    Compile-time placeholders: `{source}`, `{output}`, `{workdir}`.
+    Compiling happens in its own isolate box (see `compile`), so the
+    compile-time placeholders `{source}`, `{output}` and `{workdir}` are
+    box-relative: basenames, and `.` for the working directory.
     Run-time placeholders: `{executable}`, `{workdir}`, `{name}`.
     """
 
@@ -663,41 +665,84 @@ class Language:
         return self.interpreter is not None
 
     async def compile(self, source: Path, workdir: Path) -> CompileOutcome:
+        """Compile `source` in its own isolate box and collect the artifacts
+        into `workdir`. A failure of any kind is a failed `CompileOutcome`, never
+        a `timeout` / `out_of_memory` verdict: those judge a student's program."""
         if self.compiler is None:
             logger.debug("language %s is interpreted, skipping compilation", self.name)
             return CompileOutcome(executable=source, success=True)
         compiler = await resolve_runtime(self.runtime, self.compiler)
         output = workdir / (source.stem + self.output_ext)
-        fmt_args = [
-            a.format(source=str(source), output=str(output), workdir=str(workdir))
-            for a in self.compiler_args
-        ]
+        # Box-relative, like `run`'s: the box is the compiler's working
+        # directory, which is also why diagnostics name `hello.c` and not the
+        # judge's temp dir.
+        fmt = dict(source=source.name, output=output.name, workdir=".")
+        fmt_args = [a.format(**fmt) for a in self.compiler_args]
         logger.info("compiling %s with %s", source, self.name)
-        proc = await asyncio.create_subprocess_exec(
-            str(compiler),
-            *fmt_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        # The module constants are read here, at call time, so a test can patch
+        # them.
+        res = await isolate_run(
+            compiler,
+            None,
+            fmt_args,
+            time_limit=COMPILE_TIME_LIMIT_S,
+            mem_limit_kb=COMPILE_MEM_LIMIT_KB,
+            processes=COMPILE_PROCESSES + self.additional_processes,
+            fsize_kb=COMPILE_FSIZE_KB,
+            env=COMPILE_ENV,
+            box_files={source.name: source},
+            collect=self._compile_artifacts(source),
+            collect_into=workdir,
         )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode == 0:
+
+        # Why it failed, in the judge's words; None when it did not fail. The
+        # order is the spike's: an OOM is `RE` when gcc survives its killed
+        # `cc1` and `SG` when javac is the victim, so `oom` is tested before
+        # the status.
+        problem: str | None = None
+        if res.status == "TO":
+            problem = f"compilation took longer than {COMPILE_TIME_LIMIT_S:g} s"
+        elif res.oom:
+            problem = (
+                "compilation ran out of memory "
+                f"(limit {COMPILE_MEM_LIMIT_KB // 1024} MB)"
+            )
+        elif res.status == "RE":
+            problem = ""  # the compiler's own output says it all
+        elif res.status != "OK":
+            problem = res.message or res.status
+            if res.status not in ("SG",):
+                logger.error(
+                    "compilation of %s: isolate status %s: %s",
+                    source,
+                    res.status,
+                    res.message,
+                )
+        elif not output.is_file():
+            problem = f"the compiler produced no {output.name}"
+
+        if problem is None:
             logger.debug("compilation of %s succeeded -> %s", source, output)
             return CompileOutcome(
-                executable=output,
-                success=True,
-                stdout=stdout.decode(),
-                stderr=stderr.decode(),
+                executable=output, success=True, stdout=res.stdout, stderr=res.stderr
             )
-        else:
-            logger.info(
-                "compilation of %s failed (rc=%s)", source, proc.returncode
-            )
-            return CompileOutcome(
-                executable=None,
-                success=False,
-                stdout=stdout.decode(),
-                stderr=stderr.decode(),
-            )
+        logger.info("compilation of %s failed (%s)", source, problem or "rc != 0")
+        stderr = "\n".join(p for p in (res.stderr.rstrip("\n"), problem) if p)
+        return CompileOutcome(
+            executable=None, success=False, stdout=res.stdout, stderr=stderr
+        )
+
+    def _compile_artifacts(self, source: Path) -> List[str]:
+        """What to collect from the compiler's box, as `isolate_run` patterns.
+
+        The same reasoning as `_run_artifacts`: `javac` writes one `.class` per
+        class and only it knows which, so a compiled + VM language collects
+        `*<output_ext>`; anything else has the one output named after the
+        source.
+        """
+        if self.interpreter is not None and self.output_ext:
+            return ["*" + self.output_ext]
+        return [source.stem + self.output_ext]
 
     def _run_artifacts(self, executable: Path) -> List[Path]:
         """Everything the run needs in the box beside the entry point.
@@ -852,6 +897,18 @@ def language_for_filename(
 # widen the *students'* limits to get their checker to finish.
 EVALUATOR_TIME_LIMIT_S = 10.0
 EVALUATOR_MEM_LIMIT_KB = 1024 * 1024  # 1 GB
+
+# The compiler's budget, for the same reason as the evaluator's and fixed here
+# too: a teacher must not raise the students' run limits to make compilation
+# fit, and a student must not get a bigger compile budget by asking for one.
+COMPILE_TIME_LIMIT_S = 10.0
+COMPILE_MEM_LIMIT_KB = 1024 * 1024  # 1 GB: javac is a JVM, gcc -O2 needs hundreds of MB
+COMPILE_PROCESSES = 16  # cc1, as, collect2, ld; plus the language's additional_processes
+COMPILE_FSIZE_KB = 64 * 1024  # the binary and the diagnostics; stops endless writes
+# Empty on purpose: the nix gcc/g++/javac need nothing beyond isolate's own
+# environment (spike). It must never become the judge's own environment, which
+# is exactly the `/proc/self/environ` leak compiling in a box closes.
+COMPILE_ENV: Dict[str, str] = {}
 
 # The names the evaluator's three arguments take inside the box. The leading
 # dot is what makes them safe: `safe_filename` strips leading dots, so no

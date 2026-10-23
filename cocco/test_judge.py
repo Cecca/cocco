@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import dataclasses
 import gzip
 import tempfile
 import textwrap
@@ -147,6 +148,30 @@ async def test_language_c():
         assert exe.success and exe.executable is not None
         res = await c.run(exe.executable, stdin_path)
     assert res.stdout.strip() == "hello moon"
+
+
+@pytest.mark.integration
+async def test_compile_without_artifact_is_a_failure(tmp_path):
+    # A compiler that succeeds but writes no `{output}` is never silent.
+    c = cj.load_languages()["c"]
+    no_output = dataclasses.replace(c, compiler_args=["-fsyntax-only", "{source}"])
+    src = tmp_path / "hello.c"
+    src.write_text("int main(void) { return 0; }\n")
+    res = await no_output.compile(src, tmp_path)
+    assert not res.success and res.executable is None
+    assert "the compiler produced no hello" in res.stderr
+
+
+@pytest.mark.integration
+async def test_compile_out_of_memory_is_a_compile_failure(tmp_path):
+    # `#include "/dev/zero"` makes cc1 read until the cgroup limit: an OOM that
+    # gcc reports as a plain `RE`, which must still be recognised.
+    c = cj.load_languages()["c"]
+    src = tmp_path / "hello.c"
+    src.write_text('const char d[] = {\n#include "/dev/zero"\n};\nint main(void) { return 0; }\n')
+    res = await c.compile(src, tmp_path)
+    assert not res.success and res.executable is None
+    assert "compilation ran out of memory (limit 1024 MB)" in res.stderr
 
 
 @pytest.mark.integration
