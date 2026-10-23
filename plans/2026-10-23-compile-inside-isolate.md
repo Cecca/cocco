@@ -148,6 +148,75 @@ still at most one box per worker at a time, since a worker compiles *or* runs. T
 `--init` / `--cleanup` per submission (and one per evaluator), tens of milliseconds against a compile that takes
 hundreds. Measure it in the spike, but it does not change the design.
 
+## Spike findings (step 1)
+
+Run by hand with `isolate --cg --box-id=90 …`, `--dir=/nix/store`, the source copied into the box, the box as cwd, the
+Design's limits (`--time=10 --wall-time=21 --cg-mem=1048576`, `--fsize=65536` where noted). Runtimes from the prewarm
+paths: gcc-wrapper-15.2.0 (so `#embed` exists), openjdk-21. isolate 2.5; the host is 16 threads. Scripts were throwaway.
+
+**The design holds; the one open question resolves to "no environment needed".**
+
+- **`COMPILE_ENV` is empty**, i.e. `env=None`, nothing passed. gcc, g++ and javac compile hello-world (javac with a
+  `Main$Helper` inner class, both `.class` files appear) with isolate's own default environment, which is the single
+  variable `LIBC_FATAL_STDERR_=1` (read back from `/proc/self/environ` in the box). The nix `gcc`/`g++` are bash scripts
+  whose shebang and `as`/`ld`/`cc1` paths are absolute store paths, and they set their own PATH; javac finds its JVM by
+  its own path. No `PATH`, `TMPDIR`, `HOME` or `NIX_*` is needed, so there is nothing to derive from the resolved
+  runtime and nothing that could be copied from the host. Keep it that way: `COMPILE_ENV` should not be a constant to
+  maintain, and `/proc/self/environ` then holds only isolate's own line. Drop the "`PATH` is built from the runtime's
+  store paths" fallback from the Design unless a later nix bump needs it (the step 3 tests will say).
+- **Process counts** (`--processes=N`, smallest that works): gcc 4 (3 fails in `ld`, 2 in `collect2`), g++ 4, javac
+  about 32 (below 16 the VM does not start; 20 and 24 compile but print `Failed to create worker thread` GC warnings;
+  32, 48, 64 are clean). The JVM's thread count follows the host's core count, so it is not a constant of the language.
+  `COMPILE_PROCESSES = 16` plus java's `additional_processes = 64` (= 80) is ample for all three; 16 alone would
+  **not** start javac, so the `+ self.additional_processes` in the Design is load-bearing.
+- **javac memory**: starts and finishes at `--cg-mem=1048576` with no flag (peak cgroup memory about 60 MB for hello
+  world; it still compiles at `--cg-mem=131072`, the JVM sizes its heap from the cgroup). **No `-J-Xmx…` and no
+  `languages.toml` change.** A 940 KB generated `Big.java` (20 000 methods) ends as `TO` at 10 s with 215 MB, not OOM.
+  At a 64 MB limit the OOM shows as `status:SG`, `exitsig:9`, `cg-oom-killed:1`.
+- **`/tmp`**: gcc does use it (`as -o /tmp/cc….o /tmp/cc….s`). isolate's default per-box `/tmp` (a private, initially
+  empty directory) is enough, with `TMPDIR` unset; a bogus `TMPDIR` falls back to `/tmp` anyway. `-pipe` is not needed.
+  Diagnostics from the assembler name `/tmp/ccXXXX.s`, the box's own, which leaks nothing. `--fsize` bounds each file,
+  not the directory.
+- **The hole is closed**, inside the box: `#include "/etc/passwd"` → `fatal error: /etc/passwd: No such file or
+  directory`; `#embed "/etc/passwd"` the same; `__asm__(".incbin \"/etc/passwd\"")` → `Error: file not found:
+  /etc/passwd`; C++ `#include "/proc/self/environ"` compiles and contributes nothing of the judge's (the box process's
+  own environ); javac with a `Secret.java` in the *host's* cwd → `cannot find symbol` (its cwd is `/box`). Caveat: what
+  the box sees comes from **isolate's config** (here `/bin /dev /lib /lib64 /usr /proc /tmp /nix /box`, no `/etc`).
+  A host whose isolate config also binds `/etc` would make `/etc/passwd` readable, which step 4's test (it compares
+  against the host's real `/etc/passwd`) catches; worth a line in the deployment notes.
+- **No network**: the box has its own network namespace with only `lo` (`/proc/net/dev`). A `connect()` to a listener
+  on the host's `127.0.0.1` gets `Connection refused`, and to `8.8.8.8` `Network is unreachable`.
+- **`/dev` is the host's `/dev`, and `/dev/zero` is there** (with `null`, `full`, `urandom`, `random`; `mem` is not
+  readable by the box uid). But **`#include "/dev/zero"` is an OOM test, not a time-out test**: gcc reads it into
+  memory until the cgroup limit, in 0.3 s, `status:RE`, `exitcode:1`, `cg-oom-killed:1`, stderr `gcc: fatal error:
+  Killed signal terminated program cc1`. The same with `const char d[]={ #include "/dev/zero" };`. `--fsize` plays no
+  part. Template bombs also end as OOM (T<100,100,100>) or hit gcc's depth limit (900). A single `constexpr` loop is
+  stopped by gcc itself (`-fconstexpr-loop-limit` 262144, `-fconstexpr-ops-limit` 33554432, about 3.4 s per
+  evaluation), so it ends as a plain compile error.
+- **Recommendation for step 4's time-out test**: a C++ file with ten `constexpr long long vN = f(N);` using a nested
+  loop (`for a < 4000, for b < 1500, s += (a ^ b ^ k) & 3`), each stopping at the ops limit after about 3.4 s; the
+  whole compile ends as `status:TO`, `message:Time limit exceeded`, `time:10.07` in both runs, reliably. It costs the
+  full 10 s, so the test should `monkeypatch` `COMPILE_TIME_LIMIT_S` down rather than wait (not measured at a lower limit: check that a single constant, 3.4 s, is then enough). Keep `#include "/dev/zero"` as the **OOM** test (`cg-oom-killed`, 0.3 s, cheap). javac's
+  `Big.java` above is a Java time-out if one is wanted, but it is a 1 MB file.
+- **`--meta`** (the fields `isolate_run` reads: `status` absent means OK, `exitcode`, `cg-oom-killed`):
+
+  | Case | `status` | `exitcode` / `exitsig` | `cg-oom-killed` | `message` |
+  | --- | --- | --- | --- | --- |
+  | success | (absent) | `exitcode:0` | (absent) | (absent) |
+  | compile error (gcc or javac) | `RE` | `exitcode:1` | (absent) | `Exited with error status 1` |
+  | time-out | `TO` | (none) | (absent) | `Time limit exceeded` |
+  | OOM, gcc | `RE` | `exitcode:1` | `1` | `Exited with error status 1` |
+  | OOM, javac | `SG` | `exitsig:9` | `1` | `Caught fatal signal 9` |
+
+  So an OOM is **not** a distinct status: it is `RE` when the driver (`gcc`) survives its killed `cc1` and reports it,
+  `SG` when the top process is the victim. `compile` must test `oom` **before** it looks at `status`, which is what
+  `_classify_isolate_failure` already does for runs. The failed-compile `status:RE` is also what a gcc OOM looks like,
+  so the order matters: `TO`, then `oom`, then `RE`/`SG`.
+- **Overhead**: one `--init` is 3 to 6 ms and one `--cleanup` 2 to 7 ms, about 10 ms per box. Compile wall time in the
+  box against the host: C 70 to 90 ms against 90 to 100; C++ 250 ms against 270 to 280; javac 260 to 310 ms against
+  270 to 290 (the very first javac after a build was 770 ms, a cold cache). No measurable cost of the box; the
+  per-submission overhead is the pair above, once.
+
 ## Steps
 
 1. **Spike** (throwaway script, not committed): run `gcc`, `g++` and `javac` from the prewarmed runtimes through
