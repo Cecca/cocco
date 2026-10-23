@@ -28,7 +28,7 @@ Isolate requires a setuid binary. On NixOS this is declared via `security.wrappe
 ## Execution flow
 
 For **compiled languages** (C, C++, Java, ...):
-1. Compile outside the sandbox (trusted operation on untrusted source).
+1. Compile in its own isolate box, and collect the artifacts back out. Compiling is not a trusted operation: a compiler reads whatever the source names (`#include "/etc/passwd"`, `.incbin`, `#embed`, javac's `.` class path), and the diagnostics or the binary would hand it back.
 2. Run the resulting binary inside isolate.
 
 For **interpreted languages** (Python, ...):

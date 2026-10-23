@@ -387,7 +387,9 @@ async def isolate_run(
     refused even when a pattern matches them. A pattern is a bare name
     pattern: one with a `/` or a `..` is a `ValueError`, and matching is over
     the directory's own listing, so a match cannot be anything but a direct
-    child of the box. The total is checked against `fsize_kb` once more rather
+    child of the box. A copy keeps the execute bits (an executable that comes
+    out must still be one) but drops setuid and group/world write, and the
+    destination is opened with `O_NOFOLLOW` too. The total is checked against `fsize_kb` once more rather
     than trusting that it applied, and exceeding it raises `RuntimeError`
     instead of truncating: a cut-off binary is a mystery, a refusal says why.
     A pattern that matches nothing is not an error (a compiler that failed
