@@ -1110,3 +1110,89 @@ async def test_a_cancelled_run_cleans_its_box_up():
                 10,
             )
     assert res.stdout.strip() == "again"
+
+
+_COLLECT_PROGRAM = textwrap.dedent("""\
+    import os
+    open("main", "w").write("binary")
+    open("A.class", "w").write("a")
+    open("B$Inner.class", "w").write("b")
+    open("other.txt", "w").write("other")
+    print("printed")
+""")
+
+
+async def _collect_run(tmp: Path, program: str, collect: list[str], **kwargs):
+    python = await cj.resolve_runtime("python3", "python")
+    script = tmp / "prog.py"
+    script.write_text(program)
+    out = tmp / "out"
+    res = await cj.isolate_run(
+        python, None, ["prog.py"], box_files={"prog.py": script},
+        collect=collect, collect_into=out, **kwargs,
+    )
+    return res, out
+
+
+def _collected(out: Path) -> set[str]:
+    return {p.name for p in out.iterdir()} if out.exists() else set()
+
+
+@pytest.mark.integration
+async def test_collect_copies_a_named_file_and_a_glob_and_nothing_else(tmp_path):
+    res, out = await _collect_run(tmp_path, _COLLECT_PROGRAM, ["main", "*.class"])
+    assert res.stdout.strip() == "printed"
+    assert _collected(out) == {"main", "A.class", "B$Inner.class"}
+    assert (out / "main").read_text() == "binary"
+
+
+@pytest.mark.integration
+async def test_collect_does_not_follow_a_symlink(tmp_path):
+    secret = tmp_path / "secret.txt"
+    marker = "HOST-SECRET-7f3a9c1e"
+    secret.write_text(marker)
+    program = f"import os\nos.symlink({str(secret)!r}, 'hello')\nopen('real', 'w').write('ok')\n"
+    res, out = await _collect_run(tmp_path, program, ["hello", "real"])
+    assert _collected(out) == {"real"}
+    assert all(marker not in p.read_text() for p in out.iterdir())
+
+
+@pytest.mark.integration
+async def test_collect_skips_directories_fifos_and_the_judges_own_files(tmp_path):
+    program = textwrap.dedent("""\
+        import os
+        os.mkdir("adir")
+        os.mkfifo("afifo")
+        print("loud")
+    """)
+    res, out = await _collect_run(
+        tmp_path, program, ["adir", "afifo", "_stdout", "_stderr", "_*"]
+    )
+    assert res.stdout.strip() == "loud"
+    assert _collected(out) == set()
+
+
+@pytest.mark.integration
+async def test_collect_matching_nothing_collects_nothing(tmp_path):
+    res, out = await _collect_run(tmp_path, "print('x')\n", ["nope", "*.class"])
+    assert res.status == "OK"
+    assert _collected(out) == set()
+
+
+def test_collect_over_the_size_limit_raises_rather_than_truncating(tmp_path):
+    box = tmp_path / "box"
+    box.mkdir()
+    (box / "big").write_bytes(b"x" * 2048)
+    with pytest.raises(RuntimeError, match="limit"):
+        cj._collect_from_box(box, ["big"], tmp_path / "out", 1)
+    cj._collect_from_box(box, ["big"], tmp_path / "out", 2)
+    assert (tmp_path / "out" / "big").stat().st_size == 2048
+
+
+async def test_collect_refuses_patterns_that_could_leave_the_box(tmp_path):
+    python = Path("python")
+    for bad in ["../x", "a/b", "..", "/etc/passwd"]:
+        with pytest.raises(ValueError):
+            await cj.isolate_run(python, None, [], collect=[bad], collect_into=tmp_path)
+    with pytest.raises(ValueError):
+        await cj.isolate_run(python, None, [], collect=["x"])

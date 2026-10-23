@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import errno
+import fnmatch
 import functools
 import gzip
 import json
@@ -8,6 +10,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import sys
 import tempfile
 import time
@@ -330,6 +333,8 @@ async def isolate_run(
     compressed_box_files: Dict[str, Path] | None = None,
     fsize_kb: int | None = None,
     env: Dict[str, str] | None = None,
+    collect: List[str] | None = None,
+    collect_into: Path | None = None,
 ) -> RunOutcome:
     """Run `exe` in a fresh isolate box.
 
@@ -367,7 +372,34 @@ async def isolate_run(
     writes - its stdout and stderr included, which this function then reads
     whole into memory - for a caller that knows how much output is plenty.
     `env` is set in the box, whose environment isolate otherwise empties.
+
+    `collect` is how a file comes *back out*: top-level glob patterns over the
+    box (`"main"`, `"*.class"`), matched once the run has ended and before the
+    box is cleaned up, and copied into `collect_into` under their box names.
+    The program controls everything in the box directory, so the judge, which
+    reads it on the way out as the judge's user, trusts none of it. Only
+    regular files come out and none is ever followed: each match is opened
+    with `O_NOFOLLOW | O_NONBLOCK` and the *open descriptor* is checked with
+    `fstat` and read, so a symlink `hello -> /etc/shadow` is not copied, a FIFO
+    cannot hang the open, and there is no gap between the check and the read to
+    argue about. Directories, FIFOs, devices and symlinks are skipped and
+    logged at warning; `_stdout` and `_stderr`, which are the judge's, are
+    refused even when a pattern matches them. A pattern is a bare name
+    pattern: one with a `/` or a `..` is a `ValueError`, and matching is over
+    the directory's own listing, so a match cannot be anything but a direct
+    child of the box. The total is checked against `fsize_kb` once more rather
+    than trusting that it applied, and exceeding it raises `RuntimeError`
+    instead of truncating: a cut-off binary is a mystery, a refusal says why.
+    A pattern that matches nothing is not an error (a compiler that failed
+    produces nothing; the caller decides from the status). Collection happens
+    only on the normal path, never while cleaning up after a failure, and
+    `collect` without `collect_into` is a `ValueError`.
     """
+    if collect and collect_into is None:
+        raise ValueError("collect needs collect_into")
+    for pattern in collect or []:
+        if "/" in pattern or ".." in pattern or "\0" in pattern:
+            raise ValueError(f"collect pattern {pattern!r} must be a bare name pattern")
     box_files = box_files or {}
     compressed_box_files = compressed_box_files or {}
     async with _IDS_POOL.acquire() as box_id:
@@ -495,6 +527,11 @@ async def isolate_run(
                 ret.elapsed_time_s,
                 ret.max_rss_kb,
             )
+            if collect:
+                assert collect_into is not None
+                await asyncio.to_thread(
+                    _collect_from_box, box_path, collect, collect_into, fsize_kb
+                )
         except BaseException:
             if isolate_run is not None and isolate_run.returncode is None:
                 with suppress(ProcessLookupError):
@@ -518,6 +555,62 @@ async def isolate_run(
 
         await _cleanup_box(box_id)
         return ret
+
+
+def _collect_from_box(
+    box_path: Path, patterns: List[str], into: Path, fsize_kb: int | None
+) -> None:
+    """Copy the regular files of `box_path` matching `patterns` into `into`.
+    The rules are in `isolate_run`'s docstring."""
+    names = sorted(
+        n
+        for n in os.listdir(box_path)
+        if n not in ("_stdout", "_stderr")
+        and any(fnmatch.fnmatchcase(n, p) for p in patterns)
+    )
+    opened: List[tuple[str, int, int]] = []  # name, descriptor, mode
+    total = 0
+    try:
+        for name in names:
+            try:
+                fd = os.open(
+                    box_path / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                )
+            except OSError as e:
+                # ELOOP is what O_NOFOLLOW says of a symlink.
+                kind = "a symlink" if e.errno == errno.ELOOP else f"unreadable ({e})"
+                logger.warning("not collecting %r from the box: %s", name, kind)
+                continue
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                os.close(fd)
+                logger.warning("not collecting %r from the box: not a regular file", name)
+                continue
+            opened.append((name, fd, st.st_mode))
+            total += st.st_size
+        if fsize_kb is not None and total > fsize_kb * 1024:
+            raise RuntimeError(
+                f"the box holds {total} bytes of collected files, "
+                f"over the {fsize_kb} KB limit"
+            )
+        into.mkdir(parents=True, exist_ok=True)
+        for name, fd, mode in opened:
+            # The execute bits come along, as `shutil.copy` would have them,
+            # since an executable that comes out must still be one; setuid,
+            # group or world write do not, and the judge can always read and
+            # write what it wrote. Not followed on this side either.
+            perms = (mode & 0o755) | 0o600
+            dest = os.open(
+                into / name,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                perms,
+            )
+            with os.fdopen(dest, "wb") as out, os.fdopen(fd, "rb", closefd=False) as src:
+                shutil.copyfileobj(src, out)
+                os.fchmod(out.fileno(), perms)
+    finally:
+        for _, fd, _ in opened:
+            os.close(fd)
 
 
 async def _cleanup_box(box_id: int) -> None:
