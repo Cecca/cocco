@@ -8,8 +8,10 @@ test is the web half - what an import writes, in one transaction, and what the
 pages make of what the judge wrote. The judge half is `test_exercise_judge.py`.
 """
 
+import io
 import re
 import textwrap
+import zipfile
 
 import pytest
 from sqlalchemy import func, insert, select
@@ -398,6 +400,34 @@ async def test_the_source_downloads_verbatim(client, world, db):
     assert response.headers["content-type"].startswith("text/markdown")
     assert response.headers["content-disposition"] == 'attachment; filename="warm-up-v1.md"'
     assert response.headers["x-content-type-options"] == "nosniff"
+
+
+async def test_the_skill_downloads_as_a_zip_of_its_directory(client, world):
+    response = client.get("/skills/cocco-exercises.zip")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert (
+        response.headers["content-disposition"]
+        == 'attachment; filename="cocco-exercises.zip"'
+    )
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        names = set(archive.namelist())
+        skill = archive.read("cocco-exercises/SKILL.md").decode()
+    assert {
+        "cocco-exercises/SKILL.md",
+        "cocco-exercises/examples/python.md",
+        "cocco-exercises/examples/c.md",
+    } <= names
+    assert skill.startswith("---\nname: cocco-exercises\n")
+
+
+async def test_both_import_forms_link_the_skill(client, world):
+    set_id = _imported(client, world)
+    for url in (
+        f"/courses/{world['course']}/exercises/{set_id}",
+        f"/courses/{world['course']}",
+    ):
+        assert "/skills/cocco-exercises.zip" in client.get(url).text
 
 
 async def test_a_version_of_another_set_is_not_found(client, world, db):

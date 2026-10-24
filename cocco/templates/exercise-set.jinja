@@ -104,6 +104,11 @@
         <span class="htmx-indicator loading loading-spinner loading-xs"></span>
       </button>
     </div>
+    <p class="text-xs text-base-content/55 mt-3">
+      Writing the file with an AI assistant?
+      <a href="{{ url_for('get_exercise_skill') }}" class="link">Download the exercise-writing skill</a>
+      and unzip it into its skills folder (<code>~/.claude/skills/</code> for Claude Code).
+    </p>
     <div id="exercise-set-import-result" class="empty:hidden mt-3"></div>
   </form>
 

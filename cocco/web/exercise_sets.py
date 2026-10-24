@@ -1,5 +1,7 @@
 """Exercise sets: authoring, versions, previews and the preview jobs."""
 
+import io
+import zipfile
 from pathlib import Path
 from typing import Annotated
 
@@ -51,6 +53,38 @@ MAX_EXERCISE_FILE_BYTES = 256 << 10
 # box's stdin. Each is stored on the job row and handed to a box, so each has
 # a ceiling, and it is a script's rather than test data's.
 MAX_EXERCISE_CODE_BYTES = 64 << 10
+
+# The agent skill that writes an exercise file, shipped inside the package and
+# handed out zipped under its own name, so it unzips straight into a skills
+# directory (`~/.claude/skills/`). `test_exercise_skill.py` keeps its examples
+# importable and its language list in step with `languages.toml`.
+EXERCISE_SKILL_NAME = "cocco-exercises"
+EXERCISE_SKILL_DIR = Path(__file__).resolve().parent.parent / "skills" / EXERCISE_SKILL_NAME
+
+
+@router.get("/skills/cocco-exercises.zip")
+async def get_exercise_skill(user: CurrentUser):
+    """The exercise-writing skill, as a zip of its directory.
+
+    Behind sign-in only, like every route: the format is no secret, and a
+    teacher may want it before any course of theirs exists. A few kilobytes of
+    source tree, plain on disk like the bundled evaluators, so it is built in
+    memory rather than streamed the way a stored file is.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(EXERCISE_SKILL_DIR.rglob("*")):
+            if path.is_file():
+                archive.write(
+                    path, f"{EXERCISE_SKILL_NAME}/{path.relative_to(EXERCISE_SKILL_DIR)}"
+                )
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{EXERCISE_SKILL_NAME}.zip"'
+        },
+    )
 
 
 ########################################################################
