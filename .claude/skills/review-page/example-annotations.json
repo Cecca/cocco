@@ -1,0 +1,374 @@
+{
+  "title": "Exercises in any language (C first): review",
+  "intro_html": "The staged change from <code>plans/2026-10-23-c-exercises.md</code>; <code>uv run pytest</code>: 1050 passed, integration included.",
+  "summary_html": "<p><strong>The idea.</strong> Exercises used a bundled Python harness to drop <code>input()</code> prompts, match exceptions by class\nhierarchy and report the line. That made every other language a special case. Now an exercise program runs exactly as a challenge\nsubmission does, <code>Language.compile</code> then <code>Language.run</code>, and what differs between languages is a key in\n<code>languages.toml</code> (<code>env</code>, <code>error_name</code>, <code>editor_mode</code>), not a branch in Python.</p>\n<p><strong>Behaviour changes to review</strong>: prompts are output; <code>error:</code> matches a name exactly (no subclasses);\na failure's name comes from the signal or from the language's <code>error_name</code> regex over stderr; a failed compile is a result of its own,\nnot N failing tests; a session cannot switch language. Old stored results are folded into the new shape on read: no migration.</p>\n<p><strong>Not done</strong>: <code>npm run build:css</code> (no <code>node_modules</code> here); deployed sets built by the harness may need\nprompts and base-class <code>error</code> blocks fixed before re-import. Step 1 was a spike (no code; results in the plan).</p>",
+  "groups": [
+    {
+      "id": "s2",
+      "nav": "Languages as data",
+      "heading_html": "Step 2 &middot; <code>cocco/languages.py</code>, new <code>languages.toml</code> keys"
+    },
+    {
+      "id": "s3",
+      "nav": "Exit code and signal",
+      "heading_html": "Step 3 &middot; <code>RunOutcome.exitcode</code> / <code>exitsig</code>"
+    },
+    {
+      "id": "s4",
+      "nav": "Result schema",
+      "heading_html": "Step 4 &middot; <code>error</code> replaces <code>exception</code>, <code>ExerciseCompile</code>"
+    },
+    {
+      "id": "s5",
+      "nav": "Judge without harness",
+      "heading_html": "Step 5 &middot; the two calls, <code>read_exercise_run</code>, harness deleted"
+    },
+    {
+      "id": "s6",
+      "nav": "Exercise format",
+      "heading_html": "Step 6 &middot; <code>language:</code>, fence prefixes, one-word <code>error</code>"
+    },
+    {
+      "id": "s7",
+      "nav": "C end to end",
+      "heading_html": "Step 7 &middot; integration tests only"
+    },
+    {
+      "id": "s8",
+      "nav": "Hints, redaction, switch",
+      "heading_html": "Step 8 &middot; signal hints, <code>_shown_error_name</code>, session language fixed"
+    },
+    {
+      "id": "s9",
+      "nav": "Front end and seed",
+      "heading_html": "Step 9 &middot; editor modes, compile block, badges, C seed set"
+    },
+    {
+      "id": "s10",
+      "nav": "Docs",
+      "heading_html": "Step 10 &middot; guides, DESIGN.md, the plan"
+    }
+  ],
+  "files": {
+    "cocco/languages.py": {
+      "group": "s2",
+      "comment_html": "New module holding the <em>data</em> of a <code>languages.toml</code> entry, with no execution, so\n<code>format.py</code> and the web process read names, extensions and <code>editor_mode</code> without importing the judge\n(isolate, nix, the database). <code>LanguageSpec</code> type-checks the three new optional keys on load and compiles\n<code>error_name</code> so a bad regex fails at startup, not at the first student's run.\n<p class=q>Review: <code>load_languages(path, cls=)</code> with a <code>TypeVar</code> lets the judge build its executable subclass from the same\nloader. The <code>type: ignore</code> on the default <code>cls</code> is the price of that; the alternative was a second loader.</p>",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/languages.toml": {
+      "group": "s2",
+      "comment_html": "The language-specific bits, as data:\n<ul><li><code>[python] env</code>: <code>PYTHONHASHSEED=0</code>, what the deleted <code>EXERCISE_ENV</code> did (a <code>set</code> prints in the same order\nin the solution's box and the student's). Challenges get it too; it only makes a run reproducible.</li>\n<li><code>[python] error_name</code>: the spike's adjusted regex. The name line must <em>follow an indented line</em> (a frame, source or caret\nline), so a multi-line exception message or <code>sys.exit('bye')</code> no longer yields a bogus name. Linear-time; the\n<code>(?:[ \\t]+.*\\n)+</code> variant was quadratic and hung.</li>\n<li><code>[c]</code>: <code>-Wall</code> (warnings shown collapsed in exercises; a challenge shows compiler output only on failure, checked) and\n<code>-lm</code> last, where the linker needs it (without it <code>sqrt(x)</code> fails to link; costs ~15 ms).</li>\n<li><code>editor_mode</code> on every entry, CodeMirror's mode/MIME.</li></ul>",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/judge.py": {
+      "group": "s5",
+      "comment_html": "Most of the change. Touched in steps 2, 3, 4 and 5; the notes on each hunk say which. Read in this order:\n<code>read_exercise_run</code> (the mapping table), <code>prepare_exercise_program</code> / <code>run_exercise_program</code> (the whole\nper-language surface, no <code>if language ==</code>), <code>_check_compiled</code>, <code>run_exercise_job</code>, <code>build_exercise</code>.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/test_languages.py": {
+      "group": "s2",
+      "comment_html": "Loading defaults, the bundled entries' values, the Python <code>error_name</code> on a real traceback shape, rejection of bad\ntypes/regexes, and one integration test that <code>run</code> sets the env in the box and honours <code>fsize_kb</code>.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/web/core.py": {
+      "group": "s2",
+      "comment_html": "Step 2: imports <code>load_languages</code> from <code>cocco.languages</code> (the web no longer needs the judge for this).\nStep 9: <code>editor_mode(language)</code>, the one lookup templates need; <code>\"\"</code> means plain text for a language without the key.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/test_main.py": {
+      "group": "s2",
+      "comment_html": "Import moved to <code>cocco.languages</code>.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/test_judge.py": {
+      "group": "s3",
+      "comment_html": "Synthetic meta-file parsing (clean exit, <code>RE</code> with <code>exitcode:3</code>, <code>SG</code> with <code>exitsig:11</code>) plus one\nintegration test with real Python programs dying of SIGSEGV and exiting 3.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/schema.py": {
+      "group": "s4",
+      "comment_html": "<ul><li><code>HarnessReport</code>, <code>HarnessException</code>, <code>MAX_EXCEPTION_LINE</code> gone.</li>\n<li><code>ExerciseExecution.error: str | None</code> replaces <code>exception</code>; no <code>line</code> (only the harness knew it; the\nstderr shown on visible tests names the line itself).</li>\n<li><code>_fold_old_exception</code> (<code>mode=\"before\"</code>): an old stored row's <code>exception.type</code> becomes <code>error</code> and its\ntraceback is appended to <code>stderr</code>. <strong>No migration</strong>: every old row still validates through\n<code>EXERCISE_JOB_RESULT</code>. <code>no_report</code> stays in the literal for the same reason, though nothing produces it now.</li>\n<li><code>ExerciseCompile(ok, diagnostics)</code>, optional on check and run results (None for interpreted languages and every older row).</li></ul>\n<p class=q>Review: the validator drops <code>mro</code>; old rows were graded already, so nothing re-reads it.</p>",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/exercises/harness.py": {
+      "group": "s5",
+      "comment_html": "Deleted. Every program, Python included, now runs as <code>Language.run</code> runs it.",
+      "collapsed": true,
+      "omit_diff": false
+    },
+    "cocco/test_exercise_harness.py": {
+      "group": "s5",
+      "comment_html": "Deleted with the harness.",
+      "collapsed": true,
+      "omit_diff": false
+    },
+    "cocco/exercises/__init__.py": {
+      "group": "s5",
+      "comment_html": "<code>HARNESS_PATH</code> and the paragraph about the harness go.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/test_exercise_judge.py": {
+      "group": "s5",
+      "comment_html": "Changed only where a test pinned harness semantics; everything else passes as it was:\n<ul><li>prompts: <code>test_a_prompt_is_output</code> (a prompt now fails a check; a Run shows it in stdout, stdin not echoed);</li>\n<li><code>error: ArithmeticError</code> &rarr; <code>ZeroDivisionError</code> in <code>SOURCE</code>, and a test that <code>LookupError</code> no longer matches <code>IndexError</code>;</li>\n<li><code>os._exit(0)</code> is a normal exit (the program flushes first; unflushed output is lost, as it would be anywhere);</li>\n<li>harness-report parsing tests removed; 11 unit tests on synthetic <code>RunOutcome</code>s, one per row of the mapping, including the Python flood\n(<code>RE</code>, exit 120, <code>OSError</code>, stdout at the cap &rarr; <code>truncated</code>, not <code>error=OSError</code>);</li>\n<li>old-shape stored check/run results validate (step 4), a <code>compile</code> result round-trips.</li></ul>",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/test_exercise_routes.py": {
+      "group": "s4",
+      "comment_html": "Fixtures use <code>error</code> / <code>stderr</code> instead of <code>exception</code>; step 9 drops the one prompt from <code>SOURCE</code>.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/test_exercise_student.py": {
+      "group": "s8",
+      "comment_html": "Hidden tests: the redacted row now carries <code>error</code> (a name <code>HINTS</code> knows, else <code>\"error\"</code>); a hidden SIGSEGV is shown by\nname. <code>test_a_forged_line_is_no_line</code> removed: there is no line any more.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/exercises/format.py": {
+      "group": "s6",
+      "comment_html": "<ul><li><code>language:</code> front-matter key, checked against <code>languages.toml</code> at import (a C file read as Python would\nbuild every solution into a SyntaxError, and the build is the slow place to find out). <code>linguaggio</code> joins <code>_ITALIAN</code>.</li>\n<li>Fence prefixes come from the entry: name or any extension (<code>py starter</code> still works; <code>cc solution</code> in a C++ file).</li>\n<li><code>&lt;other language&gt; &lt;role&gt;</code> (<code>python solution</code> in a C file) is an error naming the right spelling: left alone it\nwould be statement text, solution and all. A bare <code>```c</code> block stays statement text.</li>\n<li><code>error</code> block: one word, <code>[A-Za-z_][\\w.]*</code>, so <code>SIGFPE</code> and <code>json.decoder.JSONDecodeError</code> both pass.\nWhether the language can produce it is the build's to discover.</li></ul>\n<p class=q>Review: after an unknown language the parse carries on with the first entry only to avoid an error cascade; the document is\ndiscarded anyway because the problem is an error.</p>",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/test_exercise_format.py": {
+      "group": "s6",
+      "comment_html": "One test per rule above.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/test_exercise_c.py": {
+      "group": "s7",
+      "comment_html": "16 tests; <strong>no production change was needed</strong>, which is the point of this step. Check: hello world, compile error\n(<code>tests=[]</code>, <code>main.c:2</code>), warning kept with <code>ok=True</code>, <code>SIGFPE</code> (via <code>a / b</code> read from stdin:\ngcc folds <code>1/z</code> at <code>-O2</code>), timeout, flood, <code>return 3</code>, <code>#include</code> of a host file does not compile. Run:\n<code>assert</code> &rarr; <code>SIGABRT</code>, stdout shown, non-compiling run. Build: non-compiling solution is an error, starter a warning,\n<code>error: ValueError</code> in C fails naming <code>SIGSEGV</code>.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/exercises/hints.py": {
+      "group": "s8",
+      "comment_html": "Signal hints (SIGSEGV, SIGFPE, SIGABRT, SIGBUS, SIGILL, SIGXCPU); <code>error_hint</code> loses <code>line</code>.\nOne dict: names cannot collide across languages in practice.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/test_exercise_compare.py": {
+      "group": "s8",
+      "comment_html": "<code>error_hint</code> tests for the new signature, plus a signal.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/web/exercise_sets.py": {
+      "group": "s8",
+      "comment_html": "<code>_builtin_exception_name</code> &rarr; <code>_shown_error_name</code>: the name if it is a key of <code>HINTS</code>, else\n<code>\"error\"</code>. Same bound as before (a program picks its own exception or signal name, e.g. a class named after the hidden input,\nso only a fixed list is shown) and language-neutral. The redacted row now carries a plain <code>error</code> string.\nStep 9: the preview route passes <code>language</code> / <code>editor_mode</code>.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/repository/exercise_sessions.py": {
+      "group": "s8",
+      "comment_html": "<code>query_version_language</code> (coalesced to <code>python</code> for documents that predate the key), the session's\nversions CTE carries <code>language</code>, and (step 9) the sessions list and <code>query_session_job</code> select it / <code>stdin</code>.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/web/exercise_sessions.py": {
+      "group": "s8",
+      "comment_html": "The switch guard: refused when the new version's language differs from the pinned one's. The existing guards were never\none SQL statement, they are sequential reads under the session's <code>FOR UPDATE</code> lock, so the language check joins them there.\n<code>_version_switch</code> shows the same refusal on the page instead of the Switch button. Step 9: drill-in and projector pass\n<code>language</code> to <code>highlight</code>.\n<p class=q>Review: the refusal re-reads <code>query_exercise_session</code> only for the version number, as the exercise-count refusal\nbelow it already does.</p>",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/test_exercise_sessions.py": {
+      "group": "s8",
+      "comment_html": "Python-pinned session, C version imported: no switch button, the POST is 200 with the alert, the session stays put.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/static/codemirror/clike.js": {
+      "group": "s9",
+      "comment_html": "Vendored CodeMirror 5.65.16 <code>mode/clike/clike.js</code> (C, C++, Java, &hellip;), the release of the vendored\n<code>codemirror.js</code>, MIT like the rest. Byte-identical to unpkg's copy (sha256 <code>25c92495&hellip;021b</code>). Diff omitted (942 lines of upstream code).",
+      "collapsed": true,
+      "omit_diff": true
+    },
+    "cocco/static/exercise.js": {
+      "group": "s9",
+      "comment_html": "The mode comes from <code>data-mode</code>, with no mapping of its own; the Tab comment no longer pretends only Python exists.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/templates/_exercise-editor-head.jinja": {
+      "group": "s9",
+      "comment_html": "Loads every vendored mode: a few KB, no branch per page.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/templates/exercise.jinja": {
+      "group": "s9",
+      "comment_html": "<code>data-mode</code>, <code>highlight(language)</code>, and the one sentence about prompts near the Run input.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/templates/exercise-preview.jinja": {
+      "group": "s9",
+      "comment_html": "<code>data-mode</code> on the staff preview's editor.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/templates/exercise-projector.jinja": {
+      "group": "s9",
+      "comment_html": "<code>highlight(language)</code>.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/templates/f-exercise-drill-in.jinja": {
+      "group": "s9",
+      "comment_html": "<code>highlight(language)</code>.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/web/exercise_student.py": {
+      "group": "s9",
+      "comment_html": "The student page passes <code>language</code> and <code>editor_mode</code>, read from the pinned version.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/repository/exercise_sets.py": {
+      "group": "s9",
+      "comment_html": "<code>_version_language</code> (shared with sessions), on <code>_exercise_versions</code>; <code>query_preview_job</code> selects <code>stdin</code> for the Run fragment.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/templates/f-exercise-job.jinja": {
+      "group": "s9",
+      "comment_html": "Steps 4, 8 and 9:\n<ul><li><code>compile_notes</code>: a failed compile is an alert plus the diagnostics (shown in full even where tests are redacted: it is\nabout the student's own source, no stdin involved); warnings are collapsed above the tests.</li>\n<li>A failed check compile shows only that block (no \"0 of 0 passed\").</li>\n<li>\"Standard error\" &rarr; \"Error output\" (the traceback lives there now); \"Input given\" above a Run's transcript, since stdin is\nno longer echoed.</li>\n<li>Redacted rows: <code>row.error</code>, with no hint when the name is the generic <code>\"error\"</code> (avoids \"error &mdash; Error error.\").</li></ul>",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/templates/f-exercise-set.jinja": {
+      "group": "s9",
+      "comment_html": "Language badge, only once the latest version is ready (a building one has no document and would read <code>python</code>).",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/templates/_exercise-session-card.jinja": {
+      "group": "s9",
+      "comment_html": "Language badge.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/web/seed.py": {
+      "group": "s9",
+      "comment_html": "A three-exercise C set on the first course (pass with a wrong-output starter, <code>a % b</code> &rarr; <code>SIGFPE</code>,\n<code>assert</code> &rarr; <code>SIGABRT</code>), seeded as an import leaves it: a <code>building</code> version plus a build job, so it becomes\nready once a judge runs. The seed had no Python sets, so no prompts to remove.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/test_exercise_front_end.py": {
+      "group": "s9",
+      "comment_html": "13 route tests: C/Python pages load <code>clike.js</code> and carry the right <code>data-mode</code>; failed compile and warnings\nrender; a pre-change stored Python result renders (name and traceback); Run shows its stdin; badges; the seed loads.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "cocco/model.py": {
+      "group": "s10",
+      "comment_html": "Comment only.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    ".claude/rules/exercises.md": {
+      "group": "s10",
+      "comment_html": "The guide's execution parts rewritten for what was built: the two calls, the mapping order, error names, the <code>languages.toml</code> keys, what a new language needs.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    ".claude/rules/judge.md": {
+      "group": "s10",
+      "comment_html": "<code>exitcode</code>/<code>exitsig</code>, <code>languages.py</code> vs <code>judge.Language</code>, the new keys; \"frozen dataclass\" was stale.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    ".claude/rules/frontend.md": {
+      "group": "s10",
+      "comment_html": "Names <code>clike.js</code>.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "CLAUDE.md": {
+      "group": "s10",
+      "comment_html": "The guide line no longer says Python-only.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "DESIGN.md": {
+      "group": "s10",
+      "comment_html": "The harness paragraph becomes why it went.",
+      "collapsed": false,
+      "omit_diff": false
+    },
+    "plans/2026-10-23-c-exercises.md": {
+      "group": "s10",
+      "comment_html": "Spike results (step 1) and the Outcome section; status <code>done</code>.",
+      "collapsed": true,
+      "omit_diff": false
+    }
+  },
+  "hunk_notes": {
+    "cocco/judge.py": [
+      [
+        "from cocco.languages import",
+        "Step 2: the data and the loader come from <code>cocco.languages</code>; <code>judge</code> re-exports what it used to define so <code>cj.language_for_filename</code> keeps working."
+      ],
+      [
+        "def _parse_meta",
+        "Step 3: the meta parsing pulled out as a pure function so it is unit-testable without isolate. <code>retcode</code> is isolate's own (1 for RE/SG, 0 becomes 127) and was never the program's status."
+      ],
+      [
+        "class Language(LanguageSpec)",
+        "Step 2: <code>Language</code> keeps only <code>compile</code> / <code>run</code>; its fields live on <code>LanguageSpec</code>."
+      ],
+      [
+        "fsize_kb=fsize_kb",
+        "Step 2: <code>run</code> passes <code>fsize_kb</code> and the entry's <code>env</code> in both branches; <code>None</code> leaves challenge behaviour unchanged."
+      ],
+      [
+        "EXERCISE_FSIZE_KB = 256",
+        "The output cap moves from the harness (256 K characters) to isolate (256 KB): past it a C program dies of SIGXFSZ, Python fails to write."
+      ],
+      [
+        "def read_exercise_run",
+        "The mapping, in this order: <code>XX</code> raises (judge error); <code>TO</code>; OOM; <strong>truncated</strong> (SIGXFSZ, or a stream\nat the cap by encoded length; before <code>RE</code> because Python exits 120 with <code>OSError</code> instead of dying); <code>OK</code>; <code>RE</code>\nnamed by the language's <code>error_name</code>; any other signal named by <code>signal.Signals</code> (unknown &rarr; <code>SIG&lt;n&gt;</code>), exit 128+n.\nOutput goes through <code>_jsonb_safe</code> first, so what is compared is what is stored.\n<p class=q>Accepted cost: a program writing exactly 256 KB and exiting cleanly reads as truncated.</p>"
+      ],
+      [
+        "def prepare_exercise_program",
+        "The whole per-language surface: write <code>main.&lt;ext&gt;</code>, <code>compile</code>; then <code>run</code> once per stdin. One compile per check, never one per test."
+      ],
+      [
+        "def _compile_report",
+        "<code>compile</code> is filled whenever the language has a compiler (not a C feature), capped at <code>MAX_EXERCISE_STORED_OUTPUT</code>."
+      ],
+      [
+        "def error_matches",
+        "Exact name equality: no MRO without a harness. Settled in the plan; the loss is accepted."
+      ],
+      [
+        "def _check_compiled",
+        "A source that does not compile ran nothing: <code>passed=False, tests=[]</code>. Split out so the build can grade the starter on an already-compiled program."
+      ],
+      [
+        "def exercise_language",
+        "Replaces <code>_python</code>: refuses only a name <code>languages.toml</code> lacks (the parse already checked; this is the judge not trusting a stored document)."
+      ],
+      [
+        "def _compile_detail",
+        "Added in review: a failed compile's diagnostics for a build problem, from the <em>head</em> (gcc's first error is the useful one), unlike <code>_detail</code> which keeps a stderr's tail."
+      ],
+      [
+        "solution_dir = workdir / \"solution\"",
+        "Solution and starter each compile once, in their own subdirectory (the hardcoded <code>solution.py</code> goes). A solution that does not\ncompile is an error with the diagnostics; a starter that does not, a warning (a gap to fill may be deliberate).\n<p class=q>Kept as before: an empty <code>error</code> block with a solution that fails <em>without</em> a name (<code>return 3</code>) is a build error.\nAllowing it would need <code>grade</code> to represent \"any failure\".</p>"
+      ]
+    ]
+  }
+}
