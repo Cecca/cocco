@@ -16,11 +16,12 @@ from cocco.repository.exercise_sessions import (
     query_session_heading,
     query_session_job,
     query_session_strip,
+    query_version_language,
 )
 from cocco.repository.exercise_sets import insert_exercise_job, query_exercise
 from cocco.repository.lifecycle import query_course_archived_at
 from cocco.web.access import CurrentUser
-from cocco.web.core import DBDep, EDITOR_ROLES
+from cocco.web.core import DBDep, EDITOR_ROLES, editor_mode
 from cocco.web.exercise_sessions import (
     ExerciseLocked,
     ExerciseSessionMember,
@@ -235,12 +236,15 @@ async def get_session_exercise(
     # Written last, not created last: see `query_last_session_jobs`.
     newest = max(last.values(), key=lambda job: job.submitted_at, default=None)
     view = student_exercise_view(exercise, revealed=n in session["revealed"])
+    language = await query_version_language(db, access.state.version_id) or "python"
     first_visible = view["tests"][0]["input"] if view["tests"] else ""
     context.update(
         await _session_strip_context(
             request, db, course_id, session_id, user, role, n, wait=False
         ),
         exercise=view,
+        language=language,
+        editor_mode=editor_mode(language),
         n_exercises=access.state.n_exercises,
         closed=access.state.closed_at is not None,
         staff=staff,

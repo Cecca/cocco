@@ -14,6 +14,7 @@ from cocco.migrate import (
 from cocco.model import (
     Challenge,
     Course,
+    ExerciseJobKind,
     OutcomeEnum,
     Submission,
     SubmissionStatus,
@@ -22,6 +23,11 @@ from cocco.model import (
     UserRole,
 )
 from cocco.repository.courses import insert_enrollment
+from cocco.repository.exercise_sets import (
+    insert_exercise_job,
+    insert_exercise_set,
+    insert_exercise_version,
+)
 from cocco.repository.lifecycle import set_challenge_archived
 from cocco.repository.users import insert_administrators, insert_user
 from cocco.storage import check_storage_format
@@ -37,6 +43,106 @@ DUMMY_ADMIN = "matteo.ceccarello@unipd.it"
 DUMMY_TEACHERS = ["alice@unipd.it"]
 DUMMY_STAFF = [DUMMY_ADMIN, *DUMMY_TEACHERS]
 DUMMY_STUDENTS = ["bob@unipd.it", "charlie@unipd.it"]
+
+
+C_EXERCISE_SET = """\
+---
+title: Warm-up in C
+language: c
+---
+
+# Sum
+
+Read two integers and print their sum.
+
+```c starter
+#include <stdio.h>
+
+int main(void) {
+    int a, b;
+    scanf("%d %d", &a, &b);
+    printf("%d\\n", a - b);
+    return 0;
+}
+```
+
+```c solution
+#include <stdio.h>
+
+int main(void) {
+    int a, b;
+    scanf("%d %d", &a, &b);
+    printf("%d\\n", a + b);
+    return 0;
+}
+```
+
+```input
+2 3
+```
+
+```input hidden
+-4 10
+```
+
+# Remainder
+
+Read two integers and print the remainder of the first divided by the second.
+Dividing by zero kills the program with `SIGFPE`.
+
+```c solution
+#include <stdio.h>
+
+int main(void) {
+    int a, b;
+    scanf("%d %d", &a, &b);
+    printf("%d\\n", a % b);
+    return 0;
+}
+```
+
+```input
+17 5
+```
+
+```input
+1 0
+```
+
+```error
+SIGFPE
+```
+
+# Positive
+
+Read a number and print `ok` if it is positive. Anything else fails an `assert`,
+which ends the program with `SIGABRT`.
+
+```c solution
+#include <assert.h>
+#include <stdio.h>
+
+int main(void) {
+    int n;
+    scanf("%d", &n);
+    assert(n > 0);
+    puts("ok");
+    return 0;
+}
+```
+
+```input
+3
+```
+
+```input
+-1
+```
+
+```error
+SIGABRT
+```
+"""
 
 
 async def prepare_database(reset=False):
@@ -416,6 +522,23 @@ async def _populate_dummy_data(conn: AsyncConnection):
                 stderr="" if outcome == OutcomeEnum.success else "RuntimeError: boom",
             )
         )
+
+    # A small C exercise set on the first course, as an import would leave it:
+    # a version waiting for the judge's build, which computes the expected
+    # outputs. One exercise per verdict worth showing - a pass, wrong output
+    # from the starter, a SIGFPE and a SIGABRT. The divisor is read from the
+    # input: `1 / z` with a constant numerator is folded away by gcc at -O2.
+    assert first_course_id is not None
+    c_set_id = await insert_exercise_set(conn, first_course_id)
+    c_set_version_id = await insert_exercise_version(
+        conn, c_set_id, C_EXERCISE_SET, "Warm-up in C"
+    )
+    await insert_exercise_job(
+        conn,
+        kind=ExerciseJobKind.build,
+        user_id=user_ids[DUMMY_ADMIN],
+        version_id=c_set_version_id,
+    )
 
     # A history of attempts for one student, so the submission page and the
     # per-student staff view have something to show.

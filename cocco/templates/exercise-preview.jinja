@@ -119,7 +119,7 @@
           <label class="text-xs text-base-content/55" for="preview-source">Code</label>
           <div class="cocco-editor">
             <textarea id="preview-source" name="source" rows="16" spellcheck="false"
-                      data-editor data-run="preview-run" data-check="preview-check"
+                      data-editor data-mode="{{ editor_mode }}" data-run="preview-run" data-check="preview-check"
                       class="textarea w-full font-mono text-sm leading-relaxed">{{ exercise.starter }}</textarea>
           </div>
           <label class="text-xs text-base-content/55" for="preview-stdin">Input for Run</label>

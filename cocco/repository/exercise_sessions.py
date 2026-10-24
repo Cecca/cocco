@@ -37,7 +37,7 @@ from cocco.model import (
     ExerciseSetVersion,
     User,
 )
-from cocco.repository.exercise_sets import _n_exercises, _version_number
+from cocco.repository.exercise_sets import _n_exercises, _version_language, _version_number
 from cocco.repository.rules import _EMPTY_JSON_ARRAY, _json_object
 
 
@@ -133,6 +133,17 @@ async def query_version_exercise_count(conn: AsyncConnection, version_id: int) -
     """How many exercises a version has; None while it has no document."""
     stmt = select(_n_exercises(ExerciseSetVersion)).where(
         ExerciseSetVersion.c.id == version_id
+    )
+    return (await conn.execute(stmt)).scalar_one_or_none()
+
+
+async def query_version_language(conn: AsyncConnection, version_id: int) -> str | None:
+    """The language a version's exercises are written in; None while it has
+    no document. A session's language is fixed, so the version switch compares
+    these; read it under the session's row lock with the rest of its refusals."""
+    stmt = select(_version_language(ExerciseSetVersion)).where(
+        ExerciseSetVersion.c.id == version_id,
+        ExerciseSetVersion.c.document.is_not(None),
     )
     return (await conn.execute(stmt)).scalar_one_or_none()
 
@@ -248,6 +259,7 @@ async def query_exercise_session(conn: AsyncConnection, session_id: int):
             ExerciseSetVersion.c.title,
             ExerciseSetVersion.c.status,
             _version_number(ExerciseSetVersion).label("number"),
+            _version_language(ExerciseSetVersion).label("language"),
             _exercise_titles(ExerciseSetVersion.c.document).label("titles"),
         )
         .where(ExerciseSetVersion.c.set_id == session_set)
@@ -314,6 +326,7 @@ async def query_exercise_sessions(
         SELECT s.id, s.set_id, s.label, s.mode, s.unlocked_through,
                s.opened_at, s.closed_at,
                v.title,
+               coalesce(v.document ->> 'language', 'python') AS language,
                jsonb_array_length(v.document -> 'exercises') AS n_exercises
         FROM exercise_session s
         JOIN exercise_set ON exercise_set.id = s.set_id
@@ -810,6 +823,7 @@ async def query_session_job(
         ExerciseJob.c.version_id,
         ExerciseJob.c.exercise_index,
         ExerciseJob.c.result,
+        ExerciseJob.c.stdin,
     ).where(
         ExerciseJob.c.id == job_id,
         ExerciseJob.c.user_id == user_id,

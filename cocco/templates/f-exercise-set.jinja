@@ -24,6 +24,9 @@
     <div class="card-body p-7">
       <div class="flex flex-wrap items-center gap-3">
         <h2 class="font-bold text-lg">Latest import</h2>
+        {% if latest.status == "ready" %}
+        <span class="badge badge-ghost badge-sm font-mono">{{ latest.language }}</span>
+        {% endif %}
         {% with status = latest.status, number = latest.number %}
         {% include "_exercise-version-badge.jinja" %}
         {% endwith %}

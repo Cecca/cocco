@@ -30,6 +30,7 @@ from cocco.repository.exercise_sessions import (
     query_session_progress,
     query_set_current_version,
     query_version_exercise_count,
+    query_version_language,
     reveal_exercise_solution,
     switch_exercise_session_version,
 )
@@ -208,7 +209,8 @@ def _version_switch(session) -> dict | None:
     Exercises are matched by position, so the confirmation lists every one
     whose title changed - a reordered file is the one mistake position cannot
     catch - and what was appended or dropped. `refusal` is set when the new
-    version has fewer exercises than the session has checks for.
+    version has fewer exercises than the session has checks for, or is written
+    in another language than the session's.
     """
     version, latest = session["version"], session["latest"]
     if latest is None or latest["id"] == version["id"]:
@@ -217,7 +219,9 @@ def _version_switch(session) -> dict | None:
     shared = min(len(old), len(new))
     max_checked = session["max_checked"]
     refusal = None
-    if max_checked is not None and max_checked > len(new):
+    if version["language"] != latest["language"]:
+        refusal = _language_refusal(latest["number"], version["language"], latest["language"])
+    elif max_checked is not None and max_checked > len(new):
         refusal = _switch_refusal(latest["number"], len(new), max_checked, old[max_checked - 1])
     return {
         "latest": latest,
@@ -226,6 +230,15 @@ def _version_switch(session) -> dict | None:
         "added": [(i + 1, new[i]) for i in range(shared, len(new))],
         "dropped": [(i + 1, old[i]) for i in range(shared, len(old))],
     }
+
+
+def _language_refusal(number: int, old: str, new: str) -> str:
+    """The switch's refusal across languages: a session's language is fixed,
+    since its past checks and the solutions it reveals are in it."""
+    return (
+        f"v{number} is written in {new} and this session is on {old}. A session "
+        "keeps its language; open a new session on the latest version instead."
+    )
 
 
 def _switch_refusal(number: int, n_new: int, max_checked: int, title: str) -> str:
@@ -614,6 +627,16 @@ async def post_exercise_session_switch(
             "A newer version became current since this page was loaded. Look "
             "at what it changes and confirm again."
         )
+    old_language = await query_version_language(db, state.version_id)
+    new_language = await query_version_language(db, current)
+    if old_language != new_language:
+        return await refuse(
+            _language_refusal(
+                (await query_exercise_session(db, session_id))["latest"]["number"],
+                old_language,
+                new_language,
+            )
+        )
     n_new = await query_version_exercise_count(db, current)
     max_checked = await query_max_checked_exercise(db, session_id)
     if max_checked is not None and max_checked > n_new:
@@ -859,6 +882,7 @@ async def get_fragment_exercise_drill_in(
             "person": person,
             "n": n,
             "title": exercise.title if exercise is not None else f"Exercise {n}",
+            "language": await query_version_language(db, state.version_id) or "python",
             "last": last,
             "jobs": jobs,
             "poll_url": str(request.url) if pending else None,
@@ -933,7 +957,13 @@ async def get_exercise_projector(
             raise HTTPException(status_code=404)
         exercise = await query_exercise(db, state.version_id, solution)
         if exercise is not None:
-            shown = {"n": solution, "title": exercise.title, "source": exercise.solution}
+            language = await query_version_language(db, state.version_id) or "python"
+            shown = {
+                "n": solution,
+                "title": exercise.title,
+                "source": exercise.solution,
+                "language": language,
+            }
     context.update(course=course, user=user, solution=shown)
     return templates.TemplateResponse(
         request=request, name="exercise-projector.jinja", context=context

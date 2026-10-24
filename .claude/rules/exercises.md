@@ -8,7 +8,7 @@ paths:
 
 # Exercises (`cocco/exercises/`, the `exercise_*` tables)
 
-Short Python exercises, wooclap-style: a teacher runs a set live in class, sets the pace, and
+Short programming exercises (Python, C, any language in `languages.toml`), wooclap-style: a teacher runs a set live in class, sets the pace, and
 watches who has solved what. The feature is a port of the `esercizi-python` prototype, with the
 judge in place of Pyodide (DESIGN.md says why). It is **purely formative**: nothing is graded,
 exported or ranked, and "solved" is a verdict the server reached. **Exercises are not challenges.**
@@ -42,35 +42,83 @@ An exercise has no id: it is its **1-based position** in a version, the `{n}` in
 **English keywords and one spelling each**. The front matter has `title:` / `description:`, each
 `# Heading` starts an exercise, and the fenced blocks are ` ```starter `, ` ```solution `,
 ` ```input [hidden] `, ` ```output `, ` ```error ` and ` ```hint `, with `compare:` and `time:`
-lines. Its module docstring is the reference. The prototype's Italian keywords are **errors that
+lines, and an optional `language:` (a key of `languages.toml`, default `python`; anything else is
+a parse error listing them). A code block may be prefixed by the language's name or any of its
+`extensions` (`python` / `py`, `c`, `cpp` / `cc` / `cxx`), and a block prefixed with *another*
+language's spelling is an error naming the right one, for `_ITALIAN`'s reason (`linguaggio` is
+there too). An `error` block is one word. Its module docstring is the reference. The prototype's Italian keywords are **errors that
 name the English word, not aliases** (`_ITALIAN`). A ` ```soluzione ` block left unconverted would
 otherwise be "any other code block", which stays part of the statement and would put the solution
 on every student's screen. Parsing is synchronous, at import: a file that does not parse is a 200
 with its problems and creates no version.
 `compare.py` holds the comparison rules (`exact`, `spaces`, `case`, `numbers <tol>`, `order`).
-`hints.py` holds the one-line English explanation of each Python exception. Like `transfer.py`,
+`hints.py` holds the one-line English explanation of each failure name (`HINTS`: Python exceptions
+and signals like `SIGSEGV`). Like `transfer.py`,
 `format.py`, `compare.py` and `hints.py` touch no database, FastAPI or judge, and are tested by
 import.
 
-**Nothing runs the student's file directly: `harness.py` does, inside the box.** The judge copies
-it in next to the program and runs `python harness.py <check|run> main.py`. It is not imported by
-cocco, so it stays plain stdlib. It exists because two semantics are about Python itself:
+**There is no harness: a program runs as `Language.run` runs it** (`python main.py`, or the compiled
+binary), through the challenge judge's two calls and no per-language code. `prepare_exercise_program`
+writes the source as `main.<extensions[0]>` (the name diagnostics and tracebacks report) in a private
+`workdir` and calls `Language.compile` (a no-op when interpreted, a box compile with the `COMPILE_*`
+budget otherwise, so `#include "/etc/passwd"` is "no such file"). `run_exercise_program` calls
+`Language.run` on one stdin, with `exercise.time_s`, `EXERCISE_MEM_LIMIT_KB` and
+`EXERCISE_FSIZE_KB` (256 KB), and `read_exercise_run` turns the `RunOutcome` into an
+`ExerciseExecution`. A check prepares **once** and runs every test on the result (one compile, N
+runs); a build prepares the solution once for both its rounds, and the starter once, each in its own
+subdirectory of the job's `workdir`. What differs between languages is data in `languages.toml`,
+never a branch: `env` (python's `PYTHONHASHSEED=0`, so a `set` prints alike everywhere),
+`error_name`, `editor_mode`.
 
-- an `input("…")` prompt is dropped in `check` mode, and in `run` mode it is echoed together with
-  the line read;
-- `error: ValueError` passes on that exception or a subclass, which needs the MRO, and only the
-  raising process has it.
+**`read_exercise_run`'s order matters.** `XX` raises (the judge's error); `TO` is `timeout`; `oom`
+is `memory`; then **truncated**: `SIGXFSZ`, or stdout or stderr at the 256 KB cap (compared in
+bytes). It is checked *before* `RE` because Python ignores `SIGXFSZ` and exits 120 with an `OSError`
+instead, and that must not read as `error = OSError`; the cost is that a program writing exactly
+256 KB is flagged too. Then `OK` (exit 0), `RE` (exit = isolate's `exitcode`, `error` from
+`error_name`) and `SG` (exit = 128 + signal, `error` = the signal's name, `SIGSEGV`). The exit code
+and signal come from the meta file (`RunOutcome.exitcode` / `exitsig`), because `retcode` is
+isolate's own. `no_report` is no longer produced; the literal stays so stored results validate.
+stdout and stderr go through `_jsonb_safe` (strips NULs and lone surrogates), the one boundary, so
+what is compared and what is stored are the same bytes. Output is lost when a program dies by a
+signal (stdout is a file, so fully buffered); stderr keeps what was unbuffered.
 
-It caps stdout, stderr and the traceback at 256 K characters each, always exits 0, and writes one
-JSON object, `schema.HarnessReport`, as the **last line** of the real stdout. **The isolate status
-says how the run ended; the report says what the program did.** A timeout or an OOM produces no
-report. A missing or unparseable report under status `OK` is something the *program* did
-(`os._exit`, closing fd 1), reported as "ended without reporting", and never a
-`judge_internal_error`. A program can forge the report by writing to fd 1, and that is accepted:
-the output is still compared in the judge, so a forgery can only fake the exception check, and
-nothing is graded. `_jsonb_safe` strips NULs and lone surrogates **as the report is parsed**, not
-on the way into the database. A solution's output becomes an expected output, so one boundary
-keeps what is compared and what is stored the same bytes.
+**The error name** is how `error:` blocks, hints and hidden tests name a failure. It is a signal's
+name, which is the operating system's and the same for every language, or else the language's
+optional `error_name` regex searched in stderr when the program exited non-zero: last match wins,
+group 1. Python's anchors on an **indented** line followed by a column-0 name
+(`(?m)^[ \t]+.*\n([A-Za-z_][\w.]*)(?::|$)`): every traceback frame's source, caret or `File` line is
+indented, a plain stderr line (`sys.exit('bye')`) and the first line of a message are not, so a
+multi-line message or a printed word is not mistaken for the exception. It is linear; the obvious
+`^(?:[ \t]+.*\n)+` form is quadratic. A language without the key has failures with no name
+(`error = None`, as for `sys.exit(1)` / `return 1`). stderr is the program's to forge, so a program
+can fake the error check; nothing is graded. An `error` block passes on an **exact match** of that
+name: no subclasses (there is no MRO), so `error: LookupError` does not pass on an `IndexError`.
+`KeyboardInterrupt` is `SIGINT` and an `ExceptionGroup` has no name; both accepted.
+
+**No prompts.** `input("n? ")` writes `n? ` to stdout like any print, and everything printed is
+compared, so students are told not to pass a prompt (the format docstring and the exercise page
+say so). The Run tab shows the stdin given above the transcript, for every language.
+
+**A compile is a result of its own.** `ExerciseCheckResult` and `ExerciseRunResult` carry
+`compile: ExerciseCompile | None` (`ok`, `diagnostics` capped at `MAX_EXERCISE_STORED_OUTPUT`), set
+whenever the language has a compiler. A failed compile is `passed=False, tests=[]` (so *attempted*)
+or an empty run; warnings on a successful one are shown collapsed. Diagnostics concern the student's
+own source only, so they are shown in full even where hidden tests are redacted.
+
+**Old results are folded, not migrated.** `ExerciseExecution`'s before-validator
+(`_fold_old_exception`) turns a stored `exception` object into `error` (its `type`) plus its
+traceback appended to `stderr`; a result without `compile` validates as it is. Versions built by the
+harness stay as they were: their expected outputs were computed with prompts dropped and their
+`error` blocks may name a base class, so a teacher re-imports (a new version) and switches to get
+the new semantics.
+
+**A session's language is fixed.** Switching to a version in another language is refused (every
+draft and "solved" was in one language); a *set* may change language between imports.
+
+**What a new language needs**: a `languages.toml` entry with `editor_mode` (and optionally
+`error_name`), a vendored CodeMirror mode if `clike.js` does not cover it (`_exercise-editor-head`
+loads every vendored mode), and `HINTS` lines for its common errors. Java would also need a
+`Main` source stem (`java Main`), which `main.<ext>` does not give.
 
 **Comparison happens in the judge process**, not in an evaluator box: the rules are declarative
 and the code applying them is ours, and a box per test would double a check's cost to buy nothing.
@@ -80,12 +128,14 @@ It goes through `asyncio.to_thread`, because `order` with `numbers` is quadratic
 
 - **build**: staff, one per version. It runs the solution twice on every input (to catch
   non-determinism) and the starter once, then writes the document and the problems. Errors fail
-  the build: a crash, a timeout, or an exception where no `error` was declared. Warnings do not: a
-  starter that already passes, a non-deterministic solution, every test hidden.
-- **check**: a recorded attempt. Every test runs through the harness, concurrently, and the
+  the build: a crash, a timeout, a failure where no `error` was declared, a solution that does not
+  compile (the diagnostics are the detail), or one that does not end with the declared error (so
+  `error: ValueError` in a C file fails naming the signal it dies of). Warnings do not: a starter
+  that already passes or does not compile, a non-deterministic solution, every test hidden.
+- **check**: a recorded attempt. Every test runs on the one prepared program, concurrently, and the
   result holds a verdict per test plus `passed`.
 - **run**: the student's own stdin, given up front (Run is not interactive), with nothing
-  compared. The transcript reads like a terminal because the harness echoes what was read.
+  compared; the page shows the stdin above the transcript.
 
 Because there are no child rows, a judge finishing a job whose session, set or course has just
 been deleted updates **zero rows** (`finish_exercise_job`) instead of violating a foreign key. That
@@ -155,9 +205,10 @@ be able to show who is stuck, and that is a property of the query, not of the te
 that cuts it down: statement, starter, hints, visible tests with their expected outputs, a count of
 hidden ones, and the solution only once revealed. It is `visible_outcomes`'s rule, kept in Python
 where it is testable. `exercise_check_rows` does the same for a check's result. A hidden test
-shows a student only its verdict and, on an error, the exception's type, which its hint explains.
-The line is withheld too: it is a channel the program controls, as are its output, its exit code
-and its running time. The page
+shows a student only its verdict and, on an error, its name if `HINTS` knows it, else `error`
+(`_shown_error_name`): the name is the program's to choose, and a fixed list bounds what it can
+say. Its output, exit code and running time are channels the program controls, and are withheld.
+The page
 polls only the strip, every 3 s, and **never swaps the editor**. A job's fragment polls every 500
 ms while pending. **The poll ends because the done copy replaces the polling element and carries no
 trigger, not through a 286**: the htmx 4 this app loads has no special case for 286

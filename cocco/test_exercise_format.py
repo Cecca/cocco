@@ -221,7 +221,7 @@ def test_two_outputs_for_one_input_is_an_error():
 def test_an_error_block_takes_a_class_name():
     source = "---\ntitle: T\n---\n# One\n```solution\npass\n```\n```input\n1\n```\n```error\nValueError: bad\n```\n"
     (error,) = errors(source)
-    assert '"ValueError: bad" is not an exception name' in error
+    assert '"ValueError: bad" is not an error name' in error
 
 
 def test_a_missing_solution_is_an_error_unless_every_output_is_written():
@@ -303,7 +303,7 @@ def test_warnings_come_with_a_document():
         ("warning", 'exercise 1, "One"'),
     ]
     texts = [p.text for p in result.problems]
-    assert texts[0] == 'Unknown key "author", ignored. The keys are title, description.'
+    assert texts[0] == 'Unknown key "author", ignored. The keys are title, description, language.'
     assert texts[1] == 'More than one "starter" block: using the last one.'
     assert texts[2] == 'A "hidden" block with no "input": write ```input hidden```.'
     assert texts[3] == "Every test is hidden: students will not see a single example."
@@ -397,3 +397,65 @@ def test_problems_say_which_exercise_and_test_they_are_about():
     result = parse(source)
     assert [(p.exercise, p.test) for p in result.problems] == [(2, 2), (2, None)]
     assert parse("---\ntitle: T\n---\n").problems[0].exercise is None
+
+
+def _in(language, *blocks, key=True):
+    head = f"---\ntitle: T\n{'language: ' + language + chr(10) if key else ''}---\n"
+    return head + "# One\n\n" + "\n".join(blocks) + "\n```input\n1\n```\n```output\n1\n```\n"
+
+
+def test_the_language_defaults_to_python():
+    assert parse(_in("python", key=False)).document.language == "python"
+
+
+def test_a_c_file_reads_c_blocks():
+    result = parse(_in("c", "```c starter\nint main(){}\n```", "```c solution\nint main(){return 0;}\n```"))
+    doc = result.document
+    assert doc.language == "c"
+    assert doc.exercises[0].starter == "int main(){}\n"
+    assert doc.exercises[0].solution == "int main(){return 0;}\n"
+
+
+def test_an_unknown_language_lists_the_known_ones():
+    (error,) = errors(_in("cobol"))
+    assert 'Unknown language "cobol"' in error
+    assert "python" in error and "cpp" in error and "c," in error
+
+
+def test_another_languages_spelling_is_an_error_naming_the_right_one():
+    (error,) = errors(_in("c", "```python solution\nint x;\n```"))
+    assert 'write "c solution"' in error
+
+
+def test_a_plain_code_block_named_for_a_language_stays_statement_text():
+    result = parse(_in("c", "```python\nprint(1)\n```", "```c\nint x;\n```"))
+    assert result.document is not None
+    assert "print(1)" in result.document.exercises[0].statement
+    assert "int x;" in result.document.exercises[0].statement
+
+
+def test_py_still_works_for_python():
+    result = parse(_in("python", "```py starter\nx = 1\n```"))
+    assert result.document.exercises[0].starter == "x = 1\n"
+
+
+def test_cpp_accepts_its_extensions():
+    result = parse(_in("cpp", "```cc solution\nint x;\n```"))
+    assert result.document.exercises[0].solution == "int x;\n"
+
+
+@pytest.mark.parametrize("name", ["SIGFPE", "json.decoder.JSONDecodeError"])
+def test_an_error_block_takes_signals_and_dotted_names(name):
+    source = _in("python", "```input\n1\n```", f"```error\n{name}\n```", "```solution\npass\n```")
+    assert parse(source).document.exercises[0].tests[0].error == name
+
+
+def test_an_error_block_of_two_words_is_refused():
+    source = _in("python", "```solution\npass\n```", "```input\n1\n```", "```error\ntwo words\n```")
+    (error,) = errors(source)
+    assert '"two words" is not an error name' in error
+
+
+def test_linguaggio_is_reported_like_the_other_italian_keys():
+    (error,) = errors("---\ntitle: T\nlinguaggio: c\n---\n# One\n```input\n1\n```\n```output\n1\n```\n")
+    assert 'write "language:"' in error

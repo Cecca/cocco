@@ -2,7 +2,7 @@
 
 The unmarked tests need PostgreSQL and nothing else - the sandbox is replaced
 where a job would reach it. The `integration` ones run real programs through
-the harness in isolate, the way a classroom will.
+programs in isolate, the way a classroom will.
 """
 
 import asyncio
@@ -33,10 +33,10 @@ from cocco.model import (
 from cocco.schema import (
     EXERCISE_JOB_RESULT,
     ExerciseCheckResult,
+    ExerciseCompile,
     ExerciseExecution,
     ExerciseJobError,
     ExerciseRunResult,
-    HarnessException,
 )
 
 
@@ -51,7 +51,7 @@ SOURCE = textwrap.dedent(
     Read a number and print its double.
 
     ```solution
-    n = int(input("Number? "))
+    n = int(input())
     print(n * 2)
     ```
 
@@ -82,7 +82,7 @@ SOURCE = textwrap.dedent(
     ```
 
     ```error
-    ArithmeticError
+    ZeroDivisionError
     ```
 
     ```input
@@ -208,38 +208,8 @@ def test_jsonb_safe_drops_nuls_and_lone_surrogates():
     }
 
 
-def test_the_report_is_read_off_the_last_line():
-    report = (
-        '{"stdout": "", "stderr": "", "truncated": false, "exit": 0, "exception": null}'
-    )
-    assert cj.parse_harness_report(f"junk\n{report}\n") is not None
-    # Something written to fd 1 after the report is what is read, and is not one.
-    assert cj.parse_harness_report(f"{report}\nforged?\n") is None
-    assert cj.parse_harness_report("") is None
-
-
-def test_a_report_carrying_a_nul_is_cleaned_as_it_is_read():
-    report = cj.parse_harness_report(
-        '{"stdout": "a\\u0000b\\ud800", "stderr": "", "truncated": false, '
-        '"exit": 0, "exception": null}'
-    )
-    assert report is not None
-    assert report.stdout == "ab�"
-
-
-def _ok(stdout: str = "", exception: str | None = None, exit: int = 0) -> ExerciseExecution:
-    mro = {
-        "ZeroDivisionError": ["ZeroDivisionError", "ArithmeticError", "Exception", "BaseException", "object"],
-        "ValueError": ["ValueError", "Exception", "BaseException", "object"],
-    }
-    return ExerciseExecution(
-        status="ok",
-        stdout=stdout,
-        exit=exit,
-        exception=None
-        if exception is None
-        else HarnessException(type=exception, classes=mro[exception], line=1, traceback=""),
-    )
+def _ok(stdout: str = "", error: str | None = None, exit: int = 0) -> ExerciseExecution:
+    return ExerciseExecution(status="ok", stdout=stdout, exit=exit, error=error)
 
 
 @pytest.mark.parametrize(
@@ -249,9 +219,11 @@ def _ok(stdout: str = "", exception: str | None = None, exit: int = 0) -> Exerci
         (_ok("41\n"), None, "fail"),
         (_ok("42\n", "ValueError"), None, "error"),
         (_ok("42\n", exit=3), None, "error"),
-        # A subclass of the expected exception is the expected exception.
-        (_ok("42\n", "ZeroDivisionError"), "ArithmeticError", "pass"),
+        # The name, exactly: there are no subclasses.
+        (_ok("42\n", "ZeroDivisionError"), "ZeroDivisionError", "pass"),
+        (_ok("42\n", "ZeroDivisionError"), "ArithmeticError", "error"),
         (_ok("42\n", "ValueError"), "ArithmeticError", "error"),
+        (_ok("42\n", exit=3), "ArithmeticError", "error"),
         (_ok("42\n"), "ArithmeticError", "noerror"),
         # The output before an expected exception is still compared.
         (_ok("41\n", "ZeroDivisionError"), "ZeroDivisionError", "fail"),
@@ -264,26 +236,170 @@ def test_grade(execution, expected_error, verdict):
     assert cj.grade(execution, "42\n", expected_error, Rules())[0] == verdict
 
 
-def test_a_report_nested_too_deep_is_no_report():
-    """The last line is the program's to write, and a forgery nested deeper
-    than the decoder follows is not a judge error."""
-    assert cj.parse_harness_report("[" * 100_000 + "]" * 100_000) is None
-
-
 def test_stored_output_is_clipped_and_says_so(monkeypatch):
-    """`clipped` is the judge's cut and `truncated` stays the harness's."""
+    """`clipped` is the judge's cut and `truncated` stays the run's."""
     monkeypatch.setattr(cj, "MAX_EXERCISE_STORED_OUTPUT", 4)
     stored = ExerciseRunResult(**cj._stored(ExerciseExecution(status="ok", stdout="123456")))
     assert (stored.stdout, stored.clipped, stored.truncated) == ("1234", True, False)
 
 
 def test_a_result_round_trips_through_its_one_definition():
-    """What the judge writes is what `EXERCISE_JOB_RESULT` reads back - the MRO
-    under its wire name, `mro`, included."""
+    """What the judge writes is what `EXERCISE_JOB_RESULT` reads back."""
     result = ExerciseRunResult(**cj._stored(_ok("x\n", "ValueError")))
     dumped = result.model_dump(mode="json")
-    assert dumped["exception"]["mro"][0] == "ValueError"
+    assert dumped["error"] == "ValueError"
     assert EXERCISE_JOB_RESULT.validate_python(dumped) == result
+
+
+def _old_execution(**fields) -> dict:
+    """A run as it was stored before `error` replaced `exception`."""
+    return {
+        "status": "ok",
+        "stdout": "",
+        "stderr": "",
+        "exit": 1,
+        "exception": {
+            "type": "ValueError",
+            "mro": ["ValueError", "Exception", "BaseException", "object"],
+            "line": 3,
+            "traceback": "Traceback (most recent call last):\nValueError: x\n",
+        },
+        **fields,
+    }
+
+
+def test_a_check_stored_with_an_exception_reads_as_an_error():
+    stored = {
+        "kind": "check",
+        "passed": False,
+        "tests": [
+            {**_old_execution(stderr="warning"), "verdict": "error", "hidden": False},
+            {"status": "ok", "verdict": "pass", "hidden": False, "exception": None},
+        ],
+    }
+    result = EXERCISE_JOB_RESULT.validate_python(stored)
+    first, second = result.tests
+    assert first.error == "ValueError"
+    # A stderr that did not end in a newline gets one before the traceback.
+    assert first.stderr == "warning\nTraceback (most recent call last):\nValueError: x\n"
+    assert (second.error, second.stderr) == (None, "")
+    assert result.compile is None
+    assert "exception" not in result.model_dump(mode="json")["tests"][0]
+
+
+def test_a_run_stored_with_an_exception_reads_as_an_error():
+    result = EXERCISE_JOB_RESULT.validate_python(
+        {"kind": "run", **_old_execution(stderr="out\n")}
+    )
+    assert result.error == "ValueError"
+    assert result.stderr == "out\nTraceback (most recent call last):\nValueError: x\n"
+    assert result.compile is None
+
+
+def test_a_result_with_a_compile_round_trips():
+    compile = ExerciseCompile(ok=False, diagnostics="main.c:1: error")
+    for result in (
+        ExerciseCheckResult(passed=False, tests=[], compile=compile),
+        ExerciseRunResult(status="ok", compile=compile),
+    ):
+        dumped = result.model_dump(mode="json")
+        assert dumped["compile"] == {"ok": False, "diagnostics": "main.c:1: error"}
+        assert EXERCISE_JOB_RESULT.validate_python(dumped) == result
+
+
+PYTHON = cj.load_languages()["python"]
+C = cj.load_languages()["c"]
+CAP = cj.EXERCISE_FSIZE_KB * 1024
+
+
+def _outcome(status="OK", exitcode=None, exitsig=None, oom=False, stdout="", stderr="", message=None):
+    return cj.RunOutcome(
+        retcode=0, stdout=stdout, stderr=stderr, elapsed_time_s=0.5, max_rss_kb=1,
+        status=status, message=message, oom=oom, exitcode=exitcode, exitsig=exitsig,
+    )
+
+
+TRACEBACK = (
+    "Traceback (most recent call last):\n"
+    '  File "main.py", line 1, in <module>\n'
+    "    int('x')\n"
+    "ValueError: invalid literal for int() with base 10: 'x'\n"
+)
+
+
+def test_read_exercise_run_clean_exit():
+    got = cj.read_exercise_run(_outcome(stdout="hi\n"), PYTHON)
+    assert (got.status, got.stdout, got.exit, got.error, got.truncated) == (
+        "ok", "hi\n", 0, None, False
+    )
+    assert got.elapsed_s == 0.5
+
+
+def test_read_exercise_run_isolate_failure_is_the_judges():
+    with pytest.raises(RuntimeError, match="isolate failed"):
+        cj.read_exercise_run(_outcome("XX", message="boom"), PYTHON)
+
+
+def test_read_exercise_run_timeout_and_memory():
+    timeout = cj.read_exercise_run(_outcome("TO", message="Time limit exceeded"), PYTHON)
+    assert (timeout.status, timeout.message) == ("timeout", "Time limit exceeded")
+    # An OOM arrives as a signal death with the cgroup flag set.
+    memory = cj.read_exercise_run(_outcome("SG", exitsig=9, oom=True), PYTHON)
+    assert memory.status == "memory"
+
+
+def test_read_exercise_run_names_a_python_exception_from_stderr():
+    got = cj.read_exercise_run(_outcome("RE", exitcode=1, stderr=TRACEBACK), PYTHON)
+    assert (got.status, got.exit, got.error) == ("ok", 1, "ValueError")
+    assert got.stderr == TRACEBACK
+
+
+def test_read_exercise_run_a_failure_without_a_name_has_none():
+    assert cj.read_exercise_run(_outcome("RE", exitcode=3), PYTHON).error is None
+    # A language without an `error_name` key never names an exit.
+    got = cj.read_exercise_run(_outcome("RE", exitcode=3, stderr=TRACEBACK), C)
+    assert (got.exit, got.error) == (3, None)
+
+
+def test_read_exercise_run_names_a_signal():
+    got = cj.read_exercise_run(_outcome("SG", exitsig=11), C)
+    assert (got.status, got.exit, got.error, got.truncated) == ("ok", 139, "SIGSEGV", False)
+    assert cj.read_exercise_run(_outcome("SG", exitsig=8), C).error == "SIGFPE"
+    assert cj.read_exercise_run(_outcome("SG", exitsig=6), C).exit == 134
+    assert cj.read_exercise_run(_outcome("SG", exitsig=99), C).error == "SIG99"
+
+
+def test_read_exercise_run_a_file_size_signal_is_a_flood():
+    got = cj.read_exercise_run(_outcome("SG", exitsig=25, stdout="x" * CAP), C)
+    assert (got.status, got.truncated, got.error, got.exit) == ("ok", True, None, 0)
+    # The signal alone is the evidence, whatever the streams show.
+    assert cj.read_exercise_run(_outcome("SG", exitsig=25), C).truncated
+
+
+def test_read_exercise_run_output_at_the_cap_is_a_flood_even_when_python_exits_120():
+    """Python ignores SIGXFSZ: it fails to flush and exits 120 with an OSError.
+    That is a flood, not `error = OSError`."""
+    stderr = (
+        "Exception ignored in: <_io.TextIOWrapper name='<stdout>'>\n"
+        "OSError: [Errno 27] File too large\n"
+    )
+    got = cj.read_exercise_run(
+        _outcome("RE", exitcode=120, stdout="x" * CAP, stderr=stderr), PYTHON
+    )
+    assert (got.truncated, got.error, got.exit) == (True, None, 0)
+    # The same for the other stream.
+    got = cj.read_exercise_run(_outcome("RE", exitcode=120, stderr="y" * CAP), PYTHON)
+    assert got.truncated
+
+
+def test_read_exercise_run_the_cap_is_in_bytes():
+    assert not cj.read_exercise_run(_outcome(stdout="é" * (CAP // 2 - 1)), PYTHON).truncated
+    assert cj.read_exercise_run(_outcome(stdout="é" * (CAP // 2)), PYTHON).truncated
+
+
+def test_read_exercise_run_output_is_jsonb_safe():
+    got = cj.read_exercise_run(_outcome(stdout="a\x00b", stderr="\ud800"), PYTHON)
+    assert (got.stdout, got.stderr) == ("ab", "�")
 
 
 ########################################################################
@@ -660,10 +776,10 @@ async def test_a_build_computes_the_expected_outputs_and_becomes_current(db, app
     assert _current(db, set_id) == version_id
     version = _version_row(db, version_id)
     double, divide, _ = version.document["exercises"]
-    # Computed in check mode, so the solution's prompt is not part of it.
+    # The solution reads without a prompt, so its output is just the answer.
     assert [t["expected_output"] for t in double["tests"]] == ["42\n", "10\n"]
     assert [(t["expected_output"], t["expected_error"]) for t in divide["tests"]] == [
-        ("before\n", "ArithmeticError"),
+        ("before\n", "ZeroDivisionError"),
         ("before\n5\n", None),
     ]
     assert version.problems == []
@@ -673,30 +789,37 @@ async def test_a_build_computes_the_expected_outputs_and_becomes_current(db, app
 
 
 @pytest.mark.integration
-async def test_prompts_are_dropped_in_a_check_and_echoed_in_a_run(db, app_engine):
+async def test_a_prompt_is_output(db, app_engine):
     user_id, _, version_id = await _built(db, app_engine)
 
-    # A different prompt from the solution's, and it does not matter.
     result = await _check(
-        db, app_engine, user_id, version_id, 1,
-        'print(int(input("Give me a number: ")) * 2)\n',
+        db, app_engine, user_id, version_id, 1, "print(int(input()) * 2)\n"
     )
     assert result.passed
     assert [t.verdict for t in result.tests] == ["pass", "pass"]
     # Stored, hidden or not, and marked so the pages can tell.
     assert [t.hidden for t in result.tests] == [False, True]
     assert result.tests[1].stdout == "10\n"
+    assert result.compile is None
 
+    # Everything printed is compared, a prompt included.
+    prompted = await _check(
+        db, app_engine, user_id, version_id, 1, 'print(int(input("n? ")) * 2)\n'
+    )
+    assert [t.verdict for t in prompted.tests] == ["fail", "fail"]
+    assert prompted.tests[0].stdout == "n? 42\n"
+
+    # A run shows the program's output as it is: the stdin is not echoed.
     run = await _run(
         db, app_engine, user_id, version_id,
         'n = int(input("Number? "))\nprint(n * 2)\n', "21\n",
     )
     assert run.status == "ok"
-    assert run.stdout == "Number? 21\n42\n"
+    assert run.stdout == "Number? 42\n"
 
 
 @pytest.mark.integration
-async def test_an_expected_exception_matches_its_subclasses(db, app_engine):
+async def test_an_expected_error_is_matched_by_name(db, app_engine):
     user_id, _, version_id = await _built(db, app_engine)
 
     divides = await _check(
@@ -708,7 +831,8 @@ async def test_an_expected_exception_matches_its_subclasses(db, app_engine):
         """,
     )
     assert divides.passed
-    assert divides.tests[0].exception.type == "ZeroDivisionError"
+    assert divides.tests[0].error == "ZeroDivisionError"
+    assert "ZeroDivisionError" in divides.tests[0].stderr
 
     wrong_error = await _check(
         db, app_engine, user_id, version_id, 2,
@@ -719,8 +843,8 @@ async def test_an_expected_exception_matches_its_subclasses(db, app_engine):
         """,
     )
     assert [t.verdict for t in wrong_error.tests] == ["error", "pass"]
-    assert wrong_error.tests[0].exception.type == "ValueError"
-    assert wrong_error.tests[0].exception.line == 3
+    assert wrong_error.tests[0].error == "ValueError"
+    assert 'line 3' in wrong_error.tests[0].stderr
 
     no_error = await _check(
         db, app_engine, user_id, version_id, 2,
@@ -731,6 +855,51 @@ async def test_an_expected_exception_matches_its_subclasses(db, app_engine):
         """,
     )
     assert [t.verdict for t in no_error.tests] == ["noerror", "pass"]
+
+
+@pytest.mark.integration
+async def test_a_base_class_does_not_match_a_subclass(db, app_engine):
+    """`error: LookupError` is not `IndexError`: there is no MRO any more."""
+    user_id, set_id = _set(db)
+    version_id, _ = await _build(
+        db, app_engine, user_id, set_id,
+        """\
+        ---
+        title: Names
+        ---
+
+        # Lookup
+
+        Fail on the empty list.
+
+        ```solution
+        raise LookupError("x")
+        ```
+
+        ```input
+        ```
+
+        ```error
+        LookupError
+        ```
+        """,
+    )
+    assert _version_row(db, version_id).status == ExerciseVersionStatus.ready
+    exact = await _check(db, app_engine, user_id, version_id, 1, 'raise LookupError("y")\n')
+    assert exact.passed
+    subclass = await _check(db, app_engine, user_id, version_id, 1, "[][0]\n")
+    assert [t.verdict for t in subclass.tests] == ["error"]
+    assert subclass.tests[0].error == "IndexError"
+
+
+@pytest.mark.integration
+async def test_a_syntax_error_is_named(db, app_engine):
+    user_id, _, version_id = await _built(db, app_engine)
+    run = await _run(db, app_engine, user_id, version_id, "print(\n", "")
+    assert (run.status, run.error) == ("ok", "SyntaxError")
+    assert run.exit == 1
+    assert "main.py" in run.stderr
+    assert run.compile is None
 
 
 @pytest.mark.integration
@@ -752,15 +921,16 @@ async def test_an_endless_print_stops_at_the_cap(db, app_engine):
 
 
 @pytest.mark.integration
-async def test_a_program_that_ends_before_the_report_is_its_own_doing(db, app_engine):
+async def test_ending_the_process_early_is_a_normal_exit(db, app_engine):
     user_id, _, version_id = await _built(db, app_engine)
     result = await _check(
-        db, app_engine, user_id, version_id, 3, 'import os\nprint("ok")\nos._exit(0)\n'
+        db, app_engine, user_id, version_id, 3,
+        'import os\nprint("ok", flush=True)\nos._exit(0)\n',
     )
-    assert [t.verdict for t in result.tests] == ["no_report"]
+    assert [t.verdict for t in result.tests] == ["pass"]
 
     run = await _run(db, app_engine, user_id, version_id, "import os\nos._exit(3)\n", "")
-    assert run.status == "no_report"
+    assert (run.status, run.exit, run.error) == ("ok", 3, None)
 
 
 @pytest.mark.integration
@@ -778,20 +948,26 @@ async def test_a_program_that_sleeps_runs_into_the_wall_clock(db, app_engine):
 
 
 @pytest.mark.integration
-async def test_a_flood_written_past_the_harness_is_stopped_by_the_file_size(
-    db, app_engine
-):
-    """Writing to fd 1 directly bypasses the harness's cap, and the box's
-    stdout is read whole: `--fsize` is what bounds it, and the program then
-    ends without reporting."""
+async def test_a_flood_written_to_fd_1_directly_is_truncated(db, app_engine):
+    """`--fsize` is what bounds the box's stdout, whichever way it is written."""
     user_id, _, version_id = await _built(db, app_engine)
     run = await _run(
         db, app_engine, user_id, version_id,
         'import os\nwhile True:\n    os.write(1, b"x" * 65536)\n', "",
     )
-    assert run.status == "no_report"
+    assert (run.status, run.truncated) == ("ok", True)
     assert run.clipped
     assert len(run.stdout) == cj.MAX_EXERCISE_STORED_OUTPUT
+
+
+@pytest.mark.integration
+async def test_a_flood_to_stderr_is_truncated_too(db, app_engine):
+    user_id, _, version_id = await _built(db, app_engine)
+    run = await _run(
+        db, app_engine, user_id, version_id,
+        'import sys\nwhile True:\n    sys.stderr.write("x" * 4096)\n', "",
+    )
+    assert (run.status, run.truncated, run.error) == ("ok", True, None)
 
 
 @pytest.mark.integration
@@ -799,7 +975,7 @@ async def test_a_bare_word_argument_is_not_copied_from_the_working_directory(
     db, app_engine, tmp_path, monkeypatch
 ):
     """Under systemd the judge runs in `/`, where `run` is a directory full of
-    credentials. The harness's mode is a bare word, and must stay one."""
+    credentials. A bare word given to the program must stay one."""
     for name in ("run", "check"):
         (tmp_path / name).mkdir()
         (tmp_path / name / "secret").write_text("do not copy me")
@@ -809,7 +985,7 @@ async def test_a_bare_word_argument_is_not_copied_from_the_working_directory(
         db, app_engine, user_id, version_id,
         "import os\nprint(sorted(os.listdir('.')))\n", "",
     )
-    assert run.stdout == "['_stderr', '_stdout', 'harness.py', 'main.py']\n"
+    assert run.stdout == "['_stderr', '_stdout', 'main.py']\n"
 
     python = await cj.resolve_runtime("python3", "python")
     res = await cj.isolate_run(
@@ -835,7 +1011,10 @@ async def test_set_order_is_the_same_in_every_box(db, app_engine):
 @pytest.mark.integration
 async def test_what_jsonb_cannot_hold_is_dropped_before_it_gets_there(db, app_engine):
     user_id, _, version_id = await _built(db, app_engine)
-    run = await _run(db, app_engine, user_id, version_id, 'print("a\\0b\\ud800")\n', "")
+    run = await _run(
+        db, app_engine, user_id, version_id,
+        'import sys\nsys.stdout.buffer.write(b"a\\0b\\xff\\n")\n', "",
+    )
     assert run.stdout == "ab�\n"
 
 

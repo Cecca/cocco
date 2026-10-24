@@ -6,7 +6,7 @@ import math
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from cocco.exercises.compare import Rules
 from cocco.model import ExerciseJobKind, OutcomeEnum, SubmissionStatus
@@ -240,58 +240,14 @@ class ExerciseDocument(Base):
     # A `Literal`, so that a reader handed a document of a format it does not
     # know fails here rather than misreading it.
     format: Literal[1] = EXERCISE_FORMAT
-    # Always "python" for now: the harness is Python's. The field exists so a
-    # second language is a new value rather than a new format.
+    # A key of `languages.toml`, "python" when the file says nothing. A new
+    # language is a new value rather than a new format.
     language: str = "python"
     title: str
     description: str
     # Markdown shown before the first exercise.
     intro: str
     exercises: list[Exercise]
-
-
-# The largest line `HarnessException.line` is believed to be: far past any
-# exercise anybody types, far short of a number that encodes an input.
-MAX_EXCEPTION_LINE = 10**6
-
-
-class HarnessException(Base):
-    # `mro` on the wire, `classes` here: a field called `mro` would shadow the
-    # method every class has, and Pydantic warns about exactly that.
-    model_config = ConfigDict(
-        from_attributes=True, validate_by_name=True, serialize_by_alias=True
-    )
-
-    type: str
-    # Class names, the exception's own first and `object` last: what an
-    # `error: ValueError` test is matched against, subclasses included.
-    classes: list[str] = Field(alias="mro")
-    line: int | None
-    traceback: str
-
-    @field_validator("line")
-    @classmethod
-    def _line_in_a_file(cls, line: int | None) -> int | None:
-        """A line number a file could have, or None. The report is the
-        program's to forge - its last line of stdout - and `line` is shown to
-        students, so a number no file has is not passed on as one."""
-        if line is None or not 1 <= line <= MAX_EXCEPTION_LINE:
-            return None
-        return line
-
-
-class HarnessReport(Base):
-    """The one JSON object `cocco/exercises/harness.py` writes on stdout.
-
-    Pinned here, beside the document, for the judge that reads it; the harness
-    itself cannot import it, being a stdlib program that runs inside a box.
-    """
-
-    stdout: str
-    stderr: str
-    truncated: bool
-    exit: int
-    exception: HarnessException | None
 
 
 # --- Exercise jobs -----------------------------------------------------------
@@ -309,25 +265,23 @@ class HarnessReport(Base):
 
 
 class ExerciseExecution(Base):
-    """One program run through the harness, as the judge saw it.
+    """One program run, as the judge saw it.
 
-    `status` is how the run ended, which is isolate's to say: `ok` (the harness
-    reported), `timeout` and `memory` (no report, by construction), and
-    `no_report` - the box ended otherwise, or ended cleanly without the report
-    the harness always writes. That last one is *something the program did*
-    (`os._exit`, a closed fd 1), never a judge error.
+    `status` is how the run ended, which is isolate's to say: `ok`, `timeout`
+    and `memory`. `no_report` is no longer produced (it was an older runner's
+    report going missing) but stays in the literal so stored results validate.
 
-    The rest is the harness's report when there is one. Without one, `stdout`
-    and `stderr` are whatever reached the box's own two streams, which is only
-    what the program wrote to the descriptors directly - and, should the
-    harness itself ever break, its traceback.
+    `error` is the name of how the program failed (an exception class, a
+    signal), when there is one; the traceback or diagnostic that goes with it
+    is in `stderr`. Results stored with the older `exception` object are
+    folded into this shape on the way in (`_fold_old_exception`).
 
-    Two flags for two cuts. `truncated` is the harness's: the program printed
-    past its cap, which is a verdict of its own. `clipped` is the judge's: what
-    is *stored* of `stdout`, `stderr` and the traceback is less than what the
-    harness captured and the comparison saw (`judge.MAX_EXERCISE_STORED_OUTPUT`
-    and the budgets beside it). A reader of a clipped result must clamp
-    `ExerciseTestResult.diff` to the lines it actually has.
+    Two flags for two cuts. `truncated`: the program printed past its cap,
+    which is a verdict of its own. `clipped` is the judge's: what is *stored*
+    of `stdout` and `stderr` is less than what the comparison saw
+    (`judge.MAX_EXERCISE_STORED_OUTPUT` and the budgets beside it). A reader
+    of a clipped result must clamp `ExerciseTestResult.diff` to the lines it
+    actually has.
     """
 
     status: Literal["ok", "timeout", "memory", "no_report"]
@@ -336,10 +290,33 @@ class ExerciseExecution(Base):
     truncated: bool = False
     clipped: bool = False
     exit: int = 0
-    exception: HarnessException | None = None
+    error: str | None = None
     # isolate's own sentence for a run that did not end `ok`, when it has one.
     message: str | None = None
     elapsed_s: float = 0.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fold_old_exception(cls, data):
+        """Read a result stored with the older `exception` object
+        (`{type, mro, line, traceback}`): its `type` becomes `error` and its
+        traceback goes at the end of `stderr`, where it now lives. `mro` and
+        `line` are dropped. No migration: old rows are read through this."""
+        if not isinstance(data, dict) or "exception" not in data:
+            return data
+        data = dict(data)
+        exception = data.pop("exception")
+        if not exception:
+            return data
+        if data.get("error") is None:
+            data["error"] = exception.get("type")
+        traceback = exception.get("traceback") or ""
+        if traceback:
+            stderr = data.get("stderr") or ""
+            if stderr and not stderr.endswith("\n"):
+                stderr += "\n"
+            data["stderr"] = stderr + traceback
+        return data
 
 
 # A port of the prototype's `checkTests` statuses, minus the ones that only a
@@ -352,7 +329,7 @@ class ExerciseExecution(Base):
 #   error      the program raised (or exited non-zero) when it should not
 #              have, or raised something other than what the test expects
 #   timeout / memory / no_report   `ExerciseExecution.status`, as a verdict
-#   truncated  the program printed past the harness's cap
+#   truncated  the program printed past the output cap
 ExerciseVerdict = Literal[
     "pass", "fail", "noerror", "error", "timeout", "memory", "no_report", "truncated"
 ]
@@ -369,19 +346,32 @@ class ExerciseTestResult(ExerciseExecution):
     unordered: bool = False
 
 
+class ExerciseCompile(Base):
+    """What compiling the program said. `ok` is whether it produced something
+    to run. `diagnostics` is the compiler's stderr, capped by whoever builds
+    it - the judge, at `judge.MAX_EXERCISE_STORED_OUTPUT`."""
+
+    ok: bool
+    diagnostics: str
+
+
 class ExerciseCheckResult(Base):
     kind: Literal["check"] = "check"
     # Every test passed: the one fact progress is derived from.
     passed: bool
     # In the version's order, one per test.
     tests: list[ExerciseTestResult]
+    # None for an interpreted language, and for every result stored before
+    # compiling existed. A compile that failed is `passed=False, tests=[]`.
+    compile: ExerciseCompile | None = None
 
 
 class ExerciseRunResult(ExerciseExecution):
-    """A run's transcript: `stdout` has the prompts and the lines read echoed
-    into it, so it reads like a terminal."""
+    """A run's transcript: what the program printed. The stdin it was given is
+    the job's, not part of the result."""
 
     kind: Literal["run"] = "run"
+    compile: ExerciseCompile | None = None
 
 
 class ExerciseBuildResult(Base):

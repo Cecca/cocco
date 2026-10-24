@@ -3,24 +3,32 @@ extensions = ["py"]
 runtime = "python3"
 interpreter = "python"
 interpreter_args = ["{executable}"]
+env = { PYTHONHASHSEED = "0" }
+editor_mode = "python"
+# The name line of a traceback directly follows an indented line (a frame's
+# source, caret or `File` line); a plain stderr line does not.
+error_name = '(?m)^[ \t]+.*\n([A-Za-z_][\w.]*)(?::|$)'
 
 [cpp]
 extensions = ["cpp", "cc", "cxx"]
 runtime = "gcc"
 compiler = "g++"
 compiler_args = ["-O2", "-std=c++17", "-o", "{output}", "{source}"]
+editor_mode = "text/x-c++src"
 
 [c]
 extensions = ["c"]
 runtime = "gcc"
 compiler = "gcc"
-compiler_args = ["-O2", "-std=c17", "-o", "{output}", "{source}"]
+compiler_args = ["-O2", "-std=c17", "-Wall", "-o", "{output}", "{source}", "-lm"]
+editor_mode = "text/x-csrc"
 
 [java]
 extensions = ["java"]
 runtime = "jdk"
 compiler = "javac"
 compiler_args = ["{source}"]
+editor_mode = "text/x-java"
 output_ext = ".class"
 interpreter = "java"
 interpreter_args = ["{name}"]

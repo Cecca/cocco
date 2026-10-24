@@ -98,15 +98,17 @@ Reusing one box for all of a job's tests was measured too, and not built. It wou
 a job, while concurrency saved about 9×. It would also cost isolation between tests, since a file
 one test writes would still be there for the next.
 
-Two of the prototype's semantics are about Python rather than about bytes on stdout: an
-`input("…")` prompt is not output, and `error: ValueError` must also accept a subclass. Both
-therefore need code running *inside* the student's process. A small bundled harness runs the
-program and reports what it did as one line of JSON. The comparison of outputs stays in the judge
-process: the rules are declarative and the code is ours, so a sandbox per comparison would double
-the cost to buy nothing.
+The prototype had two semantics that are about Python rather than about bytes on stdout: an
+`input("…")` prompt is not output, and `error: ValueError` also accepts a subclass. Both needed code
+running *inside* the student's process, and a bundled Python harness did it. It is gone: it made
+every other language a second special case, and the bar is that a language is a `languages.toml`
+entry. A program now runs as the challenge judge runs one (`Language.compile`, then `Language.run`),
+a prompt is ordinary output, and `error:` names a signal or an exception exactly. The comparison of
+outputs stays in the judge process: the rules are declarative and the code is ours, so a sandbox per
+comparison would double the cost to buy nothing.
 
 Run is the one thing given up. It is no longer interactive: stdin is typed into a box up front, and
-the harness echoes what was read so the transcript still reads like a terminal.
+the page shows it above the transcript.
 
 ## Not a kind of challenge
 

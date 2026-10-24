@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.routing import Match
 
-from cocco.judge import load_languages
+from cocco.languages import load_languages
 from cocco.main import app
 from cocco.web.challenges import visible_outcomes
 from cocco.web.templating import (

@@ -54,7 +54,7 @@ SOURCE = textwrap.dedent(
     ```
 
     ```solution
-    n = int(input("n? "))
+    n = int(input())
     print(2 * n)
     ```
 
@@ -522,12 +522,8 @@ async def test_a_done_run_shows_its_transcript(client, world, db, ready):
     result = ExerciseRunResult(
         status="ok",
         stdout="hi\n",
-        exception={
-            "type": "NameError",
-            "mro": ["NameError", "Exception", "BaseException", "object"],
-            "line": 1,
-            "traceback": "Traceback ...",
-        },
+        error="NameError",
+        stderr="Traceback ...",
     )
     with db.begin() as conn:
         conn.execute(
@@ -539,7 +535,7 @@ async def test_a_done_run_shows_its_transcript(client, world, db, ready):
     text = client.get(f"/f/courses/{world['course']}/exercises/{set_id}/jobs/{job.id}").text
     assert "Transcript" in text
     assert "NameError" in text
-    assert "Line 1: name not defined" in text
+    assert "Name not defined" in text
 
 
 async def test_a_preview_job_is_its_askers_own(client, world, db, ready):

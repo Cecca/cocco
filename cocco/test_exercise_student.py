@@ -30,7 +30,6 @@ from cocco.schema import (
     ExerciseCheckResult,
     ExerciseRunResult,
     ExerciseTestResult,
-    HarnessException,
 )
 from cocco.test_exercise_routes import (  # noqa: F401 - fixtures
     ADMIN,
@@ -102,16 +101,11 @@ SECRET_CHECK = ExerciseCheckResult(
             status="ok",
             elapsed_s=1.23,
             stdout="the input was 5-SECRET\n",
-            stderr="5-SECRET on stderr",
+            stderr="5-SECRET on stderr\nTraceback: 5-SECRET",
             exit=5,
             verdict="error",
             hidden=True,
-            exception={
-                "type": "Secret5",
-                "mro": ["Secret5", "ValueError", "Exception", "BaseException", "object"],
-                "line": 3,
-                "traceback": "Traceback: 5-SECRET",
-            },
+            error="Secret5",
         ),
     ],
 )
@@ -150,10 +144,25 @@ def test_a_hidden_test_is_only_its_verdict_and_its_exception():
         "verdict": "error",
         "hidden": True,
         "redacted": True,
-        # The class is the student's to name; its nearest builtin is not.
-        "exception": {"type": "ValueError"},
+        # The name is the program's to choose; one `HINTS` knows is not.
+        "error": "error",
     }
     assert "SECRET" not in repr(rows)
+
+
+def test_a_hidden_signal_is_shown_by_name():
+    check = ExerciseCheckResult(
+        passed=False,
+        tests=[
+            ExerciseTestResult(status="ok", verdict="pass", hidden=False),
+            ExerciseTestResult(
+                status="ok", verdict="error", hidden=True, error="SIGSEGV", exit=-11
+            ),
+        ],
+    )
+    _, hidden = exercise_sets.exercise_check_rows(check, _exercise(), redact=True)
+    assert hidden["error"] == "SIGSEGV"
+    assert "exit" not in hidden
 
 
 def test_staff_see_a_hidden_test_in_full():
@@ -478,8 +487,8 @@ async def test_a_student_reads_a_hidden_test_as_its_verdict(client, world, db, s
     assert "every 500ms" not in fragment
     assert "1 of 2 tests passed." in fragment
     assert "SECRET" not in fragment and "Secret5" not in fragment
-    assert "ValueError" in fragment
-    assert "Invalid value" in fragment and "Line 3" not in fragment
+    assert "Exception error." not in fragment and "Error error." not in fragment
+    assert "Line 3" not in fragment
     assert "1.23" not in fragment
 
 
@@ -552,20 +561,6 @@ async def test_a_programs_output_is_escaped(client, world, db, session):
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in fragment
     page = client.get(f"{base}/1").text
     assert "print(&#39;&lt;b&gt;&#39;)</textarea>" in page
-
-
-def test_a_forged_line_is_no_line():
-    """The report is the program's to forge, and its line is shown: a number
-    no file has - one that encodes an input - is not passed on."""
-    def line(value):
-        return HarnessException.model_validate(
-            {"type": "E", "mro": ["E"], "line": value, "traceback": ""}
-        ).line
-
-    assert line(int.from_bytes(b"secret input")) is None
-    assert line(10**6 + 1) is None
-    assert (line(0), line(-3), line(None)) == (None, None, None)
-    assert (line(1), line(10**6)) == (1, 10**6)
 
 
 async def test_a_check_after_the_teacher_went_back_is_refused(client, db, session):

@@ -461,6 +461,39 @@ async def test_a_switch_to_a_version_nobody_confirmed_is_refused(client, world, 
     assert _session(db, session_id).version_id == old_version
 
 
+C_VERSION = """\
+---
+title: Warm-up
+language: c
+---
+
+# One
+
+Return.
+
+```c solution
+int main(void) { return 0; }
+```
+"""
+
+
+async def test_a_switch_across_languages_is_refused(client, world, db, ready, session):
+    """A session's language is fixed: the page offers no switch, and the route
+    answers 200 with the alert in the controls fragment."""
+    set_id, old_version, _ = ready
+    session_id, base = session
+    c_version = _reimport(client, world, db, set_id, C_VERSION)
+    page = client.get(base).text
+    assert "is written in c and this session is on python" in page
+    assert "switch_version_modal" not in page
+
+    response = client.post(f"{base}/switch", data={"version_id": str(c_version)})
+    assert response.status_code == 200
+    assert "is written in c and this session is on python" in response.text
+    assert "Nothing was changed" in response.text
+    assert _session(db, session_id).version_id == old_version
+
+
 async def test_a_closed_session_keeps_its_version(client, world, db, ready, session):
     set_id, old_version, _ = ready
     session_id, base = session

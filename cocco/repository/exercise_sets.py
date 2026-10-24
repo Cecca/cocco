@@ -133,6 +133,12 @@ async def insert_exercise_version(
     return (await conn.execute(stmt)).scalar_one()
 
 
+def _version_language(version):
+    """A version's language; a document that predates the key, or one not
+    built yet, is Python's."""
+    return func.coalesce(version.c.document["language"].astext, "python")
+
+
 def _version_number(version):
     """A version's `number` within its set, oldest first, so "v3" means the
     third import of *this* set whatever the ids are. A window over `version`,
@@ -175,6 +181,7 @@ def _exercise_versions(condition, *, counts: bool = True):
         ExerciseSetVersion.c.status,
         ExerciseSetVersion.c.created_at,
         _version_number(ExerciseSetVersion).label("number"),
+        _version_language(ExerciseSetVersion).label("language"),
     ]
     if counts:
         columns += [
@@ -491,6 +498,7 @@ async def query_preview_job(
             ExerciseJob.c.version_id,
             ExerciseJob.c.exercise_index,
             ExerciseJob.c.result,
+            ExerciseJob.c.stdin,
         )
         .join(ExerciseSetVersion, ExerciseSetVersion.c.id == ExerciseJob.c.version_id)
         .where(

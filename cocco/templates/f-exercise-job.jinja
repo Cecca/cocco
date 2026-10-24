@@ -13,7 +13,9 @@
    `tests` (a check's rows, `exercise_check_rows`'s), and `earlier_version`
    (the job ran on a version the session has since left). A `redacted` row is a
    hidden test as a student may see it - the verdict and, on an error, the
-   exception's type - and carries nothing else to print. #}
+   error's name - and carries nothing else to print. `result.compile`, when the
+   language has a compiler, is the compiler's own output about the student's
+   source and nothing else, so it is shown in full even where tests are redacted. #}
 
 {# Escaped explicitly: `Jinja2Templates` autoescapes only .html/.xml, so a
    `.jinja` file is not, and what this prints is code and program output. #}
@@ -21,7 +23,7 @@
 {% set VERDICTS = {
   "pass": "passed",
   "fail": "wrong output",
-  "noerror": "no exception, one was expected",
+  "noerror": "no error, one was expected",
   "error": "error",
   "timeout": "time limit exceeded",
   "memory": "memory limit exceeded",
@@ -29,39 +31,44 @@
   "truncated": "too much output",
 } %}
 
+{# The compiler's output: why it did not compile, or - collapsed - what it
+   warned about on the way. #}
+{% macro compile_notes(compile) %}
+  {% if compile and not compile.ok %}
+  <div role="alert" class="alert alert-error text-sm"><span>It does not compile.</span></div>
+  <pre class="max-h-64 overflow-auto rounded-md bg-neutral text-neutral-content p-2 text-xs font-mono whitespace-pre-wrap">{{ compile.diagnostics }}</pre>
+  {% elif compile and compile.diagnostics %}
+  <details class="text-xs">
+    <summary class="cursor-pointer text-base-content/55">Compiler warnings</summary>
+    <pre class="mt-1 max-h-48 overflow-auto rounded-md bg-neutral text-neutral-content p-2 font-mono whitespace-pre-wrap">{{ compile.diagnostics }}</pre>
+  </details>
+  {% endif %}
+{% endmacro %}
+
 {# How a run ended, when that is not simply "it printed this": the
-   exception with its explanation, the isolate verdict, the cut output. #}
+   error's name with its explanation, the isolate verdict, the cut output. #}
 {% macro execution_notes(run) %}
   {% if run.status == "timeout" %}
   <p class="text-sm text-error">It did not finish in time.{% if run.message %} <span class="text-base-content/55">({{ run.message }})</span>{% endif %}</p>
   {% elif run.status == "memory" %}
   <p class="text-sm text-error">It ran out of memory.</p>
   {% elif run.status == "no_report" %}
-  <p class="text-sm text-error">
-    The program ended without the harness reporting how — for example through
-    <code>os._exit()</code>.{% if run.message %} <span class="text-base-content/55">({{ run.message }})</span>{% endif %}
-  </p>
+  <p class="text-sm text-error">The program ended without saying how.{% if run.message %} <span class="text-base-content/55">({{ run.message }})</span>{% endif %}</p>
   {% endif %}
   {% if run.truncated %}
   <p class="text-sm text-warning">It printed more than the limit; the output was cut.</p>
   {% endif %}
-  {% if run.exception %}
+  {% if run.error %}
   <div class="text-sm">
-    <span class="font-mono font-semibold text-error">{{ run.exception.type }}</span>
-    <span class="text-base-content/70">— {{ error_hint(run.exception.type, run.exception.line) }}</span>
+    <span class="font-mono font-semibold text-error">{{ run.error }}</span>
+    <span class="text-base-content/70">— {{ error_hint(run.error) }}</span>
   </div>
-  {% if run.exception.traceback %}
-  <details class="text-xs">
-    <summary class="cursor-pointer text-base-content/55">Traceback</summary>
-    <pre class="mt-1 max-h-48 overflow-auto rounded-md bg-neutral text-neutral-content p-2 font-mono whitespace-pre-wrap">{{ run.exception.traceback }}</pre>
-  </details>
-  {% endif %}
   {% elif run.exit %}
   <p class="text-sm text-base-content/70">It exited with code {{ run.exit }}.</p>
   {% endif %}
   {% if run.stderr %}
   <details class="text-xs">
-    <summary class="cursor-pointer text-base-content/55">Standard error</summary>
+    <summary class="cursor-pointer text-base-content/55">Error output</summary>
     <pre class="mt-1 max-h-48 overflow-auto rounded-md bg-base-200 p-2 font-mono whitespace-pre-wrap">{{ run.stderr }}</pre>
   </details>
   {% endif %}
@@ -115,13 +122,26 @@
   <div role="alert" class="alert alert-error text-sm"><span>{{ result.message }}</span></div>
 
   {% elif result.kind == "run" %}
+  {{ compile_notes(result.compile) }}
+  {% if not result.compile or result.compile.ok %}
+  {% if job.stdin is not none %}
+  <div>
+    <div class="text-[11px] uppercase tracking-wider text-base-content/45">Input given</div>
+    <pre class="mt-1 max-h-32 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono whitespace-pre-wrap">{{ job.stdin or "(empty)" }}</pre>
+  </div>
+  {% endif %}
   <div class="text-[11px] uppercase tracking-wider text-base-content/45">
     Transcript · {{ "%.2f" | format(result.elapsed_s) }} s
   </div>
   <pre class="max-h-80 overflow-auto rounded-xl bg-neutral text-neutral-content p-3 text-xs font-mono whitespace-pre-wrap">{{ result.stdout or "(no output)" }}</pre>
   {{ execution_notes(result) }}
+  {% endif %}
+
+  {% elif result.kind == "check" and result.compile and not result.compile.ok %}
+  {{ compile_notes(result.compile) }}
 
   {% elif result.kind == "check" %}
+  {{ compile_notes(result.compile) }}
   {% set n_passed = result.tests | selectattr("verdict", "equalto", "pass") | list | length %}
   <div role="alert" class="alert {{ 'alert-success' if result.passed else 'alert-error' }} text-sm">
     <span>
@@ -134,7 +154,7 @@
       <span class="font-mono font-semibold text-base-content/55">Test {{ row.n }}</span>
       {% if row.hidden %}
       <span class="badge badge-ghost badge-sm font-mono"
-            {% if not row.redacted %}title="A student sees only the verdict and the exception's type"{% endif %}>hidden</span>
+            {% if not row.redacted %}title="A student sees only the verdict and the error's name"{% endif %}>hidden</span>
       {% endif %}
       <span class="font-mono font-semibold {{ 'text-success' if row.verdict == 'pass' else 'text-error' }}">
         {{ "✓" if row.verdict == "pass" else "✗" }} {{ VERDICTS[row.verdict] }}
@@ -144,10 +164,12 @@
       {% endif %}
     </div>
     {% if row.redacted %}
-    {% if row.exception %}
+    {% if row.error %}
     <div class="text-sm">
-      <span class="font-mono font-semibold text-error">{{ row.exception.type }}</span>
-      <span class="text-base-content/70">— {{ error_hint(row.exception.type) }}</span>
+      <span class="font-mono font-semibold text-error">{{ row.error }}</span>
+      {% if row.error != "error" %}
+      <span class="text-base-content/70">— {{ error_hint(row.error) }}</span>
+      {% endif %}
     </div>
     {% endif %}
     {% elif row.verdict != "pass" %}

@@ -12,6 +12,7 @@
         {{ exercise_session.title }} ·
         {{ exercise_session.n_exercises }} exercise{{ "" if exercise_session.n_exercises == 1 else "s" }} ·
         opened {{ exercise_session.opened_at | datetime }}
+        <span class="badge badge-ghost badge-sm font-mono ml-1">{{ exercise_session.language }}</span>
       </div>
     </div>
     {% if exercise_session.closed_at %}

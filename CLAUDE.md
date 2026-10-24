@@ -53,7 +53,7 @@ Each area has a guide in `.claude/rules/`, loaded when you touch its files. Read
 - `migrations.md` — Alembic revisions and what autogenerate misses
 - `auth.md` — sign-in: OAuth providers, passwords, dummy auth, tokens
 - `transfer.md` — the `/api` zip format and the `cocco` CLI
-- `exercises.md` — live Python exercises
+- `exercises.md` — live exercises (Python, C, …)
 - `logging.md` — JSON logs, access log, proxy headers
 
 ## Architecture

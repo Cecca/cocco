@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Exercises in any language from `languages.toml` (C first)
@@ -280,6 +280,79 @@ prompts and with exact error names; a teacher who wants the new semantics re-imp
 switches. Step 9 checks the dev seed and any set in the repo for `input("…")` with a prompt and for base-class `error`
 blocks.
 
+## Spike results (step 1)
+
+Run through `isolate_run` / `Language.compile` with the real nix gcc and python on this host (script, not committed:
+the session scratchpad `spike.py`, `spike2.py`, `fpe.py`). The meta file is `/tmp/meta-<box>.txt`; only `exitsig`
+needs adding to what `isolate_run` already reads.
+
+**Signals in `--meta`** (C binary and `python` agree): a death by signal is `status:SG`, `exitsig:<n>`,
+`message:Caught fatal signal <n>`, and no `exitcode`. Seen: SIGSEGV `exitsig:11`, SIGFPE `8`, SIGABRT `6` (a failed
+`assert`: stderr carries `main: main.c:2: main: Assertion 'c>5' failed.`), SIGXFSZ `25`. A plain exit is
+`status:RE`, `exitcode:N`, `message:Exited with error status N`; a clean exit has `exitcode:0` and **no `status`**
+(already `OK` in `RunOutcome`). `RunOutcome.retcode` is useless for both (`isolate`'s own rc: 1 for RE/SG, 0 becomes
+127 via `retcode or 127`), so `read_exercise_run` must take the exit code from the meta file too: **step 3 should add
+`exitcode` beside `exitsig`**, not just `exitsig`. Python's `os.kill(getpid(), SIGSEGV/SIGFPE)` and `os.abort()`
+are `SG` 11 / 8 / 6 as well.
+
+**Contradicts the design in three places, none fatal:**
+
+1. **Python ignores SIGXFSZ.** A Python flood to stdout or stderr at `--fsize=256` is **not `SG`**: it is `RE`,
+   `exitcode:120` (Python's "failed to flush stdout"), with `OSError: [Errno 27] File too large` in stderr and the
+   captured file exactly 262144 bytes. A C flood *is* `SG` 25, also exactly 262144 B in the flooded stream (the other
+   stream empty). So the "`SG` with `SIGXFSZ`" row is only half the detection; the **"stdout or stderr at the cap"
+   test is the one that works for Python and must come before the `RE` row** (else Python's flood reads as
+   `error = OSError`). Cost: a program writing *exactly* 256 KB and exiting cleanly is also flagged `truncated`
+   (verified: C writing exactly 262144 B is `OK`, exit 0). Accepted. The check is on bytes, but `RunOutcome` holds
+   decoded `str` (`errors="replace"`); non-UTF-8 output can change the length, so compare `len(s.encode()) >= cap`
+   (a replacement char is 3 bytes, so this errs towards truncated, fine) or add the byte counts to `RunOutcome`.
+2. **`KeyboardInterrupt` is `SG`, signal 2.** Python re-raises SIGINT on itself after printing the traceback, so
+   the table's `SG` row names it `SIGINT`, not `KeyboardInterrupt` (the traceback is in stderr either way). Accepted:
+   it is not an error a student writes on purpose; `HINTS` can carry `SIGINT` if wanted.
+3. **Output is lost on a signal death.** `print('hi')` followed by SIGSEGV shows empty stdout in Python, and so does
+   `printf("hello\n")` then a NULL write in C (stdout is a file, so fully buffered; abort/segv do not flush). This
+   confirms the "Buffered stdout in C" open question and shows it applies to **Python too** whenever it dies by a
+   signal (not for an exception, which flushes). Stdout is empty; stderr only has what was unbuffered (C's `assert`
+   message does arrive).
+
+Also: **`1/z` is not a reliable SIGFPE at `-O2`.** With `volatile int z = 0`, `printf("%d", 1/z)` printed `0` and
+exited 0 (gcc rewrites `1/z` into a comparison); `1 % z` (and `a / b` with a non-constant `a`) dies `SG` 8. Step 7's
+`error: SIGFPE` test must use something like `a / b` or `%` with both operands read from input or `volatile`, not
+`1/0`. (A literal `1/0` is folded at compile time with a `-Wdiv-by-zero` warning; not tried.)
+
+**`-lm`**: compile of a one-function program, 8 runs each: median 0.136 s without, 0.152 s with `-lm` (min 0.128 vs
+0.140), so about 10-15 ms, noise level. Without `-lm`, `sqrt(non-constant)` **fails to link**
+(`undefined reference to 'sqrt'`), so the flag is needed. `-Wall` was not measured separately (same order).
+
+**`error_name`.** The regex in the design, `(?m)^([A-Za-z_][\w.]*)(?::|$)`, last match wins, is right for a plain
+raise (`ValueError`), both chained forms (`ValueError`, the later traceback wins), `SyntaxError`, `IndentationError`,
+`TabError`, `ModuleNotFoundError`, `AssertionError`, `RecursionError`, a `__main__` class (`MyErr`, with or without a
+message), a dotted one (`json.decoder.JSONDecodeError`), an exception with a note. It **gives wrong names** for:
+
+- a multi-line message: `raise ValueError('line one\nNotAnError: fake\nlast')` yields `last` (and a message line
+  `Foo: bar` yields `Foo`);
+- `sys.exit('bye')` (message printed to stderr, exit 1) yields `bye`; any program that prints a column-0 word to
+  stderr and exits non-zero yields that word (the forgeable case the design already accepts, but here it is also
+  accidental);
+- an `ExceptionGroup` yields `None` (the name line is inside the `+ | ` box), which is merely a missing name.
+
+**Adjusted regex** (anchor on the traceback's own shape: the name line directly follows an *indented* line, which
+every frame's source line, caret line or `File` line is, and which a plain stderr line and the first line of a message
+are not):
+
+```
+(?m)^[ \t]+.*\n([A-Za-z_][\w.]*)(?::|$)
+```
+
+Last match wins, group 1. Verified against every case above: the right names for all the good ones; `None` for
+`sys.exit('bye')`, for a forged `Fake: forged` with no frame above it, for `warnings.warn` + `sys.exit(2)`, for
+`sys.exit(1)` after printing a word, and for `ExceptionGroup`/`BaseExceptionGroup` (names `ExceptionGroup` are not
+recovered; accepted, `error = None`); `ValueError` (not `last`) for the multi-line message. Still wrong only when a
+message itself has an indented line followed by a column-0 word (`'a\n  indented\nlast'` gives `last`): the
+forgeable case. It is also linear: 60 000 indented lines with and without a match take about 10 ms (the first
+attempt, `^(?:[ \t]+.*\n)+(...)`, is quadratic on such input and hung; do not use it). Use this as the `[python]`
+`error_name`.
+
 ## Steps
 
 Each step leaves the suite green. The integration ones need isolate and nix.
@@ -341,3 +414,56 @@ lines for its common errors. Java additionally needs the `Main` source stem.
   header), or sanitizers (next point).
 - **Sanitizers.** `-fsanitize=address,undefined` would turn `SIGSEGV` into "heap-buffer-overflow at main.c:12" and
   flush on the way out. It costs memory and roughly 2× time and changes what an error name is. A follow-up plan.
+
+## Outcome (2026-10-23)
+
+Landed as planned, one implementer per step with a review after each; **not committed** (the whole change is staged).
+`uv run pytest` is 1050 passed, integration included. Deviations from the design are all spike findings or review
+fixes, listed per step.
+
+1. **Spike**: results above. Three corrections carried into later steps: `RunOutcome` needs `exitcode` as well as
+   `exitsig` (`retcode` is isolate's own); Python ignores `SIGXFSZ` (a flood is `RE`, exit 120, `OSError`), so the
+   "stream at the cap" test comes before `RE`; the `error_name` regex became `(?m)^[ \t]+.*\n([A-Za-z_][\w.]*)(?::|$)`
+   (the name line must follow an indented traceback line: a multi-line message or `sys.exit('bye')` no longer names an
+   error). Also: `KeyboardInterrupt` is `SIGINT` (accepted); stdout printed before a signal death is lost in Python too.
+2. **`cocco/languages.py`**: `LanguageSpec` (data only, with `env`, `error_name`, `editor_mode`, type-checked on load)
+   and `load_languages(path, cls=)`; `judge.Language(LanguageSpec)` keeps `compile` / `run`, and `judge.load_languages`
+   builds it. `run(fsize_kb=)` and the entry's `env` in both run branches. `[c]` gets `-Wall` and `-lm`. No challenge
+   path shows a successful compile's output. `cocco/test_languages.py`.
+3. **`RunOutcome.exitcode` / `exitsig`**: a pure `_parse_meta` / `_meta_int`; unit tests on synthetic meta, one
+   integration test.
+4. **Schema**: `ExerciseExecution.error`, `_fold_old_exception` (before-validator: `exception.type` → `error`,
+   traceback appended to `stderr`), `ExerciseCompile`, optional `compile` on check and run results. The harness models
+   lived in `judge.py` for one step to keep the suite green.
+5. **Judge**: `exercise_language`, `prepare_exercise_program`, `run_exercise_program`, `read_exercise_run`;
+   `check_exercise` / `run_exercise_job` / `build_exercise` on them (solution and starter each in their own
+   subdirectory). `harness.py`, `test_exercise_harness.py`, `HARNESS_PATH`, `run_in_harness`, `read_execution`,
+   `parse_harness_report`, `EXERCISE_ENV`, `_MAIN_IN_BOX`, `_HARNESS_IN_BOX` deleted; `EXERCISE_FSIZE_KB` = 256. An
+   empty `error` block with a solution failing *without* a name (`return 3`) is a build error, as before; accepting it
+   would need `grade` and the schema to represent "any failure". A program writing exactly 256 KB is `truncated`
+   (accepted in the spike). Review: `_compile_detail` (the head of the diagnostics) instead of two `type: ignore`s.
+6. **`format.py`**: `language:` (unknown is an error listing the known ones), prefixes from the entry, `<other
+   language> <role>` is an error naming the right spelling while a bare ```` ```c ```` stays statement text, `error`
+   is one word, `linguaggio`. `parse(languages=)` for tests.
+7. **C end to end**: `cocco/test_exercise_c.py`, 16 tests, every item of the step; no production change was needed.
+   `SIGFPE` uses `a / b` read from stdin (gcc folds `1/z` at `-O2`).
+8. **Web**: signal hints, `error_hint(name)` without `line`, `_shown_error_name` (a `HINTS` key or `"error"`). The
+   switch guard is a sequential check under the session's `FOR UPDATE` lock, like the others (they were never one
+   statement); `_version_switch` shows the same refusal instead of the Switch button.
+9. **Front end and seed**: `clike.js` 5.65.16 (byte-identical to unpkg's), `data-mode`, `editor_mode()` in
+   `web/core.py`, `highlight(language)`, the compile block (failure as an alert, warnings collapsed), "Error output",
+   "Input given" on Run, the prompt sentence, language badges (the set page's only once the version is ready). A
+   three-exercise C set in the dev seed (pass / `SIGFPE` / `SIGABRT`); the seed had no Python sets, so no prompts to
+   remove. `cocco/test_exercise_front_end.py`, 13 tests. Review: the redacted row carries `error`, not
+   `exception.type`.
+10. **Docs**: `.claude/rules/exercises.md` rewritten for execution, `judge.md` (keys, `exitcode`/`exitsig`,
+    `languages.py`), `DESIGN.md`, `CLAUDE.md`'s guide line, stale harness comments in `schema.py`, `model.py`,
+    `hints.py`.
+
+Left open:
+- **`npm run build:css` was not run** (no `node_modules` here). Step 9 uses literal classes only, but rebuild before
+  shipping in case one (e.g. `ml-1`) is new to the sources.
+- The open questions above (buffered stdout in C, sanitizers) stand; the spike showed the first applies to any
+  signal death, Python's included.
+- Sets already built by the harness: none in the repo; check deployed sets for `input("…")` prompts and base-class
+  `error` blocks before switching sessions to a rebuilt version.

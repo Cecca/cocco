@@ -69,7 +69,7 @@
     var run = function () { click(textarea.dataset.run); };
     var check = function () { click(textarea.dataset.check); };
     var editor = CodeMirror.fromTextArea(textarea, {
-      mode: "python",
+      mode: textarea.dataset.mode || null,
       lineNumbers: true,
       indentUnit: 4,
       tabSize: 4,
@@ -84,7 +84,7 @@
         "Cmd-Enter": run,
         "Shift-Ctrl-Enter": check,
         "Shift-Cmd-Enter": check,
-        // Spaces, never a tab character: Python minds the difference.
+        // Spaces, never a tab character: Python minds, and nothing else does.
         Tab: function (cm) {
           if (cm.somethingSelected()) cm.indentSelection("add");
           else cm.replaceSelection(" ".repeat(cm.getOption("indentUnit")));

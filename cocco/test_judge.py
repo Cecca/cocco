@@ -105,6 +105,47 @@ async def test_python_run():
     assert res.stdout.strip() == "hello moon"
 
 
+def test_meta_of_a_clean_exit():
+    meta = cj._parse_meta("time:0.010\nmax-rss:9000\nexitcode:0\n")
+    assert cj._meta_int(meta, "exitcode") == 0
+    assert cj._meta_int(meta, "exitsig") is None
+
+
+def test_meta_of_a_nonzero_exit():
+    meta = cj._parse_meta("status:RE\nmessage:Exited with error status 3\nexitcode:3\n")
+    assert cj._meta_int(meta, "exitcode") == 3
+    assert cj._meta_int(meta, "exitsig") is None
+
+
+def test_meta_of_a_signal_death():
+    meta = cj._parse_meta(
+        "status:SG\nexitsig:11\nmessage:Caught fatal signal 11\ntime:0.0\n"
+    )
+    assert cj._meta_int(meta, "exitsig") == 11
+    assert cj._meta_int(meta, "exitcode") is None
+    assert meta["message"] == "Caught fatal signal 11"
+
+
+@pytest.mark.integration
+async def test_run_reports_exit_code_and_signal():
+    python = await cj.resolve_runtime("python3", "python")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        segv = tmp / "segv.py"
+        segv.write_text("import os, signal\nos.kill(os.getpid(), signal.SIGSEGV)\n")
+        three = tmp / "three.py"
+        three.write_text("raise SystemExit(3)\n")
+        stdin_path = _stdin(tmp, "")
+        died = await cj.isolate_run(
+            python, stdin_path, ["segv.py"], box_files={"segv.py": segv}
+        )
+        exited = await cj.isolate_run(
+            python, stdin_path, ["three.py"], box_files={"three.py": three}
+        )
+    assert (died.exitsig, died.exitcode) == (11, None)
+    assert (exited.exitcode, exited.exitsig) == (3, None)
+
+
 @pytest.mark.integration
 async def test_language_python():
     python = cj.load_languages()["python"]

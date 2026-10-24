@@ -117,7 +117,7 @@
         <h2 class="font-bold mt-6">Solution</h2>
         <p class="text-[13px] text-base-content/55 mb-2">Your teacher has shown the solution to the class.</p>
         <div class="max-h-[60vh] overflow-auto rounded-xl border border-base-300 bg-base-200/40">
-          {{ exercise.solution | highlight("python") }}
+          {{ exercise.solution | highlight(language) }}
         </div>
         {% endif %}
       </div>
@@ -142,7 +142,7 @@
           </div>
           <div class="cocco-editor">
             <textarea id="exercise-source" name="source" rows="16" spellcheck="false"
-                      data-editor {% if not closed %}data-draft-key="{{ draft_key }}"{% endif %}
+                      data-editor data-mode="{{ editor_mode }}" {% if not closed %}data-draft-key="{{ draft_key }}"{% endif %}
                       data-run="run-button" data-check="check-button"
                       {% if closed %}readonly{% endif %}
                       class="textarea w-full font-mono text-sm leading-relaxed">{{ source }}</textarea>
@@ -174,6 +174,9 @@
               <label class="text-xs text-base-content/55" for="exercise-stdin">
                 Input, given to the program all at once. Ctrl-Enter in the editor.
               </label>
+              <p class="text-xs text-base-content/55 mt-1">
+                Don't print a prompt when reading input: everything your program prints is compared.
+              </p>
               <textarea id="exercise-stdin" name="stdin" rows="3" spellcheck="false"
                         {% if not closed %}data-draft-key="{{ draft_key }}:stdin"{% endif %}
                         {% if closed %}readonly{% endif %}

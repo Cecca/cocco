@@ -4,7 +4,6 @@ import errno
 import fnmatch
 import functools
 import gzip
-import json
 import logging
 import os
 import re
@@ -14,10 +13,9 @@ import stat
 import sys
 import tempfile
 import time
-import tomllib
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -38,9 +36,15 @@ from cocco.config import (
     load_log_config,
 )
 from cocco.evaluators import DEFAULT_EVALUATOR, bundled_path
-from cocco.exercises import HARNESS_PATH
 from cocco.exercises import format as exercise_format
 from cocco.exercises.compare import Comparison, Rules, compare
+from cocco.languages import (
+    LANGUAGES_PATH,
+    LanguageSpec,
+    extension_to_language,
+    language_for_filename,
+    load_languages as _load_languages,
+)
 from cocco.logs import bind, configure_logging
 from cocco.schema import (
     Challenge,
@@ -48,6 +52,7 @@ from cocco.schema import (
     Exercise,
     ExerciseBuildResult,
     ExerciseCheckResult,
+    ExerciseCompile,
     ExerciseExecution,
     ExerciseJobError,
     ExerciseJobRunData,
@@ -56,8 +61,6 @@ from cocco.schema import (
     ExerciseTest,
     ExerciseTestResult,
     ExerciseVerdict,
-    HarnessException,
-    HarnessReport,
     Submission,
     SubmissionRunData,
     TestCase,
@@ -122,7 +125,7 @@ _RUNTIME_CACHE: Dict[tuple[str, str], Path] = {}
 # Which flake the runtimes are built out of - `[judge] flake`, see `JudgeConfig`.
 # A module-level name rather than an argument threaded through `Language.run`,
 # `run_submission` and `run_loop`, for the reason `core.DUMMY_AUTH` is one:
-# `Language` is a frozen dataclass built straight from `languages.toml` and has
+# `Language` is a dataclass built straight from `languages.toml` and has
 # nowhere to carry it, and this is one value set once at startup and read from
 # the bottom of the call stack. `main()` assigns it; tests monkeypatch it.
 #
@@ -256,8 +259,27 @@ async def resolve_runtime(runtime_name: str, bin_name: str) -> Path:
     return binary
 
 
+def _parse_meta(text: str) -> dict[str, str]:
+    """Isolate's `--meta` file: one `key:value` per line."""
+    return dict(line.strip().split(":", maxsplit=1) for line in text.splitlines())
+
+
+def _meta_int(meta: dict[str, str], key: str) -> int | None:
+    value = meta.get(key)
+    return None if value is None else int(value)
+
+
 @dataclass(frozen=True)
 class RunOutcome(object):
+    """What one sandboxed run did.
+
+    `retcode` is *isolate's own* return code (0 ok, 1 when the program failed
+    or was killed, 2 for an internal error), not the program's exit status.
+    The program's own are `exitcode` (it called exit; None if a signal killed
+    it) and `exitsig` (the signal that killed it; None if it exited), both read
+    from the meta file.
+    """
+
     retcode: int
     stdout: str
     stderr: str
@@ -266,6 +288,8 @@ class RunOutcome(object):
     status: str
     message: str | None
     oom: bool = False
+    exitcode: int | None = None
+    exitsig: int | None = None
 
 
 def _classify_isolate_failure(res: RunOutcome) -> OutcomeEnum:
@@ -509,7 +533,7 @@ async def isolate_run(
                 stderr = fp.read().decode("utf-8", errors="replace")
 
             with open(meta_file) as fp:
-                meta = dict(line.strip().split(":", maxsplit=1) for line in fp.readlines())
+                meta = _parse_meta(fp.read())
 
             ret = RunOutcome(
                 retcode=retcode or 127,
@@ -520,6 +544,8 @@ async def isolate_run(
                 status=meta.get("status", "OK"),
                 message=meta.get("message", None),
                 oom=meta.get("cg-oom-killed", "0").strip() == "1",
+                exitcode=_meta_int(meta, "exitcode"),
+                exitsig=_meta_int(meta, "exitsig"),
             )
             logger.debug(
                 "isolate run on box %s done: status=%s rc=%s time=%.3fs rss=%dKB",
@@ -634,8 +660,8 @@ async def _cleanup_box(box_id: int) -> None:
 
 
 @dataclass
-class Language:
-    """A language runtime loaded from `languages.toml`.
+class Language(LanguageSpec):
+    """A language runtime loaded from `languages.toml` (`LanguageSpec` is its data).
 
     Three cases, driven by `compile_args` and `run_binary`:
     - Interpreted (python): `compile_args` is None. `binary` is the interpreter;
@@ -651,20 +677,6 @@ class Language:
     box-relative: basenames, and `.` for the working directory.
     Run-time placeholders: `{executable}`, `{workdir}`, `{name}`.
     """
-
-    name: str
-    extensions: List[str]
-    runtime: str
-    compiler: str | None = None
-    compiler_args: List[str] = field(default_factory=list)
-    output_ext: str = ""
-    interpreter: str | None = None
-    interpreter_args: List[str] = field(default_factory=list)
-    additional_processes: int = 0
-
-    @property
-    def is_interpreted(self) -> bool:
-        return self.interpreter is not None
 
     async def compile(self, source: Path, workdir: Path) -> CompileOutcome:
         """Compile `source` in its own isolate box and collect the artifacts
@@ -774,6 +786,7 @@ class Language:
         processes: int = 1,
         box_files: Dict[str, Path] | None = None,
         compressed_box_files: Dict[str, Path] | None = None,
+        fsize_kb: int | None = None,
     ) -> RunOutcome:
         args = args or []
         if self.is_interpreted:
@@ -805,6 +818,8 @@ class Language:
                 additional_files=self._run_artifacts(executable),
                 box_files=box_files,
                 compressed_box_files=compressed_box_files,
+                fsize_kb=fsize_kb,
+                env=self.env,
             )
         return await isolate_run(
             # For compiled executables, we strip the absolute path, which is instead needed
@@ -818,6 +833,8 @@ class Language:
             additional_files=[executable],
             box_files=box_files,
             compressed_box_files=compressed_box_files,
+            fsize_kb=fsize_kb,
+            env=self.env,
         )
 
 
@@ -850,46 +867,9 @@ def source_filename(filename: str, language: Language) -> str:
     return f"{stem or DEFAULT_SOURCE_STEM}.{language.extensions[0]}"
 
 
-# `languages.toml` is part of the package rather than a runtime setting - see
-# the comment in `run_from_queue` on why it is deliberately not configurable -
-# so it is resolved relative to this module and never to the working directory,
-# the same rule `cocco/evaluators/` states for the bundled scripts. It lives
-# *inside* `cocco/` rather than beside it, which is what lets an installed
-# `cocco-judge` find it: a wheel has a package directory and no checkout.
-LANGUAGES_PATH = Path(__file__).resolve().parent / "languages.toml"
-
-
 def load_languages(path: Path = LANGUAGES_PATH) -> Dict[str, Language]:
-    with open(path, "rb") as fp:
-        data = tomllib.load(fp)
-    languages = {name: Language(name=name, **cfg) for name, cfg in data.items()}
-    logger.debug("loaded %d languages from %s: %s", len(languages), path, list(languages))
-    return languages
-
-
-def extension_to_language(languages: Dict[str, Language]) -> Dict[str, str]:
-    """Extension (no dot, lowercased) -> language name."""
-    return {
-        ext.lower(): name
-        for name, language in languages.items()
-        for ext in language.extensions
-    }
-
-
-def language_for_filename(
-    filename: str, languages: Dict[str, Language]
-) -> Language | None:
-    """The language a file name implies, or None if the extension is unknown.
-
-    The same rule for a submitted solution and for an uploaded evaluator: the
-    extension is the only thing that says what a file is, which is why neither
-    carries a language field.
-    """
-    if "." not in filename:
-        return None
-    extension = filename.rsplit(".", 1)[-1].lower()
-    name = extension_to_language(languages).get(extension)
-    return languages[name] if name is not None else None
+    """`languages.load_languages` building the executable `Language`."""
+    return _load_languages(path, cls=Language)
 
 
 # An evaluator is course staff's code checking a whole output, not a student's
@@ -1360,35 +1340,27 @@ async def run_from_queue(engine: Engine, storage: Storage) -> bool:
 ########################################################################
 # Exercises
 #
-# An exercise job never runs the student's file directly: every program, the
-# author's solution included, goes through `cocco/exercises/harness.py` in a box
-# of its own, and the judge reads what it did off the last line of the box's
-# stdout (`schema.HarnessReport`). The comparison against the expected output
+# An exercise job runs a program the way a challenge does: `Language.compile`
+# (a no-op when interpreted), then `Language.run` once per test. What the
+# program did is isolate's status, exit code and signal, plus its stdout and
+# stderr (`read_exercise_run`). The comparison against the expected output
 # then happens here, in this process, because the rules are declarative and
 # the code applying them is ours - an evaluator box per test would double the
 # cost of a check to buy nothing.
 
 # What one exercise test may use. The time is the exercise's own (`time:` in
-# the file); the memory is fixed, an exercise being a few lines of python on a
-# few lines of input, and the process budget is the python language's, as for
-# a challenge.
+# the file); the memory is fixed, an exercise being a few lines on a few lines
+# of input, and the process budget is the language's, as for a challenge.
 EXERCISE_MEM_LIMIT_KB = 256 * 1024
 
-# isolate's `--fsize` for a harness run: the most any file the program writes
-# may hold, its stdout included - which is where the report goes, and which
-# the judge reads whole. The report of a program that printed right up to the
-# harness's 256 K-character caps is at most about 9 MB, every character
-# escaped to `\uXXXX\uXXXX`; anything past this is a program writing to fd 1
-# directly, which then ends without reporting.
-EXERCISE_FSIZE_KB = 16 * 1024
+# isolate's `--fsize` for an exercise run, and so the cap on its stdout and its
+# stderr: a program that writes past it dies of SIGXFSZ, or, if it ignores that
+# signal as python does, fails to write; either way it was `truncated`.
+EXERCISE_FSIZE_KB = 256
 
-# Set in every harness box: string hashing, and so the order a `set` prints
-# in, is then the same in the author's solution and in the student's program.
-EXERCISE_ENV = {"PYTHONHASHSEED": "0"}
-
-# What is kept of a program's stdout, stderr and traceback in a job's result.
-# The harness already caps what it captures at 256 K characters, and the
-# comparison sees all of that; what is *stored* is far less, because a check
+# What is kept of a program's stdout and stderr in a job's result. The
+# comparison sees everything up to `EXERCISE_FSIZE_KB`; what is *stored* is far
+# less, because a check
 # stores every test and a flood on each would be megabytes of JSONB per click.
 #
 # A field never keeps more than `MAX_EXERCISE_STORED_OUTPUT`; a check's tests
@@ -1400,21 +1372,14 @@ MAX_EXERCISE_STORED_OUTPUT = 32 * 1024
 MAX_EXERCISE_RESULT_OUTPUT = 256 * 1024
 PASSED_TEST_STORED_OUTPUT = 1024
 
-# A build problem's `detail` - a traceback, a stderr - as the author page shows
+# A build problem's `detail` - a stderr, a compiler's diagnostics - as the author page shows
 # it under the sentence.
 MAX_PROBLEM_DETAIL = 2000
-
-# The names the harness and the program take inside the box. `main.py` is the
-# name tracebacks and line numbers are reported against, which is the student's
-# own file as far as they are concerned.
-_HARNESS_IN_BOX = "harness.py"
-_MAIN_IN_BOX = "main.py"
 
 # Code points PostgreSQL will not hold in JSONB: a NUL, which it refuses in
 # `text` too, and a lone surrogate, which is not a character at all. A python
 # `str` keeps a valid astral character as one code point, so anything in this
-# range is lone. Both can come out of the harness's JSON - `\u0000` and
-# `\ud800` are valid escapes there - because a program can print them.
+# range is lone. A program can print either of them.
 _SURROGATE = re.compile("[\ud800-\udfff]")
 
 
@@ -1422,8 +1387,8 @@ def _jsonb_safe(value):
     """`value` with every string fit for JSONB: NULs dropped, lone surrogates
     replaced with U+FFFD. Recurses through dicts and lists.
 
-    Applied to the harness's report as soon as it is parsed, rather than to
-    the result on its way into the database: a solution's output becomes an
+    Applied to a program's output as soon as it is read, rather than to the
+    result on its way into the database: a solution's output becomes an
     expected output, and if the stored copy lost a NUL that the student's
     output kept, a correct program would fail. One boundary, so everything the
     comparison sees is what gets stored. A judge error's message is the only
@@ -1438,32 +1403,36 @@ def _jsonb_safe(value):
     return value
 
 
-def parse_harness_report(stdout: str) -> HarnessReport | None:
-    """The harness's report, from the last line of a box's stdout, or None.
-
-    The *last* line, because a program can write to fd 1 directly, ahead of
-    the report. None when that line is not a report: the program ended the
-    process first, or wrote over it. A forgery that does parse is accepted -
-    the output is still compared here, so it can only fake the exception
-    check, and exercises grade nothing.
-    """
-    last = stdout.rstrip("\n").rpartition("\n")[2]
-    try:
-        return HarnessReport.model_validate(_jsonb_safe(json.loads(last)))
-    # `RecursionError` because the last line is the program's to write: a
-    # forged `[[[[…` nests deeper than the decoder will follow.
-    except (ValueError, ValidationError, RecursionError):
+def _error_name(language: Language, stderr: str) -> str | None:
+    """How a program that exited non-zero names its failure, by the language's
+    `error_name` regex: the last match's first group. None when the language
+    has no such key or nothing matches."""
+    if language.error_name is None:
         return None
+    found = None
+    for match in re.finditer(language.error_name, stderr):
+        found = match.group(1)
+    return found
 
 
-def read_execution(res: RunOutcome) -> ExerciseExecution:
-    """What a harness run did, from isolate's outcome.
+def _signal_name(number: int) -> str:
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return f"SIG{number}"
 
-    The status says how the run ended and the report what the program did. A
-    timeout and an OOM produce no report, by construction; any other ending
-    without one is the program's doing (`no_report`), never the judge's. Only
-    isolate's own failure (`XX`) is the judge's, and raises.
+
+def read_exercise_run(res: RunOutcome, language: Language) -> ExerciseExecution:
+    """What an exercise run did, from isolate's outcome.
+
+    In this order: isolate's own failure (`XX`) is the judge's and raises; a
+    timeout; an OOM; a flood, which is checked before the exit because python
+    ignores SIGXFSZ and exits 120 with an `OSError` instead; then a clean exit,
+    a non-zero one (named by the language's `error_name`) and a death by a
+    signal (named by the signal).
     """
+    if res.status == "XX":
+        raise RuntimeError(f"isolate failed: {res.message or res.status}")
     if res.status == "TO":
         return ExerciseExecution(
             status="timeout", message=res.message, elapsed_s=res.elapsed_time_s
@@ -1472,27 +1441,32 @@ def read_execution(res: RunOutcome) -> ExerciseExecution:
         return ExerciseExecution(
             status="memory", message=res.message, elapsed_s=res.elapsed_time_s
         )
-    if res.status == "XX":
-        raise RuntimeError(f"isolate failed: {res.message or res.status}")
-    report = parse_harness_report(res.stdout) if res.status == "OK" else None
-    if report is None:
-        return ExerciseExecution(
-            status="no_report",
-            # Not the report, which is missing: whatever reached the box's
-            # descriptors - the program's direct writes, or should the harness
-            # itself ever break, its traceback.
-            stdout=_jsonb_safe(res.stdout),
-            stderr=_jsonb_safe(res.stderr),
-            message=res.message,
-            elapsed_s=res.elapsed_time_s,
-        )
+    stdout = _jsonb_safe(res.stdout)
+    stderr = _jsonb_safe(res.stderr)
+    cap = EXERCISE_FSIZE_KB * 1024
+    truncated = (
+        res.exitsig == signal.SIGXFSZ
+        or len(stdout.encode()) >= cap
+        or len(stderr.encode()) >= cap
+    )
+    exit, error = 0, None
+    if truncated or res.status == "OK":
+        pass
+    elif res.status == "RE":
+        exit = res.exitcode if res.exitcode is not None else 1
+        error = _error_name(language, stderr)
+    else:  # SG, any signal but SIGXFSZ
+        number = res.exitsig if res.exitsig is not None else 0
+        exit = 128 + number
+        error = _signal_name(number)
     return ExerciseExecution(
         status="ok",
-        stdout=report.stdout,
-        stderr=report.stderr,
-        truncated=report.truncated,
-        exit=report.exit,
-        exception=report.exception,
+        stdout=stdout,
+        stderr=stderr,
+        truncated=truncated,
+        exit=exit,
+        error=error,
+        message=res.message,
         elapsed_s=res.elapsed_time_s,
     )
 
@@ -1509,39 +1483,60 @@ def _write_stdin(path: Path, text: str) -> Path:
     return path
 
 
-async def run_in_harness(
+async def prepare_exercise_program(
+    language: Language, source: str, workdir: Path
+) -> CompileOutcome:
+    """Write `source` as `workdir / main.<ext>` and `language.compile` it.
+
+    `main.<ext>` is the name diagnostics and tracebacks report against, which
+    is the student's own file as far as they are concerned. `workdir` must be
+    private to the program: the artifacts are collected into it.
+    """
+    program = workdir / f"main.{language.extensions[0]}"
+    program.write_text(source, encoding="utf-8")
+    return await language.compile(program, workdir)
+
+
+async def run_exercise_program(
     language: Language,
-    mode: str,
-    program: Path,
+    executable: Path,
     stdin: str,
     time_limit: float,
     workdir: Path,
 ) -> ExerciseExecution:
-    """Run `program` through the harness in a box, in `check` or `run` mode.
+    """`language.run` on one stdin, read into an `ExerciseExecution`.
 
     `workdir` must be private to the caller and its stdin file is named
     uniquely in it, so the tests of a job can run at once - each in its own
     box, from the shared pool.
     """
-    assert language.interpreter is not None
-    interpreter = await resolve_runtime(language.runtime, language.interpreter)
     stdin_path = None
     if stdin:
         fd, name = tempfile.mkstemp(dir=workdir, prefix="stdin-")
         os.close(fd)
         stdin_path = _write_stdin(Path(name), stdin)
-    res = await isolate_run(
-        interpreter,
+    res = await language.run(
+        executable,
         stdin_path,
-        [_HARNESS_IN_BOX, mode, _MAIN_IN_BOX],
         time_limit=time_limit,
         mem_limit_kb=EXERCISE_MEM_LIMIT_KB,
-        processes=1 + language.additional_processes,
-        box_files={_HARNESS_IN_BOX: HARNESS_PATH, _MAIN_IN_BOX: program},
         fsize_kb=EXERCISE_FSIZE_KB,
-        env=EXERCISE_ENV,
     )
-    return read_execution(res)
+    return read_exercise_run(res, language)
+
+
+def _compile_report(
+    language: Language, compiled: CompileOutcome
+) -> ExerciseCompile | None:
+    """What a result says of the compile: None for an interpreted language,
+    otherwise whether it worked and what the compiler said (warnings, or the
+    errors), cut at the stored cap."""
+    if language.is_interpreted:
+        return None
+    diagnostics = _jsonb_safe(compiled.stderr or "")
+    return ExerciseCompile(
+        ok=compiled.success, diagnostics=diagnostics[:MAX_EXERCISE_STORED_OUTPUT]
+    )
 
 
 def _cap(text: str, limit: int) -> tuple[str, bool]:
@@ -1553,30 +1548,23 @@ def _cap(text: str, limit: int) -> tuple[str, bool]:
 def _stored(
     execution: ExerciseExecution, limit: int = MAX_EXERCISE_STORED_OUTPUT
 ) -> dict:
-    """An execution's fields as a result stores them: stdout, stderr and the
-    traceback each cut at `limit`, and `clipped` set when that cut anything.
-    `truncated` stays the harness's, which is what the verdict was about."""
+    """An execution's fields as a result stores them: stdout and stderr each
+    cut at `limit`, and `clipped` set when that cut anything.
+    `truncated` stays the run's, which is what the verdict was about."""
     limit = min(limit, MAX_EXERCISE_STORED_OUTPUT)
     stdout, cut_out = _cap(execution.stdout, limit)
     stderr, cut_err = _cap(execution.stderr, limit)
-    exception = execution.exception
-    cut_tb = False
-    if exception is not None:
-        traceback, cut_tb = _cap(exception.traceback, limit)
-        exception = exception.model_copy(update={"traceback": traceback})
     return {
         **dict(execution),
         "stdout": stdout,
         "stderr": stderr,
-        "exception": exception,
-        "clipped": execution.clipped or cut_out or cut_err or cut_tb,
+        "clipped": execution.clipped or cut_out or cut_err,
     }
 
 
-def error_matches(exception: HarnessException | None, expected: str) -> bool:
-    """Whether a program that raised `exception` ended with `expected`: that
-    class or a subclass of it, which is why the harness reports the MRO."""
-    return exception is not None and expected in exception.classes
+def error_matches(execution: ExerciseExecution, expected: str) -> bool:
+    """Whether a program ended with `expected`: that name exactly."""
+    return execution.error == expected
 
 
 def grade(
@@ -1588,8 +1576,8 @@ def grade(
     """The verdict on one test, and the comparison when there was one.
 
     A port of the prototype's `checkTests`, in its order: how the run ended,
-    then a flood, then the exception, then the output. The output printed
-    before an expected exception is compared as usual. Quadratic in the line
+    then a flood, then the error, then the output. The output printed
+    before an expected error is compared as usual. Quadratic in the line
     counts with `order` and `numbers` together, so it is called off the event
     loop.
     """
@@ -1597,11 +1585,11 @@ def grade(
         return execution.status, None
     if execution.truncated:
         return "truncated", None
-    clean = execution.exception is None and execution.exit == 0
+    clean = execution.error is None and execution.exit == 0
     if expected_error and clean:
         return "noerror", None
     if (
-        not error_matches(execution.exception, expected_error)
+        not error_matches(execution, expected_error)
         if expected_error
         else not clean
     ):
@@ -1613,11 +1601,11 @@ def grade(
 async def _run_tests(
     language: Language,
     exercise: Exercise,
-    program: Path,
+    executable: Path,
     tests: list[ExerciseTest],
     workdir: Path,
 ) -> list[ExerciseExecution]:
-    """`program` on every one of `tests`, at once, each in its own box.
+    """`executable` on every one of `tests`, at once, each in its own box.
 
     A TaskGroup rather than `gather`: when one run raises - isolate itself
     failing - the others are cancelled, and so cleaned up, instead of carrying
@@ -1626,8 +1614,8 @@ async def _run_tests(
     async with asyncio.TaskGroup() as tasks:
         runs = [
             tasks.create_task(
-                run_in_harness(
-                    language, "check", program, t.input, exercise.time_s, workdir
+                run_exercise_program(
+                    language, executable, t.input, exercise.time_s, workdir
                 )
             )
             for t in tests
@@ -1638,14 +1626,29 @@ async def _run_tests(
 async def check_exercise(
     language: Language, exercise: Exercise, source: str, workdir: Path
 ) -> ExerciseCheckResult:
-    """Run `source` on every test of `exercise` and grade it.
+    """Compile `source` once, run it on every test of `exercise` and grade it.
 
     The exercise must come from a built version: every test's
-    `expected_output` is what the build computed.
+    `expected_output` is what the build computed. A source that does not
+    compile has run nothing: `passed=False`, no tests, and the diagnostics.
     """
-    program = workdir / _MAIN_IN_BOX
-    program.write_text(source, encoding="utf-8")
-    executions = await _run_tests(language, exercise, program, exercise.tests, workdir)
+    compiled = await prepare_exercise_program(language, source, workdir)
+    return await _check_compiled(language, exercise, compiled, workdir)
+
+
+async def _check_compiled(
+    language: Language,
+    exercise: Exercise,
+    compiled: CompileOutcome,
+    workdir: Path,
+) -> ExerciseCheckResult:
+    report = _compile_report(language, compiled)
+    if not compiled.success:
+        return ExerciseCheckResult(passed=False, tests=[], compile=report)
+    assert compiled.executable is not None
+    executions = await _run_tests(
+        language, exercise, compiled.executable, exercise.tests, workdir
+    )
     graded = []
     for test, execution in zip(exercise.tests, executions):
         assert test.expected_output is not None
@@ -1673,7 +1676,9 @@ async def check_exercise(
         )
     ]
     return ExerciseCheckResult(
-        passed=all(r.verdict == "pass" for r in results), tests=results
+        passed=all(r.verdict == "pass" for r in results),
+        tests=results,
+        compile=report,
     )
 
 
@@ -1685,11 +1690,11 @@ def _languages() -> Dict[str, Language]:
     return load_languages()
 
 
-def _python(language_name: str) -> Language:
-    """The language an exercise document names. Only an interpreted one can
-    run the harness, and today that is python."""
+def exercise_language(language_name: str) -> Language:
+    """The language an exercise document names. The parse already checked it
+    against `languages.toml`; this is the judge not trusting a stored document."""
     language = _languages().get(language_name)
-    if language is None or not language.is_interpreted:
+    if language is None:
         raise ValueError(f"exercises cannot run in language {language_name!r}")
     return language
 
@@ -1707,17 +1712,20 @@ async def run_exercise_job(engine: Engine, job: ExerciseJobRunData):
             )
         )
     language_name, exercise = found
-    language = _python(language_name)
+    language = exercise_language(language_name)
     with tempfile.TemporaryDirectory() as temp:
         workdir = Path(temp)
         if job.kind is ExerciseJobKind.check:
             return await check_exercise(language, exercise, job.source, workdir)
-        program = workdir / _MAIN_IN_BOX
-        program.write_text(job.source, encoding="utf-8")
-        execution = await run_in_harness(
-            language, "run", program, job.stdin or "", exercise.time_s, workdir
+        compiled = await prepare_exercise_program(language, job.source, workdir)
+        report = _compile_report(language, compiled)
+        if not compiled.success:
+            return ExerciseRunResult(status="ok", compile=report)
+        assert compiled.executable is not None
+        execution = await run_exercise_program(
+            language, compiled.executable, job.stdin or "", exercise.time_s, workdir
         )
-        return ExerciseRunResult(**_stored(execution))
+        return ExerciseRunResult(**_stored(execution), compile=report)
 
 
 @dataclass(frozen=True)
@@ -1730,12 +1738,15 @@ class VersionBuild:
 
 
 def _detail(execution: ExerciseExecution) -> str | None:
-    text = (
-        execution.exception.traceback
-        if execution.exception is not None
-        else execution.stderr
-    ).strip()
+    text = execution.stderr.strip()
     return text[-MAX_PROBLEM_DETAIL:] or None
+
+
+def _compile_detail(compiled: CompileOutcome) -> str | None:
+    """A failed compile's diagnostics, from the head: the first error is the
+    one worth reading."""
+    text = _jsonb_safe(compiled.stderr or "").strip()
+    return text[:MAX_PROBLEM_DETAIL] or None
 
 
 async def build_exercise(
@@ -1762,9 +1773,25 @@ async def build_exercise(
 
     tests = list(exercise.tests)
     if exercise.solution is not None:
-        solution = workdir / "solution.py"
-        solution.write_text(exercise.solution, encoding="utf-8")
-        first = await _run_tests(language, exercise, solution, tests, workdir)
+        solution_dir = workdir / "solution"
+        solution_dir.mkdir()
+        solution = await prepare_exercise_program(
+            language, exercise.solution, solution_dir
+        )
+        if solution.success:
+            assert solution.executable is not None
+            first = await _run_tests(
+                language, exercise, solution.executable, tests, solution_dir
+            )
+        else:
+            # Nothing to run: the loops below have no rounds to go through, and
+            # the tests stay without an expected output.
+            first = []
+            problem(
+                "error",
+                "The solution does not compile.",
+                detail=_compile_detail(solution),
+            )
         # The tests whose expected output is the first run's.
         computed: list[int] = []
         for k, (t, r) in enumerate(zip(tests, first)):
@@ -1780,25 +1807,16 @@ async def build_exercise(
             if r.status == "memory":
                 problem("error", f"The solution runs out of memory on {name}.", test_no)
                 continue
-            if r.status == "no_report":
-                problem(
-                    "error",
-                    f"The solution ended without reporting on {name}"
-                    + (f" ({r.message})." if r.message else "."),
-                    test_no,
-                    _detail(r),
-                )
-                continue
             if r.truncated:
                 problem("error", f"The solution prints too much output on {name}.", test_no)
                 continue
             expected_error = None
             if t.error is None:
-                if r.exception is not None or r.exit != 0:
+                if r.error is not None or r.exit != 0:
                     tip = (
                         f' If that is intended, add an "error" block with '
-                        f"{r.exception.type} after the input."
-                        if r.exception is not None
+                        f"{r.error} after the input."
+                        if r.error is not None
                         else ""
                     )
                     problem(
@@ -1808,7 +1826,7 @@ async def build_exercise(
                         _detail(r),
                     )
                     continue
-            elif r.exception is None:
+            elif r.error is None:
                 ended = (
                     f"exited with code {r.exit}" if r.exit != 0 else "ended normally"
                 )
@@ -1819,17 +1837,17 @@ async def build_exercise(
                     test_no,
                 )
                 continue
-            elif t.error and not error_matches(r.exception, t.error):
+            elif t.error and not error_matches(r, t.error):
                 problem(
                     "error",
-                    f"On {name} the solution ends with {r.exception.type}, "
+                    f"On {name} the solution ends with {r.error}, "
                     f'but the "error" block says {t.error}.',
                     test_no,
                     _detail(r),
                 )
                 continue
             else:
-                expected_error = t.error or r.exception.type
+                expected_error = t.error or r.error
             if t.output is not None:
                 if not (await asyncio.to_thread(compare, t.output, r.stdout, exercise.rules)).ok:
                     problem(
@@ -1852,7 +1870,11 @@ async def build_exercise(
             )
         if computed:
             second = await _run_tests(
-                language, exercise, solution, [tests[k] for k in computed], workdir
+                language,
+                exercise,
+                solution.executable,
+                [tests[k] for k in computed],
+                solution_dir,
             )
             for k, again in zip(computed, second):
                 if again.status == "ok" and again.stdout != first[k].stdout:
@@ -1880,8 +1902,14 @@ async def build_exercise(
     if exercise.starter.strip():
         starter_dir = workdir / "starter"
         starter_dir.mkdir()
-        result = await check_exercise(language, built, exercise.starter, starter_dir)
-        if result.passed:
+        starter = await prepare_exercise_program(language, exercise.starter, starter_dir)
+        if not starter.success:
+            problem(
+                "warning",
+                "Students start from code that does not compile.",
+                detail=_compile_detail(starter),
+            )
+        elif (await _check_compiled(language, built, starter, starter_dir)).passed:
             problem("warning", "The starter code already passes every test.")
     return built, problems
 
@@ -1903,7 +1931,7 @@ async def build_version(source: str, title: str) -> VersionBuild:
     if parsed.document is None:
         return VersionBuild(ExerciseVersionStatus.failed, problems, None)
     document = parsed.document
-    language = _python(document.language)
+    language = exercise_language(document.language)
 
     exercises = []
     with tempfile.TemporaryDirectory() as temp:

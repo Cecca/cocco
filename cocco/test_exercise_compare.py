@@ -208,16 +208,18 @@ def test_split_lines():
 # ---- error_hint ---------------------------------------------------------------
 
 
-def test_error_hint_with_a_line():
-    assert error_hint("ZeroDivisionError", 4) == "Line 4: division by zero."
+def test_error_hint_is_capitalized():
+    assert error_hint("NameError").startswith("Name not defined")
+    assert error_hint("ZeroDivisionError") == "Division by zero."
 
 
-def test_error_hint_without_a_line_is_capitalized():
-    assert error_hint("NameError", None).startswith("Name not defined")
+def test_error_hint_explains_a_signal():
+    assert error_hint("SIGSEGV").startswith("Invalid memory access")
+    assert error_hint("SIGFPE") == "Integer division by zero."
 
 
-def test_error_hint_names_an_exception_it_cannot_explain():
-    assert error_hint("FloatingPointError", 2) == "Line 2: FloatingPointError error."
+def test_error_hint_names_a_failure_it_cannot_explain():
+    assert error_hint("FloatingPointError") == "FloatingPointError error."
     assert error_hint("StopIteration") == "StopIteration error."
 
 

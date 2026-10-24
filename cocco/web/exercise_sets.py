@@ -1,6 +1,5 @@
 """Exercise sets: authoring, versions, previews and the preview jobs."""
 
-import builtins
 from pathlib import Path
 from typing import Annotated
 
@@ -12,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from cocco import schema
 from cocco.exercises import format as exercise_format
 from cocco.exercises.compare import describe_rules
+from cocco.exercises.hints import HINTS
 from cocco.model import (
     ExerciseJobKind,
     ExerciseJobStatus,
@@ -34,7 +34,7 @@ from cocco.repository.exercise_sets import (
 )
 from cocco.repository.lifecycle import delete_exercise_set, query_course_archived_at
 from cocco.web.access import CourseEditor, CurrentUser
-from cocco.web.core import DBDep, _slug
+from cocco.web.core import DBDep, _slug, editor_mode
 from cocco.web.courses import _confirmation_matches, _danger_alert
 from cocco.web.templating import templates
 
@@ -404,6 +404,8 @@ async def get_exercise_preview(
             "exercise_set": exercise_set,
             "version": version,
             "document": document,
+            "language": document.language,
+            "editor_mode": editor_mode(document.language),
             "exercise": exercise,
             "rules": describe_rules(exercise.rules),
             "n": n,
@@ -423,28 +425,24 @@ def _marked_lines(text: str, marked) -> list[tuple[str, bool]]:
     return [(line, i in marked) for i, line in enumerate(lines)]
 
 
-def _builtin_exception_name(exception: schema.HarnessException) -> str:
-    """The name a hidden test may show for an exception: the nearest of its
-    classes that is one of Python's own.
+def _shown_error_name(name: str) -> str:
+    """The name a hidden test may show for a failure: its own if `HINTS` knows
+    it, else `error`.
 
-    The type's own name is the student's to choose - `type(input(), (Exception,),
-    {})` raises a class named after the hidden input - so printing it would
-    hand the input straight back. Python's own names are a fixed list, and for
-    an ordinary error (a `ValueError`, an `IndexError`) the nearest one is the
-    type itself, so nothing is lost for anybody who was not trying.
+    The name is the program's to choose - it can raise a class named after the
+    hidden input, or print a forged traceback - so showing it would hand the
+    input straight back. `HINTS` is a fixed list (the common Python exceptions
+    and the signals), and for an ordinary failure the nearest entry is the name
+    itself, so nothing is lost for anybody who was not trying.
 
-    That bounds the leak; it does not close it. Which of the roughly sixty
-    built-in exceptions a program raises is still its choice and can depend
-    on the input - about six bits per hidden test per Check, where the
-    verdict alone is already one. Accepted, since nothing here is graded: the
-    plan shows a hidden test's exception type on purpose, because that is
-    what the explanation beside it is about. Closing it means showing none.
+    That bounds the leak; it does not close it. Which entry a program ends
+    with is still its choice and can depend on the input - a few bits per
+    hidden test per Check, where the verdict alone is already one. Accepted,
+    since nothing here is graded: a hidden test's failure is shown on purpose,
+    because that is what the explanation beside it is about. Closing it means
+    showing none.
     """
-    for name in (exception.type, *exception.classes):
-        builtin = getattr(builtins, name, None)
-        if isinstance(builtin, type) and issubclass(builtin, BaseException):
-            return name
-    return "Exception"
+    return name if name in HINTS else "error"
 
 
 def exercise_check_rows(
@@ -476,11 +474,9 @@ def exercise_check_rows(
         hidden = test_result.hidden or (test is not None and test.hidden)
         row = {"n": i + 1, "verdict": test_result.verdict, "hidden": hidden}
         if redact and (hidden or test is None):
-            exception = test_result.exception if test_result.verdict == "error" else None
+            error = test_result.error if test_result.verdict == "error" else None
             row["redacted"] = True
-            row["exception"] = (
-                None if exception is None else {"type": _builtin_exception_name(exception)}
-            )
+            row["error"] = None if error is None else _shown_error_name(error)
         else:
             expected = (test.expected_output or "") if test is not None else ""
             # Computed on the whole output, so an index can point past what was

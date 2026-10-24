@@ -9,6 +9,7 @@ solution can produce, or into the problems that stop it from being one.
     ---
     title: Loops and lists
     description: Lab of 14 October
+    language: python                optional, a key of languages.toml; default python
     ---
 
     Optional introduction, shown before the first exercise.
@@ -31,17 +32,26 @@ solution can produce, or into the problems that stop it from being one.
     compare: numbers 0.01           see `compare.py`
     time: 5                         seconds per test, default 5
 
-`python starter` / `python solution` also work. Any other code block stays part
-of the statement, and an exercise with no `input` gets one test with empty input.
+A block may be prefixed by the language's name or any of its `extensions`
+(`python starter` / `py starter`; `c solution`; `cpp`, `cc` or `cxx` for C++). A
+block prefixed with another language's spelling and a role (`python solution`
+in a C file) is an error that names the right one: left alone it would be part
+of the statement, solution and all. Any other code block stays part of the
+statement, and an exercise with no `input` gets one test with empty input.
 
-Nothing here runs Python. The checks that need it - a solution that crashes, a
+There are no prompts: everything a program prints is compared, so `input()`
+takes no prompt and a prompt is part of the output.
+
+Nothing here runs the program. The checks that need it - a solution that crashes, a
 starter that already passes - belong to the judge's build.
 """
 
 import re
 from dataclasses import dataclass, field
+from functools import cache
 
 from cocco.exercises.compare import RULE_NAMES, parse_rules
+from cocco.languages import LanguageSpec, load_languages
 from cocco.schema import (
     Exercise,
     ExerciseDocument,
@@ -52,7 +62,8 @@ from cocco.schema import (
 DEFAULT_TIME_S = 5.0
 MAX_TIME_S = 120.0
 
-FRONT_MATTER_KEYS = ("title", "description")
+FRONT_MATTER_KEYS = ("title", "description", "language")
+DEFAULT_LANGUAGE = "python"
 RESERVED = ("starter", "solution", "input", "output", "error", "hint")
 
 # The prototype's keywords. They are not aliases: a file still spelling them is
@@ -69,6 +80,7 @@ _ITALIAN = {
     "tempo": "time",
     "titolo": "title",
     "descrizione": "description",
+    "linguaggio": "language",
 }
 
 _FENCE_OPEN = re.compile(r"^(\s*)(`{3,}|~{3,})(.*)$")
@@ -77,8 +89,19 @@ _HEADING = re.compile(r"^#\s+(.+?)\s*#*\s*$")
 _OPTION = re.compile(r"^\s*(compare|time)\s*:\s*(.*)$", re.IGNORECASE)
 _ITALIAN_OPTION = re.compile(r"^\s*(confronto|tempo)\s*:", re.IGNORECASE)
 _FRONT_MATTER_LINE = re.compile(r"^\s*([A-Za-zÀ-ÿ_]+)\s*:\s*(.*)$")
-_EXCEPTION_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# One word: a Python exception (`json.decoder.JSONDecodeError`) or a signal
+# (`SIGFPE`). Whether the language can end with it is the build's to find out.
+_ERROR_NAME = re.compile(r"[A-Za-z_][\w.]*")
 _SECONDS = re.compile(r"\s*s(econds?)?$", re.IGNORECASE)
+
+
+@cache
+def _known_languages() -> dict[str, LanguageSpec]:
+    return load_languages()
+
+
+def _spellings(language: LanguageSpec) -> set[str]:
+    return {language.name.lower(), *(e.lower() for e in language.extensions)}
 
 
 @dataclass(frozen=True)
@@ -122,14 +145,20 @@ def _block(body: str) -> str:
     return body + "\n" if body else ""
 
 
-def parse(source: str, default_title: str = "") -> ParseResult:
+def parse(
+    source: str,
+    default_title: str = "",
+    languages: dict[str, LanguageSpec] | None = None,
+) -> ParseResult:
     """Parse an exercise file.
 
     `default_title` stands in for a missing `title:` (the import passes the
     uploaded file's name, as the prototype used the set's id), with a warning;
     a set that ends up with no title at all is an error, because a version is
-    listed by it.
+    listed by it. `languages` stands in for `languages.toml` (tests).
     """
+    if languages is None:
+        languages = _known_languages()
     problems: list[ExerciseProblem] = []
 
     def problem(level, where, text, exercise=None, test=None):
@@ -170,6 +199,16 @@ def parse(source: str, default_title: str = "") -> ParseResult:
                         "error", "front matter",
                         f'"{key}:" is not a key: write "{_ITALIAN[key]}:".',
                     )
+                elif key == "language":
+                    value = m.group(2).strip().lower()
+                    if value not in languages:
+                        problem(
+                            "error", "front matter",
+                            f'Unknown language "{value}". The languages are '
+                            f'{", ".join(languages)}.',
+                        )
+                    else:
+                        meta[key] = value
                 elif key not in FRONT_MATTER_KEYS:
                     problem(
                         "warning", "front matter",
@@ -179,6 +218,17 @@ def parse(source: str, default_title: str = "") -> ParseResult:
                 else:
                     meta[key] = m.group(2).strip()
             i = end + 1
+
+    language_name = meta.get("language", DEFAULT_LANGUAGE)
+    # An unknown language is already an error; any spelling will do after that.
+    language = languages.get(language_name) or next(iter(languages.values()))
+    own = _spellings(language)
+    # Another language's spelling -> the spelling to write instead.
+    others = {
+        spelling: language.name
+        for other in languages.values() if other is not language
+        for spelling in _spellings(other) - own
+    }
 
     drafts: list[_Draft] = []
     intro: list[str] = []
@@ -201,7 +251,16 @@ def parse(source: str, default_title: str = "") -> ParseResult:
         ex = cur
         info = fence.info.lower().split()
         body = "\n".join(fence.body)
-        words = info[1:] if info[:1] in (["python"], ["py"]) else info
+        # ```c solution is a role block; ```c alone is a plain code block, and
+        # stays statement text.
+        words = info[1:] if info[:1] and info[0] in own else info
+        if info[:1] and info[0] in others and info[1:2] and info[1] in RESERVED:
+            here(
+                "error",
+                f'Block "{fence.info}" at line {fence.start + 1}: this is a {language.name} '
+                f'file, so write "{language.name} {info[1]}" (or just "{info[1]}") '
+                f'instead of "{info[0]} {info[1]}".',
+            )
         kind = words[0] if words else None
         line_no = fence.start + 1
         # 1-based, for a block about the test it would attach to.
@@ -253,12 +312,12 @@ def parse(source: str, default_title: str = "") -> ParseResult:
                 here("error", f'"error" block at line {line_no} with no "input" block right before it.')
             elif last_input.error is not None:
                 here("error", f'Two "error" blocks for the same input (line {line_no}).', test_no)
-            elif name and not _EXCEPTION_NAME.fullmatch(name):
+            elif name and not _ERROR_NAME.fullmatch(name):
                 here(
                     "error",
-                    f'"error" block at line {line_no}: "{name}" is not an exception name. '
-                    "Write only the class name, for example ValueError, or leave the "
-                    "block empty to use the one the solution raises.",
+                    f'"error" block at line {line_no}: "{name}" is not an error name. '
+                    "Write one word, for example ValueError or SIGFPE, or leave the "
+                    "block empty to use the one the solution ends with.",
                     test_no,
                 )
             else:
@@ -384,6 +443,7 @@ def parse(source: str, default_title: str = "") -> ParseResult:
     document = ExerciseDocument(
         title=title,
         description=meta.get("description", ""),
+        language=language_name,
         intro="\n".join(intro).strip(),
         exercises=exercises,
     )

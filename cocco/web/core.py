@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from cocco.config import config_path, load_config
-from cocco.judge import extension_to_language, load_languages
+from cocco.languages import extension_to_language, load_languages
 from cocco.model import UserRole
 from cocco.storage import Storage
 
@@ -80,6 +80,14 @@ def _zip_stored(zf: zipfile.ZipFile, relative: str, arcname: str) -> None:
 # recognised by exactly the rule a submitted solution is.
 LANGUAGES = load_languages()
 EXTENSION_TO_LANGUAGE = extension_to_language(LANGUAGES)
+
+
+def editor_mode(language: str) -> str:
+    """CodeMirror's mode for an exercise language: its `editor_mode` key in
+    `languages.toml`, or "" (plain text) for a language with none."""
+    spec = LANGUAGES.get(language)
+    return (spec.editor_mode if spec is not None else None) or ""
+
 
 MAX_UPLOAD_BYTES = 1 << 20
 
