@@ -256,6 +256,21 @@ async def test_a_c_run_shows_stdout_and_a_failed_compile(db, app_engine):
     assert broken.stdout == ""
 
 
+@pytest.mark.integration
+async def test_libfdi_h_is_on_the_include_path(db, app_engine):
+    """The flake's gcc ships `libfdi.h`, so a program includes it with nothing
+    beside it in the box - and `-isystem` keeps `-Wall` quiet about it."""
+    user_id, version_id = await _built_c(db, app_engine)
+    run = await _run(
+        db, app_engine, user_id, version_id,
+        '#include "libfdi.h"\nint main(void) {\n    int n = input_int();\n    printf("%d\\n", 2 * n);\n    return 0;\n}\n',
+        "21\n",
+    )
+    assert run.compile.ok, run.compile.diagnostics
+    assert run.compile.diagnostics == ""
+    assert (run.status, run.exit, run.stdout) == ("ok", 0, "42\n")
+
+
 def _source(solution: str, starter: str | None = None, error: str | None = None) -> str:
     text = (
         "---\ntitle: T\nlanguage: c\n---\n\n# One\n\nDo it.\n\n"

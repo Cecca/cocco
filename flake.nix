@@ -7,9 +7,20 @@
     eachSystem = f:
       nixpkgs.lib.genAttrs nixpkgs.lib.systems.flakeExposed (system: f nixpkgs.legacyPackages.${system});
   in {
-    packages = eachSystem (pkgs: {
+    packages = eachSystem (pkgs: let
+      libfdi = pkgs.runCommand "libfdi" {} ''
+        install -Dm644 ${./runtimes/libfdi.h} $out/include/libfdi.h
+      '';
+    in {
       python3 = pkgs.python312.withPackages (ps: with ps; [numpy pyspark bitarray]);
-      gcc = pkgs.gcc;
+      # libfdi.h is on gcc's default include path, so a program can
+      # `#include "libfdi.h"` with nothing beside it in the box. `-isystem`
+      # keeps `-Wall` quiet about the header's own code.
+      gcc = pkgs.gcc.override {
+        extraBuildCommands = ''
+          echo "-isystem ${libfdi}/include" >> $out/nix-support/cc-cflags
+        '';
+      };
       jdk = pkgs.jdk21;
     });
 
