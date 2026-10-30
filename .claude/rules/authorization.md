@@ -37,7 +37,7 @@ Appointing takes an address; `/admin` and the people page are the **only two** p
 
 **Administrators are staff on every course**, in exactly one place: `effective_course_role` / `effective_challenge_role` return the enrollment's role, or `teacher` for an admin (only looked up when there is no enrollment). So `EDITOR_ROLES` stays per-course and every `role in EDITOR_ROLES` keeps working. Consequences: `get_course` gives admins the course, not the preview, and `get_challenge` takes `can_edit` from the dependency, not from `query_challenge`'s `viewer_role` (a `LEFT JOIN`, NULL for admins).
 
-**Nothing is reachable without an identity**: every route depends on `CurrentUser` or `ApiUser`, directly or via `require_challenge_editor` / `require_api_challenge_editor`. The only open paths are `/login`, `/auth/{provider}`, `/auth/{provider}/callback`, `/static`. `ApiUser` is the only non-session identity (bearer tokens for the CLI; see `transfer.md`).
+**Nothing is reachable without an identity**: every route depends on `CurrentUser` or `ApiUser`, directly or via `require_challenge_editor` / `require_api_challenge_editor`. The only open paths are `/login`, `/auth/{provider}`, `/auth/{provider}/callback`, `/about`, `/static`. `/about` calls `get_user` itself and reads a missing session or a block as anonymous, only to draw the navbar. `ApiUser` is the only non-session identity (bearer tokens for the CLI; see `transfer.md`).
 
 - **An anonymous htmx request gets `HX-Redirect`, not a 302.** `get_user` raises `NotAuthenticated` (a dependency can't return a `Response`), and the handler branches on `HX-Request`. A 302 would be followed inside the XHR and splice the login page into every polling div.
 

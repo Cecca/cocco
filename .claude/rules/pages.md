@@ -19,6 +19,8 @@ Uploads carry no language field: `post_submission` maps the extension through `E
 
 **`course.enrollment_key`**: NULL = anyone signed in may join; otherwise `post_course_enroll` compares it with `hmac.compare_digest` on the trimmed string before writing. It's stored and shown **in plaintext** on purpose (staff read it out to the class; it guards a class list, not an account), so the **course editor is the only place it's printed**. `query_courses` / `query_course` expose only `requires_key` (`enrollment_key IS NOT NULL`) and list columns rather than `SELECT *`; `query_enrollment_key` is the single read. The key field lives only on the course preview (`f-enroll.jinja`, re-swapped with the message on a bad key); a keyed course's card shows an `Enroll…` link to it.
 
+**About page** `/about` (`about.jinja`, `cocco/web/about.py`) renders `cocco/about.md` through the `markdown` filter. The file is authored in the repo and ships in the wheel; it is read **per request** (an edit shows without a restart, which `--reload` would not catch). Open to anonymous visitors, linked from the navbar on every page.
+
 **Course creation** is `/courses/new` (`course-new.jinja`), button shown only to administrators; on success → the new course's editor.
 
 **`/admin`** (`admin.jinja`, behind `Admin`) lists users, appoints administrators and blocks accounts. Blocking is an inline per-row form with a reason, not a `<dialog>`: it's reversible, and N dialogs would be rebuilt on every filter keystroke.

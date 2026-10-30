@@ -1,0 +1,12 @@
+{% extends "base.jinja" %}
+{% block title %}About{% endblock %}
+
+{% set crumbs = [{"label": "About"}] %}
+
+{% block content %}
+{# The text is `cocco/about.md`, edited in the repository and rendered through
+   the same `markdown` filter as a challenge statement. #}
+<article class="prose max-w-none lg:max-w-2/3 mx-auto">
+  {{ about | markdown }}
+</article>
+{% endblock %}

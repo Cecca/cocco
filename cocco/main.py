@@ -12,6 +12,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from cocco.logs import AccessLogMiddleware
 from cocco.web import (
+    about,
     admin,
     api,
     challenge_editor,
@@ -74,6 +75,7 @@ app.mount("/static", VersionedStaticFiles(directory=STATIC_DIR), name="static")
 app.include_router(signin.router)
 app.include_router(home.router)
 app.include_router(admin.router)
+app.include_router(about.router)
 
 # Route order is load-bearing: `/courses/{course_id}/{challenge_id}` matches any
 # single segment, so every other two-segment course page (the editor, people,

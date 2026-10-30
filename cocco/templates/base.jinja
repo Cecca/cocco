@@ -55,6 +55,8 @@
         {% endfor %}
       </ul>
     </div>
+    <a href="{{ url_for('get_about') }}"
+       class="mr-4 text-sm font-medium text-base-content/60 hover:text-base-content">About</a>
     {# The login page renders with no user, so everything below is guarded. #}
     {% if user %}
     <div class="dropdown dropdown-end">
