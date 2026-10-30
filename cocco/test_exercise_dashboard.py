@@ -100,6 +100,8 @@ def _counts(exercises, n_participants, titles=("Double", "Shout"), mode="live", 
     n_checked, n_solved, checking)`."""
     return {
         "id": 1,
+        "set_id": 1,
+        "version_id": 1,
         "label": "Lab A",
         "mode": mode,
         "unlocked_through": unlocked_through,
@@ -346,6 +348,18 @@ async def test_the_projector_shows_no_names(client, world, db, session, carol):
     assert "1 solved, 0 tried, 1 not tried" in page
     assert "Double" in page and "Shout" not in page
     assert "1 more exercise still locked." in page
+
+
+async def test_the_projector_opens_the_editor_in_the_staff_preview(client, world, ready, session):
+    """A teacher writing a solution in front of the class does it in the
+    preview of the session's version: the session's own page refuses staff's
+    Run and Check."""
+    set_id, version_id, _ = ready
+    _, base = session
+    page = client.get(f"{base}/projector").text
+    preview = f"/courses/{world['course']}/exercises/{set_id}/versions/{version_id}/preview/1"
+    assert preview in page
+    assert client.get(preview).status_code == 200
 
 
 async def test_pacing_from_the_projector_answers_with_the_projector(client, world, db, session):

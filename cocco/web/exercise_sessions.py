@@ -765,6 +765,8 @@ def projector_view(counts: dict) -> dict:
         )
     return {
         "label": counts["label"],
+        "set_id": counts["set_id"],
+        "version_id": counts["version_id"],
         "mode": counts["mode"],
         "closed_at": counts["closed_at"],
         "unlocked_through": counts["unlocked_through"],

@@ -710,7 +710,8 @@ async def query_session_progress(conn: AsyncConnection, session_id: int):
 
 async def query_session_counts(conn: AsyncConnection, session_id: int):
     """The projector's document: `query_session_progress` with nobody in it.
-    The session's label and pacing, the titles, the reveals, the size of the
+    The session's label and pacing, the set and version it is on (for the
+    link to the staff preview), the titles, the reveals, the size of the
     cohort, and per exercise how many people have checked it, how many of
     those solved it and whether a check is pending - or None.
 
@@ -740,6 +741,8 @@ async def query_session_counts(conn: AsyncConnection, session_id: int):
     stmt = _session_document(
         session,
         ExerciseSession.c.id,
+        ExerciseSession.c.set_id,
+        ExerciseSession.c.version_id,
         ExerciseSession.c.label,
         _session_revealed(session).label("revealed"),
         select(func.count())

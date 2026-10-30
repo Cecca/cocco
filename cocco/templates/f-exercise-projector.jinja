@@ -1,7 +1,8 @@
 {# The projector's bars and controls: one bar per exercise the class can see -
    solved, attempted, not attempted, out of the participants - with the
    pacing buttons and, per exercise, its reveal button or, once revealed, a
-   link that shows the solution under this fragment.
+   link that shows the solution under this fragment, and a link to the staff
+   preview where the teacher can write and run a solution live.
 
    One swap target that polls itself every three seconds, `outerHTML`. The
    pacing and reveal forms carry `view=projector`, so the routes behind them
@@ -104,6 +105,13 @@ data-swap-guard
           <button type="submit" class="btn btn-sm btn-ghost border border-base-300">Reveal solution</button>
         </form>
         {% endif %}
+        {# The staff preview of the version the session is on, not the
+           student page, which refuses staff's jobs: a solution written in
+           front of the class runs there and is recorded nowhere. Its own
+           tab, so the projector keeps polling. #}
+        <a href="{{ url_for('get_exercise_preview', course_id=course_id, set_id=projector.set_id, version_id=projector.version_id, n=exercise.n) }}"
+           target="_blank" rel="noopener"
+           class="btn btn-sm btn-primary">Open editor</a>
       </div>
       <div class="flex h-6 w-full overflow-hidden rounded-md bg-base-300"
            role="img"
