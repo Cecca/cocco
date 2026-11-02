@@ -218,3 +218,4 @@ __marimo__/
 /.scratch
 /.codegraph
 .claude/settings.local.json
+/.claude/worktrees
