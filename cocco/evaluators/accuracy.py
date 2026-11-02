@@ -5,6 +5,9 @@ lines that match.
     accuracy.py <actual_output> <expected_output> <test_input>
 
 Prints one JSON object on stdout: {"score": <float>, "message": "<text>"}
+
+The score is raw and is summed into the submission score; this one scores each
+test in [0, 1], so a challenge using it has a maximum of `n_tests`.
 """
 
 import json

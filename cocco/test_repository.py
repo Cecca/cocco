@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg
 import pytest
-from sqlalchemy import func, insert, or_, select, text, update
+from sqlalchemy import Float, cast, func, insert, literal, or_, select, text, update
 
 import cocco.model as cm
 from cocco.avatar import generate_identicon
@@ -56,6 +56,7 @@ from cocco.repository.courses import (
     reorder_challenges,
     set_enrollment_role,
 )
+from cocco.repository.rules import _clears_threshold
 from cocco.repository.challenges import (
     challenge_in_course,
     count_running_submissions,
@@ -65,6 +66,7 @@ from cocco.repository.challenges import (
     query_challenge,
     query_challenge_leaderboard,
     query_challenge_ranking,
+    query_challenge_score_threshold,
     query_challenge_standings,
     query_challenge_testcases,
     query_sample_testcase,
@@ -666,8 +668,8 @@ async def test_challenge_page_queries(example_database, app_engine):
         carol, dave = standings
         assert [carol["rank"], dave["rank"]] == [1, 2]
         # Both peak at 2 of 3 tests; carol is ahead on the tie-break, time.
-        assert carol["score"] == pytest.approx(2 / 3)
-        assert dave["score"] == pytest.approx(2 / 3)
+        assert carol["score"] == pytest.approx(2.0)
+        assert dave["score"] == pytest.approx(2.0)
         assert carol["elapsed_s"] < dave["elapsed_s"]
         assert [carol["n_passed"], carol["n_tests"]] == [2, 3]
         # Two attempts, but the row describes the better of them
@@ -697,16 +699,31 @@ async def test_challenge_page_queries(example_database, app_engine):
         )
         assert await query_challenge_ranking(conn, 999) is None
 
-        # Nobody passed all three tests of "Hello", so the speed board is empty
-        # even though there are graded submissions to show...
+        # With no threshold every graded submission clears it, so the speed
+        # board lists them by time, a partial solution included...
+        by_time = await query_challenge_leaderboard(
+            conn, 1, LeaderboardRanking.running_time
+        )
+        assert by_time is not None
+        assert [e["nickname"] for e in by_time] == ["carol", "dave"]
+        assert by_time[0]["score_threshold"] is None
+
+        # ...and a threshold nobody reached (all three tests right) empties it.
+        await conn.execute(
+            update(Challenge).where(Challenge.c.id == 1).values(score_threshold=3)
+        )
         assert (
             await query_challenge_leaderboard(
                 conn, 1, LeaderboardRanking.running_time
             )
             is None
         )
+        assert await query_challenge_score_threshold(conn, 1) == 3
+        await conn.execute(
+            update(Challenge).where(Challenge.c.id == 1).values(score_threshold=None)
+        )
 
-        # ...and that is exactly what the score boards are for: carol and dave
+        # The score board: carol and dave
         # both peak at 2 of 3, and the tie goes to the faster one.
         by_total = await query_challenge_leaderboard(
             conn, 1, LeaderboardRanking.total_score
@@ -718,13 +735,6 @@ async def test_challenge_page_queries(example_database, app_engine):
         # The denominator the points are shown out of
         assert [e["n_tests"] for e in by_total] == [3, 3]
         assert by_total[0]["elapsed_s"] < by_total[1]["elapsed_s"]
-
-        by_average = await query_challenge_leaderboard(
-            conn, 1, LeaderboardRanking.average_score
-        )
-        assert by_average is not None
-        assert [e["nickname"] for e in by_average] == ["carol", "dave"]
-        assert by_average[0]["average_score"] == pytest.approx(2 / 3)
 
         # A user is represented once, by their best attempt: carol's other
         # "Hello" submission scored 1 of 3 and is nowhere to be seen.
@@ -816,7 +826,7 @@ async def test_submission_page_queries(example_database, app_engine):
         # Two of "Hello"'s three test cases passed - the same aggregate the
         # standings and the history compute
         assert [newer["n_passed"], newer["n_tests"]] == [2, 3]
-        assert newer["score"] == pytest.approx(2 / 3)
+        assert newer["score"] == pytest.approx(2.0)
 
         # In execution order, carrying what the page needs to decide whether a
         # student may see the free text of each one
@@ -1906,3 +1916,269 @@ async def test_the_lock_helpers_count_the_running_submissions(example_database, 
         algorithms = await _course_id(conn, "Algorithms 101")
         assert await lock_course_submissions(conn, algorithms) == 0
         await conn.rollback()
+
+
+# ── raw scores and the score threshold ────────────────────────────────────────
+def _graded_attempt(
+    engine,
+    nickname: str,
+    challenge_id: int,
+    scores: list[float | None],
+    outcomes: list[cm.OutcomeEnum] | None = None,
+    elapsed_s: float = 1.0,
+    minutes_ago: int = 10,
+) -> int:
+    """A `done` submission by `nickname` with one outcome per entry of
+    `scores`, each on a fresh test case of the challenge, `elapsed_s` apiece.
+    `outcomes` defaults to `success` throughout, which is what the judge writes
+    for any evaluator verdict, a score of zero included."""
+    outcomes = outcomes or [cm.OutcomeEnum.success] * len(scores)
+    with engine.begin() as conn:
+        user_id = conn.execute(
+            select(User.c.id).where(User.c.nickname == nickname)
+        ).scalar_one()
+        sub_id = conn.execute(
+            insert(Submission)
+            .values(
+                user_id=user_id,
+                challenge_id=challenge_id,
+                language="python",
+                filename="a.py",
+                source="",
+                status=cm.SubmissionStatus.done,
+                enqueued=datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
+            )
+            .returning(Submission.c.id)
+        ).scalar_one()
+        for score, outcome in zip(scores, outcomes):
+            order = conn.execute(
+                select(func.count()).where(TestCase.c.challenge_id == challenge_id)
+            ).scalar_one()
+            tc_id = conn.execute(
+                insert(TestCase)
+                .values(
+                    challenge_id=challenge_id,
+                    execution_order=order,
+                    input_path="in",
+                    expected_output_path="out",
+                )
+                .returning(TestCase.c.id)
+            ).scalar_one()
+            conn.execute(
+                insert(TestOutcome).values(
+                    submission_id=sub_id,
+                    testcase_id=tc_id,
+                    outcome=outcome,
+                    elapsed_s=elapsed_s,
+                    score=score,
+                )
+            )
+    return sub_id
+
+
+def _new_challenge(engine, score_threshold: float | None) -> int:
+    with engine.begin() as conn:
+        return conn.execute(
+            insert(Challenge)
+            .values(
+                title="Scored",
+                description="",
+                course_id=1,
+                max_memory_bytes=1 << 20,
+                max_time_s=1.0,
+                max_threads=1,
+                visible_from=PUBLISHED,
+                score_threshold=score_threshold,
+            )
+            .returning(Challenge.c.id)
+        ).scalar_one()
+
+
+async def test_clears_threshold_is_null_or_at_least(app_engine):
+    cases = [
+        (5, None, True),  # no threshold: everything clears
+        (-5, None, True),
+        (9.99, 10, False),
+        (10, 10, True),  # reaching it exactly clears it
+        (10.5, 10, True),
+        (-3, -2, False),  # negative thresholds are fine
+        (-2, -2, True),
+    ]
+    async with app_engine.connect() as conn:
+        for score, threshold, expected in cases:
+            clears = _clears_threshold(
+                cast(literal(score), Float), cast(literal(threshold), Float)
+            )
+            assert (await conn.execute(select(clears))).scalar_one() is expected
+
+
+async def test_scores_are_summed_not_averaged(example_database, app_engine):
+    challenge_id = _new_challenge(example_database, None)
+    # Raw scores outside [0, 1], and a missing one that counts as zero.
+    sub_id = _graded_attempt(example_database, "carol", challenge_id, [10, 2.5, None])
+    async with app_engine.connect() as conn:
+        [attempt] = await query_user_submissions(conn, 4, challenge_id)
+        assert attempt["score"] == pytest.approx(12.5)
+        page = await query_submission(conn, sub_id)
+        assert page["score"] == pytest.approx(12.5)
+        row = next(
+            r
+            for r in await query_challenge_standings(conn, challenge_id)
+            if r["nickname"] == "carol"
+        )
+        assert row["score"] == pytest.approx(12.5)
+        [entry] = await query_challenge_leaderboard(
+            conn, challenge_id, LeaderboardRanking.total_score
+        )
+        assert entry["total_score"] == pytest.approx(12.5)
+        assert "average_score" not in entry
+
+
+async def test_cleared_follows_the_threshold(example_database, app_engine):
+    """Every reading of a submission says whether it cleared, with no
+    threshold, below it, on it and above it; and an ungraded one never did."""
+    challenge_id = _new_challenge(example_database, None)
+    sub_id = _graded_attempt(example_database, "carol", challenge_id, [4])
+    queued = _queue_for(example_database, "dave", challenge_id)
+
+    async def readings(conn):
+        [attempt] = await query_user_submissions(conn, 4, challenge_id)
+        page = await query_submission(conn, sub_id)
+        polled = await query_submission_outcomes(conn, sub_id)
+        standings = await query_challenge_standings(conn, challenge_id)
+        carol = next(r for r in standings if r["nickname"] == "carol")
+        return [attempt, page, polled, carol]
+
+    async with app_engine.connect() as conn:
+        for threshold, cleared in ((None, True), (5, False), (4, True), (3, True)):
+            await conn.execute(
+                update(Challenge)
+                .where(Challenge.c.id == challenge_id)
+                .values(score_threshold=threshold)
+            )
+            for reading in await readings(conn):
+                assert reading["cleared"] is cleared
+                assert reading["score_threshold"] == threshold
+            for reading in (await readings(conn))[:3]:
+                assert reading["has_threshold"] is (threshold is not None)
+
+        # Nothing has graded the queued one, so it clears nothing, threshold or no
+        await conn.execute(
+            update(Challenge)
+            .where(Challenge.c.id == challenge_id)
+            .values(score_threshold=None)
+        )
+        pending = await query_submission_outcomes(conn, queued)
+        assert pending["cleared"] is False and pending["score"] is None
+        [dave] = await query_user_submissions(conn, 5, challenge_id)
+        assert dave["cleared"] is False
+
+
+def _queue_for(engine, nickname: str, challenge_id: int) -> int:
+    with engine.begin() as conn:
+        return conn.execute(
+            insert(Submission)
+            .values(
+                user_id=select(User.c.id)
+                .where(User.c.nickname == nickname)
+                .scalar_subquery(),
+                challenge_id=challenge_id,
+                language="python",
+                filename="a.py",
+                source="",
+                status=cm.SubmissionStatus.queued,
+            )
+            .returning(Submission.c.id)
+        ).scalar_one()
+
+
+async def test_failed_submissions_are_on_neither_leaderboard(example_database, app_engine):
+    challenge_id = _new_challenge(example_database, 5)
+    _graded_attempt(example_database, "carol", challenge_id, [5], elapsed_s=3.0)
+    _graded_attempt(example_database, "dave", challenge_id, [4], elapsed_s=0.1)
+    async with app_engine.connect() as conn:
+        for ranking in LeaderboardRanking:
+            board = await query_challenge_leaderboard(conn, challenge_id, ranking)
+            assert [e["nickname"] for e in board] == ["carol"], ranking
+            assert board[0]["score_threshold"] == 5
+
+
+async def test_the_time_board_wants_a_cleared_submission_not_a_clean_run(
+    example_database, app_engine
+):
+    """`all_passed` is gone: the threshold decides who qualifies."""
+    challenge_id = _new_challenge(example_database, 5)
+    # Every outcome `success`, but the score is short of the threshold.
+    _graded_attempt(example_database, "carol", challenge_id, [1, 1], elapsed_s=0.1)
+    # A test timed out, yet the total reaches the threshold.
+    _graded_attempt(
+        example_database,
+        "dave",
+        challenge_id,
+        [5, 0],
+        outcomes=[cm.OutcomeEnum.success, cm.OutcomeEnum.timeout],
+        elapsed_s=2.0,
+    )
+    async with app_engine.connect() as conn:
+        board = await query_challenge_leaderboard(
+            conn, challenge_id, LeaderboardRanking.running_time
+        )
+        assert [e["nickname"] for e in board] == ["dave"]
+        assert board[0]["elapsed_s"] == pytest.approx(4.0)
+
+
+async def test_a_student_is_represented_by_their_cleared_attempt(
+    example_database, app_engine
+):
+    """An older cleared attempt beats a newer, faster failed one - on both
+    leaderboards, as `is_best` and in the standings. (A failed attempt can
+    never out-score a cleared one, since both are `>= threshold` of the same
+    sum; it is the time and the recency that could mislead.)"""
+    challenge_id = _new_challenge(example_database, 5)
+    cleared = _graded_attempt(
+        example_database, "carol", challenge_id, [5], elapsed_s=3.0, minutes_ago=30
+    )
+    failed = _graded_attempt(
+        example_database, "carol", challenge_id, [4], elapsed_s=0.1, minutes_ago=5
+    )
+    async with app_engine.connect() as conn:
+        for ranking in LeaderboardRanking:
+            [entry] = await query_challenge_leaderboard(conn, challenge_id, ranking)
+            assert entry["submission_id"] == cleared
+        history = await query_user_submissions(conn, 4, challenge_id)
+        assert [(s["id"], s["is_best"], s["cleared"]) for s in history] == [
+            (failed, False, False),
+            (cleared, True, True),
+        ]
+        row = next(
+            r
+            for r in await query_challenge_standings(conn, challenge_id)
+            if r["nickname"] == "carol"
+        )
+        assert row["best_submission_id"] == cleared and row["cleared"] is True
+
+
+async def test_standings_rank_cleared_students_before_failed_ones(
+    example_database, app_engine
+):
+    challenge_id = _new_challenge(example_database, 5)
+    _graded_attempt(example_database, "carol", challenge_id, [4], elapsed_s=0.1)
+    _graded_attempt(example_database, "dave", challenge_id, [5], elapsed_s=9.0)
+    _graded_attempt(example_database, "erin", challenge_id, [9], elapsed_s=9.0)
+    async with app_engine.connect() as conn:
+        standings = await query_challenge_standings(conn, challenge_id)
+        assert [(s["nickname"], s["cleared"]) for s in standings] == [
+            ("erin", True),
+            ("dave", True),
+            ("carol", False),
+        ]
+        assert all(s["score_threshold"] == 5 and s["has_threshold"] for s in standings)
+
+        # With no threshold nothing fails; the order is by score alone.
+        await conn.execute(
+            update(Challenge)
+            .where(Challenge.c.id == challenge_id)
+            .values(score_threshold=None)
+        )
+        standings = await query_challenge_standings(conn, challenge_id)
+        assert all(s["cleared"] and not s["has_threshold"] for s in standings)

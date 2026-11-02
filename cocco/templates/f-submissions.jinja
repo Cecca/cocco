@@ -35,7 +35,8 @@
     {% elif submission.score is none %}
     <span class="badge badge-ghost gap-1.5 font-mono font-semibold">no tests</span>
     {% else %}
-    {% with score = submission.score, n_passed = submission.n_passed, n_tests = submission.n_tests %}
+    {% with score = submission.score, n_passed = submission.n_passed, n_tests = submission.n_tests,
+       cleared = submission.cleared, has_threshold = submission.has_threshold %}
     {% include "_score-badge.jinja" %}
     {% endwith %}
     {% endif %}

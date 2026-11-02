@@ -14,6 +14,12 @@ three paths on argv, and one JSON object on stdout::
 
     {"score": 0.75, "message": "shown to the student"}
 
+`score` is raw: the judge records it as given and the submission's score is the
+sum over its tests, so an evaluator may return any number it likes. The bundled
+ones happen to score each test in [0, 1], so a challenge using them has a
+maximum of `n_tests`, and `n_tests` is the natural score threshold for
+"everything right".
+
 `message` is optional. Exiting non-zero is *never* "wrong answer" - it means the
 checker itself broke, and the judge reports `evaluator_error` for that test.
 

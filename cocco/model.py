@@ -41,15 +41,15 @@ class SubmissionStatus(Enum):
 class LeaderboardRanking(str, Enum):
     """What "best" means on a challenge's leaderboard.
 
-    `running_time` is the speed board: only a submission that passed every test
-    qualifies, and the fastest one wins. The two score boards admit partially
-    correct submissions - that is the whole point of running a challenge on a
-    partial-credit evaluator - and rank them highest first.
+    Scores are raw: a submission's score is the sum of its tests' scores. The
+    challenge's `score_threshold` gates both boards, so a submission that does
+    not clear it never appears, whatever the ranking. `running_time` puts the
+    fastest qualifying submission first; `total_score` the highest score. It is
+    presentation-only: the judge never reads it.
     """
 
     running_time = "running_time"
     total_score = "total_score"
-    average_score = "average_score"
 
 
 class OutcomeEnum(Enum):
@@ -339,6 +339,10 @@ Challenge = Table(
         default=LeaderboardRanking.running_time,
         server_default=text("'running_time'"),
     ),
+    # The score a submission must reach (`score >= score_threshold`) to count
+    # as passed and make the leaderboard. NULL means no threshold: every graded
+    # submission clears it. Applied when reading, so the judge never sees it.
+    Column("score_threshold", Float, nullable=True),
     # Where the challenge sits on its course page, the way `execution_order`
     # places a test case within its challenge. Course staff reorder them in the
     # course editor. Ties are broken by id everywhere this is ordered by, so a

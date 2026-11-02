@@ -65,6 +65,13 @@
       <span class="badge badge-ghost font-semibold">unlimited attempts</span>
     </div>
 
+    {# Said up front so that a "failed" badge never comes as a surprise. #}
+    {% if challenge.score_threshold is not none %}
+    <p class="text-sm font-semibold mb-4">
+      Reach {{ challenge.score_threshold | score }} points to make the leaderboard.
+    </p>
+    {% endif %}
+
     <article class="prose prose-sm max-w-none">
       {{ challenge.description | markdown }}
     </article>

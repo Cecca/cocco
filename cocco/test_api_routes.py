@@ -440,6 +440,44 @@ async def test_a_push_with_an_unreadable_date_is_refused(client, world):
     assert "date and time" in response.json()["detail"]
 
 
+async def test_score_threshold_round_trips_through_a_directory(client, world, app_engine):
+    _, archive = pull(client, world, "alice", world["challenge"])
+    members = {name: archive.read(name) for name in archive.namelist()}
+    assert b"score_threshold" not in members[MANIFEST_NAME]
+
+    members[MANIFEST_NAME] = members[MANIFEST_NAME].replace(
+        b"max_threads = 1", b"max_threads = 1\nscore_threshold = 2"
+    )
+    assert push(client, world, "alice", world["challenge"], members).status_code == 200
+    _, archive = pull(client, world, "alice", world["challenge"])
+    assert b"score_threshold = 2.0" in archive.read(MANIFEST_NAME)
+
+    async with app_engine.connect() as conn:
+        stored = (await conn.execute(select(Challenge.c.score_threshold).where(
+            Challenge.c.id == world["challenge"]))).scalar_one()
+    assert stored == 2.0
+
+
+async def test_a_push_with_a_bad_threshold_or_ranking_is_refused(client, world):
+    _, archive = pull(client, world, "alice", world["challenge"])
+    members = {name: archive.read(name) for name in archive.namelist()}
+    original = members[MANIFEST_NAME]
+
+    members[MANIFEST_NAME] = original.replace(
+        b"max_threads = 1", b'max_threads = 1\nscore_threshold = "ten"'
+    )
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.status_code == 400
+    assert "score_threshold" in response.json()["detail"]
+
+    members[MANIFEST_NAME] = re.sub(
+        rb'ranking = ".*"', b'ranking = "average_score"', original
+    )
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.status_code == 400
+    assert "Unknown ranking" in response.json()["detail"]
+
+
 # ── the export ──────────────────────────────────────────────────────────────
 
 

@@ -227,6 +227,7 @@ async def _challenge_snapshot(
         # `dump_manifest` does with a None - so pushing a pulled file back keeps
         # it hidden rather than publishing it.
         visible_from=challenge.visible_from,
+        score_threshold=challenge.score_threshold,
         testcases=tuple(
             ManifestTestCase(
                 input=f"{TESTS_DIR}/{row.input_path.rsplit('/', 1)[-1]}",
@@ -540,6 +541,7 @@ async def api_import_challenge(
             manifest.max_threads,
             manifest.ranking.value,
             manifest.visible_from,
+            manifest.score_threshold,
         )
         if fields is None:
             return refuse(error or "Invalid challenge.")

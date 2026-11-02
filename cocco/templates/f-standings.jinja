@@ -28,7 +28,8 @@
     {% elif row.score is none %}
     <span class="badge badge-ghost gap-1.5 font-mono font-semibold">not graded yet</span>
     {% else %}
-    {% with score = row.score, n_passed = row.n_passed, n_tests = row.n_tests %}
+    {% with score = row.score, n_passed = row.n_passed, n_tests = row.n_tests,
+         cleared = row.cleared, has_threshold = row.has_threshold %}
     {% include "_score-badge.jinja" %}
     {% endwith %}
     {% endif %}

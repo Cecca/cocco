@@ -22,7 +22,7 @@ files live in one directory per challenge with no per-test subdirectory, which i
 output names are already unique within a challenge — `tests/` keeps exactly that shape, and that is
 why **a test case is identified by its input file name**. The manifest carries no ids on purpose: a
 directory is meant to be edited, copied between checkouts and committed, so renaming an input
-*replaces* the test case rather than renaming it. Three things are deliberately absent from it.
+*replaces* the test case rather than renaming it. `score_threshold` is an optional key (absent = no threshold); `average_score` as a ranking is refused. Three things are deliberately absent from it.
 `position` belongs to the course editor, and a key that silently did nothing would be worse than no
 key; `course_id` and `challenge_id`, because the challenge a push lands on is the one in the URL,
 never a number inside a file somebody may have copied; and `execution_order`, because the block

@@ -9,7 +9,7 @@ enrollment anywhere - `effective_course_role`'s promotion, from the outside.
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 
 from cocco.conftest import PUBLISHED, sign_in_as
 from cocco.model import (
@@ -551,3 +551,237 @@ async def test_scheduling_without_a_date_is_an_alert(client, world, app_engine):
             )
         ).scalar_one()
     assert still is not None
+
+
+########################################################################
+# The score threshold: a defaulted form field, empty meaning "none".
+
+NO_THRESHOLD_WARNING = "No score threshold: every graded submission counts as passed"
+
+
+@pytest.mark.parametrize("value,expected", [("", None), ("  ", None), ("7", 7.0), ("-1.5", -1.5)])
+async def test_the_editor_saves_a_score_threshold(
+    client, world, app_engine, value, expected
+):
+    challenge_id = await _add_challenge(app_engine, world["course"], None)
+    response = client.post(
+        f"/courses/{world['course']}/{challenge_id}/edit",
+        data={**FORM, "score_threshold": value},
+    )
+    assert response.status_code == 200
+    assert "Saved." in response.text
+    async with app_engine.connect() as conn:
+        stored = (
+            await conn.execute(
+                select(Challenge.c.score_threshold).where(Challenge.c.id == challenge_id)
+            )
+        ).scalar_one()
+    assert stored == expected
+
+
+async def test_a_form_without_the_field_means_no_threshold(client, world, app_engine):
+    """A defaulted field: a missing one would be a 422 htmx drops."""
+    response = client.post(f"/courses/{world['course']}/challenges/new", data=FORM)
+    assert response.status_code == 204
+    async with app_engine.connect() as conn:
+        stored = (
+            await conn.execute(
+                select(Challenge.c.score_threshold).where(
+                    Challenge.c.course_id == world["course"]
+                )
+            )
+        ).scalar_one()
+    assert stored is None
+
+
+@pytest.mark.parametrize("value", ["lots", "nan", "inf", "-inf", "1,5"])
+async def test_a_garbage_threshold_comes_back_as_an_alert(
+    client, world, app_engine, value
+):
+    challenge_id = await _add_challenge(app_engine, world["course"], None)
+    for url in (
+        f"/courses/{world['course']}/challenges/new",
+        f"/courses/{world['course']}/{challenge_id}/edit",
+    ):
+        response = client.post(url, data={**FORM, "score_threshold": value})
+        assert response.status_code == 200
+        assert "The score threshold must be a number." in response.text
+    async with app_engine.connect() as conn:
+        n = (await conn.execute(select(Challenge.c.id).where(
+            Challenge.c.course_id == world["course"]))).all()
+    assert len(n) == 1
+
+
+async def test_the_threshold_is_shown_on_re_edit_and_the_warning_goes(
+    client, world, app_engine
+):
+    course_id = world["course"]
+    assert NO_THRESHOLD_WARNING in client.get(
+        f"/courses/{course_id}/challenges/new"
+    ).text
+
+    challenge_id = await _add_challenge(app_engine, course_id, None)
+    url = f"/courses/{course_id}/{challenge_id}/edit"
+    assert NO_THRESHOLD_WARNING in client.get(url).text
+
+    client.post(url, data={**FORM, "score_threshold": "3.5"})
+    page = client.get(url).text
+    assert 'name="score_threshold"' in page
+    assert 'value="3.5"' in page
+    assert NO_THRESHOLD_WARNING not in page
+    assert "Average score" not in page
+
+
+########################################################################
+# Scores are raw sums, and a threshold decides who has "failed".
+
+
+@pytest.mark.parametrize(
+    "value,text",
+    [
+        (None, "—"), (0, "0"), (0.0, "0"), (7, "7"), (7.0, "7"), (7.5, "7.5"),
+        (1 / 3, "0.33"), (-1.5, "-1.5"), (1.0, "1"), (12.345, "12.35"),
+    ],
+)
+def test_render_score_prints_the_raw_number(value, text):
+    from cocco.web.templating import render_score
+
+    assert render_score(value) == text
+
+
+async def _graded(app_engine, challenge_id, user_id, scores):
+    """A finished submission by `user_id` whose tests scored `scores`."""
+    from cocco.model import (
+        OutcomeEnum, Submission, SubmissionStatus, TestCase, TestOutcome,
+    )
+
+    async with app_engine.connect() as conn:
+        submission_id = (
+            await conn.execute(
+                insert(Submission)
+                .values(
+                    user_id=user_id, challenge_id=challenge_id,
+                    status=SubmissionStatus.done, language="python",
+                    filename="a.py", source="print(1)",
+                )
+                .returning(Submission.c.id)
+            )
+        ).scalar_one()
+        for order, score in enumerate(scores):
+            testcase_id = (
+                await conn.execute(
+                    insert(TestCase)
+                    .values(challenge_id=challenge_id, execution_order=order,
+                            input_path="i", expected_output_path="o")
+                    .returning(TestCase.c.id)
+                )
+            ).scalar_one()
+            await conn.execute(
+                insert(TestOutcome).values(
+                    submission_id=submission_id, testcase_id=testcase_id,
+                    outcome=OutcomeEnum.success, elapsed_s=0.1, score=score,
+                )
+            )
+        await conn.commit()
+    return submission_id
+
+
+async def _set_threshold(app_engine, challenge_id, threshold):
+    async with app_engine.connect() as conn:
+        await conn.execute(
+            update(Challenge).where(Challenge.c.id == challenge_id)
+            .values(score_threshold=threshold)
+        )
+        await conn.commit()
+
+
+async def test_a_failed_submission_is_badged_failed_everywhere(
+    client, world, app_engine
+):
+    course_id = world["course"]
+    challenge_id = await _add_challenge(app_engine, course_id, PUBLISHED)
+    await _set_threshold(app_engine, challenge_id, 3)
+    submission_id = await _graded(app_engine, challenge_id, world["bob"], [1, 1])
+
+    sign_in_as(client, STUDENT)
+    history = client.get(f"/f/submissions/{challenge_id}").text
+    assert "failed · 2" in history
+    assert "/ 100" not in history
+    assert "failed · 2" in client.get(f"/submissions/{submission_id}").text
+
+    sign_in_as(client, TEACHER)
+    standings = client.get(f"/f/standings/{challenge_id}?course_id={course_id}").text
+    assert "failed · 2" in standings
+
+
+async def test_a_cleared_submission_is_not_failed(client, world, app_engine):
+    course_id = world["course"]
+    challenge_id = await _add_challenge(app_engine, course_id, PUBLISHED)
+    await _set_threshold(app_engine, challenge_id, 2)
+    submission_id = await _graded(app_engine, challenge_id, world["bob"], [1, 1])
+
+    sign_in_as(client, STUDENT)
+    for url in (f"/f/submissions/{challenge_id}", f"/submissions/{submission_id}"):
+        page = client.get(url).text
+        assert "failed" not in page
+        assert "badge-success" in page
+    sign_in_as(client, TEACHER)
+    standings = client.get(f"/f/standings/{challenge_id}?course_id={course_id}").text
+    assert "failed" not in standings
+
+
+async def test_without_a_threshold_nothing_is_ever_failed(client, world, app_engine):
+    course_id = world["course"]
+    challenge_id = await _add_challenge(app_engine, course_id, PUBLISHED)
+    submission_id = await _graded(app_engine, challenge_id, world["bob"], [0, 0])
+
+    sign_in_as(client, STUDENT)
+    for url in (f"/f/submissions/{challenge_id}", f"/submissions/{submission_id}"):
+        page = client.get(url).text
+        assert "failed" not in page
+        assert "badge-error" not in page
+    assert "Reach" not in client.get(f"/courses/{course_id}/{challenge_id}").text
+
+
+async def test_the_leaderboard_empty_state_names_the_threshold(
+    client, world, app_engine
+):
+    challenge_id = await _add_challenge(app_engine, world["course"], PUBLISHED)
+    sign_in_as(client, STUDENT)
+    plain = client.get(f"/f/leaderboard/{challenge_id}").text
+    assert "Nobody has reached" not in plain
+
+    await _set_threshold(app_engine, challenge_id, 7.5)
+    page = client.get(f"/f/leaderboard/{challenge_id}").text
+    assert "Nobody has reached 7.5 points yet — be the first." in page
+
+
+async def test_the_leaderboard_shows_the_raw_total(client, world, app_engine):
+    challenge_id = await _add_challenge(app_engine, world["course"], PUBLISHED)
+    await _set_threshold(app_engine, challenge_id, 2)
+    await _graded(app_engine, challenge_id, world["bob"], [1, 1.5])
+    sign_in_as(client, STUDENT)
+    page = client.get(f"/f/leaderboard/{challenge_id}").text
+    assert "2.5" in page
+    assert "/ 100" not in page and "250" not in page
+
+
+async def test_the_staff_view_warns_about_a_missing_threshold(
+    client, world, app_engine
+):
+    course_id = world["course"]
+    challenge_id = await _add_challenge(app_engine, course_id, PUBLISHED)
+    url = f"/courses/{course_id}/{challenge_id}"
+    sign_in_as(client, TEACHER)
+    page = client.get(url).text
+    assert NO_THRESHOLD_WARNING in page
+    assert f"/courses/{course_id}/{challenge_id}/edit" in page
+
+    await _set_threshold(app_engine, challenge_id, 4)
+    page = client.get(url).text
+    assert NO_THRESHOLD_WARNING not in page
+    assert "threshold 4" in page
+    assert "Reach 4 points to make the leaderboard." in page
+
+    sign_in_as(client, STUDENT)
+    assert "Reach 4 points to make the leaderboard." in client.get(url).text

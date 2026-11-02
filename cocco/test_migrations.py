@@ -20,7 +20,7 @@ next - and which test that was would depend on collection order.
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 from cocco.migrate import (
     COMPARE_OPTIONS,
@@ -91,6 +91,49 @@ def test_every_revision_downgrades_and_upgrades_again(migrations_database):
             assert applied_revisions(conn) == head_revisions()
             context = MigrationContext.configure(conn, opts=dict(COMPARE_OPTIONS))
             assert compare_metadata(context, metadata) == []
+    finally:
+        with engine.begin() as conn:
+            reset_schema(conn)
+        engine.dispose()
+
+
+def test_raw_scores_migration_turns_average_score_into_total_score(
+    migrations_database,
+):
+    """The revision that dropped `average_score` from the enum: a challenge on it
+    reads back as `total_score` with no threshold, and the others keep theirs."""
+    engine = create_engine(migrations_database)
+    try:
+        with engine.begin() as conn:
+            reset_schema(conn)
+        with engine.begin() as conn:
+            command.upgrade(alembic_config(connection=conn), "b7d41e2c9a10")
+        with engine.begin() as conn:
+            for title, ranking in [
+                ("avg", "average_score"),
+                ("time", "running_time"),
+            ]:
+                conn.execute(
+                    text(
+                        "INSERT INTO challenge (title, description, "
+                        "max_memory_bytes, max_time_s, max_threads, position, ranking) "
+                        "VALUES (:t, '', 1, 1, 1, 0, :r)"
+                    ),
+                    {"t": title, "r": ranking},
+                )
+        with engine.begin() as conn:
+            upgrade_to_head(conn)
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT title, ranking::text, score_threshold "
+                    "FROM challenge ORDER BY id"
+                )
+            ).all()
+        assert [tuple(r) for r in rows] == [
+            ("avg", "total_score", None),
+            ("time", "running_time", None),
+        ]
     finally:
         with engine.begin() as conn:
             reset_schema(conn)

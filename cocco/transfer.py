@@ -22,6 +22,7 @@ unique within a challenge; `tests/` keeps exactly that shape.
 """
 
 import hashlib
+import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -121,6 +122,9 @@ class Manifest:
     evaluator: str | None
     testcases: tuple[ManifestTestCase, ...]
     visible_from: datetime | None = None
+    # Absent from the file = None = no threshold, which is a real value (every
+    # graded submission counts), so it round-trips like `visible_from`.
+    score_threshold: float | None = None
 
     @property
     def evaluator_name(self) -> str | None:
@@ -193,6 +197,8 @@ def dump_manifest(manifest: Manifest, header: str = "") -> str:
     }
     if manifest.visible_from is not None:
         document["visible_from"] = manifest.visible_from
+    if manifest.score_threshold is not None:
+        document["score_threshold"] = manifest.score_threshold
     if manifest.evaluator is not None:
         document["evaluator"] = manifest.evaluator
     document["testcase"] = [
@@ -333,6 +339,14 @@ def parse_manifest(text: str) -> Manifest:
             "2026-09-01T09:00:00+02:00. Leave it out to hide the challenge."
         )
 
+    score_threshold = None
+    if "score_threshold" in table:
+        score_threshold = float(
+            _require(table, "score_threshold", (int, float), MANIFEST_NAME)
+        )
+        if not math.isfinite(score_threshold):
+            raise ManifestError(f"{MANIFEST_NAME}: `score_threshold` must be finite.")
+
     evaluator = table.get("evaluator")
     if evaluator is not None:
         evaluator = _member_path(evaluator, EVALUATOR_DIR, "`evaluator`")
@@ -386,6 +400,7 @@ def parse_manifest(text: str) -> Manifest:
         evaluator=evaluator,
         testcases=tuple(testcases),
         visible_from=visible_from,
+        score_threshold=score_threshold,
     )
 
 

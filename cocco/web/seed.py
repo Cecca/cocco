@@ -309,6 +309,11 @@ async def _populate_dummy_data(conn: AsyncConnection):
                         # challenge is hidden - so a seed that did not say so
                         # would hand Bob and Charlie an empty course.
                         visible_from=func.now(),
+                        # The first challenge has a threshold, so a fresh
+                        # database shows a cleared and a failed submission.
+                        # Its one test case scores 1 at most (see the seeded
+                        # submissions), so 1 means "got it right".
+                        score_threshold=1.0 if first else None,
                     )
                     .returning(Challenge.c.id)
                 )

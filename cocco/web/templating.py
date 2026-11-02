@@ -148,10 +148,15 @@ def render_datetime_local(value) -> str:
     return value.strftime("%Y-%m-%dT%H:%M")
 
 def render_score(value) -> str:
-    """Per-test scores are in [0, 1]; the UI shows their mean out of 100."""
+    """A raw score as written: the evaluator's numbers summed, with no scaling.
+
+    Integers print as integers, anything else with up to two decimals and the
+    trailing zeros stripped: `7`, `7.5`, `0.33`. None is "—".
+    """
     if value is None:
         return "—"
-    return f"{round(float(value) * 100)}"
+    text = f"{float(value):.2f}".rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
 
 def render_duration(value) -> str:
     if value is None:

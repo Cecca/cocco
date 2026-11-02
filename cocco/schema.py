@@ -49,6 +49,8 @@ class Challenge(Base):
     description: str
     max_memory_bytes: int
     max_time_s: float
+    # NULL means no threshold: every graded submission clears it.
+    score_threshold: float | None = None
     # The challenge's own state, not the effective one: a challenge under an
     # archived course is archived with this still NULL. See `Challenge` in
     # `model.py` for where that `or` lives.
@@ -130,10 +132,9 @@ class SubmissionRunData(Base):
 class EvaluatorResult(Base):
     """The single JSON object an evaluator script prints on stdout.
 
-    `score` is conventionally in [0, 1] and higher-is-better, which is what the
-    headline score and the leaderboards assume, but nothing enforces it: an
-    evaluator is free to use its own scale, and then those aggregates are the
-    thing that is wrong, not the score.
+    `score` is a raw number, higher-is-better: a submission's score is the sum
+    of its tests' scores, with no rescaling. No range is enforced; a test worth
+    10 points says 10.
 
     It must however be finite. `json.loads` accepts Python's `Infinity` and
     `NaN` spellings, no other language emits them, and neither survives a round

@@ -2,6 +2,7 @@ from sqlalchemy import (
     and_,
     func,
     literal_column,
+    or_,
 )
 
 from cocco.model import (
@@ -52,6 +53,22 @@ def _challenge_visible():
         Challenge.c.visible_from.is_not(None),
         Challenge.c.visible_from <= func.now(),
     )
+
+
+# Whether a score clears a challenge's threshold: `challenge.score_threshold`
+# is NULL for "no threshold", and then every score does; otherwise it takes
+# `score >= threshold`, so reaching it exactly clears it.
+#
+# Written once, here, like its neighbours above: the page queries select it as
+# a boolean `cleared` and no template compares numbers itself. The `text()`
+# queries that cannot call it (`query_user_submissions`, the leaderboard, the
+# standings) spell the same expression and say so. It is only the comparison:
+# a submission nothing has graded yet has no score, and a caller that can meet
+# one asks for `score IS NOT NULL` as well.
+def _clears_threshold(score, threshold):
+    """`threshold IS NULL OR score >= threshold`, for a score expression and a
+    threshold expression (column, scalar subquery or bound value)."""
+    return or_(threshold.is_(None), score >= threshold)
 
 
 # A challenge's `number`, the "Challenge 03" a page prints: its rank within its

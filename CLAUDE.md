@@ -60,7 +60,7 @@ Each area has a guide in `.claude/rules/`, loaded when you touch its files. Read
 
 ### Data model (`cocco/model.py`)
 
-Core `Table`s on one `MetaData`: `User` (roles via `Enrollment`; `Administrator` beside it, keyed on email so it can name someone who never signed in), `Course` → `Challenge` → `TestCase` (files referenced by path, not stored in the DB; `is_sample` = downloadable by students, `is_active` = graded), `Submission` → `TestOutcome`. No queue table: queued means `status == SubmissionStatus.queued`. `Challenge.ranking` (`LeaderboardRanking`) is presentation-only; the judge never reads it. The `exercise_*` tables share nothing with this above the execution layer.
+Core `Table`s on one `MetaData`: `User` (roles via `Enrollment`; `Administrator` beside it, keyed on email so it can name someone who never signed in), `Course` → `Challenge` → `TestCase` (files referenced by path, not stored in the DB; `is_sample` = downloadable by students, `is_active` = graded), `Submission` → `TestOutcome`. No queue table: queued means `status == SubmissionStatus.queued`. `Challenge.ranking` (`LeaderboardRanking`) and `Challenge.score_threshold` are presentation-only; the judge never reads either. The `exercise_*` tables share nothing with this above the execution layer.
 
 **Every timestamp is `timestamptz` written by Postgres** (`server_default=func.now()`), never `datetime.now()`.
 

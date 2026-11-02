@@ -18,6 +18,7 @@ from cocco.repository.challenges import (
     query_challenge,
     query_challenge_leaderboard,
     query_challenge_ranking,
+    query_challenge_score_threshold,
     query_challenge_standings,
     query_sample_testcase,
     query_submission,
@@ -227,6 +228,7 @@ async def get_fragment_leaderboard(
     ranking = await query_challenge_ranking(db, challenge_id)
     if ranking is None:
         raise HTTPException(status_code=404)
+    score_threshold = await query_challenge_score_threshold(db, challenge_id)
     entries = await query_challenge_leaderboard(
         db, challenge_id=challenge_id, ranking=ranking
     )
@@ -236,6 +238,7 @@ async def get_fragment_leaderboard(
         context={
             "entries": entries or [],
             "ranking": ranking.value,
+            "score_threshold": score_threshold,
             "user": user,
         },
     )

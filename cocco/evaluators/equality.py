@@ -7,6 +7,9 @@ chosen one of its own.
     equality.py <actual_output> <expected_output> <test_input>
 
 Prints one JSON object on stdout: {"score": <float>, "message": "<text>"}
+
+The score is raw and is summed into the submission score; this one scores each
+test 0 or 1, so a challenge using it has a maximum of `n_tests`.
 """
 
 import json

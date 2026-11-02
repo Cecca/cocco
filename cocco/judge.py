@@ -1323,10 +1323,9 @@ async def run_from_queue(engine: Engine, storage: Storage) -> bool:
             repo.insert_test_outcomes(conn, outcomes)
             repo.mark_submission_done(conn, run_data.submission_id)
         # The headline score the pages show, computed the way they compute it
-        # (the mean, out of 1) so the log and the standings agree.
-        score = (
-            sum(o.score for o in outcomes) / len(outcomes) if outcomes else None
-        )
+        # (the sum of the raw per-test scores) so the log and the standings
+        # agree. The threshold is the pages' business; the judge never reads it.
+        score = sum(o.score for o in outcomes) if outcomes else None
         logger.info(
             "submission %s done, recorded %d test outcomes",
             run_data.submission_id,

@@ -1,5 +1,6 @@
 """The challenge editor: creating a challenge, editing it, and the danger zone."""
 
+import math
 from datetime import datetime
 from typing import Annotated
 
@@ -67,6 +68,8 @@ NEW_CHALLENGE_DEFAULTS = {
     "max_memory_bytes": 256 << 20,
     "max_threads": 1,
     "ranking": LeaderboardRanking.running_time.value,
+    # No threshold: every graded submission counts. The form warns about it.
+    "score_threshold": None,
     # Hidden, which is what `insert_challenge` writes too. The form's radio
     # group reads this, so the create page opens on "Hidden" and a challenge is
     # published deliberately rather than by default.
@@ -81,6 +84,7 @@ def _challenge_fields(
     max_threads: int,
     ranking: str,
     visible_from: str | datetime | None = None,
+    score_threshold: str | float | None = None,
 ) -> tuple[dict | None, str | None]:
     """The columns a challenge form writes, or the message explaining why not.
 
@@ -112,6 +116,20 @@ def _challenge_fields(
             return None, "That is not a date and time."
     visible_from = _as_aware(visible_from)
 
+    # The form posts text (empty = no threshold); a pushed `challenge.toml`
+    # hands over a number or None. Either way it has to be finite: `nan` and
+    # `inf` parse as floats and would make every comparison quietly false.
+    threshold: float | None = None
+    if isinstance(score_threshold, str):
+        score_threshold = score_threshold.strip() or None
+    if score_threshold is not None:
+        try:
+            threshold = float(score_threshold)
+        except ValueError:
+            return None, "The score threshold must be a number."
+        if not math.isfinite(threshold):
+            return None, "The score threshold must be a number."
+
     return {
         "description": description,
         "max_time_s": max_time_s,
@@ -119,6 +137,7 @@ def _challenge_fields(
         "max_threads": max_threads,
         "ranking": criterion,
         "visible_from": visible_from,
+        "score_threshold": threshold,
     }, None
 
 
@@ -214,6 +233,7 @@ async def post_challenge_new(
     max_memory_mb: Annotated[float, Form()],
     max_threads: Annotated[int, Form()],
     ranking: Annotated[str, Form()],
+    score_threshold: Annotated[str, Form()] = "",
     visibility: Annotated[str, Form()] = "hidden",
     visible_at: Annotated[str, Form()] = "",
 ):
@@ -237,7 +257,13 @@ async def post_challenge_new(
         return alert(error)
 
     fields, error = _challenge_fields(
-        description, max_time_s, max_memory_mb, max_threads, ranking, visible_from
+        description,
+        max_time_s,
+        max_memory_mb,
+        max_threads,
+        ranking,
+        visible_from,
+        score_threshold,
     )
     if fields is None:
         return alert(error or "Invalid challenge.")
@@ -310,6 +336,7 @@ async def post_challenge_edit(
     max_memory_mb: Annotated[float, Form()],
     max_threads: Annotated[int, Form()],
     ranking: Annotated[str, Form()],
+    score_threshold: Annotated[str, Form()] = "",
     visibility: Annotated[str, Form()] = "hidden",
     visible_at: Annotated[str, Form()] = "",
 ):
@@ -331,7 +358,13 @@ async def post_challenge_edit(
         return alert(error)
 
     fields, error = _challenge_fields(
-        description, max_time_s, max_memory_mb, max_threads, ranking, visible_from
+        description,
+        max_time_s,
+        max_memory_mb,
+        max_threads,
+        ranking,
+        visible_from,
+        score_threshold,
     )
     if fields is None:
         return alert(error or "Invalid challenge.")

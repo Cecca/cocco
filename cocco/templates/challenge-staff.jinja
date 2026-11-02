@@ -18,6 +18,14 @@
   {% include "_statement.jinja" %}
   {% endwith %}
 
+  {# The same warning as the editor's, from the saved value. #}
+  {% if challenge.score_threshold is none %}
+  <div role="alert" class="alert alert-warning text-sm mt-6">
+    <span>No score threshold: every graded submission counts as passed and goes on the leaderboard, including wrong answers. On the time ranking the fastest program wins whatever it printed. With the bundled evaluators, set it to the number of test cases to require every test right.
+    <a href="{{ url_for('get_challenge_edit', course_id=course_id, challenge_id=challenge.id) }}" class="link font-semibold">Set one in the editor.</a></span>
+  </div>
+  {% endif %}
+
   <!-- ══ CLASS STANDINGS ═════════════════════════════════════════════ -->
   <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
     <div class="card-body p-7">
@@ -48,7 +56,8 @@
             <tr class="text-xs uppercase tracking-wider text-base-content/45 font-mono">
               <th class="w-12">#</th>
               <th>Student</th>
-              <th class="w-40 text-right">Best score</th>
+              <th class="w-40 text-right">Best score{% if challenge.score_threshold is not none %}
+                <span class="block normal-case tracking-normal text-base-content/40">threshold {{ challenge.score_threshold | score }}</span>{% endif %}</th>
               <th class="w-28 text-right">Time</th>
               <th class="w-24 text-right">Attempts</th>
               <th class="w-52">Last submitted</th>

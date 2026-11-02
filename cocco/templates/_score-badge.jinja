@@ -1,28 +1,32 @@
-{# The score badge, green / amber / red by score. Included wherever a score is
-   shown - the submission history, the class standings, the submission page -
-   so the three cannot drift apart. Never served from a route, hence no `f-`.
+{# The score badge: green when the submission clears the challenge's score
+   threshold, red and marked "failed" when it does not, neutral when the
+   challenge has no threshold. Included wherever a score is shown - the
+   submission history, the class standings, the submission page - so the three
+   cannot drift apart. Never served from a route, hence no `f-`.
 
-   Context: `score` in [0, 1], and optionally `n_passed` / `n_tests` for the
-   tooltip. Callers handle the "no score yet" cases themselves, since what to
-   say instead is theirs to decide ("queued", "not graded yet", ...).
+   Context: `score` (raw, summed), `cleared` and `has_threshold` as the queries
+   give them, and optionally `n_passed` / `n_tests` for the tooltip. Callers
+   handle the "no score yet" cases themselves, since what to say instead is
+   theirs to decide ("queued", "not graded yet", ...).
 
    Class names are spelled out rather than built from a variable: Tailwind only
    emits the utilities it can literally see in these templates. #}
-{% if score >= 0.9 %}
-{% set badge = "badge-success" %}
-{% set dot = "bg-success" %}
-{% set tint = "background:color-mix(in oklch, var(--color-success) 16%, transparent);color:oklch(38% 0.1 150);" %}
-{% elif score >= 0.5 %}
-{% set badge = "badge-warning" %}
-{% set dot = "bg-warning" %}
-{% set tint = "background:color-mix(in oklch, var(--color-warning) 18%, transparent);color:oklch(45% 0.12 55);" %}
-{% else %}
+{% set failed = has_threshold and not cleared %}
+{% if failed %}
 {% set badge = "badge-error" %}
 {% set dot = "bg-error" %}
 {% set tint = "background:color-mix(in oklch, var(--color-error) 14%, transparent);color:oklch(45% 0.15 28);" %}
+{% elif has_threshold %}
+{% set badge = "badge-success" %}
+{% set dot = "bg-success" %}
+{% set tint = "background:color-mix(in oklch, var(--color-success) 16%, transparent);color:oklch(38% 0.1 150);" %}
+{% else %}
+{% set badge = "badge-ghost" %}
+{% set dot = "bg-base-content/40" %}
+{% set tint = "" %}
 {% endif %}
 <span class="badge {{ badge }} gap-1.5 font-mono font-bold border-none"
-      style="{{ tint }}"
+      {% if tint %}style="{{ tint }}"{% endif %}
       {% if n_tests %}title="{{ n_passed }} of {{ n_tests }} tests passed"{% endif %}>
-  <span class="h-1.5 w-1.5 rounded-full {{ dot }}"></span>{{ score | score }} / 100
+  <span class="h-1.5 w-1.5 rounded-full {{ dot }}"></span>{{ "failed · " if failed }}{{ score | score }}
 </span>

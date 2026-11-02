@@ -273,3 +273,41 @@ def test_visible_from_has_to_be_a_datetime():
     )
     with pytest.raises(ManifestError, match="date and time"):
         parse_manifest(text)
+
+
+########################################################################
+# `score_threshold`: absent is a value (no threshold), like `visible_from`.
+
+
+def test_score_threshold_survives_the_round_trip():
+    for value in (3.0, -1.5, 0.0):
+        text = dump_manifest(a_manifest(score_threshold=value))
+        assert parse_manifest(text).score_threshold == value
+
+
+def test_no_threshold_has_no_key_and_parses_as_none():
+    text = dump_manifest(a_manifest())
+    assert "score_threshold" not in text
+    assert parse_manifest(text).score_threshold is None
+
+
+def test_an_integer_threshold_is_accepted():
+    text = dump_manifest(a_manifest()).replace(
+        "max_threads = 1", "max_threads = 1\nscore_threshold = 4"
+    )
+    assert parse_manifest(text).score_threshold == 4.0
+
+
+@pytest.mark.parametrize("spelling", ['"ten"', "true", "inf", "nan"])
+def test_a_threshold_that_is_not_a_finite_number_is_refused(spelling):
+    text = dump_manifest(a_manifest()).replace(
+        "max_threads = 1", f"max_threads = 1\nscore_threshold = {spelling}"
+    )
+    with pytest.raises(ManifestError, match="score_threshold"):
+        parse_manifest(text)
+
+
+def test_the_retired_average_score_ranking_is_refused():
+    text = dump_manifest(a_manifest()).replace("total_score", "average_score")
+    with pytest.raises(ManifestError, match="Unknown ranking.*running_time, total_score"):
+        parse_manifest(text)

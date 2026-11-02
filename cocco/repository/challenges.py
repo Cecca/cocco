@@ -23,6 +23,7 @@ from cocco.repository.rules import (
     _EMPTY_JSON_ARRAY,
     _challenge_number,
     _challenge_visible,
+    _clears_threshold,
     _effective_archived_at,
 )
 
@@ -62,17 +63,19 @@ async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_
     ones - which have no outcomes yet - still show up: those are exactly the
     rows the challenge page polls for.
 
-    The aggregate `score` is the mean of the per-test scores. Note that this is
-    only meaningful for higher-is-better evaluators: nothing stops a challenge's
-    evaluator from scoring on another scale - an error metric, say - and this
-    aggregation then gets it backwards.
+    The aggregate `score` is the sum of the per-test scores, raw. `cleared` is
+    whether it reaches the challenge's `score_threshold` (always, with none, but
+    never for an attempt nothing has graded yet); `has_threshold` tells a page
+    whether "not cleared" may be called failed. The best attempt is a cleared
+    one before a failed one, then the higher score, then the newest. The
+    clearing expression is `_clears_threshold`'s, spelled again here.
     """
     query = text("""
     WITH
     outcomes AS (
         SELECT submission_id,
                json_agg(testoutcome ORDER BY testoutcome.id) AS outcome,
-               avg(coalesce(score, 0)) AS score,
+               sum(coalesce(score, 0)) AS score,
                sum(elapsed_s) AS elapsed_s,
                count(*) FILTER (WHERE outcome = 'success') AS n_passed,
                count(*) AS n_tests
@@ -86,8 +89,15 @@ async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_
                outcomes.elapsed_s,
                outcomes.n_passed,
                outcomes.n_tests,
+               challenge.score_threshold,
+               challenge.score_threshold IS NOT NULL AS has_threshold,
+               -- `_clears_threshold`, and a graded attempt only.
+               (outcomes.score IS NOT NULL
+                AND (challenge.score_threshold IS NULL
+                     OR outcomes.score >= challenge.score_threshold)) AS cleared,
                row_number() OVER (ORDER BY submission.enqueued) AS attempt
         FROM submission
+        JOIN challenge ON challenge.id = submission.challenge_id
         LEFT JOIN outcomes ON submission.id = outcomes.submission_id
         WHERE submission.challenge_id = :challenge_id
           AND submission.user_id = :user_id
@@ -96,7 +106,9 @@ async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_
         SELECT attempts.*,
                attempts.score IS NOT NULL
                AND row_number() OVER (
-                   ORDER BY attempts.score DESC NULLS LAST, attempts.attempt DESC
+                   ORDER BY attempts.cleared DESC,
+                            attempts.score DESC NULLS LAST,
+                            attempts.attempt DESC
                ) = 1 AS is_best
         FROM attempts
     )
@@ -107,24 +119,39 @@ async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_
     return res.scalar_one_or_none()
 
 
-def _score_columns(outcomes):
+def _score_columns(outcomes, threshold=None):
     """A submission's headline numbers, as aggregates over rows of
     `testoutcome` - `outcomes` is that table or anything with its columns:
-    the mean score, the total running time, how many tests passed and how many
-    there were. Labelled, for a `select`. A missing score counts as zero, and
-    the mean assumes a higher-is-better evaluator.
+    the total score (the sum of the raw per-test scores), the total running
+    time, how many tests passed and how many there were. Labelled, for a
+    `select`. A missing score counts as zero.
+
+    With a `threshold` expression (the challenge's `score_threshold`) it adds
+    `score_threshold`, `has_threshold` and the boolean `cleared`:
+    `_clears_threshold` over the total, false when there is no score at all
+    because nothing has been graded yet.
 
     `query_user_submissions` and `query_challenge_standings` spell the same
     four aggregates in their own `text()`; keep them in step.
     """
-    return [
-        func.avg(func.coalesce(outcomes.c.score, 0)).label("score"),
+    score = func.sum(func.coalesce(outcomes.c.score, 0))
+    columns = [
+        score.label("score"),
         func.sum(outcomes.c.elapsed_s).label("elapsed_s"),
         func.count()
         .filter(outcomes.c.outcome == OutcomeEnum.success)
         .label("n_passed"),
         func.count().label("n_tests"),
     ]
+    if threshold is not None:
+        columns += [
+            threshold.label("score_threshold"),
+            threshold.is_not(None).label("has_threshold"),
+            and_(score.is_not(None), _clears_threshold(score, threshold)).label(
+                "cleared"
+            ),
+        ]
+    return columns
 
 
 def _submission_outcomes(submission_id):
@@ -150,6 +177,12 @@ def _submission_outcomes(submission_id):
     )
     # Aggregated with no GROUP BY, so this is one row even when the submission
     # has no outcomes yet and can be joined `ON true` unconditionally.
+    threshold = (
+        select(Challenge.c.score_threshold)
+        .select_from(Submission.join(Challenge, Challenge.c.id == Submission.c.challenge_id))
+        .where(Submission.c.id == submission_id)
+        .scalar_subquery()
+    )
     agg = select(
         func.coalesce(
             func.json_agg(
@@ -161,7 +194,7 @@ def _submission_outcomes(submission_id):
             ),
             _EMPTY_JSON_ARRAY,
         ).label("outcomes"),
-        *_score_columns(outcomes),
+        *_score_columns(outcomes, threshold),
     ).cte("agg")
     return agg
 
@@ -263,7 +296,7 @@ async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int
     is false, because `require_challenge_viewer` refuses everybody else before
     this query runs; it is here so the editor's form and the staff badge can say
     which of the three states the challenge is in. `visible_from` itself rides
-    along in `challenge.*`.
+    along in `challenge.*`, and so does `score_threshold`.
     """
     challenge = bindparam("challenge_id", challenge_id)
     user = bindparam("user_id", user_id)
@@ -315,22 +348,21 @@ async def query_challenge(conn: AsyncConnection, user_id: int, challenge_id: int
 # SQL spliced into the leaderboard query below. They are written here and keyed
 # by the enum - no request data ever reaches the query as text.
 #
-# The speed board keeps its historical rule: only a submission that passed every
-# test is on it. The score boards take any submission that was actually graded,
-# because a partial-credit evaluator is exactly the case where nobody passes
-# everything, and they fall back on time to break a tie.
+# Both boards share one gate: the submission must have `cleared` the challenge's
+# score threshold (`_clears_threshold`; no threshold clears everything), so a
+# failed submission is on neither. The ranking only decides the order. The speed
+# board also needs a running time to rank by. The score board falls back on time
+# to break a tie. Whether every test ran to a verdict is not asked: a submission
+# that timed out on one test but still reaches the threshold qualifies, and the
+# threshold is what keeps a fast wrong answer off the speed board.
 _LEADERBOARD_CRITERIA: dict[LeaderboardRanking, tuple[str, str]] = {
     LeaderboardRanking.running_time: (
-        "all_passed AND elapsed_s IS NOT NULL",
+        "cleared AND elapsed_s IS NOT NULL",
         "elapsed_s ASC",
     ),
     LeaderboardRanking.total_score: (
-        "total_score IS NOT NULL",
+        "cleared",
         "total_score DESC, elapsed_s ASC NULLS LAST",
-    ),
-    LeaderboardRanking.average_score: (
-        "average_score IS NOT NULL",
-        "average_score DESC, elapsed_s ASC NULLS LAST",
     ),
 }
 
@@ -347,6 +379,18 @@ async def query_challenge_ranking(
     return res.scalar_one_or_none()
 
 
+async def query_challenge_score_threshold(
+    conn: AsyncConnection, challenge_id: int
+) -> float | None:
+    """The challenge's score threshold, None for "no threshold" - and for no
+    such challenge. Beside `query_challenge_ranking`, for the leaderboard's
+    empty state, which has no row to carry it."""
+    res = await conn.execute(
+        select(Challenge.c.score_threshold).where(Challenge.c.id == challenge_id)
+    )
+    return res.scalar_one_or_none()
+
+
 async def query_challenge_leaderboard(
     conn: AsyncConnection,
     challenge_id: int,
@@ -355,12 +399,12 @@ async def query_challenge_leaderboard(
 ):
     """Ranking of the users who did best on the challenge, best first.
 
-    "Best" is whatever the challenge says: the total running time of a fully
-    correct submission, the sum of its per-test scores, or their mean - see
-    `_LEADERBOARD_CRITERIA`. Only submissions that are done and have outcomes
-    count, and each user is represented by their single best one. Every metric
-    comes back on every row, so a row carries the number the criterion ranked on
-    plus the `n_tests` the scores are out of.
+    "Best" is whatever the challenge says: the total running time or the sum of
+    the raw per-test scores - see `_LEADERBOARD_CRITERIA`. Only submissions that
+    are done, have outcomes and clear the challenge's score threshold count, and
+    each user is represented by their best cleared one, so a newer failed
+    attempt never displaces it. Every metric comes back on every row, with the
+    `n_tests` and the `score_threshold` (NULL for none) the board was gated by.
     """
     qualifier, order = _LEADERBOARD_CRITERIA[LeaderboardRanking(ranking)]
     query = text(f"""
@@ -369,15 +413,21 @@ async def query_challenge_leaderboard(
         SELECT submission.id,
                submission.user_id,
                sum(testoutcome.elapsed_s) AS elapsed_s,
-               sum(testoutcome.score) AS total_score,
-               avg(testoutcome.score) AS average_score,
+               sum(coalesce(testoutcome.score, 0)) AS total_score,
                count(testoutcome.id) AS n_tests,
-               bool_and(testoutcome.outcome = 'success') AS all_passed
+               challenge.score_threshold
         FROM submission
+        JOIN challenge ON challenge.id = submission.challenge_id
         JOIN testoutcome ON testoutcome.submission_id = submission.id
         WHERE submission.challenge_id = :challenge_id
           AND submission.status = 'done'
-        GROUP BY submission.id, submission.user_id
+        GROUP BY submission.id, submission.user_id, challenge.score_threshold
+    ),
+    -- `_clears_threshold`, spelled again: this is a text() query.
+    scored AS (
+        SELECT per_submission.*,
+               (score_threshold IS NULL OR total_score >= score_threshold) AS cleared
+        FROM per_submission
     ),
     best AS (
         SELECT DISTINCT ON (user_id)
@@ -385,9 +435,9 @@ async def query_challenge_leaderboard(
                id AS submission_id,
                elapsed_s,
                total_score,
-               average_score,
-               n_tests
-        FROM per_submission
+               n_tests,
+               score_threshold
+        FROM scored
         WHERE {qualifier}
         ORDER BY user_id, {order}, id
     ),
@@ -397,8 +447,8 @@ async def query_challenge_leaderboard(
                best.submission_id,
                best.elapsed_s,
                best.total_score,
-               best.average_score,
                best.n_tests,
+               best.score_threshold,
                "user".nickname
         FROM best
         JOIN "user" ON "user".id = best.user_id
@@ -418,16 +468,21 @@ async def query_challenge_standings(conn: AsyncConnection, challenge_id: int):
     """How the whole class is doing on a challenge - one row per student.
 
     This is the staff view of `query_user_submissions`: every student is
-    represented by their best attempt, ranked by score and then by total running
-    time. Students who are enrolled but have handed in nothing appear too, with
-    a null score, which is exactly what a teacher wants to see.
+    represented by their best attempt - a cleared one before a failed one, then
+    the higher score, then the shorter running time - and ranked the same way,
+    so a failed best sorts below every cleared one. Students who are enrolled
+    but have handed in nothing appear too, with a null score, which is exactly
+    what a teacher wants to see.
 
     The cohort is the union of the enrolled students and everyone who has
     submitted: a submission can outlive an enrollment, and a course may be
     seeded with submissions before anyone is enrolled.
 
-    As in `query_user_submissions`, `score` is the mean of the per-test scores
-    and so only means anything for a higher-is-better evaluator.
+    As in `query_user_submissions`, `score` is the sum of the raw per-test
+    scores and `cleared` is whether it reaches the challenge's score threshold
+    (`_clears_threshold`'s expression, spelled again; false for an attempt
+    nothing has graded yet). Every row carries `score_threshold` and
+    `has_threshold`, those without attempts included.
     """
     query = text("""
     WITH
@@ -439,9 +494,12 @@ async def query_challenge_standings(conn: AsyncConnection, challenge_id: int):
         JOIN challenge ON challenge.course_id = enrollment.course_id
         WHERE challenge.id = :challenge_id AND enrollment.role = 'student'
     ),
+    th AS (
+        SELECT score_threshold FROM challenge WHERE id = :challenge_id
+    ),
     outcomes AS (
         SELECT submission_id,
-               avg(coalesce(score, 0)) AS score,
+               sum(coalesce(score, 0)) AS score,
                sum(elapsed_s) AS elapsed_s,
                count(*) FILTER (WHERE outcome = 'success') AS n_passed,
                count(*) AS n_tests
@@ -460,17 +518,22 @@ async def query_challenge_standings(conn: AsyncConnection, challenge_id: int):
                outcomes.score,
                outcomes.elapsed_s,
                outcomes.n_passed,
-               outcomes.n_tests
+               outcomes.n_tests,
+               (outcomes.score IS NOT NULL
+                AND (th.score_threshold IS NULL
+                     OR outcomes.score >= th.score_threshold)) AS cleared
         FROM submission
+        CROSS JOIN th
         LEFT JOIN outcomes ON outcomes.submission_id = submission.id
         WHERE submission.challenge_id = :challenge_id
     ),
     best AS (
         SELECT DISTINCT ON (user_id)
-               user_id, id AS best_submission_id, score, elapsed_s,
+               user_id, id AS best_submission_id, score, cleared, elapsed_s,
                n_passed, n_tests
         FROM attempts
-        ORDER BY user_id, score DESC NULLS LAST, elapsed_s ASC NULLS LAST
+        ORDER BY user_id, cleared DESC, score DESC NULLS LAST,
+                 elapsed_s ASC NULLS LAST
     ),
     totals AS (
         SELECT user_id,
@@ -482,7 +545,8 @@ async def query_challenge_standings(conn: AsyncConnection, challenge_id: int):
     ),
     board AS (
         SELECT row_number() OVER (
-                   ORDER BY best.score DESC NULLS LAST,
+                   ORDER BY best.cleared DESC NULLS LAST,
+                            best.score DESC NULLS LAST,
                             best.elapsed_s ASC NULLS LAST,
                             "user".nickname
                ) AS rank,
@@ -490,6 +554,9 @@ async def query_challenge_standings(conn: AsyncConnection, challenge_id: int):
                "user".nickname,
                best.best_submission_id,
                best.score,
+               best.cleared,
+               th.score_threshold,
+               th.score_threshold IS NOT NULL AS has_threshold,
                best.elapsed_s,
                best.n_passed,
                best.n_tests,
@@ -497,6 +564,7 @@ async def query_challenge_standings(conn: AsyncConnection, challenge_id: int):
                coalesce(totals.n_pending, 0) AS n_pending,
                totals.last_enqueued
         FROM cohort
+        CROSS JOIN th
         JOIN "user" ON "user".id = cohort.user_id
         LEFT JOIN best ON best.user_id = cohort.user_id
         LEFT JOIN totals ON totals.user_id = cohort.user_id
@@ -745,6 +813,7 @@ async def insert_challenge(
     max_threads: int,
     ranking: LeaderboardRanking,
     visible_from: datetime | None = None,
+    score_threshold: float | None = None,
 ) -> int:
     """Create a challenge on a course and return its id.
 
@@ -761,8 +830,10 @@ async def insert_challenge(
     that listed it the instant it was created was advertising a page that could
     not be solved. The create form offers the three states all the same, so
     staff who want it live at once can say so.
-    Like the other insert helpers here, this does not commit - the caller owns
-    the transaction.
+
+    `score_threshold` defaults to NULL too: no threshold, every graded
+    submission counts. Like the other insert helpers here, this does not
+    commit - the caller owns the transaction.
     """
     next_position = (
         await conn.execute(
@@ -784,6 +855,7 @@ async def insert_challenge(
             position=next_position,
             evaluator_path=None,
             visible_from=visible_from,
+            score_threshold=score_threshold,
         )
         .returning(Challenge.c.id)
     )
