@@ -1,4 +1,6 @@
-{# The alert swapped into #edit-result after saving the challenge. #}
+{# The alert swapped into a status slot after saving: #edit-result on the create
+   page, #statement-result on the editor's statement card (the other cards draw
+   the same alert themselves, inside their whole-card fragments). #}
 <div role="alert" class="alert {{ 'alert-success' if ok else 'alert-error' }} py-2 text-sm">
   <span>{{ message }}</span>
 </div>

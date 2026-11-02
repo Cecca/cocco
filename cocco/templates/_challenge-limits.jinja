@@ -1,0 +1,50 @@
+{# The sandbox limits card, shared by the editor and the create page.
+
+   Context: challenge (a row, or the defaults dict - max_memory_bytes is shown
+   in MB), and optionally card_url (see _challenge-statement.jinja) plus
+   message / ok for the footer's alert. With card_url the card is its own form
+   and is swapped whole, by its id. #}
+
+<!-- ══ SANDBOX LIMITS ══════════════════════════════════════════════ -->
+<div id="challenge-limits" class="card bg-base-100 border border-base-300 shadow-sm">
+  {% if card_url %}
+  <form class="card-body p-7 group" data-card{% if message and not ok %} data-dirty{% endif %}
+        hx-post="{{ card_url }}"
+        hx-target="#challenge-limits"
+        hx-swap="outerHTML">
+  {% else %}
+  <div class="card-body p-7">
+  {% endif %}
+    <h2 class="font-bold text-lg">Sandbox limits</h2>
+    <p class="text-[13px] text-base-content/55 -mt-1">
+      Enforced by isolate on every run. Too tight and correct solutions get killed.
+    </p>
+
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-3">
+      <div>
+        <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Time (s)</label>
+        <input type="number" name="max_time_s" step="0.5" min="0.5" required
+               value="{{ challenge.max_time_s }}"
+               class="input font-mono w-full mt-1.5" />
+      </div>
+      <div>
+        <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Memory (MB)</label>
+        <input type="number" name="max_memory_mb" step="1" min="1" required
+               value="{{ (challenge.max_memory_bytes / 1024 / 1024) | round | int }}"
+               class="input font-mono w-full mt-1.5" />
+      </div>
+      <div>
+        <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Threads</label>
+        <input type="number" name="max_threads" step="1" min="1" required
+               value="{{ challenge.max_threads }}"
+               class="input font-mono w-full mt-1.5" />
+      </div>
+    </div>
+  {% if card_url %}
+    {% set result_id = "limits-result" %}
+    {% include "_card-footer.jinja" %}
+  </form>
+  {% else %}
+  </div>
+  {% endif %}
+</div>

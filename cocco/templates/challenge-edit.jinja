@@ -26,17 +26,22 @@
     </a>
   </div>
 
-  {# The same form the create page shows, minus the title: a challenge is
-     named once, when it is created. #}
-  {% set action_url = url_for('post_challenge_edit', course_id=course_id, challenge_id=challenge.id) %}
-  {% set show_title = false %}
-  {% set submit_label = "Save changes" %}
-  {% include "_challenge-form.jinja" %}
+  <!-- ══ VISIBILITY ════════════════════════════════════════════════════ -->
+  {# First, because whether the class can see the challenge is the first thing
+     you want to know. Every card from here to the limits saves itself: what
+     you change in a card is saved by that card. #}
+  <div class="mb-6">{% include "f-challenge-visibility.jinja" %}</div>
 
-  {# Outside the form above, like the test cases below it: nested forms are
-     invalid HTML, and this card has upload and reset forms of its own. Above
-     the test cases because you pick the checker before writing what it
-     checks. #}
+  {# A card_url makes the card its own form. The statement answers with a status
+     line only (see its partial); the others are swapped whole by their ids. #}
+  {% set card_url = url_for('post_challenge_statement', course_id=course_id, challenge_id=challenge.id) %}
+  {% include "_challenge-statement.jinja" %}
+
+  <div class="mt-6">{% include "f-challenge-leaderboard.jinja" %}</div>
+  <div class="mt-6">{% include "f-challenge-limits.jinja" %}</div>
+
+  {# Its own forms for upload and reset, not a card_url one. Above the test
+     cases because you pick the checker before writing what it checks. #}
   <!-- ══ EVALUATOR ═════════════════════════════════════════════════════ -->
   <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
     <div class="card-body p-7">
@@ -183,6 +188,33 @@
     document.getElementById("delete_challenge_modal")
             .addEventListener("close", () => { field.value = ""; check(); });
     check();
+  })();
+</script>
+
+<script>
+  /* Unsaved-changes tracking for the cards that save themselves. An edit inside
+     a form[data-card] flags it, and the flag shows the hint in its footer (a
+     `group-data-[dirty]:` variant). A whole-card swap brings fresh markup, so
+     nothing resets there; the statement is not swapped, so a successful save
+     clears its flag here. */
+  (() => {
+    const dirty = () => document.querySelector("form[data-card][data-dirty]");
+    const mark = (e) => {
+      const form = e.target.closest && e.target.closest("form[data-card]");
+      if (form) form.setAttribute("data-dirty", "");
+    };
+    document.addEventListener("input", mark);
+    document.addEventListener("change", mark);
+    document.body.addEventListener("htmx:afterRequest", (e) => {
+      const form = e.detail.elt;
+      if (form.matches && form.matches("form[data-card]") && e.detail.successful
+          && form.querySelector(".alert-success")) {
+        form.removeAttribute("data-dirty");
+      }
+    });
+    window.addEventListener("beforeunload", (e) => {
+      if (dirty()) { e.preventDefault(); e.returnValue = ""; }
+    });
   })();
 </script>
 {% endblock %}

@@ -106,8 +106,8 @@ class Manifest:
     the whole point of editing this in a text editor.
 
     `visible_from` is not one of them, and the difference is worth stating: it
-    is a column a challenge form writes, so `_challenge_fields` validates it for
-    a push exactly as it does for the editor. Absent means hidden - which is a
+    is a column the editor writes, so `_challenge_fields` validates it for a push
+    exactly as the editor's visibility strip does (through `_visible_from_value`). Absent means hidden - which is a
     real value and not a missing one - so a pulled hidden challenge has no key
     and pushing that file back hides it, which round-trips. TOML has native
     datetimes, so it is written offset-carrying; one typed by hand without an
@@ -300,8 +300,8 @@ def parse_manifest(text: str) -> Manifest:
 
     Structure and file names are checked here. The sandbox limits are *not*:
     `_challenge_fields` in `web/challenge_editor.py` is already the one place the create form
-    and the edit form agree on what a valid limit is, and the import route is
-    its third caller rather than a second opinion.
+    and the editor's cards (through its pieces) agree on what a valid limit is,
+    and the import route calls it rather than giving a second opinion.
     """
     try:
         table = tomllib.loads(text)

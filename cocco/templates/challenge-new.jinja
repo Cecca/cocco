@@ -16,8 +16,9 @@
     <div>
       <h1 class="font-serif text-3xl font-semibold tracking-tight">New challenge</h1>
       <p class="text-[13px] text-base-content/55 mt-1">
-        The evaluator and the test cases are set up on the editor, which is where
-        this form lands once the challenge exists.
+        A new challenge starts hidden: only course staff can see it. The evaluator,
+        the test cases and publishing are done on the editor, which is where this
+        form lands once the challenge exists.
       </p>
     </div>
     <a href="{{ url_for('get_course', course_id=course_id) }}"
@@ -26,9 +27,39 @@
     </a>
   </div>
 
-  {% set action_url = url_for('post_challenge_new', course_id=course_id) %}
-  {% set show_title = true %}
-  {% set submit_label = "Create challenge" %}
-  {% include "_challenge-form.jinja" %}
+  {# One form for the whole page: the title does not exist yet, so there is
+     nothing for a card to save on its own. The cards below are bare fields. #}
+  <form hx-post="{{ url_for('post_challenge_new', course_id=course_id) }}"
+        hx-target="#edit-result"
+        hx-swap="innerHTML">
+
+    <!-- ══ TITLE ═════════════════════════════════════════════════════════ -->
+    <div class="card bg-base-100 border border-base-300 shadow-sm mb-6">
+      <div class="card-body p-7">
+        <h2 class="font-bold text-lg">Title</h2>
+        <p class="text-[13px] text-base-content/55 -mt-1">
+          How the challenge is listed on the course page.
+        </p>
+        <input type="text" name="title" required autofocus
+               value="{{ challenge.title }}"
+               placeholder="Two Sum"
+               class="input w-full mt-3" />
+      </div>
+    </div>
+
+    {% include "_challenge-statement.jinja" %}
+    <div class="mt-6">{% include "_challenge-leaderboard.jinja" %}</div>
+    <div class="mt-6">{% include "_challenge-limits.jinja" %}</div>
+
+    <div class="flex items-center gap-4 mt-6">
+      <button type="submit" class="btn btn-primary shadow-md shadow-primary/30">
+        <span class="submit-label">Create challenge</span>
+        <span class="htmx-indicator loading loading-spinner loading-sm"></span>
+      </button>
+      {# Where the alert lands on a failure. On a successful create there is
+         nothing to swap: the response is a 204 carrying HX-Redirect. #}
+      <div id="edit-result" class="empty:hidden flex-1"></div>
+    </div>
+  </form>
 </main>
 {% endblock %}

@@ -1,0 +1,10 @@
+{# The sandbox limits card of the editor, saving itself. Served by
+   post_challenge_limits and inlined by challenge-edit.jinja; the whole card is
+   swapped (outerHTML, by its id).
+
+   Context: course_id, challenge (a row or dict: id, max_time_s,
+   max_memory_bytes, max_threads; on a refused save the posted values laid over
+   the stored ones, memory converted back to bytes), and optionally message / ok
+   for the alert in the footer. #}
+{% set card_url = url_for('post_challenge_limits', course_id=course_id, challenge_id=challenge.id) %}
+{% include "_challenge-limits.jinja" %}

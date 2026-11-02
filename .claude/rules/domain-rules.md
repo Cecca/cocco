@@ -32,7 +32,7 @@ Moved from `CLAUDE.md`'s *Conventions*: ordering, test cases, regrading, deletio
   - Spelled once, `_challenge_visible()`, with a behavioural test in `test_repository.py`. Unlike archiving it does **not** cascade from the course.
   - Enforced in **one** place: `require_challenge_visible`, called from `require_challenge_viewer` and `require_challenge_member`, so routes (including `post_submission`) need no check of their own.
   - Hidden → bare 404; scheduled → `Forbidden` naming the date, matching its teaser card.
-  - `insert_challenge` writes NULL, so **new challenges are hidden**.
+  - `insert_challenge` writes NULL, so **new challenges are hidden**: the create page has no visibility, and a challenge is published only from the editor's Publish / Schedule buttons (or `cocco push`).
   - `_course_challenges` exposes **`is_visible`** (never `AS visible`); its callers' `include_hidden` defaults to the student's list.
   - It **is** a `challenge.toml` key (absent = hidden, so a pushed draft stays a draft).
 - **A block stops a person, it doesn't retract their work**: queued submissions are graded, and standings and leaderboards keep listing them. Nothing blocked is seeded (a blocked seeded admin would lock out a fresh checkout). **Removing an enrollment draws the same line**: `delete_enrollment` takes one row. Submissions and outcomes stay, because `query_challenge_standings`'s cohort already unions in everyone who submitted.

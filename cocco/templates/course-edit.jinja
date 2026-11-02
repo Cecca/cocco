@@ -27,8 +27,8 @@
   </div>
 
   <!-- ══ TITLE + DESCRIPTION ═════════════════════════════════════════ -->
-  {# One form for both, the way the challenge form covers the statement and the
-     limits with a single Save. The challenge list below is outside it: nested
+  {# One form for both, with a single Save (the challenge editor, by contrast,
+     saves card by card). The challenge list below is outside it: nested
      forms are invalid HTML, and every arrow down there is a form of its own. #}
   <form hx-post="{{ url_for('post_course_edit', course_id=course.id) }}"
         hx-target="#edit-result"

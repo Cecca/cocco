@@ -529,9 +529,9 @@ async def api_import_challenge(
             return refuse(str(e))
 
         # The limits, the ranking and the visibility are validated by the same
-        # function the create form and the edit form go through, rather than a
-        # second time here: this is `_challenge_fields`' third caller, not its
-        # rival. `visible_from` arrives as a `datetime` from `tomllib` where the
+        # function the create form goes through (and the editor's cards through
+        # its pieces), rather than a second time here: `_challenge_fields` is
+        # shared, not rivalled. `visible_from` arrives as a `datetime` from `tomllib` where the
         # forms hand it a string, which is exactly the difference that function
         # exists to absorb.
         fields, error = _challenge_fields(

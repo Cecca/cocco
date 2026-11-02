@@ -1,0 +1,56 @@
+{# The problem statement card, shared by the editor and the create page.
+
+   Context: challenge (a row, or the defaults dict the create page passes -
+   Jinja falls back to __getitem__, so both work), and optionally card_url.
+   With card_url the card is its own form and saves itself, answering into
+   #statement-result; without it the card is bare fields for an enclosing form.
+
+   The statement is the one card that answers with just a status line rather
+   than being swapped whole: someone may still be typing while the request is
+   in flight, and swapping the textarea would drop those keystrokes and the
+   focus. There is nothing derived to re-render either. #}
+
+<!-- ══ PROBLEM STATEMENT ═════════════════════════════════════════════ -->
+<div class="card bg-base-100 border border-base-300 shadow-sm">
+  {% if card_url %}
+  <form class="card-body p-7 group" data-card
+        hx-post="{{ card_url }}"
+        hx-target="#statement-result"
+        hx-swap="innerHTML">
+  {% else %}
+  <div class="card-body p-7">
+  {% endif %}
+    <div class="flex items-baseline justify-between">
+      <h2 class="font-bold text-lg">Problem statement</h2>
+      <span class="font-mono text-xs text-base-content/45">markdown</span>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 mt-3">
+      <div>
+        <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Source</label>
+        <!-- Preview re-renders server-side through the same filter the
+             challenge page uses, so it cannot drift from the real thing. -->
+        <textarea name="description"
+                  id="description"
+                  rows="24"
+                  class="textarea font-mono text-sm w-full mt-1.5 leading-relaxed"
+                  hx-post="{{ url_for('post_markdown_preview') }}"
+                  hx-trigger="load, keyup changed delay:400ms"
+                  hx-target="#preview"
+                  hx-swap="innerHTML">{{ challenge.description }}</textarea>
+      </div>
+      <div>
+        <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Preview</label>
+        <div id="preview"
+             class="rounded-xl border border-base-300 bg-base-200/40 p-5 mt-1.5 min-h-[10rem] overflow-x-auto">
+        </div>
+      </div>
+    </div>
+  {% if card_url %}
+    {% set result_id = "statement-result" %}
+    {% include "_card-footer.jinja" %}
+  </form>
+  {% else %}
+  </div>
+  {% endif %}
+</div>

@@ -13,6 +13,7 @@ from fastapi import (
 from fastapi.responses import (
     Response,
 )
+from sqlalchemy import func
 
 from cocco.model import (
     LeaderboardRanking,
@@ -70,51 +71,35 @@ NEW_CHALLENGE_DEFAULTS = {
     "ranking": LeaderboardRanking.running_time.value,
     # No threshold: every graded submission counts. The form warns about it.
     "score_threshold": None,
-    # Hidden, which is what `insert_challenge` writes too. The form's radio
-    # group reads this, so the create page opens on "Hidden" and a challenge is
-    # published deliberately rather than by default.
+    # Hidden, which is what `insert_challenge` writes too. A challenge is
+    # published deliberately, from the editor's visibility strip, rather than
+    # by default.
     "visible_from": None,
 }
 
 
-def _challenge_fields(
-    description: str,
-    max_time_s: float,
-    max_memory_mb: float,
-    max_threads: int,
-    ranking: str,
-    visible_from: str | datetime | None = None,
-    score_threshold: str | float | None = None,
+def _limit_fields(
+    max_time_s: float, max_memory_mb: float, max_threads: int
 ) -> tuple[dict | None, str | None]:
-    """The columns a challenge form writes, or the message explaining why not.
-
-    The create and the edit form are the same form - `_challenge-form.jinja` -
-    so they are validated once, here, and the caller only decides what to do
-    with the result. `api_import_challenge` is the third caller rather than a
-    second opinion.
-
-    `visible_from` arrives in whichever shape its caller naturally holds: the
-    `"2026-09-01T09:00"` an `<input type="datetime-local">` posts, the real
-    `datetime` `tomllib` parses out of a pushed `challenge.toml`, or None for a
-    challenge that is hidden. Normalizing all three here is what stops the
-    browser and `cocco push` disagreeing about what a date means - and a naive
-    value is read as the app server's local clock, which is the one clock
-    `render_datetime` prints in and `render_datetime_local` fills the box with.
-    """
+    """The sandbox limits as columns, or the message explaining why not."""
     if max_time_s <= 0 or max_memory_mb <= 0 or max_threads < 1:
         return None, "Limits must be positive."
+    return {
+        "max_time_s": max_time_s,
+        "max_memory_bytes": int(max_memory_mb * 1024 * 1024),
+        "max_threads": max_threads,
+    }, None
 
+
+def _leaderboard_fields(
+    ranking: str, score_threshold: str | float | None
+) -> tuple[dict | None, str | None]:
+    """The leaderboard's criterion and pass threshold as columns, or the message
+    explaining why not."""
     try:
         criterion = LeaderboardRanking(ranking)
     except ValueError:
         return None, "Unknown leaderboard ranking."
-
-    if isinstance(visible_from, str):
-        try:
-            visible_from = datetime.fromisoformat(visible_from)
-        except ValueError:
-            return None, "That is not a date and time."
-    visible_from = _as_aware(visible_from)
 
     # The form posts text (empty = no threshold); a pushed `challenge.toml`
     # hands over a number or None. Either way it has to be finite: `nan` and
@@ -130,15 +115,55 @@ def _challenge_fields(
         if not math.isfinite(threshold):
             return None, "The score threshold must be a number."
 
-    return {
-        "description": description,
-        "max_time_s": max_time_s,
-        "max_memory_bytes": int(max_memory_mb * 1024 * 1024),
-        "max_threads": max_threads,
-        "ranking": criterion,
-        "visible_from": visible_from,
-        "score_threshold": threshold,
-    }, None
+    return {"ranking": criterion, "score_threshold": threshold}, None
+
+
+def _visible_from_value(
+    visible_from: str | datetime | None,
+) -> tuple[dict | None, str | None]:
+    """`visible_from` as a column, or the message explaining why not.
+
+    It arrives in whichever shape its caller naturally holds: the
+    `"2026-09-01T09:00"` an `<input type="datetime-local">` posts, the real
+    `datetime` `tomllib` parses out of a pushed `challenge.toml`, or None for a
+    challenge that is hidden. Normalizing all three here is what stops the
+    browser and `cocco push` disagreeing about what a date means - and a naive
+    value is read as the app server's local clock, which is the one clock
+    `render_datetime` prints in and `render_datetime_local` fills the box with.
+    """
+    if isinstance(visible_from, str):
+        try:
+            visible_from = datetime.fromisoformat(visible_from)
+        except ValueError:
+            return None, "That is not a date and time."
+    return {"visible_from": _as_aware(visible_from)}, None
+
+
+def _challenge_fields(
+    description: str,
+    max_time_s: float,
+    max_memory_mb: float,
+    max_threads: int,
+    ranking: str,
+    visible_from: str | datetime | None = None,
+    score_threshold: str | float | None = None,
+) -> tuple[dict | None, str | None]:
+    """The columns a whole challenge form writes, or the message explaining why
+    not.
+
+    The composition of the per-card validators, for the callers that save every
+    column at once: `post_challenge_new` and `api_import_challenge`.
+    """
+    fields: dict = {"description": description}
+    for part, error in (
+        _limit_fields(max_time_s, max_memory_mb, max_threads),
+        _leaderboard_fields(ranking, score_threshold),
+        _visible_from_value(visible_from),
+    ):
+        if part is None:
+            return None, error
+        fields.update(part)
+    return fields, None
 
 
 def _as_aware(value: datetime | None) -> datetime | None:
@@ -157,43 +182,6 @@ def _as_aware(value: datetime | None) -> datetime | None:
     if value is None or value.tzinfo is not None:
         return value
     return value.astimezone()
-
-
-# What the Visibility card's radio group can say. `now` and `scheduled` both end
-# up as a timestamp in the same column - the difference is only which one - and
-# `hidden` is the NULL.
-VISIBILITY_CHOICES = ("hidden", "now", "scheduled")
-
-
-def _visible_from_choice(
-    visibility: str, visible_at: str, current: datetime | None
-) -> tuple[str | datetime | None, str | None]:
-    """Turn the Visibility card's two fields into one value, or say why not.
-
-    A radio and a box rather than a box alone, because "publish this now" is the
-    commonest thing anybody does here and should not require typing a date; and
-    one column behind them, because "hidden", "live" and "opens on Tuesday" are
-    three answers to one question.
-
-    `current` is what the challenge already says, and it exists for one case:
-    re-saving a challenge that is already live must not re-stamp its publication
-    date, or every edit to the statement would move the "visible since" a badge
-    prints. A challenge whose date is still in the future is *not* preserved -
-    picking `now` there is precisely the act of bringing it forward.
-    """
-    if visibility not in VISIBILITY_CHOICES:
-        return None, "Unknown visibility."
-    if visibility == "hidden":
-        return None, None
-    if visibility == "scheduled":
-        if not visible_at.strip():
-            return None, "Pick the date and time the challenge opens."
-        return visible_at.strip(), None
-    now = datetime.now().astimezone()
-    current = _as_aware(current)
-    if current is not None and current <= now:
-        return current, None
-    return now, None
 
 
 @router.get("/courses/{course_id}/challenges/new")
@@ -234,8 +222,6 @@ async def post_challenge_new(
     max_threads: Annotated[int, Form()],
     ranking: Annotated[str, Form()],
     score_threshold: Annotated[str, Form()] = "",
-    visibility: Annotated[str, Form()] = "hidden",
-    visible_at: Annotated[str, Form()] = "",
 ):
     """Create the challenge and send the browser to its editor."""
 
@@ -250,19 +236,13 @@ async def post_challenge_new(
     if not title:
         return alert("A challenge needs a title.")
 
-    # No current value to preserve - there is no challenge yet - so `now` here
-    # always means this moment.
-    visible_from, error = _visible_from_choice(visibility, visible_at, None)
-    if error is not None:
-        return alert(error)
-
     fields, error = _challenge_fields(
         description,
         max_time_s,
         max_memory_mb,
         max_threads,
         ranking,
-        visible_from,
+        None,
         score_threshold,
     )
     if fields is None:
@@ -324,54 +304,210 @@ async def get_challenge_edit(
     )
 
 
-@router.post("/courses/{course_id}/{challenge_id}/edit")
-async def post_challenge_edit(
+def _alert(request: Request, message: str, ok: bool = False):
+    return templates.TemplateResponse(
+        request=request,
+        name="f-edit-result.jinja",
+        context={"ok": ok, "message": message},
+    )
+
+
+def _render_card(
+    request: Request,
+    name: str,
+    course_id: int,
+    challenge,
+    message: str | None = None,
+    ok: bool = False,
+):
+    """One editor card as its own response: `challenge` is the stored row, or on
+    a refused save the stored row with the posted values laid over it, so the
+    teacher keeps what they typed."""
+    return templates.TemplateResponse(
+        request=request,
+        name=name,
+        context={
+            "course_id": course_id,
+            "challenge": challenge,
+            "message": message,
+            "ok": ok,
+        },
+    )
+
+
+async def _visibility_card(
+    request: Request,
+    db,
+    course_id: int,
+    challenge_id: int,
+    message: str | None = None,
+    ok: bool = False,
+):
+    """The visibility strip, always from the database's own answer."""
+    visible_from, is_visible = await query_challenge_visibility(db, challenge_id)
+    challenge = {
+        "id": challenge_id,
+        "visible_from": visible_from,
+        "is_visible": is_visible,
+    }
+    return _render_card(
+        request, "f-challenge-visibility.jinja", course_id, challenge, message, ok
+    )
+
+
+@router.post("/courses/{course_id}/{challenge_id}/edit/statement")
+async def post_challenge_statement(
     course_id: int,
     challenge_id: int,
     request: Request,
     db: DBDep,
     role: ChallengeEditor,
     description: Annotated[str, Form()],
+):
+    """Save the problem statement, and answer with only a status line: this is
+    the one card where someone may still be typing while the request is in
+    flight, and swapping the textarea would drop those keystrokes."""
+    await update_challenge(db, challenge_id, description=description)
+    await db.commit()
+    return _alert(request, "Saved.", ok=True)
+
+
+@router.post("/courses/{course_id}/{challenge_id}/edit/leaderboard")
+async def post_challenge_leaderboard(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+    ranking: Annotated[str, Form()],
+    score_threshold: Annotated[str, Form()] = "",
+):
+    """Save the leaderboard's criterion and pass threshold, and answer with the
+    whole card, so the "no threshold" warning comes and goes on save."""
+    fields, error = _leaderboard_fields(ranking, score_threshold)
+    if fields is None:
+        stored = await query_challenge_config(db, challenge_id)
+        if stored is None:
+            raise HTTPException(status_code=404)
+        posted = {**stored._mapping, "ranking": ranking}
+        posted["score_threshold"] = score_threshold.strip() or None
+        return _render_card(
+            request,
+            "f-challenge-leaderboard.jinja",
+            course_id,
+            posted,
+            error or "Invalid leaderboard.",
+        )
+    await update_challenge(db, challenge_id, **fields)
+    await db.commit()
+    challenge = await query_challenge_config(db, challenge_id)
+    return _render_card(
+        request, "f-challenge-leaderboard.jinja", course_id, challenge, "Saved.", True
+    )
+
+
+@router.post("/courses/{course_id}/{challenge_id}/edit/limits")
+async def post_challenge_limits(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
     max_time_s: Annotated[float, Form()],
     max_memory_mb: Annotated[float, Form()],
     max_threads: Annotated[int, Form()],
-    ranking: Annotated[str, Form()],
-    score_threshold: Annotated[str, Form()] = "",
-    visibility: Annotated[str, Form()] = "hidden",
-    visible_at: Annotated[str, Form()] = "",
 ):
-    """Save the problem statement, the sandbox limits, the leaderboard and when
-    the class may see any of it."""
-
-    def alert(message: str, ok: bool = False):
-        return templates.TemplateResponse(
-            request=request,
-            name="f-edit-result.jinja",
-            context={"ok": ok, "message": message},
-        )
-
-    # The current value, so that saving a live challenge with "Visible now"
-    # keeps the date it went live rather than re-stamping it on every edit.
-    current, _ = await query_challenge_visibility(db, challenge_id)
-    visible_from, error = _visible_from_choice(visibility, visible_at, current)
-    if error is not None:
-        return alert(error)
-
-    fields, error = _challenge_fields(
-        description,
-        max_time_s,
-        max_memory_mb,
-        max_threads,
-        ranking,
-        visible_from,
-        score_threshold,
-    )
+    """Save the sandbox limits, and answer with the whole card."""
+    fields, error = _limit_fields(max_time_s, max_memory_mb, max_threads)
     if fields is None:
-        return alert(error or "Invalid challenge.")
-
+        stored = await query_challenge_config(db, challenge_id)
+        if stored is None:
+            raise HTTPException(status_code=404)
+        posted = {
+            **stored._mapping,
+            "max_time_s": max_time_s,
+            "max_memory_bytes": max_memory_mb * 1024 * 1024,
+            "max_threads": max_threads,
+        }
+        return _render_card(
+            request,
+            "f-challenge-limits.jinja",
+            course_id,
+            posted,
+            error or "Invalid limits.",
+        )
     await update_challenge(db, challenge_id, **fields)
     await db.commit()
-    return alert("Saved.", ok=True)
+    challenge = await query_challenge_config(db, challenge_id)
+    return _render_card(
+        request, "f-challenge-limits.jinja", course_id, challenge, "Saved.", True
+    )
+
+
+@router.post("/courses/{course_id}/{challenge_id}/publish")
+async def post_challenge_publish(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+):
+    """Open the challenge to the class now. A hidden or scheduled one gets
+    Postgres's `now()`, like every other timestamp; one that is already live
+    keeps the date it went live (a stale tab can still post this, and an edit is
+    not a republication)."""
+    _, is_visible = await query_challenge_visibility(db, challenge_id)
+    if not is_visible:
+        await update_challenge(db, challenge_id, visible_from=func.now())
+        await db.commit()
+    return await _visibility_card(
+        request, db, course_id, challenge_id, "Published.", True
+    )
+
+
+@router.post("/courses/{course_id}/{challenge_id}/schedule")
+async def post_challenge_schedule(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+    visible_at: Annotated[str, Form()] = "",
+):
+    """Open the challenge at a chosen moment. Past ones are accepted, as with
+    `cocco push`: they simply mean visible now."""
+    if not visible_at.strip():
+        return await _visibility_card(
+            request,
+            db,
+            course_id,
+            challenge_id,
+            "Pick the date and time the challenge opens.",
+        )
+    fields, error = _visible_from_value(visible_at.strip())
+    if fields is None:
+        return await _visibility_card(
+            request, db, course_id, challenge_id, error or "Invalid date."
+        )
+    await update_challenge(db, challenge_id, **fields)
+    await db.commit()
+    return await _visibility_card(
+        request, db, course_id, challenge_id, "Scheduled.", True
+    )
+
+
+@router.post("/courses/{course_id}/{challenge_id}/hide")
+async def post_challenge_hide(
+    course_id: int,
+    challenge_id: int,
+    request: Request,
+    db: DBDep,
+    role: ChallengeEditor,
+):
+    """Take the challenge off the class's pages."""
+    await update_challenge(db, challenge_id, visible_from=None)
+    await db.commit()
+    return await _visibility_card(request, db, course_id, challenge_id, "Hidden.", True)
 
 
 ########################################################################

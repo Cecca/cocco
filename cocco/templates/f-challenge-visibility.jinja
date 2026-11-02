@@ -1,0 +1,83 @@
+{# Whether the class may see the challenge: a status line and the buttons that
+   change it. Served by post_challenge_publish / _schedule / _hide and inlined
+   by challenge-edit.jinja; the whole strip is swapped (outerHTML, by its id), so
+   the status is always the database's.
+
+   One column behind three states: hidden, live and "opens on Tuesday" are
+   `challenge.visible_from` NULL, a past instant, or a future one. These are
+   actions, not fields: each button is its own form, so a change of state is
+   never a side effect of saving something else.
+
+   Context: course_id, challenge (id, visible_from, is_visible - from
+   `query_challenge` or `query_challenge_visibility`), and optionally message /
+   ok for an alert. `is_visible` is the server's answer, computed with the
+   database's clock - see `_challenge_visible` - so the template never compares
+   dates. #}
+{% set scheduled = challenge.visible_from and not challenge.is_visible %}
+{% set live = challenge.is_visible %}
+{% set base = {"course_id": course_id, "challenge_id": challenge.id} %}
+<div id="challenge-visibility"
+     class="card bg-base-100 border {{ 'border-base-300' if live else 'border-warning/40' }} shadow-sm">
+  <div class="card-body p-5">
+    <div class="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+      <div class="min-w-0 flex-1 basis-64">
+        <h2 class="font-bold text-lg">
+          {{ "Visible" if live else ("Scheduled" if scheduled else "Hidden") }}
+        </h2>
+        <p class="text-[13px] text-base-content/55">
+          {% if live %}
+          Visible to the class since {{ challenge.visible_from | datetime }}.
+          {% elif scheduled %}
+          Opens on {{ challenge.visible_from | datetime }}. Until then the class
+          sees the title and when it opens.
+          {% else %}
+          Hidden: only course staff can see it.
+          {% endif %}
+        </p>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-3">
+        {% if not live %}
+        <form hx-post="{{ url_for('post_challenge_publish', **base) }}"
+              hx-target="#challenge-visibility"
+              hx-swap="outerHTML"
+              hx-disabled-elt="find button">
+          <button type="submit" class="btn btn-sm btn-outline btn-warning font-semibold">Publish now</button>
+        </form>
+
+        {# The box carries the server's clock, the same `astimezone()` as the
+           `| datetime` above. Pre-filled only when a date is already set. #}
+        <form hx-post="{{ url_for('post_challenge_schedule', **base) }}"
+              hx-target="#challenge-visibility"
+              hx-swap="outerHTML"
+              hx-disabled-elt="find button"
+              class="flex items-center gap-2">
+          <label class="text-xs font-bold uppercase tracking-wider text-base-content/50">Schedule</label>
+          <input type="datetime-local" name="visible_at"
+                 value="{{ challenge.visible_from | datetime_local if scheduled }}"
+                 aria-label="Date and time the challenge opens"
+                 class="input input-sm font-mono" />
+          <button type="submit" class="btn btn-sm btn-outline btn-warning font-semibold">Schedule</button>
+        </form>
+        {% endif %}
+
+        {% if live or scheduled %}
+        {# Only a live challenge disappears from students' pages. #}
+        <form hx-post="{{ url_for('post_challenge_hide', **base) }}"
+              hx-target="#challenge-visibility"
+              hx-swap="outerHTML"
+              hx-disabled-elt="find button"
+              {% if live %}hx-confirm="Hide this challenge? The class stops seeing it; their attempts and scores are kept."{% endif %}>
+          <button type="submit" class="btn btn-sm btn-outline btn-warning font-semibold">Hide</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if message %}
+    <div role="alert" class="alert {{ 'alert-success' if ok else 'alert-error' }} py-2 text-sm">
+      <span>{{ message }}</span>
+    </div>
+    {% endif %}
+  </div>
+</div>

@@ -47,8 +47,8 @@ exactly as it was. `execution_order` is then rewritten densely from the block or
 sentinels, for the reason `reorder_challenges` uses them.
 
 The two ends share their rules rather than restating them. `_challenge_fields` validates the limits
-and the ranking here as it does for the create and the edit form — this is its third caller, not a
-second opinion — and `_check_evaluator_source` is the size/extension/UTF-8 chain, factored out of
+and the ranking here as it does for the create form, and the editor's cards use its pieces
+(`_limit_fields`, `_leaderboard_fields`, `_visible_from_value`) — one rule, not a second opinion — and `_check_evaluator_source` is the size/extension/UTF-8 chain, factored out of
 `post_evaluator`, because a script the browser accepted and the CLI refused would be a difference
 nobody could explain.
 

@@ -1,0 +1,10 @@
+{# The leaderboard card of the editor, saving itself. Served by
+   post_challenge_leaderboard and inlined by challenge-edit.jinja; the whole
+   card is swapped (outerHTML, by its id), so the "no threshold" warning comes
+   and goes on save.
+
+   Context: course_id, challenge (a row or dict: ranking, score_threshold; on a
+   refused save the posted values laid over the stored ones), and optionally
+   message / ok for the alert in the footer. #}
+{% set card_url = url_for('post_challenge_leaderboard', course_id=course_id, challenge_id=challenge.id) %}
+{% include "_challenge-leaderboard.jinja" %}

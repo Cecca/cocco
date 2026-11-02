@@ -27,6 +27,13 @@ Uploads carry no language field: `post_submission` maps the extension through `E
 
 **Course editor** `/courses/{course_id}/edit`: title, description (same markdown textarea and `post_markdown_preview` as challenges), and the challenge list reordered with ↑/↓. Cards are `_challenge-card.jinja`, shared with the course page via `f-course-challenges.jinja`, so the two lists can't drift.
 
+**Challenge editor** `/courses/{course_id}/{challenge_id}/edit` (`challenge-edit.jinja`, behind `ChallengeEditor`): **each card saves itself**, to its own route, writing only its own columns (so two tabs can't overwrite each other's unrelated edits). Statement, leaderboard and limits are forms with a Save button and status line in their own footer; the evaluator and test cases already worked that way.
+- **Leaderboard, limits and visibility answer with their whole card** (`hx-swap="outerHTML"`), re-rendered from the database, so the "no score threshold" warning and the visibility status are always true. A refused save (200 + alert inside the card) echoes the **posted** values and keeps the dirty flag; it never throws away what was typed.
+- **The statement answers with only a status line** (`f-edit-result.jinja` into `#statement-result`): someone may still be typing while the request is in flight, and swapping the textarea would drop keystrokes and focus. Nothing derived needs re-rendering.
+- **Visibility is an action, not a field**: a status strip with **Publish now**, **Schedule** (a datetime box) and **Hide**. The state comes from `query_challenge_visibility`, never from comparing dates in the template. Publish stamps Postgres `now()`, but keeps a live challenge's date (an edit is not a republication; a stale tab can still post it); publishing a scheduled one brings it forward. Schedule accepts any valid moment, past included, like `cocco push`. Hide asks to confirm only when the challenge is live.
+- The unsaved-changes hint and the `beforeunload` warning are one small script in `challenge-edit.jinja`, keyed on `form[data-card]`.
+- **The create page** (`challenge-new.jinja`) is one form with one submit and **no visibility**: a new challenge starts hidden and is published from the editor it lands on. It shares the card partials (`_challenge-statement.jinja`, `_challenge-leaderboard.jinja`, `_challenge-limits.jinja`) with the editor; without a `card_url` they render bare fields.
+
 **Danger zones** end both editors: archive (reversible) and delete (not).
 - The course's is **`Admin` only**, not `CourseEditor`: what exists site-wide is the site's business. `get_course_edit` passes `is_admin` to draw it; the routes check for themselves.
 - The challenge's is behind `ChallengeEditor` (admins + staff, with the `challenge_in_course` cross-check).

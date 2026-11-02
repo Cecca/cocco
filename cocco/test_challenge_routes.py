@@ -476,11 +476,18 @@ async def test_the_fragments_are_gated_too(client, world, app_engine):
 
 
 async def test_a_new_challenge_starts_hidden(client, world, app_engine):
-    """The form's radio group defaults to Hidden, and so does the route behind
-    it: a challenge with no test cases and no evaluator has no business being on
-    a student's course page."""
+    """The create page has no visibility choice at all, and the route behind it
+    writes Hidden: a challenge with no test cases and no evaluator has no
+    business being on a student's course page. It is published from the editor."""
     course_id = world["course"]
-    assert client.post(f"/courses/{course_id}/challenges/new", data=FORM).status_code == 204
+    page = client.get(f"/courses/{course_id}/challenges/new").text
+    assert 'name="visibility"' not in page
+    assert 'name="visible_at"' not in page
+    # ...and a stale tab that still posts one changes nothing.
+    response = client.post(
+        f"/courses/{course_id}/challenges/new", data={**FORM, "visibility": "now"}
+    )
+    assert response.status_code == 204
 
     async with app_engine.connect() as conn:
         row = (
@@ -491,43 +498,42 @@ async def test_a_new_challenge_starts_hidden(client, world, app_engine):
     assert row.visible_from is None
 
 
-async def test_the_form_publishes_and_schedules(client, world, app_engine):
-    """One column behind three radios, and the round trip through all three."""
+async def _stored(app_engine, challenge_id: int):
+    async with app_engine.connect() as conn:
+        return (
+            await conn.execute(select(Challenge).where(Challenge.c.id == challenge_id))
+        ).one()
+
+
+async def test_visibility_is_publish_schedule_hide(client, world, app_engine):
+    """One column behind three actions, and the round trip through all of them."""
     course_id = world["course"]
     challenge_id = await _add_challenge(app_engine, course_id, None)
-    url = f"/courses/{course_id}/{challenge_id}/edit"
+    base = f"/courses/{course_id}/{challenge_id}"
 
-    async def stored():
-        async with app_engine.connect() as conn:
-            return (
-                await conn.execute(
-                    select(Challenge.c.visible_from).where(
-                        Challenge.c.id == challenge_id
-                    )
-                )
-            ).scalar_one()
-
-    edit = {k: v for k, v in FORM.items() if k != "title"}
-
-    response = client.post(url, data={**edit, "visibility": "now"})
+    response = client.post(f"{base}/publish")
     assert response.status_code == 200
-    published_at = await stored()
+    assert 'id="challenge-visibility"' in response.text
+    published_at = (await _stored(app_engine, challenge_id)).visible_from
     assert published_at is not None
 
-    # Saving a live challenge again keeps the date it went live: the badge says
-    # "visible since", and an edit to the statement is not a republication.
-    assert client.post(url, data={**edit, "visibility": "now"}).status_code == 200
-    assert await stored() == published_at
+    # Publishing a live challenge keeps the date it went live: the badge says
+    # "visible since", and a stale tab is not a republication.
+    assert client.post(f"{base}/publish").status_code == 200
+    assert (await _stored(app_engine, challenge_id)).visible_from == published_at
 
-    response = client.post(
-        url, data={**edit, "visibility": "scheduled", "visible_at": "2099-01-01T09:00"}
-    )
+    response = client.post(f"{base}/schedule", data={"visible_at": "2099-01-01T09:00"})
     assert response.status_code == 200
-    scheduled = await stored()
+    scheduled = (await _stored(app_engine, challenge_id)).visible_from
     assert scheduled is not None and scheduled.year == 2099
 
-    assert client.post(url, data={**edit, "visibility": "hidden"}).status_code == 200
-    assert await stored() is None
+    # A scheduled challenge is brought forward to now
+    assert client.post(f"{base}/publish").status_code == 200
+    brought = (await _stored(app_engine, challenge_id)).visible_from
+    assert brought.year < 2099
+
+    assert client.post(f"{base}/hide").status_code == 200
+    assert (await _stored(app_engine, challenge_id)).visible_from is None
 
 
 async def test_scheduling_without_a_date_is_an_alert(client, world, app_engine):
@@ -535,22 +541,165 @@ async def test_scheduling_without_a_date_is_an_alert(client, world, app_engine):
     htmx submitted - and nothing is written."""
     course_id = world["course"]
     challenge_id = await _add_challenge(app_engine, course_id, PUBLISHED)
-    edit = {k: v for k, v in FORM.items() if k != "title"}
 
     response = client.post(
-        f"/courses/{course_id}/{challenge_id}/edit",
-        data={**edit, "visibility": "scheduled", "visible_at": "  "},
+        f"/courses/{course_id}/{challenge_id}/schedule", data={"visible_at": "  "}
     )
     assert response.status_code == 200
     assert "Pick the date and time" in response.text
 
+    assert (await _stored(app_engine, challenge_id)).visible_from == PUBLISHED
+
+
+async def test_each_card_writes_only_its_own_columns(client, world, app_engine):
+    """The single form used to rewrite everything, so two tabs overwrote each
+    other. Seed distinct values, post one card, and the rest must not move."""
+    course_id = world["course"]
+    challenge_id = await _add_challenge(app_engine, course_id, SCHEDULED)
     async with app_engine.connect() as conn:
-        still = (
-            await conn.execute(
-                select(Challenge.c.visible_from).where(Challenge.c.id == challenge_id)
-            )
-        ).scalar_one()
-    assert still is not None
+        await conn.execute(
+            update(Challenge)
+            .where(Challenge.c.id == challenge_id)
+            .values(score_threshold=4.0, max_threads=3, max_time_s=1.5)
+        )
+        await conn.commit()
+    base = f"/courses/{course_id}/{challenge_id}"
+    columns = (
+        "description", "ranking", "score_threshold", "max_time_s",
+        "max_memory_bytes", "max_threads", "visible_from", "title",
+    )
+
+    def snapshot(row):
+        return {c: row._mapping[c] for c in columns}
+
+    before = snapshot(await _stored(app_engine, challenge_id))
+
+    posts = [
+        ("edit/statement", {"description": "New text."}, {"description": "New text."}),
+        (
+            "edit/leaderboard",
+            {"ranking": "total_score", "score_threshold": "9"},
+            {"ranking": before["ranking"].__class__("total_score"), "score_threshold": 9.0},
+        ),
+        (
+            "edit/limits",
+            {"max_time_s": "3", "max_memory_mb": "64", "max_threads": "2"},
+            {"max_time_s": 3.0, "max_memory_bytes": 64 << 20, "max_threads": 2},
+        ),
+        ("publish", {}, None),
+    ]
+    expected = dict(before)
+    for path, data, changes in posts:
+        assert client.post(f"{base}/{path}", data=data).status_code == 200
+        after = snapshot(await _stored(app_engine, challenge_id))
+        if changes is None:
+            # Visibility: brought forward from 2099, everything else untouched
+            assert after["visible_from"] != before["visible_from"]
+            assert after["visible_from"].year < 2099
+            expected["visible_from"] = after["visible_from"]
+        else:
+            expected.update(changes)
+        assert after == expected, path
+
+    # ...and hiding touches the one column it names
+    assert client.post(f"{base}/hide").status_code == 200
+    expected["visible_from"] = None
+    assert snapshot(await _stored(app_engine, challenge_id)) == expected
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+async def test_garbage_limits_come_back_as_an_alert_with_the_typed_values(
+    client, world, app_engine, value
+):
+    course_id = world["course"]
+    challenge_id = await _add_challenge(app_engine, course_id, None)
+    before = await _stored(app_engine, challenge_id)
+
+    response = client.post(
+        f"/courses/{course_id}/{challenge_id}/edit/limits",
+        data={"max_time_s": value, "max_memory_mb": "77", "max_threads": "5"},
+    )
+    assert response.status_code == 200
+    assert "Limits must be positive." in response.text
+    # The refused card keeps what was typed, and says it is unsaved
+    assert 'id="challenge-limits"' in response.text
+    assert f'value="{float(value)}"' in response.text
+    assert 'value="77"' in response.text
+    assert 'value="5"' in response.text
+    assert "data-dirty" in response.text
+
+    after = await _stored(app_engine, challenge_id)
+    assert (after.max_time_s, after.max_memory_bytes, after.max_threads) == (
+        before.max_time_s, before.max_memory_bytes, before.max_threads
+    )
+
+
+CARD_ROUTES = [
+    ("edit/statement", {"description": "x"}),
+    ("edit/leaderboard", {"ranking": "total_score"}),
+    ("edit/limits", {"max_time_s": "1", "max_memory_mb": "64", "max_threads": "1"}),
+    ("publish", {}),
+    ("schedule", {"visible_at": "2099-01-01T09:00"}),
+    ("hide", {}),
+]
+
+
+@pytest.mark.parametrize("path,data", CARD_ROUTES)
+async def test_every_card_route_is_staff_only(client, world, app_engine, path, data):
+    """Hiding the controls is presentation: each route refuses on its own."""
+    course_id = world["course"]
+    challenge_id = await _add_challenge(app_engine, course_id, PUBLISHED)
+
+    sign_in_as(client, STUDENT)
+    response = client.post(f"/courses/{course_id}/{challenge_id}/{path}", data=data)
+    assert response.status_code == 403
+    assert (await _stored(app_engine, challenge_id)).visible_from == PUBLISHED
+
+
+@pytest.mark.parametrize("path,data", CARD_ROUTES)
+async def test_a_card_route_needs_the_course_that_owns_the_challenge(
+    client, world, app_engine, path, data
+):
+    """Alice teaches the first course: naming it in front of the other's
+    challenge is a challenge that does not exist."""
+    response = client.post(
+        f"/courses/{world['course']}/{world['other_challenge']}/{path}", data=data
+    )
+    assert response.status_code == 404
+    other = await _stored(app_engine, world["other_challenge"])
+    assert other.visible_from == PUBLISHED
+    assert other.description == "..."
+
+
+async def test_the_edit_page_offers_the_actions_its_state_allows(
+    client, world, app_engine
+):
+    course_id = world["course"]
+    hidden = await _add_challenge(app_engine, course_id, None)
+    live = await _add_challenge(app_engine, course_id, PUBLISHED)
+    scheduled = await _add_challenge(app_engine, course_id, SCHEDULED)
+
+    page = client.get(f"/courses/{course_id}/{hidden}/edit").text
+    assert "Publish now" in page
+    assert "Schedule" in page
+    assert "/hide" not in page
+    # No form posts to the old single-form route, which no longer exists
+    assert f'hx-post="/courses/{course_id}/{hidden}/edit"' not in page
+    assert client.post(
+        f"/courses/{course_id}/{hidden}/edit", data=FORM
+    ).status_code in (404, 405)
+
+    page = client.get(f"/courses/{course_id}/{live}/edit").text
+    assert "Publish now" not in page
+    assert 'name="visible_at"' not in page
+    assert f"/courses/{course_id}/{live}/hide" in page
+    # Live: hiding takes it off students' pages, so it asks first
+    assert "hx-confirm=\"Hide this challenge?" in page
+
+    page = client.get(f"/courses/{course_id}/{scheduled}/edit").text
+    assert "Publish now" in page
+    assert f"/courses/{course_id}/{scheduled}/hide" in page
+    assert "Hide this challenge?" not in page
 
 
 ########################################################################
@@ -565,8 +714,8 @@ async def test_the_editor_saves_a_score_threshold(
 ):
     challenge_id = await _add_challenge(app_engine, world["course"], None)
     response = client.post(
-        f"/courses/{world['course']}/{challenge_id}/edit",
-        data={**FORM, "score_threshold": value},
+        f"/courses/{world['course']}/{challenge_id}/edit/leaderboard",
+        data={"ranking": "total_score", "score_threshold": value},
     )
     assert response.status_code == 200
     assert "Saved." in response.text
@@ -601,11 +750,14 @@ async def test_a_garbage_threshold_comes_back_as_an_alert(
     challenge_id = await _add_challenge(app_engine, world["course"], None)
     for url in (
         f"/courses/{world['course']}/challenges/new",
-        f"/courses/{world['course']}/{challenge_id}/edit",
+        f"/courses/{world['course']}/{challenge_id}/edit/leaderboard",
     ):
         response = client.post(url, data={**FORM, "score_threshold": value})
         assert response.status_code == 200
         assert "The score threshold must be a number." in response.text
+    # The refused card keeps the typed value and is flagged unsaved
+    assert f'value="{value}"' in response.text
+    assert "data-dirty" in response.text
     async with app_engine.connect() as conn:
         n = (await conn.execute(select(Challenge.c.id).where(
             Challenge.c.course_id == world["course"]))).all()
@@ -624,7 +776,13 @@ async def test_the_threshold_is_shown_on_re_edit_and_the_warning_goes(
     url = f"/courses/{course_id}/{challenge_id}/edit"
     assert NO_THRESHOLD_WARNING in client.get(url).text
 
-    client.post(url, data={**FORM, "score_threshold": "3.5"})
+    response = client.post(f"{url}/leaderboard", data={**FORM, "score_threshold": "3.5"})
+    # The card itself comes back re-rendered: the warning goes with the save,
+    # not on the next page load.
+    assert 'id="challenge-leaderboard"' in response.text
+    assert 'value="3.5"' in response.text
+    assert NO_THRESHOLD_WARNING not in response.text
+
     page = client.get(url).text
     assert 'name="score_threshold"' in page
     assert 'value="3.5"' in page
