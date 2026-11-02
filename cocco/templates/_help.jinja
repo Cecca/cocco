@@ -1,0 +1,12 @@
+{# The ? button beside a box's heading: `{{ help("challenges", "leaderboard") }}`.
+   A real link to the section on its page, so it works without JS and on a
+   middle-click; with htmx it loads the section into the pop-up in `base.jinja`
+   instead. `data-help` is what the listener there looks for. The classes are
+   written out, never built, so Tailwind sees them. #}
+{% macro help(topic, section, label="Help") -%}
+<a href="/docs/{{ topic }}#{{ section }}"
+   hx-get="/f/docs/{{ topic }}/{{ section }}" hx-target="#help-body" hx-swap="innerHTML"
+   data-help
+   class="btn btn-ghost btn-circle btn-xs align-middle text-base-content/50"
+   aria-label="{{ label }}">?</a>
+{%- endmacro %}

@@ -11,6 +11,7 @@
    mutation answers with, inside the swap so the sentence and the new state
    arrive together. #}
 
+{% from "_help.jinja" import help %}
 {% if message %}
 <div class="mb-4">
   {% include "f-edit-result.jinja" %}
@@ -47,7 +48,7 @@
         <input type="file" name="avatar_file" accept="image/png,image/jpeg,image/gif,image/webp"
                aria-label="Upload a new avatar" class="hidden" />
       </label>
-      <span class="text-[11px] text-base-content/45">PNG, JPEG, GIF or WebP</span>
+      <span class="text-[11px] text-base-content/45">PNG, JPEG, GIF or WebP {{ help("account", "avatar", "Help: Your picture") }}</span>
     </form>
     <form hx-post="{{ url_for('post_avatar_reset', user_id=profile.id) }}"
           hx-target="#identity"

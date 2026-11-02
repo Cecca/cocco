@@ -5,6 +5,7 @@
    Context: profile_id, tokens, message/ok, and `minted` — the one value here
    that no query can produce, because only the hash is stored. #}
 
+{% from "_help.jinja" import help %}
 {% if message %}
 <div role="alert" class="alert {{ 'alert-success' if ok else 'alert-error' }} text-sm mb-4">
   <span>{{ message }}</span>
@@ -22,6 +23,7 @@
   <p class="text-[13px] text-base-content/55 mt-2">
     Use it as <code class="font-mono">COCCO_TOKEN</code>, or send it as
     <code class="font-mono">Authorization: Bearer &lt;token&gt;</code>.
+    {{ help("cli", "install", "Help: Installing and setting up") }}
   </p>
 </div>
 {% endif %}
@@ -73,7 +75,7 @@
       hx-swap="innerHTML"
       class="mt-5 rounded-xl border border-base-300 bg-base-200/40 p-4">
   <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">
-    New token
+    New token {{ help("cli", "tokens", "Help: API tokens") }}
   </h3>
   <div class="flex flex-wrap items-end gap-4">
     <div class="flex-1 min-w-56">

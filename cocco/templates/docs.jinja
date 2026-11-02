@@ -1,0 +1,21 @@
+{% extends "base.jinja" %}
+{% block title %}{{ doc.title }}{% endblock %}
+
+{% set crumbs = [{"label": "Docs", "href": url_for('get_docs')}, {"label": doc.title}] %}
+
+{% block content %}
+{# The text is `cocco/docs/<topic>.md`, rendered by `render_doc`. #}
+{% if contents %}
+<nav class="mb-6 text-sm" aria-label="On this page">
+  <ul class="menu bg-base-100 rounded-box border border-base-300 w-full max-w-sm">
+    {% for heading in contents %}
+    <li><a href="#{{ heading.id }}">{{ heading.text }}</a></li>
+    {% endfor %}
+  </ul>
+</nav>
+{% endif %}
+<article class="prose max-w-none lg:max-w-2/3 mx-auto">
+  <h1>{{ doc.title }}</h1>
+  {{ html }}
+</article>
+{% endblock %}

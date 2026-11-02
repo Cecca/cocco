@@ -54,6 +54,7 @@ Each area has a guide in `.claude/rules/`, loaded when you touch its files. Read
 - `auth.md` — sign-in: OAuth providers, passwords, dummy auth, tokens
 - `transfer.md` — the `/api` zip format and the `cocco` CLI
 - `exercises.md` — live exercises (Python, C, …)
+- `docs.md` — the in-app docs: `cocco/docs/*.md`, `{#id}` sections, the ? buttons and their tests
 - `logging.md` — JSON logs, access log, proxy headers
 
 ## Architecture

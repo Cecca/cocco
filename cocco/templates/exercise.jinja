@@ -1,5 +1,6 @@
 {% extends "base.jinja" %}
 {% block title %}{% autoescape true %}{{ exercise.title }}{% endautoescape %}{% endblock %}
+{% from "_help.jinja" import help %}
 {% block head %}{% include "_exercise-editor-head.jinja" %}{% endblock %}
 
 {% set crumbs = [
@@ -45,6 +46,7 @@
       to try the exercise yourself, use the
       <a class="link font-semibold" href="{{ preview_url }}">set's preview</a>,
       which records nothing.
+      {{ help("exercises", "preview", "Help: Previewing exercises") }}
     </span>
   </div>
   {% endif %}
@@ -63,8 +65,8 @@
         </article>
 
         <p class="text-xs text-base-content/55 mt-3">
-          Output check: {{ exercise.rules | join("; ") }}. What you pass to
-          <code>input()</code> as a prompt is not compared. Up to
+          Output check: {{ exercise.rules | join("; ") }}. A prompt printed while
+          reading input is compared like any other output, so leave it out. Up to
           {{ "%g" | format(exercise.time_s) }} s per test.
         </p>
 
@@ -83,7 +85,7 @@
         {% endif %}
 
         {% if exercise.tests or exercise.n_hidden %}
-        <h2 class="font-bold mt-6">Tests</h2>
+        <h2 class="font-bold mt-6">Tests {{ help("students", "exercises-in-class", "Help: Exercises in class") }}</h2>
         <div class="flex flex-col gap-3 mt-2">
           {% for test in exercise.tests %}
           <div class="rounded-xl border border-base-300 p-3">
@@ -114,7 +116,7 @@
         {% endif %}
 
         {% if exercise.solution is not none %}
-        <h2 class="font-bold mt-6">Solution</h2>
+        <h2 class="font-bold mt-6">Solution {{ help("students", "exercises-in-class", "Help: Exercises in class") }}</h2>
         <p class="text-[13px] text-base-content/55 mb-2">Your teacher has shown the solution to the class.</p>
         <div class="max-h-[60vh] overflow-auto rounded-xl border border-base-300 bg-base-200/40">
           {{ exercise.solution | highlight(language) }}

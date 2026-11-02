@@ -1,4 +1,5 @@
 {% extends "base.jinja" %}
+{% from "_help.jinja" import help %}
 {% block title %}#{{ submission.attempt }} · {{ submission.challenge_title }}{% endblock %}
 
 {# The ids are on the document: this route's URL carries only the submission.
@@ -58,6 +59,7 @@
         {% include "_score-badge.jinja" %}
         {% endwith %}
         {% endif %}
+        {{ help("submissions", "statuses", "Help: Submission status") }}
       </div>
     </div>
   </div>

@@ -1,4 +1,5 @@
 {% extends "base.jinja" %}
+{% from "_help.jinja" import help %}
 {% block title %}Editing {{ challenge.title }}{% endblock %}
 
 {% set crumbs = [
@@ -45,7 +46,7 @@
   <!-- ══ EVALUATOR ═════════════════════════════════════════════════════ -->
   <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
     <div class="card-body p-7">
-      <h2 class="font-bold text-lg">Evaluator</h2>
+      <h2 class="font-bold text-lg">Evaluator {{ help("evaluators", "default", "Help: Evaluator") }}</h2>
       <p class="text-[13px] text-base-content/55 -mt-1 mb-3">
         The script that turns a submission's output into a score. It runs in the
         same sandbox as submissions — in any language this judge supports, picked
@@ -68,7 +69,7 @@
   <!-- ══ TEST CASES ════════════════════════════════════════════════════ -->
   <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
     <div class="card-body p-7">
-      <h2 class="font-bold text-lg">Test cases</h2>
+      <h2 class="font-bold text-lg">Test cases {{ help("test-cases", "add", "Help: Test cases") }}</h2>
       <p class="text-[13px] text-base-content/55 -mt-1 mb-3">
         Run in order. Public samples are downloadable from the challenge page; the rest stay hidden.
       </p>
@@ -92,6 +93,7 @@
         <div class="min-w-0 flex-1">
           <h3 class="font-semibold">
             {{ "Unarchive this challenge" if challenge.archived_at else "Archive this challenge" }}
+            {{ help("challenges", "archive", "Help: Archiving a challenge") }}
           </h3>
           <p class="text-[13px] text-base-content/55">
             {% if challenge.archived_at %}
@@ -127,7 +129,7 @@
 
       <div class="flex flex-wrap items-center justify-between gap-4 mt-4 rounded-xl border border-error/30 p-4">
         <div class="min-w-0 flex-1">
-          <h3 class="font-semibold">Delete this challenge</h3>
+          <h3 class="font-semibold">Delete this challenge {{ help("challenges", "delete", "Help: Deleting a challenge") }}</h3>
           <p class="text-[13px] text-base-content/55">
             Every test case and its files, the evaluator, every submission ever
             made to it and every recorded score. There is no undo — archive it

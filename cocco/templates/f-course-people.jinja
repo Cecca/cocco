@@ -12,6 +12,8 @@
    own: one target means the sentence and the new state arrive together instead
    of having to be kept in step. #}
 
+{% from "_help.jinja" import help %}
+
 {% if message %}
 <div class="mb-4">
   {% include "f-edit-result.jinja" %}
@@ -23,7 +25,7 @@
     <thead>
       <tr class="text-xs uppercase tracking-wider text-base-content/45 font-mono">
         <th>Person</th>
-        <th class="w-52">Role</th>
+        <th class="w-52">Role {{ help("courses", "roles", "Help: Changing a role") }}</th>
         <th class="w-32 text-right">Submissions</th>
         <th class="w-44">Last submitted</th>
         <th class="w-28"></th>
@@ -64,7 +66,7 @@
           {% if is_last_teacher %}
           <div class="flex items-center gap-2">
             <span class="badge badge-primary badge-sm font-mono">teacher</span>
-            <span class="text-[13px] text-base-content/45 whitespace-nowrap">the last one</span>
+            <span class="text-[13px] text-base-content/45 whitespace-nowrap">the last one {{ help("courses", "last-teacher", "Help: The last teacher") }}</span>
           </div>
           {% else %}
           {# Its own form - the Remove button below is another, and nesting them
@@ -113,7 +115,7 @@
                    for outcomes being destroyed, and nothing here is - their work
                    stays. A dialog per row would also carry a unique id and be
                    rebuilt on every keystroke in the filter box above. #}
-                hx-confirm="{{ person.nickname }} has {{ person.n_submissions }} submission(s) on this course. Their work stays in the database, but they lose access to the course and drop out of its standings."
+                hx-confirm="{{ person.nickname }} has {{ person.n_submissions }} submission(s) on this course. They lose access to the course, but their submissions and scores stay, in the standings too."
                 {% endif %}>
             <input type="hidden" name="q" value="{{ q }}" />
             <button type="submit" class="btn btn-xs btn-error btn-outline font-semibold">

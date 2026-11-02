@@ -10,6 +10,7 @@
    div of its own: one target means the sentence and the new state arrive
    together instead of having to be kept in step. #}
 
+{% from "_help.jinja" import help %}
 {% if message %}
 <div class="mb-4">
   {% include "f-edit-result.jinja" %}
@@ -24,6 +25,7 @@
 <div class="rounded-xl border-2 border-primary bg-primary/5 p-4 mb-4">
   <p class="text-xs font-bold uppercase tracking-wider text-primary mb-2">
     Copy this now — it is not shown again
+    {{ help("administration", "reset-password", "Help: Resetting a password") }}
   </p>
   <p class="text-[13px] text-base-content/70 mb-2">
     The new password for <code class="font-mono">{{ issued[0] }}</code>:
@@ -44,7 +46,7 @@
         <th class="w-28 text-right">Courses</th>
         <th class="w-32 text-right">Submissions</th>
         <th class="w-44">Last submitted</th>
-        <th class="w-80"></th>
+        <th class="w-80">{{ help("administration", "blocking", "Help: Blocking an account") }}</th>
       </tr>
     </thead>
     <tbody>
@@ -167,10 +169,10 @@
    did nothing. #}
 {% if users.pending_administrators %}
 <div class="mt-8">
-  <h2 class="font-bold text-lg">Appointed, never signed in</h2>
+  <h2 class="font-bold text-lg">Appointed, never signed in {{ help("administration", "administrators", "Help: Administrators") }}</h2>
   <p class="text-[13px] text-base-content/55 mb-3">
     Administrators who have no account yet. One appears the first time they sign
-    in with Google.
+    in.
   </p>
   <div class="flex flex-col gap-2">
     {% for pending in users.pending_administrators %}

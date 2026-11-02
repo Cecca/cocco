@@ -1,0 +1,19 @@
+{% extends "base.jinja" %}
+{% block title %}Documentation{% endblock %}
+
+{% set crumbs = [{"label": "Docs"}] %}
+
+{% block content %}
+{% set headings = {"staff": "For teachers", "student": "For students", "everyone": "For everyone"} %}
+<h1 class="text-2xl font-bold mb-6">Documentation</h1>
+{% for group in groups %}
+<section class="mb-8">
+  <h2 class="font-bold text-lg mb-2">{{ headings[group.audience] }}</h2>
+  <ul class="menu bg-base-100 rounded-box border border-base-300 w-full">
+    {% for doc in group.docs %}
+    <li><a href="{{ url_for('get_doc', topic=doc.topic) }}">{{ doc.title }}</a></li>
+    {% endfor %}
+  </ul>
+</section>
+{% endfor %}
+{% endblock %}

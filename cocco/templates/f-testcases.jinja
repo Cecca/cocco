@@ -1,3 +1,4 @@
+{% from "_help.jinja" import help %}
 {# The test case list. Every mutation returns this whole fragment, so what is
    on screen always matches the database. Rendered both standalone (htmx) and
    inlined by challenge-edit.jinja. #}
@@ -15,9 +16,9 @@
         <th class="w-12">#</th>
         <th>Input</th>
         <th>Expected output</th>
-        <th class="w-24">Active</th>
-        <th class="w-24">Public</th>
-        <th class="w-32 text-right">Order</th>
+        <th class="w-24">Active {{ help("test-cases", "active", "Help: Active") }}</th>
+        <th class="w-24">Public {{ help("test-cases", "samples", "Help: Public samples") }}</th>
+        <th class="w-32 text-right">Order {{ help("test-cases", "order", "Help: Order") }}</th>
         <th class="w-16"></th>
       </tr>
     </thead>
@@ -119,7 +120,7 @@
       hx-target="#testcases"
       hx-swap="innerHTML"
       class="mt-5 rounded-xl border border-base-300 bg-base-200/40 p-4">
-  <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Add a test case</h3>
+  <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Add a test case {{ help("test-cases", "add", "Help: Adding a test case") }}</h3>
   <div class="flex flex-wrap items-end gap-4">
     <div>
       <label class="text-xs text-base-content/55">Input file</label>

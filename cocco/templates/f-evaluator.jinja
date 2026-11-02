@@ -1,3 +1,4 @@
+{% from "_help.jinja" import help %}
 {# The challenge's evaluator. Every mutation returns this whole fragment, so
    what is on screen is always what will grade the next submission. Rendered
    both standalone (htmx) and inlined by challenge-edit.jinja. #}
@@ -43,7 +44,7 @@
       hx-target="#evaluator"
       hx-swap="innerHTML"
       class="mt-4 rounded-xl border border-base-300 bg-base-200/40 p-4">
-  <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Upload an evaluator</h3>
+  <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Upload an evaluator {{ help("evaluators", "upload", "Help: Uploading an evaluator") }}</h3>
   <div class="flex flex-wrap items-end gap-4">
     <div>
       <label class="text-xs text-base-content/55">Script</label>
@@ -63,7 +64,7 @@
       hx-swap="innerHTML"
       hx-confirm="Replace this challenge's evaluator with a copy of the bundled one?"
       class="mt-4 rounded-xl border border-base-300 bg-base-200/40 p-4">
-  <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Start from a bundled evaluator</h3>
+  <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Start from a bundled evaluator {{ help("evaluators", "bundled", "Help: Bundled evaluators") }}</h3>
   <div class="flex flex-wrap items-end gap-4">
     <div>
       <label class="text-xs text-base-content/55">Evaluator</label>

@@ -1,4 +1,5 @@
 {% extends "base.jinja" %}
+{% from "_help.jinja" import help %}
 {% block title %}{% autoescape true %}Preview · {{ exercise.title }}{% endautoescape %}{% endblock %}
 {% block head %}{% include "_exercise-editor-head.jinja" %}{% endblock %}
 
@@ -97,7 +98,7 @@
 
         {% if exercise.solution %}
         <details class="mt-6 rounded-lg border border-base-300 px-3 py-2">
-          <summary class="cursor-pointer text-sm font-semibold">Solution · staff only</summary>
+          <summary class="cursor-pointer text-sm font-semibold">Solution · staff only {{ help("exercises", "preview", "Help: Previewing exercises") }}</summary>
           <pre id="preview-solution" class="mt-2 max-h-80 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono whitespace-pre">{{ exercise.solution }}</pre>
           <button type="button" class="btn btn-xs btn-ghost border border-base-300 mt-2"
                   onclick="coccoSetCode('preview-source', document.getElementById('preview-solution').textContent)">

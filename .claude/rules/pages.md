@@ -21,6 +21,8 @@ Uploads carry no language field: `post_submission` maps the extension through `E
 
 **About page** `/about` (`about.jinja`, `cocco/web/about.py`) renders `cocco/about.md` through the `markdown` filter. The file is authored in the repo and ships in the wheel; it is read **per request** (an edit shows without a restart, which `--reload` would not catch). Open to anonymous visitors, linked from the navbar on every page.
 
+**Docs** `/docs`, `/docs/{topic}` and the `/f/docs/{topic}/{section}` fragment (`cocco/web/docs.py`) render `cocco/docs/*.md` through their own `render_doc`, not the `markdown` filter. Read per request like `/about`, open to anonymous visitors, linked from the navbar beside `About`; the fragment fills the one `#help_modal` dialog in `base.jinja` for the ? buttons. See `docs.md`.
+
 **Course creation** is `/courses/new` (`course-new.jinja`), button shown only to administrators; on success → the new course's editor.
 
 **`/admin`** (`admin.jinja`, behind `Admin`) lists users, appoints administrators and blocks accounts. Blocking is an inline per-row form with a reason, not a `<dialog>`: it's reversible, and N dialogs would be rebuilt on every filter keystroke.

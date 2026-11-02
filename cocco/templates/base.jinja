@@ -57,6 +57,8 @@
     </div>
     <a href="{{ url_for('get_about') }}"
        class="mr-4 text-sm font-medium text-base-content/60 hover:text-base-content">About</a>
+    <a href="{{ url_for('get_docs') }}"
+       class="mr-4 text-sm font-medium text-base-content/60 hover:text-base-content">Docs</a>
     {# The login page renders with no user, so everything below is guarded. #}
     {% if user %}
     <div class="dropdown dropdown-end">
@@ -78,6 +80,31 @@
     <a href="{{ url_for('get_login') }}" class="btn btn-sm btn-primary">Sign in</a>
     {% endif %}
   </div>
+
+  {# The one help pop-up of the page, filled by the ? buttons (`_help.jinja`).
+     Outside every swap target, so a polled fragment cannot swap it away while
+     it is open; the listener opens it once the section has landed. #}
+  <dialog id="help_modal" class="modal">
+    <div class="modal-box max-w-2xl">
+      <div id="help-body" class="prose max-w-none"></div>
+      <div class="modal-action">
+        <form method="dialog">
+          <button class="btn btn-sm btn-ghost">Close</button>
+        </form>
+      </div>
+    </div>
+    <form method="dialog" class="modal-backdrop"><button>close</button></form>
+  </dialog>
+  <script>
+    // htmx 4 fires `htmx:after:swap` on the element that made the request.
+    document.addEventListener("htmx:after:swap", (event) => {
+      const ctx = event.detail && event.detail.ctx;
+      const source = ctx && ctx.sourceElement;
+      if (source && source.matches && source.matches("[data-help]")) {
+        document.getElementById("help_modal").showModal();
+      }
+    });
+  </script>
 
   {% block body %}
   <div class="container mx-auto lg:max-w-1/2 px-4 py-8">

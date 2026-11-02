@@ -1,4 +1,5 @@
 {% extends "base.jinja" %}
+{% from "_help.jinja" import help %}
 {% block title %}New course{% endblock %}
 
 {% set crumbs = [
@@ -13,8 +14,7 @@
     <div>
       <h1 class="font-serif text-3xl font-semibold tracking-tight">New course</h1>
       <p class="text-[13px] text-base-content/55 mt-1">
-        The challenges are added on the course editor, which is where this form
-        lands once the course exists.
+        You add the challenges in the course editor, once the course exists.
       </p>
     </div>
     <a href="{{ url_for('index') }}"
@@ -33,7 +33,7 @@
 
     <div class="card bg-base-100 border border-base-300 shadow-sm">
       <div class="card-body p-7">
-        <h2 class="font-bold text-lg">Title</h2>
+        <h2 class="font-bold text-lg">Title {{ help("courses", "create", "Help: Creating a course") }}</h2>
         <p class="text-[13px] text-base-content/55 -mt-1">
           How the course is listed on the home page.
         </p>
@@ -46,12 +46,11 @@
     <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
       <div class="card-body p-7">
         <div class="flex items-baseline justify-between">
-          <h2 class="font-bold text-lg">Description</h2>
+          <h2 class="font-bold text-lg">Description {{ help("courses", "description", "Help: Description") }}</h2>
           <span class="font-mono text-xs text-base-content/45">markdown</span>
         </div>
         <p class="text-[13px] text-base-content/55 -mt-1">
-          The short introduction at the top of the course page — what the course
-          is about, how it is graded, where to ask for help.
+          The introduction at the top of the course page.
         </p>
 
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 mt-3">

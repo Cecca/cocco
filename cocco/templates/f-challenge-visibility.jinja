@@ -1,3 +1,4 @@
+{% from "_help.jinja" import help %}
 {# Whether the class may see the challenge: a status line and the buttons that
    change it. Served by post_challenge_publish / _schedule / _hide and inlined
    by challenge-edit.jinja; the whole strip is swapped (outerHTML, by its id), so
@@ -22,7 +23,7 @@
     <div class="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
       <div class="min-w-0 flex-1 basis-64">
         <h2 class="font-bold text-lg">
-          {{ "Visible" if live else ("Scheduled" if scheduled else "Hidden") }}
+          {{ "Visible" if live else ("Scheduled" if scheduled else "Hidden") }} {{ help("challenges", "visibility", "Help: Visibility") }}
         </h2>
         <p class="text-[13px] text-base-content/55">
           {% if live %}

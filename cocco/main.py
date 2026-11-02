@@ -19,6 +19,7 @@ from cocco.web import (
     challenges,
     core,
     courses,
+    docs,
     exercise_sessions,
     exercise_sets,
     exercise_student,
@@ -40,7 +41,9 @@ from cocco.web.seed import prepare_database
 from cocco.web.templating import STATIC_DIR, VersionedStaticFiles
 
 # Root of the app
-app = FastAPI(default_response_class=HTMLResponse)
+# `docs_url=None`: FastAPI's Swagger UI would otherwise answer `/docs`, the
+# address of the documentation (`cocco/web/docs.py`).
+app = FastAPI(default_response_class=HTMLResponse, docs_url=None)
 app.add_exception_handler(NotAuthenticated, handle_not_authenticated)
 app.add_exception_handler(Forbidden, handle_forbidden)
 app.add_exception_handler(Blocked, handle_blocked)
@@ -76,6 +79,7 @@ app.include_router(signin.router)
 app.include_router(home.router)
 app.include_router(admin.router)
 app.include_router(about.router)
+app.include_router(docs.router)
 
 # Route order is load-bearing: `/courses/{course_id}/{challenge_id}` matches any
 # single segment, so every other two-segment course page (the editor, people,

@@ -9,6 +9,7 @@
 
    Context: `exercise_set` (`query_exercise_set`), `course_id`, `oob`, and
    `first_paint` on the page itself. #}
+{% from "_help.jinja" import help %}
 {% set latest = exercise_set.latest %}
 {% set current_id = exercise_set.current_version_id %}
 <div id="exercise-set-status"
@@ -23,7 +24,7 @@
   <div class="card bg-base-100 border border-base-300 shadow-sm">
     <div class="card-body p-7">
       <div class="flex flex-wrap items-center gap-3">
-        <h2 class="font-bold text-lg">Latest import</h2>
+        <h2 class="font-bold text-lg">Latest import {{ help("exercises", "import", "Help: Importing a set") }}</h2>
         {% if latest.status == "ready" %}
         <span class="badge badge-ghost badge-sm font-mono">{{ latest.language }}</span>
         {% endif %}
@@ -42,7 +43,8 @@
         Fix the file and import it again.
         {% else %}
         It did not build, and no version of this set has, so there is nothing to
-        open a session on yet. Fix the file and import it again.
+        open a session on yet. Fix the file and import it again
+        (<a href="{{ url_for('get_doc', topic='exercises') }}#format" class="link">the file format</a>).
         {% endif %}
       </p>
 
@@ -63,10 +65,9 @@
   <!-- ── EVERY VERSION ──────────────────────────────────────────────── -->
   <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
     <div class="card-body p-7">
-      <h2 class="font-bold text-lg">Versions</h2>
+      <h2 class="font-bold text-lg">Versions {{ help("exercises", "versions", "Help: Versions") }}</h2>
       <p class="text-[13px] text-base-content/55">
-        Every import, newest first. A version is never changed once built; the
-        current one is the newest that built without errors.
+        Every import, newest first. The current one is the newest that built.
       </p>
       <div class="overflow-x-auto mt-3">
         <table class="table">

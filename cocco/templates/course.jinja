@@ -1,4 +1,5 @@
 {% extends "base.jinja" %}
+{% from "_help.jinja" import help %}
 {% block title %}{{ course.title }}{% endblock %}
 
 {% set crumbs = [
@@ -57,7 +58,9 @@
   <!-- ══ CHALLENGES ══════════════════════════════════════════════════ -->
   <div class="flex items-baseline justify-between gap-4 mt-8 mb-3">
     <div>
-      <h2 class="font-bold text-lg">Challenges</h2>
+      {# Staff's ? explains the course editor's ordering, which a student has
+         no use for; a student's explains handing in. #}
+      <h2 class="font-bold text-lg">Challenges{% if can_edit %} {{ help("courses", "challenge-order", "Help: Challenge order") }}{% else %} {{ help("students", "submitting", "Help: Handing in a solution") }}{% endif %}</h2>
       <p class="text-[13px] text-base-content/55">
         In the order the course sets them. Your best score on each one counts.
       </p>
@@ -80,6 +83,9 @@
     {% else %}
     <div class="rounded-xl border border-dashed border-base-300 bg-base-200/40 px-4 py-8 text-center text-sm text-base-content/50">
       No challenges yet.
+      {% if can_edit %}
+      <a href="{{ url_for('get_doc', topic='challenges') }}#create" class="link">How to create one</a>
+      {% endif %}
     </div>
     {% endfor %}
   </div>
@@ -92,9 +98,10 @@
   {% if exercise_sessions %}
   <!-- ══ EXERCISE SESSIONS ═══════════════════════════════════════════ -->
   <div class="mt-10 mb-3">
-    <h2 class="font-bold text-lg">Exercise sessions</h2>
+    {# Staff's ? explains sessions; a student's explains taking part. #}
+    <h2 class="font-bold text-lg">Exercise sessions{% if can_edit %} {{ help("exercises", "sessions", "Help: Sessions") }}{% else %} {{ help("students", "exercises-in-class", "Help: Exercises in class") }}{% endif %}</h2>
     <p class="text-[13px] text-base-content/55">
-      Short Python exercises, paced by your teacher. Pick the session of your group.
+      Short programming exercises, paced by your teacher. Pick the session of your group.
     </p>
   </div>
 
@@ -128,10 +135,9 @@
   {% if can_edit %}
   <!-- ══ EXERCISES ═══════════════════════════════════════════════════ -->
   <div class="mt-10 mb-3">
-    <h2 class="font-bold text-lg">Exercises</h2>
+    <h2 class="font-bold text-lg">Exercises {{ help("exercises", "what", "Help: Exercises and challenges") }}</h2>
     <p class="text-[13px] text-base-content/55">
-      Short Python exercises, imported from one Markdown file per set and run
-      by the judge. Only staff see this list.
+      One Markdown file per set. Only staff see this list.
     </p>
   </div>
 
@@ -159,6 +165,7 @@
     {% else %}
     <div class="rounded-xl border border-dashed border-base-300 bg-base-200/40 px-4 py-8 text-center text-sm text-base-content/50">
       No exercise sets yet.
+      <a href="{{ url_for('get_doc', topic='exercises') }}#format" class="link">How to write one</a>
     </div>
     {% endfor %}
   </div>
@@ -168,7 +175,7 @@
         hx-target="#exercise-import-result"
         hx-swap="innerHTML"
         class="mt-4 rounded-xl border border-base-300 bg-base-200/40 p-4">
-    <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Import a set</h3>
+    <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Import a set {{ help("exercises", "import", "Help: Importing a set") }}</h3>
     <div class="flex flex-wrap items-end gap-4">
       <div>
         <label class="text-xs text-base-content/55">Exercise file (.md)</label>

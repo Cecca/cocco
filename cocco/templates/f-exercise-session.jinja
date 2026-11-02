@@ -9,6 +9,7 @@
 
    Context: `session` (`query_exercise_session`), `switch` (`_version_switch`),
    `course_id`, `message`, `ok`. #}
+{% from "_help.jinja" import help %}
 {% set n_exercises = session.version.titles | length %}
 {% set live = session.mode == "live" %}
 {% set closed = session.closed_at is not none %}
@@ -31,7 +32,9 @@ hx-swap="outerHTML"
     <div class="card-body p-7">
       <div class="flex flex-wrap items-center gap-3">
         <h2 class="font-bold text-lg">
-          {% if closed %}Closed{% elif live %}Live{% else %}Open{% endif %}
+          {% if closed %}Closed {{ help("exercises", "close", "Help: Closing a session") }}
+          {%- elif live %}Live {{ help("exercises", "unlocking", "Help: Unlocking exercises") }}
+          {%- else %}Open {{ help("exercises", "sessions", "Help: Sessions") }}{% endif %}
         </h2>
         {% if closed %}
         <span class="badge badge-ghost badge-sm font-semibold">Closed</span>
@@ -87,10 +90,9 @@ hx-swap="outerHTML"
   <!-- ── EXERCISES ──────────────────────────────────────────────────── -->
   <div class="card bg-base-100 border border-base-300 shadow-sm">
     <div class="card-body p-7">
-      <h2 class="font-bold text-lg">Exercises</h2>
+      <h2 class="font-bold text-lg">Exercises {{ help("exercises", "reveal", "Help: Revealing a solution") }}</h2>
       <p class="text-[13px] text-base-content/55">
-        Revealing a solution shows it to the class under the statement. It
-        cannot be hidden again.
+        Revealing a solution shows it to the class. It cannot be hidden again.
       </p>
       <ol class="mt-3 divide-y divide-base-300">
         {% for title in session.version.titles %}
@@ -122,7 +124,7 @@ hx-swap="outerHTML"
   <!-- ── VERSION ────────────────────────────────────────────────────── -->
   <div class="card bg-base-100 border border-base-300 shadow-sm">
     <div class="card-body p-7">
-      <h2 class="font-bold text-lg">Version</h2>
+      <h2 class="font-bold text-lg">Version {{ help("exercises", "switch-version", "Help: Switching version") }}</h2>
       {% if not switch %}
       <p class="text-[13px] text-base-content/55">
         The session is on v{{ session.version.number }}, the set's current version.
@@ -132,9 +134,7 @@ hx-swap="outerHTML"
       {% else %}
       <p class="text-[13px] text-base-content/55">
         The session is on v{{ session.version.number }}; the set's current
-        version is v{{ switch.latest.number }}. Exercises are matched by
-        position. Past checks keep their results and the version they were
-        graded on.
+        version is v{{ switch.latest.number }}. Exercises are matched by position.
       </p>
       {% if switch.refusal %}
       <div role="alert" class="alert alert-warning py-2 text-sm mt-3">
@@ -160,7 +160,7 @@ hx-swap="outerHTML"
     <div class="card-body p-7">
       <div class="flex flex-wrap items-center justify-between gap-4">
         <div class="min-w-0 flex-1">
-          <h2 class="font-bold text-lg text-error">Close the session</h2>
+          <h2 class="font-bold text-lg text-error">Close the session {{ help("exercises", "close", "Help: Closing a session") }}</h2>
           <p class="text-[13px] text-base-content/55">
             Students keep their code and results to review, but nothing new is
             accepted. A session cannot be reopened.

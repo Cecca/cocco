@@ -14,6 +14,7 @@
    answered with a redirect to the exercise once the teacher unlocks it - this
    page has no editor, so the reload costs nothing. In a closed session there
    is nothing to wait for, and the strip polls only as itself. #}
+{% from "_help.jinja" import help %}
 {% block body %}
 {# Escaped explicitly: `Jinja2Templates` autoescapes only .html/.xml, so a
    `.jinja` file is not, and what this prints is code and program output. #}
@@ -25,7 +26,7 @@
     <div class="card-body p-7 items-center text-center">
       {% if waiting %}
       <span class="loading loading-dots loading-lg text-primary"></span>
-      <h1 class="font-serif text-2xl font-semibold tracking-tight mt-2">Wait for the teacher</h1>
+      <h1 class="font-serif text-2xl font-semibold tracking-tight mt-2">Wait for the teacher {{ help("students", "exercises-in-class", "Help: Exercises in class") }}</h1>
       {% else %}
       <h1 class="font-serif text-2xl font-semibold tracking-tight">Not unlocked</h1>
       {% endif %}

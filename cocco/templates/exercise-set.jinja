@@ -1,4 +1,5 @@
 {% extends "base.jinja" %}
+{% from "_help.jinja" import help %}
 {% block title %}{{ exercise_set.title }}{% endblock %}
 
 {% set crumbs = [
@@ -32,10 +33,9 @@
      where it is moved to a newer one. #}
   <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
     <div class="card-body p-7">
-      <h2 class="font-bold text-lg">Sessions</h2>
+      <h2 class="font-bold text-lg">Sessions {{ help("exercises", "sessions", "Help: Sessions") }}</h2>
       <p class="text-[13px] text-base-content/55">
-        One run of this set with one group of students, with its own pacing
-        and its own progress. Students find the open ones on the course page.
+        One run of this set with one group of students.
       </p>
 
       {% if exercise_sessions %}
@@ -50,12 +50,10 @@
             hx-target="#exercise-session-new-result"
             hx-swap="innerHTML"
             class="mt-4 rounded-xl border border-base-300 bg-base-200/40 p-4">
-        <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-1">Open a session</h3>
+        <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-1">Open a session {{ help("exercises", "open-session", "Help: Opening a session") }}</h3>
         <p class="text-xs text-base-content/55 mb-3">
           On the current version. <span class="font-semibold">Live</span>: you
-          unlock the exercises one at a time, starting from the first.
-          <span class="font-semibold">Open</span>: everything is unlocked, for
-          homework.
+          unlock the exercises one at a time. <span class="font-semibold">Open</span>: all unlocked.
         </p>
         <div class="flex flex-wrap items-end gap-4">
           <div>
@@ -87,11 +85,9 @@
         hx-target="#exercise-set-import-result"
         hx-swap="innerHTML"
         class="mt-6 rounded-xl border border-base-300 bg-base-200/40 p-4">
-    <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-1">Import a new version</h3>
+    <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-1">Import a new version {{ help("exercises", "versions", "Help: Versions") }}</h3>
     <p class="text-xs text-base-content/55 mb-3">
-      The file replaces nothing until the judge has built it without errors;
-      then it becomes the current version. Open sessions keep the version they
-      were opened on.
+      It becomes current once the judge has built it without errors.
     </p>
     <div class="flex flex-wrap items-end gap-4">
       <div>
@@ -120,7 +116,7 @@
 
       <div class="flex flex-wrap items-center justify-between gap-4 mt-4 rounded-xl border border-error/30 p-4">
         <div class="min-w-0 flex-1">
-          <h3 class="font-semibold">Delete this set</h3>
+          <h3 class="font-semibold">Delete this set {{ help("exercises", "delete", "Help: Deleting") }}</h3>
           <p class="text-[13px] text-base-content/55">
             {% if exercise_set.n_sessions %}
             It has {{ exercise_set.n_sessions }} session{{ "" if exercise_set.n_sessions == 1 else "s" }},

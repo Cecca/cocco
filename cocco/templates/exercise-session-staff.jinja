@@ -1,4 +1,5 @@
 {% extends "base.jinja" %}
+{% from "_help.jinja" import help %}
 {% block title %}{{ session.label }}{% endblock %}
 
 {% set crumbs = [
@@ -40,7 +41,7 @@
 
       <div class="flex flex-wrap items-center justify-between gap-4 mt-4 rounded-xl border border-error/30 p-4">
         <div class="min-w-0 flex-1">
-          <h3 class="font-semibold">Delete this session</h3>
+          <h3 class="font-semibold">Delete this session {{ help("exercises", "delete", "Help: Deleting") }}</h3>
           <p class="text-[13px] text-base-content/55">
             Every Run and Check its students made, who took part and which
             solutions were revealed. The set and its other sessions stay.

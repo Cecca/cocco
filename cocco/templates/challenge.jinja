@@ -1,4 +1,5 @@
 {% extends "base.jinja" %}
+{% from "_help.jinja" import help %}
 {% block title %}{{ challenge.title }}{% endblock %}
 
 {% set crumbs = [
@@ -50,7 +51,7 @@
 
       <div class="card bg-base-100 border border-base-300 shadow-sm">
         <div class="card-body p-5">
-          <h2 class="font-bold text-[15px]">Submit a solution</h2>
+          <h2 class="font-bold text-[15px]">Submit a solution {{ help("students", "submitting", "Help: Handing in a solution") }}</h2>
           <p class="text-xs text-base-content/55 -mt-1">Hand in as many as you like — your best score counts.</p>
 
           <!-- The language is derived server-side from the file extension, so
@@ -87,6 +88,7 @@
             <h2 class="font-bold text-[15px]">
               {% if challenge.ranking == 'total_score' %}Top total scores
               {% else %}Fastest solutions{% endif %}
+              {{ help("students", "leaderboard", "Help: The leaderboard") }}
             </h2>
             <span class="font-mono text-xs text-success flex items-center gap-1.5">
               <span class="h-1.5 w-1.5 rounded-full bg-success"></span>live
@@ -116,7 +118,7 @@
   <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
     <div class="card-body p-7">
       <div class="flex items-center justify-between">
-        <h2 class="font-bold text-lg">Your submissions</h2>
+        <h2 class="font-bold text-lg">Your submissions {{ help("students", "reading-results", "Help: Your submissions") }}</h2>
       </div>
       <p class="flex items-center gap-2 text-[13px] text-base-content/55 mb-3">
         <span class="h-2 w-2 rounded-sm bg-primary"></span>

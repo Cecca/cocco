@@ -1,3 +1,4 @@
+{% from "_help.jinja" import help %}
 {# The problem statement card, shared by the editor and the create page.
 
    Context: challenge (a row, or the defaults dict the create page passes -
@@ -21,7 +22,7 @@
   <div class="card-body p-7">
   {% endif %}
     <div class="flex items-baseline justify-between">
-      <h2 class="font-bold text-lg">Problem statement</h2>
+      <h2 class="font-bold text-lg">Problem statement {{ help("challenges", "statement", "Help: Problem statement") }}</h2>
       <span class="font-mono text-xs text-base-content/45">markdown</span>
     </div>
 

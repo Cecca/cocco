@@ -1,4 +1,5 @@
 {% extends "base.jinja" %}
+{% from "_help.jinja" import help %}
 {% block title %}Editing {{ course.title }}{% endblock %}
 
 {% set crumbs = [
@@ -36,7 +37,7 @@
 
     <div class="card bg-base-100 border border-base-300 shadow-sm">
       <div class="card-body p-7">
-        <h2 class="font-bold text-lg">Title</h2>
+        <h2 class="font-bold text-lg">Title {{ help("courses", "title", "Help: Title") }}</h2>
         <p class="text-[13px] text-base-content/55 -mt-1">
           How the course is listed on the home page.
         </p>
@@ -52,13 +53,11 @@
     <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
       <div class="card-body p-7">
         <div class="flex items-baseline justify-between">
-          <h2 class="font-bold text-lg">Enrollment key</h2>
+          <h2 class="font-bold text-lg">Enrollment key {{ help("courses", "enrollment-key", "Help: Enrollment key") }}</h2>
           <span class="font-mono text-xs text-base-content/45">optional</span>
         </div>
         <p class="text-[13px] text-base-content/55 -mt-1">
-          Leave it empty and anyone signed in can join. Set it and students have
-          to quote it on the course page before they are enrolled. It is shown
-          here in the clear so you can read it out to the class.
+          Leave it empty and anyone signed in can join.
         </p>
         <input type="text" name="enrollment_key"
                value="{{ course.enrollment_key or '' }}"
@@ -71,12 +70,11 @@
     <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
       <div class="card-body p-7">
         <div class="flex items-baseline justify-between">
-          <h2 class="font-bold text-lg">Description</h2>
+          <h2 class="font-bold text-lg">Description {{ help("courses", "description", "Help: Description") }}</h2>
           <span class="font-mono text-xs text-base-content/45">markdown</span>
         </div>
         <p class="text-[13px] text-base-content/55 -mt-1">
-          The short introduction at the top of the course page — what the course
-          is about, how it is graded, where to ask for help.
+          The introduction at the top of the course page.
         </p>
 
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-5 mt-3">
@@ -119,10 +117,9 @@
     <div class="card-body p-7">
       <div class="flex items-start justify-between gap-4">
         <div>
-          <h2 class="font-bold text-lg">Challenges</h2>
+          <h2 class="font-bold text-lg">Challenges {{ help("courses", "challenge-order", "Help: Challenge order") }}</h2>
           <p class="text-[13px] text-base-content/55">
-            The order students see them in. Moving one only changes the listing —
-            no submission, score or test case is touched.
+            The order students see them in.
           </p>
         </div>
         <a href="{{ url_for('get_challenge_new', course_id=course.id) }}"
@@ -156,6 +153,7 @@
         <div class="min-w-0 flex-1">
           <h3 class="font-semibold">
             {{ "Unarchive this course" if course.archived_at else "Archive this course" }}
+            {{ help("courses", "archive", "Help: Archiving a course") }}
           </h3>
           <p class="text-[13px] text-base-content/55">
             {% if course.archived_at %}
@@ -185,7 +183,7 @@
 
       <div class="flex flex-wrap items-center justify-between gap-4 mt-4 rounded-xl border border-error/30 p-4">
         <div class="min-w-0 flex-1">
-          <h3 class="font-semibold">Delete this course</h3>
+          <h3 class="font-semibold">Delete this course {{ help("courses", "delete", "Help: Deleting a course") }}</h3>
           <p class="text-[13px] text-base-content/55">
             Every challenge on it, every test case and evaluator file on disk,
             every submission and every recorded score, and every enrollment.

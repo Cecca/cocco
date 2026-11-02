@@ -19,11 +19,12 @@ paths:
 
 # Authentication (`cocco/auth.py`)
 
-Login is **somebody else's login page**, and there are two of them: Google OIDC and GitHub OAuth2.
-`GET /login` offers one button per *configured* provider; `GET /auth/{provider}` hands off to
+Login is mostly **somebody else's login page**, and there are two of them: Google OIDC and GitHub
+OAuth2. The third way in, an address and a password, is off by default (`[auth] password_login`,
+below). `GET /login` offers one button per *configured* provider; `GET /auth/{provider}` hands off to
 Authlib and `GET /auth/{provider}/callback` comes back — **one parameterized pair of routes, not
 one pair each**, because everything either provider does is the same sentence apart from the step
-that turns a token into an address. There are no passwords and no sign-up step — **the account is
+that turns a token into an address. A provider sign-in has no sign-up step — **the account is
 created the first time an accepted address comes back** — and it is keyed on the address alone, so
 someone who signs in with Google today and GitHub tomorrow lands on the same account by
 construction rather than by a rule anybody had to write. A new user has no enrollments and is

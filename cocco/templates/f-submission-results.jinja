@@ -10,13 +10,14 @@
    compiler output, so the first one is the whole story. Compiler output does
    not depend on any test input, which is why this block is shown whether or not
    the test case is a public sample. #}
+{% from "_help.jinja" import help %}
 {% set compile_failures = outcomes | selectattr("outcome", "equalto", "compile_failure") | list %}
 {% if compile_failures %}
 <div class="card bg-base-100 border border-error/40 shadow-sm mb-6">
   <div class="card-body p-7">
     <div class="flex items-center gap-2.5">
       <span class="grid h-6 w-6 place-items-center rounded-md bg-error/15 text-error font-bold">!</span>
-      <h2 class="font-bold text-lg">It did not compile</h2>
+      <h2 class="font-bold text-lg">It did not compile {{ help("submissions", "results", "Help: Reading your results") }}</h2>
     </div>
     <p class="text-[13px] text-base-content/55 -mt-1">
       Every test was scored zero without being run. This is what the compiler said.
@@ -29,7 +30,7 @@
 <div class="card bg-base-100 border border-base-300 shadow-sm">
   <div class="card-body p-7">
     <div class="flex items-center gap-2.5">
-      <h2 class="font-bold text-lg">Test cases</h2>
+      <h2 class="font-bold text-lg">Test cases {{ help("submissions", "results", "Help: Reading your results") }}</h2>
       {% if submission.status != "done" %}
       <span class="badge badge-ghost gap-1.5 font-mono font-semibold">
         <span class="loading loading-spinner loading-xs"></span>{{ submission.status }}
@@ -41,7 +42,7 @@
       Every test case this submission was graded on, with the judge's output.
       {% else %}
       Hidden test cases show their verdict only — the output of a run on one
-      would give the test away.
+      would give the test away. {{ help("submissions", "hidden-outputs", "Help: Hidden test cases") }}
       {% endif %}
     </p>
 

@@ -1,3 +1,4 @@
+{% from "_help.jinja" import help %}
 {# The leaderboard card, shared by the editor and the create page.
 
    Context: challenge (a row, or the defaults dict), and optionally card_url
@@ -14,7 +15,7 @@
   {% else %}
   <div class="card-body p-7">
   {% endif %}
-    <h2 class="font-bold text-lg">Leaderboard</h2>
+    <h2 class="font-bold text-lg">Leaderboard {{ help("challenges", "leaderboard", "Help: Leaderboard") }}</h2>
     <p class="text-[13px] text-base-content/55 -mt-1">
       What the board on the challenge page ranks students by. Every student is
       represented by their single best submission.

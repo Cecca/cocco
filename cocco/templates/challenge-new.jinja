@@ -1,4 +1,5 @@
 {% extends "base.jinja" %}
+{% from "_help.jinja" import help %}
 {% block title %}New challenge{% endblock %}
 
 {# `challenge` here is NEW_CHALLENGE_DEFAULTS, which has no id and no
@@ -36,7 +37,7 @@
     <!-- ══ TITLE ═════════════════════════════════════════════════════════ -->
     <div class="card bg-base-100 border border-base-300 shadow-sm mb-6">
       <div class="card-body p-7">
-        <h2 class="font-bold text-lg">Title</h2>
+        <h2 class="font-bold text-lg">Title {{ help("challenges", "create", "Help: Creating a challenge") }}</h2>
         <p class="text-[13px] text-base-content/55 -mt-1">
           How the challenge is listed on the course page.
         </p>
