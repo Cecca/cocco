@@ -295,6 +295,6 @@ Where the code differs from the plan, or was corrected in review:
   restricted to the challenge's references); leaderboard reference rows lacked the language.
 - Seed: a `results` reference, "Teacher's Dijkstra", by the dummy admin.
 
-Noticed, not touched: the unsaved-changes script in `challenge-edit.jinja` listens for
-`htmx:afterRequest`, an htmx 2 event name; under htmx 4 the statement card's dirty flag may never
-clear after a save.
+Noticed and fixed after: the unsaved-changes script in `challenge-edit.jinja` listened for
+`htmx:afterRequest`, an htmx 2 event name that htmx 4 never fires, so the statement card's dirty
+flag never cleared after a save. It now listens for `htmx:after:swap` and reads `ctx.sourceElement`.

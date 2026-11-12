@@ -221,9 +221,13 @@
     };
     document.addEventListener("input", mark);
     document.addEventListener("change", mark);
-    document.body.addEventListener("htmx:afterRequest", (e) => {
-      const form = e.detail.elt;
-      if (form.matches && form.matches("form[data-card]") && e.detail.successful
+    /* htmx 4: `htmx:after:swap` (not 2's `htmx:afterRequest`, which never
+       fires), detail `{ctx}`. After the swap, so the status line just placed
+       in #statement-result is there to read. */
+    document.addEventListener("htmx:after:swap", (e) => {
+      const ctx = e.detail && e.detail.ctx;
+      const form = ctx && ctx.sourceElement;
+      if (form && form.matches && form.matches("form[data-card]")
           && form.querySelector(".alert-success")) {
         form.removeAttribute("data-dirty");
       }
