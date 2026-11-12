@@ -74,6 +74,7 @@ from cocco.transfer import (
     EVALUATOR_DIR,
     EXERCISES_NAME,
     MANIFEST_NAME,
+    REFERENCES_DIR,
     STATEMENT_NAME,
     TESTS_DIR,
     ManifestError,
@@ -109,7 +110,8 @@ class Kind:
 
 CHALLENGE = Kind(
     noun="challenge", key="challenge_id", api="/api/challenges",
-    members=(STATEMENT_NAME, MANIFEST_NAME), member_dirs=(TESTS_DIR, EVALUATOR_DIR),
+    members=(STATEMENT_NAME, MANIFEST_NAME),
+    member_dirs=(TESTS_DIR, EVALUATOR_DIR, REFERENCES_DIR),
     stub="challenge", suffix=".zip",
 )
 EXERCISE_SET = Kind(
@@ -750,7 +752,11 @@ def cmd_pull(args) -> int:
 
     if kind is CHALLENGE:
         count = sum(1 for name in incoming if name.startswith(f"{TESTS_DIR}/")) // 2
-        print(f"{target}/  ({count} test case{'' if count == 1 else 's'})")
+        refs = sum(1 for name in incoming if name.startswith(f"{REFERENCES_DIR}/"))
+        counts = f"{count} test case{'' if count == 1 else 's'}"
+        if refs:
+            counts += f", {refs} reference{'' if refs == 1 else 's'}"
+        print(f"{target}/  ({counts})")
     else:
         print(f"{target}/")
     if state is None:
@@ -923,8 +929,29 @@ def cmd_push(args) -> int:
         )
     if testcases["deleted"]:
         print("  deleted: " + ", ".join(testcases["deleted"]))
+    _report_references(summary.get("references") or {})
     print(f"  evaluator: {summary['evaluator'] or 'the bundled default'}")
     return 0
+
+
+def _report_references(references: dict) -> None:
+    """The reference solutions a push touched. Said only when there is
+    something to say, and an older server sends no such key at all."""
+    added = references.get("added") or []
+    replaced = references.get("replaced") or []
+    deleted = references.get("deleted") or []
+    updated = references.get("updated") or 0
+    if not (updated or added or replaced or deleted):
+        return
+    print(f"  references: {updated} updated, {len(added)} added, {len(replaced)} replaced")
+    if added:
+        print("  queued for grading (new): " + ", ".join(added))
+    if replaced:
+        print("  queued for grading (code changed): " + ", ".join(replaced))
+    if deleted:
+        print("  references deleted: " + ", ".join(deleted))
+    if added or replaced:
+        print("  results appear on the challenge editor's Reference solutions card.")
 
 
 def _report_set_push(args, ident: int, summary: dict) -> int:

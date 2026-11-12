@@ -127,19 +127,14 @@ async def get_challenge(
     )
 
 
-async def read_solution_upload(solution: UploadFile) -> tuple[str, str, str] | str:
-    """`(filename, language, source)` for an uploaded solution, or the sentence
-    that says why it was refused.
+def check_solution_bytes(filename: str, contents: bytes) -> tuple[str, str] | str:
+    """`(language, source)` for the bytes of a solution file, or the sentence
+    that says why it was refused: the size, the extension and the UTF-8 chain.
 
-    One rule with two callers - a student's submission and a teacher's reference
-    solution - so the two cannot drift on what is accepted. The caller turns the
-    sentence into its own alert.
+    One rule with three callers - a student's submission, a teacher's reference
+    and a pushed reference - so the browser and the CLI cannot disagree on what
+    is accepted.
     """
-    filename = os.path.basename(solution.filename or "")
-    if not filename:
-        return "No file was uploaded."
-
-    contents = await solution.read()
     if len(contents) > MAX_UPLOAD_BYTES:
         return f"That file is {len(contents) / 1024:.0f} KB — the limit is 1 MB."
 
@@ -153,6 +148,25 @@ async def read_solution_upload(solution: UploadFile) -> tuple[str, str, str] | s
         source = contents.decode("utf-8")
     except UnicodeDecodeError:
         return f"{filename} is not valid UTF-8 text."
+    return language, source
+
+
+async def read_solution_upload(solution: UploadFile) -> tuple[str, str, str] | str:
+    """`(filename, language, source)` for an uploaded solution, or the sentence
+    that says why it was refused.
+
+    One rule with two callers - a student's submission and a teacher's reference
+    solution - so the two cannot drift on what is accepted. The caller turns the
+    sentence into its own alert.
+    """
+    filename = os.path.basename(solution.filename or "")
+    if not filename:
+        return "No file was uploaded."
+
+    checked = check_solution_bytes(filename, await solution.read())
+    if isinstance(checked, str):
+        return checked
+    language, source = checked
     return filename, language, source
 
 

@@ -105,9 +105,11 @@ A pulled challenge is a folder, and the zip `--zip` gives you holds the same
 files:
 
 - `README.md`: the problem statement, in Markdown.
-- `challenge.toml`: the settings and the list of test cases.
+- `challenge.toml`: the settings and the lists of test cases and reference
+  solutions.
 - `tests/`: the test files, all in one folder.
 - `evaluator/`: your uploaded evaluator, only if the challenge has one.
+- `references/`: your reference solutions, only if the challenge has any.
 
 `challenge.toml` looks like this:
 
@@ -132,6 +134,11 @@ input = "tests/big.in"
 expected_output = "tests/big.out"
 is_sample = false
 is_active = true
+
+[[reference]]
+file = "references/dijkstra.cpp"
+label = "Teacher's Dijkstra"
+visibility = "results"
 ```
 
 - `ranking` is `running_time` or `total_score`, and `score_threshold` the
@@ -151,6 +158,20 @@ A test case is known by its **input file name**. Renaming the input replaces
 the test case with a new one. Deleting a block retires the test case if any
 submission has been graded on it, and deletes it otherwise, so a push never
 throws away a score.
+
+Each `[[reference]]` block is one [reference solution](/docs/challenges#references).
+Only `file` is required: `label` defaults to the file name and `visibility` to
+`hidden`, which is what the web's **Add** does. `visibility` is `hidden`
+(**Staff only**), `results` (**Leaderboard**) or `source` (**Leaderboard and
+source**). A reference is known by its **file name**. Change the code in the
+file and the push replaces the reference with a new one, which is graded again;
+change only the label or `visibility` and it is updated in place. Deleting a
+block deletes the reference and its results. A push queues new and replaced
+references and returns without waiting; their results appear on the
+**Reference solutions** card. A push is refused while a reference it would
+replace or delete is being graded: push again when it has finished. A
+checkout that rewrites line endings (git's `autocrlf`) changes every file's
+code, so its next push replaces every reference.
 
 Everything is checked before anything changes. If the push is refused, for a
 missing file, a bad limit or a name used twice, the challenge stays exactly as

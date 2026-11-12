@@ -67,8 +67,11 @@ from cocco.repository.challenges import (
     query_challenge,
     query_challenge_leaderboard,
     query_challenge_ranking,
+    lock_challenge_references,
+    query_challenge_reference_sources,
     query_challenge_references,
     query_reference,
+    query_reference_by_filename,
     query_challenge_score_threshold,
     query_challenge_standings,
     query_challenge_testcases,
@@ -2256,7 +2259,11 @@ def _make_reference(engine, submission_id: int, label: str, visibility) -> None:
         conn.execute(
             update(Submission)
             .where(Submission.c.id == submission_id)
-            .values(reference_label=label, reference_visibility=visibility)
+            .values(
+                reference_label=label,
+                reference_visibility=visibility,
+                filename=f"ref_{submission_id}.py",
+            )
         )
 
 
@@ -2458,6 +2465,7 @@ async def test_query_challenge_references_cleared_and_order(example_database, ap
                 .where(Submission.c.id == sub_id)
                 .values(
                     reference_label=label,
+                    filename=f"ref_{sub_id}.py",
                     reference_visibility=cm.ReferenceVisibility.results,
                 )
             )
@@ -2620,7 +2628,11 @@ def _make_reference(engine, submission_id, label, visibility=cm.ReferenceVisibil
         conn.execute(
             update(Submission)
             .where(Submission.c.id == submission_id)
-            .values(reference_label=label, reference_visibility=visibility)
+            .values(
+                reference_label=label,
+                reference_visibility=visibility,
+                filename=f"ref_{submission_id}.py",
+            )
         )
 
 
@@ -2757,3 +2769,87 @@ async def test_a_submissions_attempt_number_ignores_references(
         polled = await query_submission_outcomes(conn, ref)
         assert polled["reference_label"] == "Ref"
         assert polled["reference_visibility"] == "hidden"
+
+
+# ── a reference's file name is unique among a challenge's references ──────────
+def _a_submission(engine, challenge_id: int, filename: str, label: str | None) -> int:
+    with engine.begin() as conn:
+        user_id = conn.execute(select(User.c.id).limit(1)).scalar_one()
+        return conn.execute(
+            insert(Submission)
+            .values(
+                user_id=user_id,
+                challenge_id=challenge_id,
+                language="python",
+                filename=filename,
+                source="",
+                reference_label=label,
+                reference_visibility=None if label is None else cm.ReferenceVisibility.hidden,
+            )
+            .returning(Submission.c.id)
+        ).scalar_one()
+
+
+def test_two_references_with_one_file_name_on_one_challenge_are_refused(example_database):
+    from sqlalchemy.exc import IntegrityError
+
+    challenge_id = _new_challenge(example_database, None)
+    _a_submission(example_database, challenge_id, "sol.py", "A")
+    with pytest.raises(IntegrityError):
+        _a_submission(example_database, challenge_id, "sol.py", "B")
+
+
+def test_a_reference_file_name_may_repeat_elsewhere(example_database):
+    one = _new_challenge(example_database, None)
+    two = _new_challenge(example_database, None)
+    _a_submission(example_database, one, "sol.py", "A")
+    # Another challenge, and a student's submission on the same one
+    _a_submission(example_database, two, "sol.py", "A")
+    _a_submission(example_database, one, "sol.py", None)
+    _a_submission(example_database, one, "sol.py", None)
+
+
+async def test_query_reference_by_filename_finds_references_only(example_database, app_engine):
+    challenge_id = _new_challenge(example_database, None)
+    _a_submission(example_database, challenge_id, "student.py", None)
+    reference_id = _a_submission(example_database, challenge_id, "sol.py", "A")
+    async with app_engine.connect() as conn:
+        found = await query_reference_by_filename(conn, challenge_id, "sol.py")
+        assert found.id == reference_id
+        assert await query_reference_by_filename(conn, challenge_id, "student.py") is None
+        assert await query_reference_by_filename(conn, challenge_id + 1, "sol.py") is None
+
+
+async def test_query_challenge_reference_sources(example_database, app_engine):
+    challenge_id = _new_challenge(example_database, None)
+    other_id = _new_challenge(example_database, None)
+    second = _a_submission(example_database, challenge_id, "b.py", "B")
+    _a_submission(example_database, challenge_id, "student.py", None)
+    _a_submission(example_database, other_id, "c.py", "C")
+    first = _a_submission(example_database, challenge_id, "a.py", "A")
+    with example_database.begin() as conn:
+        conn.execute(
+            update(Submission).where(Submission.c.id == first).values(source="print(1)")
+        )
+    async with app_engine.connect() as conn:
+        rows = await query_challenge_reference_sources(conn, challenge_id)
+    assert [r.id for r in rows] == [second, first]
+    assert rows[1].filename == "a.py"
+    assert rows[1].source == "print(1)"
+    assert rows[1].reference_label == "A"
+    assert rows[1].reference_visibility == cm.ReferenceVisibility.hidden
+    assert rows[1].status == cm.SubmissionStatus.queued
+
+
+async def test_lock_challenge_references_returns_the_running_ones(example_database, app_engine):
+    challenge_id = _new_challenge(example_database, None)
+    running = _a_submission(example_database, challenge_id, "a.py", "A")
+    queued = _a_submission(example_database, challenge_id, "b.py", "B")
+    student = _a_submission(example_database, challenge_id, "s.py", None)
+    _set_status(example_database, running, cm.SubmissionStatus.running)
+    _set_status(example_database, student, cm.SubmissionStatus.running)
+    async with app_engine.connect() as conn:
+        assert await lock_challenge_references(conn, [running, queued, student]) == [running]
+        assert await lock_challenge_references(conn, [queued, student]) == []
+        assert await lock_challenge_references(conn, []) == []
+        await conn.rollback()

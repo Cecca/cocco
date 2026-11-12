@@ -19,12 +19,13 @@ unique within a challenge; `tests/` keeps exactly that shape.
     tests/01.in        the names are the identity - see `plan_testcases`
     tests/01.out
     evaluator/check.py only when the challenge has an uploaded evaluator
+    references/sol.cpp a reference solution, one flat file per [[reference]]
 """
 
 import hashlib
 import math
 import re
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -33,13 +34,14 @@ import tomllib
 
 import toml
 
-from cocco.model import LeaderboardRanking
+from cocco.model import LeaderboardRanking, ReferenceVisibility
 from cocco.storage import safe_filename
 
 MANIFEST_NAME = "challenge.toml"
 STATEMENT_NAME = "README.md"
 TESTS_DIR = "tests"
 EVALUATOR_DIR = "evaluator"
+REFERENCES_DIR = "references"
 
 # An exercise set is one file, the source an import stores verbatim, so it has
 # no format of its own here: a pulled set is a directory holding this file and
@@ -63,6 +65,10 @@ HEADER = """\
 #
 # Removing a block retires the test case if anything has ever been graded on
 # it, and deletes it otherwise. Nothing here can strand a score.
+#
+# Reference solutions live in references/, one [[reference]] block each, and a
+# reference is identified by its file name. Changing a file's code replaces the
+# reference (and regrades it); removing a block deletes it.
 """
 
 
@@ -91,6 +97,19 @@ class ManifestTestCase:
     @property
     def expected_output_name(self) -> str:
         return self.expected_output.split("/")[-1]
+
+
+@dataclass(frozen=True)
+class ManifestReference:
+    """One `[[reference]]` block: a reference solution and how it is shown."""
+
+    file: str
+    label: str
+    visibility: ReferenceVisibility
+
+    @property
+    def file_name(self) -> str:
+        return self.file.split("/")[-1]
 
 
 @dataclass(frozen=True)
@@ -125,6 +144,7 @@ class Manifest:
     # Absent from the file = None = no threshold, which is a real value (every
     # graded submission counts), so it round-trips like `visible_from`.
     score_threshold: float | None = None
+    references: tuple[ManifestReference, ...] = ()
 
     @property
     def evaluator_name(self) -> str | None:
@@ -175,6 +195,36 @@ class Plan:
     deleted: tuple[ExistingTestCase, ...]
 
 
+@dataclass(frozen=True)
+class ExistingReference:
+    """A reference solution as the database has it, reduced to what a plan
+    needs, so `plan_references` can be tested without a database."""
+
+    id: int
+    file_name: str
+    source: str
+    label: str
+    visibility: ReferenceVisibility
+    status: str
+
+
+@dataclass(frozen=True)
+class ReferencePlan:
+    """What a push does to a challenge's references. `updated` and `replaced`
+    are pairs of the server's reference and the block that names it; `added`
+    is in block order."""
+
+    updated: tuple[tuple[ExistingReference, ManifestReference], ...]
+    replaced: tuple[tuple[ExistingReference, ManifestReference], ...]
+    added: tuple[ManifestReference, ...]
+    deleted: tuple[ExistingReference, ...]
+
+    def blocking(self) -> tuple[ExistingReference, ...]:
+        """The existing references the push would delete: the ones to lock, and
+        to refuse the push over if the judge is running any of them."""
+        return (*(old for old, _ in self.replaced), *self.deleted)
+
+
 # ---------------------------------------------------------------------------
 # Writing
 
@@ -210,15 +260,33 @@ def dump_manifest(manifest: Manifest, header: str = "") -> str:
         }
         for tc in manifest.testcases
     ]
+    if manifest.references:
+        document["reference"] = [
+            {
+                "file": ref.file,
+                "label": ref.label,
+                "visibility": ref.visibility.value,
+            }
+            for ref in manifest.references
+        ]
     # `dumps` runs the tables together; one blank line before each makes the
     # blocks something you can move around without counting lines.
-    body = toml.dumps(document).replace("[[testcase]]", "\n[[testcase]]")
+    # Anchored to a line of its own: a label is free text and may spell one.
+    body = re.sub(
+        r"^(\[\[(?:testcase|reference)\]\])$",
+        r"\n\1",
+        toml.dumps(document),
+        flags=re.MULTILINE,
+    )
     body = re.sub(r"\n{3,}", "\n\n", body).strip() + "\n"
     return f"{header}\n{body}" if header else body
 
 
 def challenge_version(
-    manifest: Manifest, statement: str, files: Iterable[tuple[str, int, int]]
+    manifest: Manifest,
+    statement: str,
+    files: Iterable[tuple[str, int, int]],
+    references: Iterable[tuple[str, int]] = (),
 ) -> str:
     """A digest of everything an export carries: the version a pull records and
     a push's `If-Match` names.
@@ -228,6 +296,11 @@ def challenge_version(
     manifest is hashed without its header, so rewording the comment at the top
     of `challenge.toml` does not make every checkout look stale. Each part is
     length-prefixed, so no statement can be spelled to look like a file entry.
+
+    `references` is `(name in the archive, submission id)` per reference. A
+    reference's code is immutable, so its id names the contents exactly and
+    hashing the source is unnecessary. Its label and visibility are in the
+    dumped manifest already; its grading is deliberately in neither.
     """
     digest = hashlib.sha256()
     for part in (dump_manifest(manifest), statement):
@@ -239,6 +312,11 @@ def challenge_version(
         digest.update(f"{len(data)}:".encode())
         digest.update(data)
         digest.update(f"{size}:{mtime_ns};".encode())
+    for name, submission_id in sorted(references):
+        data = name.encode("utf-8")
+        digest.update(f"{len(data)}:".encode())
+        digest.update(data)
+        digest.update(f"{submission_id};".encode())
     return digest.hexdigest()
 
 
@@ -295,8 +373,16 @@ def _member_path(value: str, directory: str, where: str) -> str:
     return f"{prefix}{name}"
 
 
-def parse_manifest(text: str) -> Manifest:
+def parse_manifest(
+    text: str, known_extensions: Collection[str] | None = None
+) -> Manifest:
     """`challenge.toml` as a `Manifest`, or `ManifestError` saying why not.
+
+    `known_extensions` (no dot, lowercase, like `EXTENSION_TO_LANGUAGE`'s keys)
+    is what a `[[reference]]` file may end in. It is passed in because this
+    module touches nothing and that table is built from `languages.toml`.
+    `None` skips the check, for a caller that only canonicalises a file the
+    server will check anyway (the CLI's fingerprints).
 
     Structure and file names are checked here. The sandbox limits are *not*:
     `_challenge_fields` in `web/challenge_editor.py` is already the one place the create form
@@ -391,6 +477,43 @@ def parse_manifest(text: str) -> Manifest:
             )
         )
 
+    raw_references = table.get("reference", [])
+    if not isinstance(raw_references, list):
+        raise ManifestError("`reference` must be a list of [[reference]] blocks.")
+
+    references: list[ManifestReference] = []
+    named: set[str] = set()
+    for index, raw in enumerate(raw_references, start=1):
+        where = f"[[reference]] {index}"
+        if not isinstance(raw, dict):
+            raise ManifestError(f"{where} is not a table.")
+        file = _member_path(_require(raw, "file", (str,), where), REFERENCES_DIR, where)
+        name = file.split("/")[-1]
+        extension = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        if known_extensions is not None and extension not in known_extensions:
+            known = ", ".join(sorted("." + e for e in known_extensions))
+            raise ManifestError(
+                f"{where}: {name!r} has no known language extension. One of: {known}."
+            )
+        if name in named:
+            raise ManifestError(
+                f"{where}: {file} is used twice. Every reference needs its own file."
+            )
+        named.add(name)
+        label = raw.get("label", name)
+        if not isinstance(label, str):
+            raise ManifestError(f"{where}: `label` must be text.")
+        label = label.strip() or name
+        visibility_name = raw.get("visibility", ReferenceVisibility.hidden.value)
+        try:
+            visibility = ReferenceVisibility(visibility_name)
+        except ValueError as e:
+            known = ", ".join(v.value for v in ReferenceVisibility)
+            raise ManifestError(
+                f"{where}: unknown visibility {visibility_name!r}. One of: {known}."
+            ) from e
+        references.append(ManifestReference(file, label, visibility))
+
     return Manifest(
         title=title,
         ranking=ranking,
@@ -401,6 +524,7 @@ def parse_manifest(text: str) -> Manifest:
         testcases=tuple(testcases),
         visible_from=visible_from,
         score_threshold=score_threshold,
+        references=tuple(references),
     )
 
 
@@ -445,4 +569,45 @@ def plan_testcases(
         added=tuple(added),
         retired=tuple(tc for tc in gone if tc.n_outcomes),
         deleted=tuple(tc for tc in gone if not tc.n_outcomes),
+    )
+
+
+def plan_references(
+    existing: Iterable[ExistingReference],
+    manifest: Manifest,
+    sources: Mapping[str, str],
+) -> ReferencePlan:
+    """What a push does to the references already there.
+
+    A reference is identified by its **file name**, as a test case is by its
+    input name; the server keeps one per name per challenge. Same name and the
+    same code is an **update** (label and visibility are written, nothing is
+    regraded); same name and different code is a **replacement**, because code
+    is immutable - the old reference goes and a new one is queued. A name the
+    manifest does not carry is **deleted**; one the server lacks is **added**.
+    Code is compared exactly, character for character.
+
+    `sources` maps a block's `file` (its member path, `references/x.py`) to the
+    decoded text of that file, and must have an entry for every block.
+    """
+    by_name = {ref.file_name: ref for ref in existing}
+    named = {entry.file_name for entry in manifest.references}
+
+    updated: list[tuple[ExistingReference, ManifestReference]] = []
+    replaced: list[tuple[ExistingReference, ManifestReference]] = []
+    added: list[ManifestReference] = []
+    for entry in manifest.references:
+        found = by_name.get(entry.file_name)
+        if found is None:
+            added.append(entry)
+        elif found.source == sources[entry.file]:
+            updated.append((found, entry))
+        else:
+            replaced.append((found, entry))
+
+    return ReferencePlan(
+        updated=tuple(updated),
+        replaced=tuple(replaced),
+        added=tuple(added),
+        deleted=tuple(ref for ref in by_name.values() if ref.file_name not in named),
     )

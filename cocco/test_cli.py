@@ -80,6 +80,17 @@ def test_nothing_else_in_the_directory_is_sent(challenge_dir, tmp_path):
     assert "tests/.01.in.swp" in names
 
 
+def test_references_are_packed_and_a_stray_dotfile_in_them_too(challenge_dir, tmp_path):
+    (challenge_dir / "references").mkdir()
+    (challenge_dir / "references" / "sol.py").write_text("print(3)\n")
+    (challenge_dir / "references" / ".sol.py.swp").write_bytes(b"\0")
+    with _packed(challenge_dir, tmp_path) as archive:
+        names = archive.namelist()
+    assert "references/sol.py" in names
+    # Like tests/: the server decides whether the manifest names it.
+    assert "references/.sol.py.swp" in names
+
+
 def test_a_directory_that_is_not_a_challenge_is_refused(tmp_path):
     (tmp_path / "tests").mkdir()
     with pytest.raises(CliError, match=MANIFEST_NAME):
@@ -231,6 +242,7 @@ class FakeServer:
             "tests/01.out": "3\n",
         }
         self.version = 1
+        self.references: dict = {}
         self.statuses: list[int] = []
         self.pushes = 0
         self.if_match: str | None = None
@@ -276,6 +288,7 @@ class FakeServer:
             "challenge_id": challenge_id, "title": "Two Sum",
             "version": f"v{self.version}", "evaluator": None,
             "testcases": {"updated": 1, "added": 0, "retired": [], "deleted": []},
+            **({"references": self.references} if self.references else {}),
         })
 
 
@@ -463,3 +476,39 @@ def test_ls_still_lists_challenges_on_a_server_without_exercise_sets(
     assert run("ls") == 0
     out = capsys.readouterr().out
     assert "12  Two Sum" in out and "exercise sets" not in out
+
+
+def test_a_pull_counts_references_beside_test_cases(server, tmp_path, capsys):
+    server.files["references/sol.py"] = "print(3)\n"
+    assert run("pull", "12") == 0
+    assert "(1 test case, 1 reference)" in capsys.readouterr().out
+    assert (tmp_path / CHECKOUT / "references" / "sol.py").read_text() == "print(3)\n"
+
+
+def test_a_reference_removed_on_the_server_is_removed_here_and_edits_are_kept(
+    server, tmp_path, monkeypatch
+):
+    server.files["references/a.py"] = "a\n"
+    server.files["references/b.py"] = "b\n"
+    assert run("pull", "12") == 0
+    monkeypatch.chdir(tmp_path / CHECKOUT)
+    Path("references/b.py").write_text("mine\n")
+    server.edit({"references/a.py": None})
+
+    assert run("pull") == 0
+    assert not Path("references/a.py").exists()
+    assert Path("references/b.py").read_text() == "mine\n"
+
+
+def test_the_push_report_names_replaced_and_deleted_references(
+    server, checkout, capsys
+):
+    server.references = {
+        "updated": 1, "added": ["new.py"], "replaced": ["sol.py"], "deleted": ["old.py"],
+    }
+    assert run("push") == 0
+    out = capsys.readouterr().out
+    assert "queued for grading (code changed): sol.py" in out
+    assert "queued for grading (new): new.py" in out
+    assert "references deleted: old.py" in out
+    assert "Reference solutions" in out

@@ -18,5 +18,6 @@ Moved from `CLAUDE.md`'s *Data model* section.
 - **`submission.started_at` / `finished_at`** bracket a judge run (`pull_queued_submission`, `mark_submission_done`) and `regrade_challenge` resets them to NULL. `submission.enqueued` is that table's `created_at`.
 - Neither goes through `_USER_COLUMNS`, which stays the list `schema.User` is built from.
 - **`submission.reference_label` / `reference_visibility`** (nullable `String` / `ReferenceVisibility`) mark a teacher's reference solution (`user_id` is only who added it). The named check constraint `submission_reference_columns_together` keeps them both NULL or both set. See `domain-rules.md`.
+- **`submission_reference_filename`** is a partial unique index on `(challenge_id, filename) WHERE reference_label IS NOT NULL`: a reference's file name is its identity in a pulled directory (`transfer.md`), and students' submissions keep any name. Its migration refuses to run on data that repeats or isn't a safe name.
 
 `cocco/schema.py` holds the Pydantic mirrors (including the judge's `SubmissionRunData`). `schema.User`'s block fields have **no defaults**, so a query with a trimmed column list fails validation instead of reporting everyone as unblocked.

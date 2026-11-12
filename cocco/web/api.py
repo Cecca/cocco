@@ -28,15 +28,20 @@ from cocco import transfer
 from cocco.model import (
     ExerciseVersionStatus,
     LeaderboardRanking,
+    ReferenceVisibility,
 )
 from cocco.repository.challenges import (
     delete_testcase,
+    insert_reference,
     insert_testcase,
+    lock_challenge_references,
     query_challenge_config,
+    query_challenge_reference_sources,
     query_challenge_testcases,
     query_editable_challenges,
     query_evaluator_path,
     update_challenge,
+    update_reference,
     update_testcase,
 )
 from cocco.repository.exercise_sets import (
@@ -45,20 +50,25 @@ from cocco.repository.exercise_sets import (
     query_exercise_set_course,
     query_exercise_version_summary,
 )
+from cocco.repository.lifecycle import delete_reference
 from cocco.repository.users import (
     is_administrator,
 )
 from cocco.transfer import (
     EVALUATOR_DIR,
     MANIFEST_NAME,
+    REFERENCES_DIR,
     STATEMENT_NAME,
     TESTS_DIR,
+    ExistingReference,
     ExistingTestCase,
     Manifest,
     ManifestError,
+    ManifestReference,
     ManifestTestCase,
     dump_manifest,
     parse_manifest,
+    plan_references,
     plan_testcases,
 )
 from cocco.web import (
@@ -70,8 +80,10 @@ from cocco.web.access import (
     effective_course_role,
 )
 from cocco.web.challenge_editor import _challenge_fields
+from cocco.web.challenges import check_solution_bytes
 from cocco.web.core import (
     EDITOR_ROLES,
+    MAX_UPLOAD_BYTES,
     DBDep,
     _slug,
     _zip_stored,
@@ -189,6 +201,7 @@ class _ChallengeSnapshot:
     statement: str
     rows: list
     evaluator_path: str | None
+    references: list
 
     def stored_files(self) -> list[tuple[str, str]]:
         """`(path in storage, name in the archive)` for every file exported."""
@@ -213,6 +226,7 @@ async def _challenge_snapshot(
     evaluator_name = (
         None if evaluator_path is None else evaluator_path.rsplit("/", 1)[-1]
     )
+    references = list(await query_challenge_reference_sources(db, challenge_id))
 
     manifest = Manifest(
         title=challenge.title,
@@ -239,12 +253,22 @@ async def _challenge_snapshot(
             )
             for row in rows
         ),
+        # In `id` order, which is what a pull writes and a push reproduces.
+        references=tuple(
+            ManifestReference(
+                file=f"{REFERENCES_DIR}/{ref.filename}",
+                label=ref.reference_label,
+                visibility=ReferenceVisibility(ref.reference_visibility),
+            )
+            for ref in references
+        ),
     )
     return _ChallengeSnapshot(
         manifest=manifest,
         statement=challenge.description or "",
         rows=rows,
         evaluator_path=evaluator_path,
+        references=references,
     )
 
 
@@ -266,7 +290,14 @@ def _challenge_version(snapshot: _ChallengeSnapshot) -> str:
     for stored, name in snapshot.stored_files():
         size, mtime_ns = core.storage.stamp(stored) or (-1, -1)
         stamps.append((name, size, mtime_ns))
-    return transfer.challenge_version(snapshot.manifest, snapshot.statement, stamps)
+    # A reference is named by its submission id: its code is immutable, so the
+    # id is its contents, and its grading is deliberately not part of this.
+    references = [
+        (f"{REFERENCES_DIR}/{ref.filename}", ref.id) for ref in snapshot.references
+    ]
+    return transfer.challenge_version(
+        snapshot.manifest, snapshot.statement, stamps, references
+    )
 
 
 def _etag(version: str) -> str:
@@ -375,6 +406,12 @@ async def api_export_challenge(
             zf.writestr(STATEMENT_NAME, snapshot.statement)
             for stored, name in snapshot.stored_files():
                 _zip_stored(zf, stored, name)
+            # Rows, not files: the source is database text, so there is
+            # nothing to stream.
+            for ref in snapshot.references:
+                zf.writestr(
+                    f"{REFERENCES_DIR}/{ref.filename}", ref.source.encode("utf-8")
+                )
         handle.close()
 
     try:
@@ -395,8 +432,11 @@ async def api_export_challenge(
     )
 
 
-def _read_archive(handle) -> tuple[zipfile.ZipFile, Manifest, str]:
-    """Open a pushed zip and take the manifest and the statement out of it.
+def _read_archive(
+    handle,
+) -> tuple[zipfile.ZipFile, Manifest, str, dict[str, tuple[str, str]]]:
+    """Open a pushed zip and take the manifest, the statement and the reference
+    solutions out of it. The last is `{member path: (language, source)}`.
 
     Two caps, and they are not the same cap. The upload's own bytes are counted
     as they stream in, before this; here the *uncompressed* sizes declared in
@@ -419,7 +459,10 @@ def _read_archive(handle) -> tuple[zipfile.ZipFile, Manifest, str]:
     if MANIFEST_NAME not in names:
         raise ManifestError(f"The archive has no {MANIFEST_NAME}.")
 
-    manifest = parse_manifest(archive.read(MANIFEST_NAME).decode("utf-8"))
+    manifest = parse_manifest(
+        archive.read(MANIFEST_NAME).decode("utf-8"),
+        frozenset(core.EXTENSION_TO_LANGUAGE),
+    )
 
     # An absent README is an empty statement rather than a refusal: a challenge
     # with no description is a challenge the editor lets you save today.
@@ -434,6 +477,7 @@ def _read_archive(handle) -> tuple[zipfile.ZipFile, Manifest, str]:
     wanted |= {tc.expected_output for tc in manifest.testcases}
     if manifest.evaluator is not None:
         wanted.add(manifest.evaluator)
+    wanted |= {ref.file for ref in manifest.references}
     missing = sorted(wanted - names)
     if missing:
         raise ManifestError(
@@ -445,7 +489,7 @@ def _read_archive(handle) -> tuple[zipfile.ZipFile, Manifest, str]:
     stray = sorted(
         name
         for name in names
-        if name.startswith(f"{TESTS_DIR}/")
+        if name.startswith((f"{TESTS_DIR}/", f"{REFERENCES_DIR}/"))
         and not name.endswith("/")
         and name not in wanted
     )
@@ -453,16 +497,33 @@ def _read_archive(handle) -> tuple[zipfile.ZipFile, Manifest, str]:
         raise ManifestError(
             ", ".join(stray)
             + f" {'is' if len(stray) == 1 else 'are'} in the archive but not in "
-            f"{MANIFEST_NAME}. Add a [[testcase]] block, or remove the file."
+            f"{MANIFEST_NAME}. Add a [[testcase]] or [[reference]] block, or remove "
+            "the file."
         )
 
-    return archive, manifest, statement
+    # A reference is a row, so it is read whole here, once the total above has
+    # bounded the archive; the declared size is looked at before a byte is
+    # inflated, and the same chain as the web's upload then judges it.
+    references: dict[str, tuple[str, str]] = {}
+    for ref in manifest.references:
+        if archive.getinfo(ref.file).file_size > MAX_UPLOAD_BYTES:
+            raise ManifestError(
+                f"{ref.file} is larger than {MAX_UPLOAD_BYTES >> 10} KB, the "
+                "limit for a reference solution."
+            )
+        checked = check_solution_bytes(ref.file_name, archive.read(ref.file))
+        if isinstance(checked, str):
+            raise ManifestError(f"{ref.file}: {checked}")
+        references[ref.file] = checked
+
+    return archive, manifest, statement, references
 
 
 @router.post("/api/challenges/{challenge_id}")
 async def api_import_challenge(
     challenge_id: int,
     db: DBDep,
+    user: ApiUser,
     role: ApiChallengeEditor,
     file: Annotated[UploadFile, File()],
     if_match: Annotated[str | None, Header()] = None,
@@ -524,7 +585,7 @@ async def api_import_challenge(
         upload.seek(0)
 
         try:
-            archive, manifest, statement = _read_archive(upload)
+            archive, manifest, statement, reference_files = _read_archive(upload)
         except ManifestError as e:
             return refuse(str(e))
 
@@ -584,6 +645,40 @@ async def api_import_challenge(
                 + " already belongs to a retired test case that this push does "
                 "not name. Retired test cases keep their files - rename yours, "
                 "or keep the [[testcase]] block."
+            )
+
+        # References are rows, so their plan is made and their rows locked here,
+        # in the transaction the writes below commit: the judge pulls with
+        # `SKIP LOCKED`, so a reference locked now can't start running before
+        # that commit. `db` is already inside one (the reads above began it), so
+        # a refusal rolls back to release the locks and leaves nothing changed.
+        existing_references = [
+            ExistingReference(
+                id=row.id,
+                file_name=row.filename,
+                source=row.source,
+                label=row.reference_label,
+                visibility=ReferenceVisibility(row.reference_visibility),
+                status=row.status,
+            )
+            for row in await query_challenge_reference_sources(db, challenge_id)
+        ]
+        reference_plan = plan_references(
+            existing_references,
+            manifest,
+            {path: source for path, (_, source) in reference_files.items()},
+        )
+        blocking = reference_plan.blocking()
+        running = set(
+            await lock_challenge_references(db, [ref.id for ref in blocking])
+        )
+        if running:
+            await db.rollback()
+            names = [ref.file_name for ref in blocking if ref.id in running]
+            return refuse(
+                f"{', '.join(names)} "
+                f"{'is' if len(names) == 1 else 'are'} being graded right now. "
+                "Push again when it has finished."
             )
 
         with archive:
@@ -687,6 +782,32 @@ async def api_import_challenge(
             await update_challenge(
                 db, challenge_id, title=manifest.title, **fields
             )
+
+            # Deletes before inserts: the unique index on a reference's file
+            # name would refuse a replacement otherwise. Rows locked above, so
+            # a False here would be a bug.
+            for old in reference_plan.blocking():
+                gone = await delete_reference(db, old.id)
+                assert gone, f"locked reference {old.id} refused to go"
+            for new in (
+                *(entry for _, entry in reference_plan.replaced),
+                *reference_plan.added,
+            ):
+                language, source = reference_files[new.file]
+                await insert_reference(
+                    db,
+                    user_id=user.id,
+                    challenge_id=challenge_id,
+                    language=language,
+                    filename=new.file_name,
+                    source=source,
+                    label=new.label,
+                    visibility=new.visibility,
+                )
+            for old, entry in reference_plan.updated:
+                await update_reference(
+                    db, old.id, label=entry.label, visibility=entry.visibility
+                )
             await db.commit()
 
         # Only now, and never a path this push just wrote: a new test case is
@@ -720,6 +841,12 @@ async def api_import_challenge(
                 "deleted": [tc.input_name for tc in plan.deleted],
             },
             "evaluator": evaluator_name,
+            "references": {
+                "updated": len(reference_plan.updated),
+                "added": [entry.file_name for entry in reference_plan.added],
+                "replaced": [entry.file_name for _, entry in reference_plan.replaced],
+                "deleted": [ref.file_name for ref in reference_plan.deleted],
+            },
         }
     )
 

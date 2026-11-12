@@ -10,18 +10,21 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from cocco.model import LeaderboardRanking
+from cocco.model import LeaderboardRanking, ReferenceVisibility
 from cocco.transfer import (
     HEADER,
     STATEMENT_NAME,
     TESTS_DIR,
+    ExistingReference,
     ExistingTestCase,
     Manifest,
     ManifestError,
+    ManifestReference,
     ManifestTestCase,
     challenge_version,
     dump_manifest,
     parse_manifest,
+    plan_references,
     plan_testcases,
 )
 
@@ -311,3 +314,145 @@ def test_the_retired_average_score_ranking_is_refused():
     text = dump_manifest(a_manifest()).replace("total_score", "average_score")
     with pytest.raises(ManifestError, match="Unknown ranking.*running_time, total_score"):
         parse_manifest(text)
+
+
+########################################################################
+# `[[reference]]`: reference solutions, identified by file name.
+
+KNOWN = frozenset({"py", "cpp", "c"})
+
+
+def a_ref(name: str, label: str | None = None, visibility="hidden") -> ManifestReference:
+    return ManifestReference(
+        f"references/{name}", label or name, ReferenceVisibility(visibility)
+    )
+
+
+def an_existing_ref(name: str, source: str = "code", **overrides) -> ExistingReference:
+    fields = dict(
+        id=hash(name) % 10_000,
+        file_name=name,
+        source=source,
+        label=name,
+        visibility=ReferenceVisibility.hidden,
+        status="done",
+    )
+    fields.update(overrides)
+    return ExistingReference(**fields)  # type: ignore[arg-type]
+
+
+def with_reference_block(body: str) -> str:
+    return dump_manifest(a_manifest()) + "\n[[reference]]\n" + body
+
+
+def test_references_survive_a_round_trip():
+    manifest = a_manifest(
+        references=(
+            a_ref("sol.py", "Teacher's solution", "source"),
+            a_ref("fast.cpp", visibility="results"),
+        )
+    )
+    assert parse_manifest(dump_manifest(manifest), KNOWN) == manifest
+
+
+def test_a_label_spelling_a_block_header_survives_a_round_trip():
+    manifest = a_manifest(references=(a_ref("sol.py", "see [[reference]] and [[testcase]]"),))
+    assert parse_manifest(dump_manifest(manifest), KNOWN) == manifest
+
+
+def test_a_block_with_only_a_file_gets_the_defaults():
+    parsed = parse_manifest(with_reference_block('file = "references/sol.py"\n'), KNOWN)
+    assert parsed.references == (a_ref("sol.py"),)
+    assert parsed.references[0].file_name == "sol.py"
+
+
+def test_a_blank_label_is_the_file_name():
+    parsed = parse_manifest(
+        with_reference_block('file = "references/sol.py"\nlabel = "  "\n'), KNOWN
+    )
+    assert parsed.references[0].label == "sol.py"
+
+
+@pytest.mark.parametrize(
+    "block, match",
+    [
+        ('file = "tests/sol.py"', "must be inside references/"),
+        ('file = "references/a/sol.py"', "subdirectory"),
+        ('file = "references/sol.xyz"', "known language"),
+        ('file = "references/sol"', "known language"),
+        ('file = "references/sol.py"\nvisibility = "public"', "hidden, results, source"),
+    ],
+)
+def test_a_bad_reference_block_is_refused(block, match):
+    with pytest.raises(ManifestError, match=match):
+        parse_manifest(with_reference_block(block + "\n"), KNOWN)
+
+
+def test_a_reference_file_named_twice_is_refused():
+    text = with_reference_block(
+        'file = "references/sol.py"\n\n[[reference]]\nfile = "references/sol.py"\n'
+    )
+    with pytest.raises(ManifestError, match="used twice"):
+        parse_manifest(text, KNOWN)
+
+
+def test_reference_has_to_be_a_list():
+    with pytest.raises(ManifestError, match="list of"):
+        parse_manifest("reference = 3\n" + dump_manifest(a_manifest()), KNOWN)
+
+
+def test_each_outcome_of_plan_references():
+    manifest = a_manifest(
+        references=(
+            a_ref("same.py", "New label", "source"),
+            a_ref("changed.py"),
+            a_ref("new.py"),
+            a_ref("new2.py"),
+        )
+    )
+    same = an_existing_ref("same.py")
+    changed = an_existing_ref("changed.py", source="old")
+    gone = an_existing_ref("gone.py")
+    sources = {
+        "references/same.py": "code",
+        "references/changed.py": "new",
+        "references/new.py": "x",
+        "references/new2.py": "y",
+    }
+    plan = plan_references([same, changed, gone], manifest, sources)
+
+    assert plan.updated == ((same, manifest.references[0]),)
+    assert plan.replaced == ((changed, manifest.references[1]),)
+    assert [r.file_name for r in plan.added] == ["new.py", "new2.py"]
+    assert plan.deleted == (gone,)
+    assert set(plan.blocking()) == {changed, gone}
+
+
+def test_code_is_compared_exactly():
+    existing = an_existing_ref("a.py", source="x = 1\n")
+    manifest = a_manifest(references=(a_ref("a.py"),))
+    plan = plan_references([existing], manifest, {"references/a.py": "x = 1\r\n"})
+    assert len(plan.replaced) == 1 and not plan.updated
+
+
+def test_a_manifest_without_references_deletes_every_existing_one():
+    existing = [an_existing_ref("a.py"), an_existing_ref("b.py")]
+    plan = plan_references(existing, a_manifest(), {})
+    assert plan.deleted == tuple(existing)
+    assert not (plan.updated or plan.replaced or plan.added)
+
+
+def test_the_version_moves_with_a_reference_id_and_visibility_only():
+    refs = [("references/a.py", 7)]
+    manifest = a_manifest(references=(a_ref("a.py"),))
+    base = challenge_version(manifest, "s", [], refs)
+
+    assert base == challenge_version(manifest, "s", [], list(refs))
+    assert base != challenge_version(manifest, "s", [], [("references/a.py", 8)])
+    assert base != challenge_version(manifest, "s", [])
+    assert base != challenge_version(
+        a_manifest(references=(a_ref("a.py", visibility="source"),)), "s", [], refs
+    )
+    assert base != challenge_version(
+        a_manifest(references=(a_ref("a.py", "Other"),)), "s", [], refs
+    )

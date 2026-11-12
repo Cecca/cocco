@@ -268,9 +268,7 @@ the visibility as a badge.
 
 ## Out of scope / follow-ups
 
-- **Transfer**: a `references/` directory and a `[[references]]` manifest table (label, file,
-  visibility), with a push matching references by file name and refusing to silently destroy graded
-  runs, in the spirit of `plan_testcases`.
+- **Transfer**: see `2026-11-12-reference-transfer.md`.
 - Comparing a student's submission with a reference per test case (a "vs reference" column on the
   submission page).
 - Automatically requeuing references on test-case changes, if manual turns out to be a chore.

@@ -227,6 +227,12 @@ shown. Delete is refused while the judge is running the reference; try again
 when it finishes. A test case a reference has been graded on can't be deleted
 until the reference is, just as for a student's submission.
 
+References travel with `cocco pull` and `push` (see
+[The challenge folder](/docs/cli#zip-format)). A reference's file name must be
+unique among the challenge's references and plain: letters, digits, dot, dash
+and underscore, with no leading dot. **Add** refuses a name that is taken or
+not plain, because the name is the file the reference becomes in `cocco pull`.
+
 ## Archiving a challenge {#archive}
 
 Archiving closes a challenge without taking it away. The class keeps reading

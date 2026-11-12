@@ -454,6 +454,16 @@ Submission = Table(
         "(reference_label IS NULL) = (reference_visibility IS NULL)",
         name="submission_reference_columns_together",
     ),
+    # A reference's file name is its identity in a pulled directory
+    # (`references/<filename>`), so it is unique among a challenge's
+    # references. Students' submissions keep any name, hence the predicate.
+    Index(
+        "submission_reference_filename",
+        "challenge_id",
+        "filename",
+        unique=True,
+        postgresql_where=text("reference_label IS NOT NULL"),
+    ),
 )
 
 

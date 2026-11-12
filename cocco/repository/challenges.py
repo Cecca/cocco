@@ -38,13 +38,15 @@ async def insert_submission(
     filename: str,
     source: str,
     reference_label: str | None = None,
+    reference_visibility: ReferenceVisibility = ReferenceVisibility.hidden,
 ) -> int:
     """Enqueue a new submission, and wake the judge for it. Like
     `insert_enrollment`, this does not commit: the caller owns the transaction,
     and the notification goes out when - and only if - it commits.
 
-    A `reference_label` makes it a teacher's reference solution instead, hidden
-    from students until staff say otherwise (the two columns are NULL together).
+    A `reference_label` makes it a teacher's reference solution instead, shown
+    as `reference_visibility` says, hidden by default (the two columns are NULL
+    together).
     """
     stmt = (
         insert(Submission)
@@ -57,7 +59,7 @@ async def insert_submission(
             status=SubmissionStatus.queued,
             reference_label=reference_label,
             reference_visibility=(
-                None if reference_label is None else ReferenceVisibility.hidden
+                None if reference_label is None else reference_visibility
             ),
         )
         .returning(Submission.c.id)
@@ -75,11 +77,19 @@ async def insert_reference(
     filename: str,
     source: str,
     label: str,
+    visibility: ReferenceVisibility = ReferenceVisibility.hidden,
 ) -> int:
     """Enqueue a reference solution: `insert_submission` with a label, so there
     is one insert. `user_id` is the staff member adding it. Does not commit."""
     return await insert_submission(
-        conn, user_id, challenge_id, language, filename, source, reference_label=label
+        conn,
+        user_id,
+        challenge_id,
+        language,
+        filename,
+        source,
+        reference_label=label,
+        reference_visibility=visibility,
     )
 
 
@@ -842,6 +852,67 @@ async def query_reference(conn: AsyncConnection, challenge_id: int, submission_i
         Submission.c.reference_label.is_not(None),
     )
     return (await conn.execute(stmt)).first()
+
+
+async def query_reference_by_filename(
+    conn: AsyncConnection, challenge_id: int, filename: str
+):
+    """The reference of this challenge with that file name, or None. A file
+    name is a reference's identity in a pulled directory."""
+    stmt = select(
+        Submission.c.id,
+        Submission.c.filename,
+        Submission.c.status,
+    ).where(
+        Submission.c.challenge_id == challenge_id,
+        Submission.c.filename == filename,
+        Submission.c.reference_label.is_not(None),
+    )
+    return (await conn.execute(stmt)).first()
+
+
+async def query_challenge_reference_sources(conn: AsyncConnection, challenge_id: int):
+    """The challenge's references with their code, one row each in `id` order:
+    `id, filename, source, reference_label, reference_visibility, status`.
+
+    The export's and the push's read. Kept apart from `query_challenge_references`
+    (the editor card's JSON document) so the card never carries every
+    reference's source on every poll."""
+    stmt = (
+        select(
+            Submission.c.id,
+            Submission.c.filename,
+            Submission.c.source,
+            Submission.c.reference_label,
+            Submission.c.reference_visibility,
+            Submission.c.status,
+        )
+        .where(
+            Submission.c.challenge_id == challenge_id,
+            Submission.c.reference_label.is_not(None),
+        )
+        .order_by(Submission.c.id)
+    )
+    return (await conn.execute(stmt)).all()
+
+
+async def lock_challenge_references(
+    conn: AsyncConnection, submission_ids: Iterable[int]
+) -> list[int]:
+    """`FOR UPDATE` on these reference rows, returning the ids a judge is
+    running (`running`). The judge pulls with `SKIP LOCKED`, so a locked
+    `queued` reference can't start while the lock is held, until the caller's
+    transaction ends. Non-references are ignored. Does not commit."""
+    ids = list(submission_ids)
+    if not ids:
+        return []
+    rows = await conn.execute(
+        select(Submission.c.id, Submission.c.status)
+        .where(Submission.c.id.in_(ids), Submission.c.reference_label.is_not(None))
+        .order_by(Submission.c.id)
+        .with_for_update()
+    )
+    return [r.id for r in rows if r.status == SubmissionStatus.running]
 
 
 async def update_reference(

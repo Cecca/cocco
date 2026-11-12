@@ -17,7 +17,7 @@ becomes moving two lines in a text editor and the statement becomes a markdown f
 git.
 
 The zip is flat and **mirrors what is already on disk**: `challenge.toml`, `README.md` (the
-statement, verbatim), `tests/`, and `evaluator/` when the challenge has an uploaded checker. Test
+statement, verbatim), `tests/`, `evaluator/` when the challenge has an uploaded checker, and `references/` when it has reference solutions. Test
 files live in one directory per challenge with no per-test subdirectory, which is why input and
 output names are already unique within a challenge — `tests/` keeps exactly that shape, and that is
 why **a test case is identified by its input file name**. The manifest carries no ids on purpose: a
@@ -30,12 +30,14 @@ order *is* the order.
 
 **`cocco/transfer.py` touches nothing** — no FastAPI, no `AsyncConnection`, no `Storage` — which is
 the seam that makes the format testable by import, the way `auth.py` keeps the interesting half of
-sign-in unit-testable. It owns the shape (`parse_manifest`, `dump_manifest`) and the one rule that
-must not be got wrong (`plan_testcases`); `cocco/web/api.py` owns the I/O. Written with `toml.dumps` and read
+sign-in unit-testable. It owns the shape (`parse_manifest`, `dump_manifest`) and the rules that
+must not be got wrong (`plan_testcases`, `plan_references`); `parse_manifest(text, known_extensions=None)` takes the extensions as an argument because `transfer.py` imports no language table, and `None` skips the check (the CLI's fingerprints); `cocco/web/api.py` owns the I/O. Written with `toml.dumps` and read
 with stdlib `tomllib`: hand-rolled escaping works until somebody names a challenge "Dijkstra's".
 Every path is checked against `safe_filename` and its directory *before anything is opened* — a
 `../`, an absolute path or a nested `tests/a/b.in` is a `ManifestError`, and `Storage.resolve` stays
 the backstop rather than the check.
+
+**`references/` is the one directory that mirrors rows, not `Storage`**: a reference's code is `submission.source`, so `references/sol.py` and `tests/sol.py` are different namespaces and the retired-file clash check doesn't apply. Each is a `[[reference]]` block (`file` required, `label` defaulting to the file name, `visibility` to `hidden`). **A reference is identified by its file name**, as a test case is by its input name, which is why `submission_reference_filename` makes it unique per challenge and the web Add refuses a duplicate or unsafe one. `plan_references` sorts by that: same name and same code (compared exactly, so git `autocrlf` replaces everything) is `updated` in place; same name and different code is `replaced` (code is immutable: delete the row and its outcomes, insert a fresh queued one); absent from the manifest is `deleted`. A stray file under `references/` or `tests/`, dotfiles included (`_pack` sends them), is refused as stray. Deletion is allowed here where a test case would be retired because a reference's outcomes can be reproduced by re-running it; "never strand a score" is about students. The push **locks, then refuses**: before writing anything it takes `FOR UPDATE` on every reference it would replace or delete (`lock_challenge_references`) and refuses if one is `running`, so a rejected push still changes nothing and the judge's `SKIP LOCKED` can't start a locked queued one mid-push. New and replaced references are queued and nothing waits; unchanged ones are not requeued, even if the test cases changed (the **stale** badge says so). Deletes run before inserts, or the unique index would refuse a replacement.
 
 **A push can never strand a score**, which is the same rule `post_testcase_delete` enforces and the
 reason `plan_testcases` sorts an absent test case into `retired` or `deleted` by `n_outcomes` alone:
@@ -50,7 +52,7 @@ The two ends share their rules rather than restating them. `_challenge_fields` v
 and the ranking here as it does for the create form, and the editor's cards use its pieces
 (`_limit_fields`, `_leaderboard_fields`, `_visible_from_value`) — one rule, not a second opinion — and `_check_evaluator_source` is the size/extension/UTF-8 chain, factored out of
 `post_evaluator`, because a script the browser accepted and the CLI refused would be a difference
-nobody could explain.
+nobody could explain. `check_solution_bytes` is the same for solutions (size, extension, UTF-8), shared by the upload routes and the push's `references/` files.
 
 **A pulled directory remembers where it came from, and a push is conditional on it.** `cocco pull`
 writes `.cocco/state.toml` — the server's URL, the challenge id, the version it pulled and a
@@ -59,7 +61,7 @@ checkout agreed with the server on and a colleague's clone has agreed with nothi
 the export's `ETag` and goes back as the push's `If-Match`, so a challenge edited on the web since
 is a **412** where it used to be silently overwritten; an unchanged one answers a pull's
 `If-None-Match` with a 304. It is **derived, never stored**: `_challenge_version` digests the
-manifest, the statement and each stored file's *size and mtime*, because a revision column would
+manifest, the statement, each stored file's *size and mtime* and each reference's file and **submission id** (code is immutable, so the id names the contents; a reference's grading is not in it, or a regrade would make every checkout stale), because a revision column would
 have to be bumped by every route that touches a challenge or its files and the one that forgot
 would be exactly the overwrite this exists to stop — and mtime rather than content, because gzip's
 header timestamp makes identical plaintext differ on disk and reading every test case for a
@@ -108,6 +110,6 @@ gone stale before they revoke it.
 but a URL and a token to be useful. `COCCO_URL` and `COCCO_TOKEN` are
 its configuration, and that is a *client's* — nothing to do with `cocco.toml`, which is a
 deployment's. `pull` extracts into a directory by default, because a directory is the thing you can
-edit; `push` zips **only** `challenge.toml`, `README.md`, `tests/` and `evaluator/`, so a `.git` or
+edit; `push` zips **only** `challenge.toml`, `README.md`, `tests/`, `evaluator/` and `references/`, so a `.git` or
 an editor's swap file is never sent, and it checks every member's path on the way out of a zip even
 though that zip came from our own server.

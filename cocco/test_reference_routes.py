@@ -351,3 +351,29 @@ async def test_a_demoted_author_does_not_keep_a_hidden_reference(
     client = make_client(as_=TEACHER)
     for url in _urls(world):
         assert client.get(url).status_code == 403, url
+
+
+async def test_a_duplicate_file_name_is_an_alert_and_inserts_nothing(
+    client, world, app_engine
+):
+    assert _upload(client, world, name="dijkstra.py").status_code == 200
+    before = await _reference_rows(app_engine)
+    response = _upload(client, world, name="dijkstra.py", body=b"print(2)\n")
+    assert response.status_code == 200
+    assert 'id="references"' in response.text
+    assert "alert-error" in response.text
+    assert "A reference named dijkstra.py already exists" in response.text
+    assert len(await _reference_rows(app_engine)) == len(before)
+
+
+@pytest.mark.parametrize("name", ["my solution.py", "résumé.py", ".hidden.py"])
+async def test_an_unsafe_file_name_is_an_alert_and_inserts_nothing(
+    client, world, app_engine, name
+):
+    before = await _reference_rows(app_engine)
+    response = _upload(client, world, name=name)
+    assert response.status_code == 200
+    assert 'id="references"' in response.text
+    assert "alert-error" in response.text
+    assert "letters, digits, dot, dash and underscore only" in response.text
+    assert len(await _reference_rows(app_engine)) == len(before)

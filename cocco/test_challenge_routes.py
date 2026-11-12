@@ -956,6 +956,7 @@ async def _reference(app_engine, challenge_id, user_id, label, visibility):
             .where(Submission.c.id == submission_id)
             .values(
                 reference_label=label,
+                filename=f"ref_{submission_id}.py",
                 reference_visibility=ReferenceVisibility(visibility),
             )
         )

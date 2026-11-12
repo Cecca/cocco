@@ -10,6 +10,7 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from sqlalchemy.exc import IntegrityError
 
 from cocco.model import ReferenceVisibility
 from cocco.repository.challenges import (
@@ -17,10 +18,12 @@ from cocco.repository.challenges import (
     query_challenge_references,
     query_challenge_score_threshold,
     query_reference,
+    query_reference_by_filename,
     requeue_reference,
     update_reference,
 )
 from cocco.repository.lifecycle import delete_reference
+from cocco.storage import safe_filename
 from cocco.web.access import ChallengeEditor, CurrentUser
 from cocco.web.challenges import read_solution_upload
 from cocco.web.core import DBDep
@@ -96,16 +99,41 @@ async def post_reference(
         return await _render_references(request, db, course_id, challenge_id, parsed)
     filename, language, source = parsed
 
-    await insert_reference(
-        db,
-        user_id=user.id,
-        challenge_id=challenge_id,
-        language=language,
-        filename=filename,
-        source=source,
-        label=label.strip() or filename,
+    # The file name is the reference's identity in `cocco pull`, so it must be
+    # a bare safe name, and unique among this challenge's references.
+    try:
+        unsafe = safe_filename(filename) != filename
+    except ValueError:
+        unsafe = True
+    if unsafe:
+        return await _render_references(
+            request, db, course_id, challenge_id,
+            "Name the file with letters, digits, dot, dash and underscore only "
+            "(no leading dot). It becomes the file's name in `cocco pull`.",
+        )
+    taken = (
+        f"A reference named {filename} already exists: delete it first, or "
+        "rename your file."
     )
-    await db.commit()
+    if await query_reference_by_filename(db, challenge_id, filename) is not None:
+        return await _render_references(request, db, course_id, challenge_id, taken)
+
+    try:
+        await insert_reference(
+            db,
+            user_id=user.id,
+            challenge_id=challenge_id,
+            language=language,
+            filename=filename,
+            source=source,
+            label=label.strip() or filename,
+        )
+        await db.commit()
+    except IntegrityError:
+        # Lost the race with another upload of the same name: the unique index
+        # is the backstop for the check above.
+        await db.rollback()
+        return await _render_references(request, db, course_id, challenge_id, taken)
     logger.info("reference added", extra={"challenge_id": challenge_id})
     return await _render_references(
         request, db, course_id, challenge_id,

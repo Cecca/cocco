@@ -30,6 +30,7 @@ from cocco.model import (
     Enrollment,
     LeaderboardRanking,
     OutcomeEnum,
+    ReferenceVisibility,
     Submission,
     SubmissionStatus,
     TestCase,
@@ -576,6 +577,82 @@ async def test_every_kind_of_web_edit_moves_the_version(client, world, app_engin
     assert _etag(client, world) not in seen
 
 
+async def _reference(app_engine, world, filename, source, label,
+                     visibility=ReferenceVisibility.hidden) -> int:
+    async with app_engine.connect() as conn:
+        reference_id = (
+            await conn.execute(
+                insert(Submission)
+                .values(user_id=world["alice"], challenge_id=world["challenge"],
+                        status=SubmissionStatus.queued, language="python",
+                        filename=filename, source=source,
+                        reference_label=label, reference_visibility=visibility)
+                .returning(Submission.c.id)
+            )
+        ).scalar_one()
+        await conn.commit()
+    return reference_id
+
+
+async def test_an_export_carries_its_references(client, world, app_engine):
+    await _reference(app_engine, world, "hidden.py", "print('h')\n", "Hidden one")
+    await _reference(app_engine, world, "shown.py", "print('é')\n", "Shown one",
+                     ReferenceVisibility.source)
+    _, archive = pull(client, world, "alice", world["challenge"])
+    assert archive.read("references/hidden.py").decode() == "print('h')\n"
+    assert archive.read("references/shown.py").decode("utf-8") == "print('é')\n"
+    manifest = parse_manifest(archive.read(MANIFEST_NAME).decode())
+    assert [(r.file, r.label, r.visibility) for r in manifest.references] == [
+        ("references/hidden.py", "Hidden one", ReferenceVisibility.hidden),
+        ("references/shown.py", "Shown one", ReferenceVisibility.source),
+    ]
+
+
+async def test_an_export_without_references_has_no_directory(client, world):
+    _, archive = pull(client, world, "alice", world["challenge"])
+    assert not [n for n in archive.namelist() if n.startswith("references/")]
+
+
+async def test_a_reference_edit_moves_the_version_and_a_regrade_does_not(
+    client, world, app_engine
+):
+    where = Submission.c.id
+    first = await _reference(app_engine, world, "a.py", "print(1)\n", "A")
+    seen = {_etag(client, world)}
+
+    async def moved(statement):
+        await _execute(app_engine, statement)
+        etag = _etag(client, world)
+        assert etag not in seen
+        seen.add(etag)
+
+    await moved(update(Submission).where(where == first).values(reference_label="B"))
+    await moved(update(Submission).where(where == first)
+                .values(reference_visibility=ReferenceVisibility.results))
+    second = await _reference(app_engine, world, "b.py", "print(2)\n", "C")
+    with_second = _etag(client, world)
+    assert with_second not in seen
+    await _execute(app_engine, Submission.delete().where(where == second))
+    assert _etag(client, world) != with_second
+
+    before = _etag(client, world)
+    await _execute(
+        app_engine,
+        update(Submission).where(where == first)
+        .values(status=SubmissionStatus.done),
+    )
+    await _execute(app_engine, insert(TestOutcome).values(
+        submission_id=first, testcase_id=world["tc01"],
+        outcome=OutcomeEnum.success, score=1.0))
+    assert _etag(client, world) == before
+    from cocco.repository.challenges import requeue_reference
+
+    async with app_engine.connect() as conn:
+        assert await requeue_reference(conn, first)
+        await conn.commit()
+    assert _etag(client, world) == before
+
+
 async def test_a_push_on_the_current_version_returns_the_next_one(client, world):
     response, archive = pull(client, world, "alice", world["challenge"])
     members = {name: archive.read(name) for name in archive.namelist()}
@@ -980,3 +1057,223 @@ async def test_nothing_is_written_when_a_push_is_refused(client, world, app_engi
     after = await _testcases(app_engine, world["challenge"])
     assert [r.id for r in before] == [r.id for r in after]
     assert world["storage"].exists(f"challenge_{world['challenge']}/02.in")
+
+
+# ── references in a push ────────────────────────────────────────────────────
+
+
+def _members_with(client, world, references, files=None):
+    """A pulled challenge with its `[[reference]]` blocks replaced by
+    `references` ((file name, label, visibility) tuples) and `files` written
+    under `references/` (name -> text; defaults to a body per block)."""
+    from cocco.transfer import ManifestReference
+
+    _, archive = pull(client, world, "alice", world["challenge"])
+    members = {
+        name: archive.read(name)
+        for name in archive.namelist()
+        if not name.startswith("references/")
+    }
+    manifest = parse_manifest(archive.read(MANIFEST_NAME).decode())
+    blocks = tuple(
+        ManifestReference(f"references/{name}", label, visibility)
+        for name, label, visibility in references
+    )
+    members[MANIFEST_NAME] = dump_manifest(
+        type(manifest)(**{**manifest.__dict__, "references": blocks})
+    )
+    for name, _, _ in references:
+        members[f"references/{name}"] = f"print('{name}')\n"
+    for name, text in (files or {}).items():
+        members[f"references/{name}"] = text
+    return members
+
+
+async def _references(app_engine, challenge_id):
+    async with app_engine.connect() as conn:
+        return (
+            await conn.execute(
+                select(Submission)
+                .where(Submission.c.challenge_id == challenge_id,
+                       Submission.c.reference_label.is_not(None))
+                .order_by(Submission.c.id)
+            )
+        ).all()
+
+
+async def _state(app_engine, world):
+    async with app_engine.connect() as conn:
+        description = (await conn.execute(
+            select(Challenge.c.description).where(Challenge.c.id == world["challenge"])
+        )).scalar_one()
+    return (
+        description,
+        [r.id for r in await _testcases(app_engine, world["challenge"])],
+        [(r.id, r.status, r.reference_label, r.source)
+         for r in await _references(app_engine, world["challenge"])],
+    )
+
+
+H, R, S = (ReferenceVisibility.hidden, ReferenceVisibility.results,
+           ReferenceVisibility.source)
+
+
+async def test_a_push_adds_a_reference_queued_and_hidden(client, world, app_engine):
+    members = _members_with(client, world, [("a.py", "Alpha", H), ("b.py", "Beta", S)])
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.status_code == 200
+    assert response.json()["references"] == {
+        "updated": 0, "added": ["a.py", "b.py"], "replaced": [], "deleted": [],
+    }
+    rows = await _references(app_engine, world["challenge"])
+    assert [(r.filename, r.reference_label, r.reference_visibility) for r in rows] == [
+        ("a.py", "Alpha", H), ("b.py", "Beta", S),
+    ]
+    assert all(r.status == SubmissionStatus.queued for r in rows)
+    assert all(r.user_id == world["alice"] and r.language == "python" for r in rows)
+
+
+async def test_an_unchanged_reference_keeps_its_id_status_and_outcomes(
+    client, world, app_engine
+):
+    ref = await _reference(app_engine, world, "a.py", "print('a.py')\n", "Alpha")
+    await _execute(app_engine, update(Submission).where(Submission.c.id == ref)
+                   .values(status=SubmissionStatus.done))
+    await _execute(app_engine, insert(TestOutcome).values(
+        submission_id=ref, testcase_id=world["tc01"],
+        outcome=OutcomeEnum.success, score=1.0))
+
+    members = _members_with(client, world, [("a.py", "Alpha", H)])
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.json()["references"]["updated"] == 1
+    (row,) = await _references(app_engine, world["challenge"])
+    assert (row.id, row.status) == (ref, SubmissionStatus.done)
+    async with app_engine.connect() as conn:
+        outcomes = (await conn.execute(
+            select(TestOutcome).where(TestOutcome.c.submission_id == ref))).all()
+    assert len(outcomes) == 1
+
+
+async def test_a_relabel_or_visibility_change_keeps_the_id(client, world, app_engine):
+    ref = await _reference(app_engine, world, "a.py", "print('a.py')\n", "Alpha")
+    members = _members_with(client, world, [("a.py", "Renamed", R)])
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.json()["references"]["updated"] == 1
+    (row,) = await _references(app_engine, world["challenge"])
+    assert (row.id, row.reference_label, row.reference_visibility) == (ref, "Renamed", R)
+
+
+async def test_changed_code_replaces_the_reference_and_its_outcomes(
+    client, world, app_engine
+):
+    old = await _reference(app_engine, world, "a.py", "print('old')\n", "Alpha")
+    await _execute(app_engine, update(Submission).where(Submission.c.id == old)
+                   .values(status=SubmissionStatus.done))
+    await _execute(app_engine, insert(TestOutcome).values(
+        submission_id=old, testcase_id=world["tc01"],
+        outcome=OutcomeEnum.success, score=1.0))
+
+    members = _members_with(client, world, [("a.py", "Alpha 2", S)],
+                            files={"a.py": "print('new')\n"})
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.status_code == 200
+    assert response.json()["references"]["replaced"] == ["a.py"]
+    (row,) = await _references(app_engine, world["challenge"])
+    assert row.id != old
+    assert (row.source, row.reference_label, row.reference_visibility, row.status) == (
+        "print('new')\n", "Alpha 2", S, SubmissionStatus.queued)
+    async with app_engine.connect() as conn:
+        assert not (await conn.execute(
+            select(TestOutcome).where(TestOutcome.c.submission_id == old))).all()
+
+
+async def test_an_absent_block_deletes_the_reference(client, world, app_engine):
+    await _reference(app_engine, world, "a.py", "print('a.py')\n", "Alpha")
+    members = _members_with(client, world, [])
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.status_code == 200
+    assert response.json()["references"]["deleted"] == ["a.py"]
+    assert await _references(app_engine, world["challenge"]) == []
+
+
+@pytest.mark.parametrize("change", ["replace", "delete"])
+async def test_a_running_reference_refuses_the_whole_push(
+    client, world, app_engine, change
+):
+    ref = await _reference(app_engine, world, "a.py", "print('a.py')\n", "Alpha")
+    await _reference(app_engine, world, "b.py", "print('b.py')\n", "Beta")
+    await _execute(app_engine, update(Submission).where(Submission.c.id == ref)
+                   .values(status=SubmissionStatus.running))
+    before = await _state(app_engine, world)
+
+    blocks = [("b.py", "Beta", H)]
+    files = {}
+    if change == "replace":
+        blocks.append(("a.py", "Alpha", H))
+        files["a.py"] = "print('different')\n"
+    members = _members_with(client, world, blocks, files)
+    members[STATEMENT_NAME] = "Changed statement."
+    members.pop("tests/02.in")
+    members.pop("tests/02.out")
+    manifest = parse_manifest(members[MANIFEST_NAME])
+    members[MANIFEST_NAME] = dump_manifest(
+        type(manifest)(**{**manifest.__dict__, "testcases": manifest.testcases[:1]}))
+
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "a.py is being graded right now. Push again when it has finished.")
+    assert await _state(app_engine, world) == before
+    assert world["storage"].exists(f"challenge_{world['challenge']}/02.in")
+
+
+async def test_a_stray_reference_file_is_refused(client, world):
+    members = _members_with(client, world, [])
+    members["references/stray.py"] = "print()\n"
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.status_code == 400
+    assert "references/stray.py" in response.json()["detail"]
+    assert "[[reference]]" in response.json()["detail"]
+
+
+async def test_a_missing_reference_file_is_refused(client, world):
+    members = _members_with(client, world, [("a.py", "Alpha", H)])
+    del members["references/a.py"]
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.status_code == 400
+    assert "references/a.py" in response.json()["detail"]
+
+
+async def test_a_reference_with_an_unknown_extension_is_refused(client, world, app_engine):
+    members = _members_with(client, world, [("a.py", "Alpha", H)])
+    manifest = members[MANIFEST_NAME].replace("references/a.py", "references/a.brainfuck")
+    members[MANIFEST_NAME] = manifest
+    members["references/a.brainfuck"] = members.pop("references/a.py")
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.status_code == 400
+    assert await _references(app_engine, world["challenge"]) == []
+
+
+async def test_a_reference_that_is_not_utf8_is_refused_naming_the_file(
+    client, world, app_engine
+):
+    members = _members_with(client, world, [("a.py", "Alpha", H)],
+                            files={"a.py": b"\xff\xfe"})
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.status_code == 400
+    assert "references/a.py" in response.json()["detail"]
+    assert await _references(app_engine, world["challenge"]) == []
+
+
+async def test_a_push_on_an_archived_challenge_accepts_references(
+    client, world, app_engine
+):
+    await _execute(
+        app_engine,
+        update(Challenge).where(Challenge.c.id == world["challenge"])
+        .values(archived_at=datetime(2026, 1, 1, tzinfo=timezone.utc)),
+    )
+    members = _members_with(client, world, [("a.py", "Alpha", H)])
+    response = push(client, world, "alice", world["challenge"], members)
+    assert response.status_code == 200
+    assert len(await _references(app_engine, world["challenge"])) == 1
