@@ -11,6 +11,7 @@ from cocco.model import (
     Enrollment,
     LeaderboardRanking,
     OutcomeEnum,
+    ReferenceVisibility,
     Submission,
     SubmissionStatus,
     TestCase,
@@ -25,6 +26,7 @@ from cocco.repository.rules import (
     _challenge_visible,
     _clears_threshold,
     _effective_archived_at,
+    _is_student_submission,
 )
 
 
@@ -35,10 +37,15 @@ async def insert_submission(
     language: str,
     filename: str,
     source: str,
+    reference_label: str | None = None,
 ) -> int:
     """Enqueue a new submission, and wake the judge for it. Like
     `insert_enrollment`, this does not commit: the caller owns the transaction,
-    and the notification goes out when - and only if - it commits."""
+    and the notification goes out when - and only if - it commits.
+
+    A `reference_label` makes it a teacher's reference solution instead, hidden
+    from students until staff say otherwise (the two columns are NULL together).
+    """
     stmt = (
         insert(Submission)
         .values(
@@ -48,12 +55,32 @@ async def insert_submission(
             filename=filename,
             source=source,
             status=SubmissionStatus.queued,
+            reference_label=reference_label,
+            reference_visibility=(
+                None if reference_label is None else ReferenceVisibility.hidden
+            ),
         )
         .returning(Submission.c.id)
     )
     submission_id = (await conn.execute(stmt)).scalar_one()
     await notify_queue(conn)
     return submission_id
+
+
+async def insert_reference(
+    conn: AsyncConnection,
+    user_id: int,
+    challenge_id: int,
+    language: str,
+    filename: str,
+    source: str,
+    label: str,
+) -> int:
+    """Enqueue a reference solution: `insert_submission` with a label, so there
+    is one insert. `user_id` is the staff member adding it. Does not commit."""
+    return await insert_submission(
+        conn, user_id, challenge_id, language, filename, source, reference_label=label
+    )
 
 
 async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_id: int):
@@ -101,6 +128,9 @@ async def query_user_submissions(conn: AsyncConnection, user_id: int, challenge_
         LEFT JOIN outcomes ON submission.id = outcomes.submission_id
         WHERE submission.challenge_id = :challenge_id
           AND submission.user_id = :user_id
+          -- `_is_student_submission`, spelled again: a teacher's reference
+          -- is not an attempt.
+          AND submission.reference_label IS NULL
     ),
     ranked AS (
         SELECT attempts.*,
@@ -207,8 +237,9 @@ async def query_submission(conn: AsyncConnection, submission_id: int):
     polls the same page uses `query_submission_outcomes` instead.
 
     `attempt` is the submission's position in its author's history on the
-    challenge, computed exactly as `query_user_submissions` does it, so the "#3"
-    on this page is the "#3" of the table the viewer clicked.
+    challenge, computed exactly as `query_user_submissions` does it (students'
+    submissions only), so the "#3" on this page is the "#3" of the table the
+    viewer clicked. A reference has no attempt number: it is NULL.
     """
     submission = bindparam("submission_id", submission_id)
     agg = _submission_outcomes(submission)
@@ -226,7 +257,7 @@ async def query_submission(conn: AsyncConnection, submission_id: int):
                 this.c.challenge_id == Submission.c.challenge_id,
             ),
         )
-        .where(this.c.id == submission)
+        .where(this.c.id == submission, _is_student_submission())
         .cte("attempts")
     )
     s = (
@@ -269,6 +300,8 @@ async def query_submission_outcomes(conn: AsyncConnection, submission_id: int):
             Submission.c.user_id,
             Submission.c.challenge_id,
             Submission.c.status,
+            Submission.c.reference_label,
+            Submission.c.reference_visibility,
             *agg.c,
         )
         .select_from(Submission.join(agg, true()))
@@ -396,6 +429,7 @@ async def query_challenge_leaderboard(
     challenge_id: int,
     ranking: LeaderboardRanking = LeaderboardRanking.running_time,
     limit: int = 10,
+    include_hidden_references: bool = False,
 ):
     """Ranking of the users who did best on the challenge, best first.
 
@@ -405,6 +439,17 @@ async def query_challenge_leaderboard(
     each user is represented by their best cleared one, so a newer failed
     attempt never displaces it. Every metric comes back on every row, with the
     `n_tests` and the `score_threshold` (NULL for none) the board was gated by.
+
+    The teacher's reference solutions are interleaved, unranked: each done
+    reference that passes the same gate as a student (the criterion's qualifier)
+    is a row with `rank`, `user_id` and `nickname` NULL, `is_reference` true,
+    its `label`, `visibility` and `language`, sitting where it would rank and after a
+    student it ties with. The `limit` applies to the students alone, before the
+    union, so a reference never takes a top slot and one that ranks below the
+    last student is still listed after the board. Hidden references are listed
+    only with `include_hidden_references` (the staff's view). A teacher with
+    several references gets a row for each: there is no best-per-user step.
+    Student rows carry `is_reference` false and NULL `label` / `visibility`.
     """
     qualifier, order = _LEADERBOARD_CRITERIA[LeaderboardRanking(ranking)]
     query = text(f"""
@@ -421,6 +466,8 @@ async def query_challenge_leaderboard(
         JOIN testoutcome ON testoutcome.submission_id = submission.id
         WHERE submission.challenge_id = :challenge_id
           AND submission.status = 'done'
+          -- `_is_student_submission`, spelled again.
+          AND submission.reference_label IS NULL
         GROUP BY submission.id, submission.user_id, challenge.score_threshold
     ),
     -- `_clears_threshold`, spelled again: this is a text() query.
@@ -454,12 +501,75 @@ async def query_challenge_leaderboard(
         JOIN "user" ON "user".id = best.user_id
         ORDER BY rank
         LIMIT :limit
+    ),
+    -- `_is_student_submission`'s opposite, spelled again. One row per
+    -- reference, no DISTINCT ON: a teacher may own several.
+    ref_submission AS (
+        SELECT submission.id,
+               sum(testoutcome.elapsed_s) AS elapsed_s,
+               sum(coalesce(testoutcome.score, 0)) AS total_score,
+               count(testoutcome.id) AS n_tests,
+               challenge.score_threshold,
+               submission.reference_label,
+               submission.reference_visibility,
+               submission.language
+        FROM submission
+        JOIN challenge ON challenge.id = submission.challenge_id
+        JOIN testoutcome ON testoutcome.submission_id = submission.id
+        WHERE submission.challenge_id = :challenge_id
+          AND submission.status = 'done'
+          AND submission.reference_label IS NOT NULL
+          AND (:include_hidden OR submission.reference_visibility <> 'hidden')
+        GROUP BY submission.id, challenge.score_threshold
+    ),
+    ref_scored AS (
+        SELECT ref_submission.*,
+               (score_threshold IS NULL OR total_score >= score_threshold) AS cleared
+        FROM ref_submission
+    ),
+    refs AS (
+        SELECT * FROM ref_scored WHERE {qualifier}
+    ),
+    combined AS (
+        SELECT board.rank,
+               board.user_id,
+               board.submission_id,
+               board.elapsed_s,
+               board.total_score,
+               board.n_tests,
+               board.score_threshold,
+               board.nickname,
+               false AS is_reference,
+               NULL::text AS label,
+               NULL::text AS visibility,
+               NULL::text AS language
+        FROM board
+        UNION ALL
+        SELECT NULL::bigint,
+               NULL::integer,
+               refs.id,
+               refs.elapsed_s,
+               refs.total_score,
+               refs.n_tests,
+               refs.score_threshold,
+               NULL::text,
+               true,
+               refs.reference_label,
+               refs.reference_visibility::text,
+               refs.language
+        FROM refs
     )
-    SELECT json_agg(board ORDER BY board.rank) FROM board;
+    SELECT json_agg(combined ORDER BY {order}, is_reference, submission_id)
+    FROM combined;
     """)
 
     res = await conn.execute(
-        query, dict(challenge_id=challenge_id, limit=limit)
+        query,
+        dict(
+            challenge_id=challenge_id,
+            limit=limit,
+            include_hidden=include_hidden_references,
+        ),
     )
     return res.scalar_one_or_none()
 
@@ -483,11 +593,25 @@ async def query_challenge_standings(conn: AsyncConnection, challenge_id: int):
     (`_clears_threshold`'s expression, spelled again; false for an attempt
     nothing has graded yet). Every row carries `score_threshold` and
     `has_threshold`, those without attempts included.
+
+    The teacher's reference solutions are listed among them, unranked: every
+    reference of the challenge - hidden ones and ungraded ones too, this is the
+    staff's view - is a row with `rank`, `user_id`, `nickname`, `n_attempts`,
+    `n_pending` and `last_enqueued` NULL, `is_reference` true, its `label`,
+    `visibility` and `language`, and the metrics of its one submission
+    (`best_submission_id`). It sorts by the students' own order, the label
+    standing where the nickname breaks a tie, so an ungraded one sits with the
+    students whose attempts are all pending. Student rows carry `is_reference`
+    false and NULL `label` / `visibility` / `language`, and their `rank` counts
+    the students alone.
     """
     query = text("""
     WITH
     cohort AS (
-        SELECT user_id FROM submission WHERE challenge_id = :challenge_id
+        -- `_is_student_submission`, spelled again: a reference's author is
+        -- not a student.
+        SELECT user_id FROM submission
+        WHERE challenge_id = :challenge_id AND reference_label IS NULL
         UNION
         SELECT enrollment.user_id
         FROM enrollment
@@ -526,6 +650,8 @@ async def query_challenge_standings(conn: AsyncConnection, challenge_id: int):
         CROSS JOIN th
         LEFT JOIN outcomes ON outcomes.submission_id = submission.id
         WHERE submission.challenge_id = :challenge_id
+          -- `_is_student_submission`, spelled again.
+          AND submission.reference_label IS NULL
     ),
     best AS (
         SELECT DISTINCT ON (user_id)
@@ -568,12 +694,201 @@ async def query_challenge_standings(conn: AsyncConnection, challenge_id: int):
         JOIN "user" ON "user".id = cohort.user_id
         LEFT JOIN best ON best.user_id = cohort.user_id
         LEFT JOIN totals ON totals.user_id = cohort.user_id
+    ),
+    -- Every reference, hidden and ungraded included: this is the staff's view.
+    -- `_is_student_submission`'s opposite, spelled again. The same metrics as a
+    -- student's best attempt, so an ungraded one (null score, not cleared) sorts
+    -- with the students who have only pending attempts.
+    refs AS (
+        SELECT submission.id AS best_submission_id,
+               outcomes.score,
+               (outcomes.score IS NOT NULL
+                AND (th.score_threshold IS NULL
+                     OR outcomes.score >= th.score_threshold)) AS cleared,
+               th.score_threshold,
+               th.score_threshold IS NOT NULL AS has_threshold,
+               outcomes.elapsed_s,
+               outcomes.n_passed,
+               outcomes.n_tests,
+               submission.reference_label,
+               submission.reference_visibility::text AS visibility,
+               submission.language
+        FROM submission
+        CROSS JOIN th
+        LEFT JOIN outcomes ON outcomes.submission_id = submission.id
+        WHERE submission.challenge_id = :challenge_id
+          AND submission.reference_label IS NOT NULL
+    ),
+    combined AS (
+        SELECT board.*,
+               false AS is_reference,
+               NULL::text AS label,
+               NULL::text AS visibility,
+               NULL::text AS language
+        FROM board
+        UNION ALL
+        SELECT NULL::bigint AS rank,
+               NULL::integer AS user_id,
+               NULL::text AS nickname,
+               refs.best_submission_id,
+               refs.score,
+               refs.cleared,
+               refs.score_threshold,
+               refs.has_threshold,
+               refs.elapsed_s,
+               refs.n_passed,
+               refs.n_tests,
+               NULL::bigint AS n_attempts,
+               NULL::bigint AS n_pending,
+               NULL::timestamptz AS last_enqueued,
+               true AS is_reference,
+               refs.reference_label AS label,
+               refs.visibility,
+               refs.language
+        FROM refs
     )
-    SELECT json_agg(board ORDER BY board.rank) FROM board;
+    SELECT json_agg(
+        combined
+        ORDER BY combined.cleared DESC NULLS LAST,
+                 combined.score DESC NULLS LAST,
+                 combined.elapsed_s ASC NULLS LAST,
+                 coalesce(combined.nickname, combined.label),
+                 combined.is_reference,
+                 combined.best_submission_id
+    ) FROM combined;
     """)
 
     res = await conn.execute(query, dict(challenge_id=challenge_id))
     return res.scalar_one_or_none()
+
+
+async def query_challenge_references(conn: AsyncConnection, challenge_id: int):
+    """The challenge's reference solutions for the editor card, one entry per
+    reference in `id` order, `[]` when there are none.
+
+    `score`, `elapsed_s` and `n_tests` are the leaderboard's sums, null until
+    something has been graded; `cleared` is `_clears_threshold`'s expression
+    spelled again (false for an ungraded one). `stale` is true when the
+    reference is `done` but the set of active test cases is not the set it has
+    outcomes for: a case was added, or retired since. Exact, and needs no
+    timestamp.
+    """
+    query = text("""
+    WITH
+    outcomes AS (
+        SELECT submission_id,
+               sum(coalesce(score, 0)) AS score,
+               sum(elapsed_s) AS elapsed_s,
+               count(*) AS n_tests,
+               array_agg(testcase_id ORDER BY testcase_id) AS testcase_ids
+        FROM testoutcome
+        WHERE submission_id IN (
+            SELECT id FROM submission
+            WHERE challenge_id = :challenge_id AND reference_label IS NOT NULL
+        )
+        GROUP BY submission_id
+    ),
+    active AS (
+        SELECT coalesce(array_agg(id ORDER BY id), '{}') AS testcase_ids
+        FROM testcase
+        WHERE challenge_id = :challenge_id AND is_active
+    ),
+    refs AS (
+        SELECT submission.id,
+               submission.reference_label AS label,
+               submission.language,
+               submission.filename,
+               submission.reference_visibility AS visibility,
+               submission.status,
+               outcomes.score,
+               outcomes.elapsed_s,
+               outcomes.n_tests,
+               -- `_clears_threshold`, spelled again: this is a text() query.
+               (outcomes.score IS NOT NULL
+                AND (challenge.score_threshold IS NULL
+                     OR outcomes.score >= challenge.score_threshold)) AS cleared,
+               (submission.status = 'done'
+                AND coalesce(outcomes.testcase_ids, '{}')
+                    IS DISTINCT FROM active.testcase_ids) AS stale
+        FROM submission
+        JOIN challenge ON challenge.id = submission.challenge_id
+        CROSS JOIN active
+        LEFT JOIN outcomes ON outcomes.submission_id = submission.id
+        WHERE submission.challenge_id = :challenge_id
+          AND submission.reference_label IS NOT NULL
+    )
+    SELECT coalesce(json_agg(refs ORDER BY refs.id), '[]'::json) FROM refs;
+    """)
+    res = await conn.execute(query, dict(challenge_id=challenge_id))
+    return res.scalar_one()
+
+
+async def query_reference(conn: AsyncConnection, challenge_id: int, submission_id: int):
+    """One reference solution of *this* challenge, or None: a student's
+    submission, another challenge's reference and a missing id all answer None,
+    so a route that starts here cannot be pointed at anything else."""
+    stmt = select(
+        Submission.c.id,
+        Submission.c.user_id,
+        Submission.c.challenge_id,
+        Submission.c.reference_label.label("label"),
+        Submission.c.reference_visibility.label("visibility"),
+        Submission.c.language,
+        Submission.c.filename,
+        Submission.c.status,
+    ).where(
+        Submission.c.id == submission_id,
+        Submission.c.challenge_id == challenge_id,
+        Submission.c.reference_label.is_not(None),
+    )
+    return (await conn.execute(stmt)).first()
+
+
+async def update_reference(
+    conn: AsyncConnection,
+    submission_id: int,
+    *,
+    label: str | None = None,
+    visibility: ReferenceVisibility | None = None,
+) -> None:
+    """Change a reference's label and/or visibility, writing only what is given.
+    The code is immutable. Only reference rows are touched. Does not commit."""
+    values = {}
+    if label is not None:
+        values["reference_label"] = label
+    if visibility is not None:
+        values["reference_visibility"] = ReferenceVisibility(visibility)
+    if not values:
+        return
+    await conn.execute(
+        update(Submission)
+        .where(Submission.c.id == submission_id, Submission.c.reference_label.is_not(None))
+        .values(**values)
+    )
+
+
+async def requeue_reference(conn: AsyncConnection, submission_id: int) -> bool:
+    """Throw away one reference's outcomes and queue it again: one row of
+    `regrade_challenge`. False, changing nothing, while a judge is running it
+    (the run would write its outcomes after the reset). The row is locked first,
+    so a claim in flight is waited for. Does not commit."""
+    status = (
+        await conn.execute(
+            select(Submission.c.status)
+            .where(Submission.c.id == submission_id, Submission.c.reference_label.is_not(None))
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if status is None or status == SubmissionStatus.running:
+        return False
+    await conn.execute(delete(TestOutcome).where(TestOutcome.c.submission_id == submission_id))
+    await conn.execute(
+        update(Submission)
+        .where(Submission.c.id == submission_id)
+        .values(status=SubmissionStatus.queued, started_at=None, finished_at=None)
+    )
+    await notify_queue(conn)
+    return True
 
 
 async def count_running_submissions(conn: AsyncConnection, challenge_id: int) -> int:
@@ -582,6 +897,9 @@ async def count_running_submissions(conn: AsyncConnection, challenge_id: int) ->
     A regrade refuses while this is non-zero: the in-flight run would write its
     outcomes and mark the submission done *after* the reset, leaving one stale
     grade behind with nothing to say it is stale.
+
+    References are counted on purpose: a regrade covers them and must wait for
+    them too.
     """
     stmt = select(func.count()).where(
         and_(
@@ -681,7 +999,8 @@ async def query_testcase(conn: AsyncConnection, challenge_id: int, testcase_id: 
 async def regrade_challenge(conn: AsyncConnection, challenge_id: int) -> int:
     """Throw away every recorded outcome of a challenge and requeue its
     submissions. Returns how many were requeued, and if that is any, wakes the
-    judge for them when the caller commits (`notify_queue`).
+    judge for them when the caller commits (`notify_queue`). Reference solutions
+    are requeued with the rest, on purpose.
 
     This is how a fixed expected output or a corrected time limit is applied
     retroactively, without asking students to submit again. Two consequences are

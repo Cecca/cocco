@@ -52,6 +52,16 @@ class LeaderboardRanking(str, Enum):
     total_score = "total_score"
 
 
+class ReferenceVisibility(str, Enum):
+    """What students see of a reference solution: `hidden` is staff only,
+    `results` puts it on the leaderboard (label, language, metrics) and
+    `source` adds a link to the submission page with the code."""
+
+    hidden = "hidden"
+    results = "results"
+    source = "source"
+
+
 class OutcomeEnum(Enum):
     success = "success"
     compile_failure = "compile_failure"
@@ -433,6 +443,17 @@ Submission = Table(
     # The name of the file the student uploaded, shown in the submission history
     Column("filename", String, nullable=False),
     Column("source", String, nullable=False),
+    # A non-NULL `reference_label` marks a teacher's reference solution rather
+    # than a student's submission: the judge grades it like any other row, and
+    # `user_id` is the staff member who added it (audit only). Every
+    # student-facing read filters on `reference_label IS NULL`; see
+    # `.claude/rules/domain-rules.md`. The two columns are NULL together.
+    Column("reference_label", String, nullable=True),
+    Column("reference_visibility", SAEnum(ReferenceVisibility), nullable=True),
+    CheckConstraint(
+        "(reference_label IS NULL) = (reference_visibility IS NULL)",
+        name="submission_reference_columns_together",
+    ),
 )
 
 

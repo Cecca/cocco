@@ -8,6 +8,7 @@ from cocco.repository.rules import (
     _challenge_number,
     _challenge_visible,
     _effective_archived_at,
+    _is_student_submission,
 )
 
 
@@ -361,6 +362,8 @@ async def query_course_people(conn: AsyncConnection, course_id: int, q: str = ""
         FROM submission
         JOIN challenge ON challenge.id = submission.challenge_id
         WHERE challenge.course_id = :course_id
+          -- `_is_student_submission`, spelled again: this is a text() query.
+          AND submission.reference_label IS NULL
         GROUP BY submission.user_id
     ),
     members AS (
@@ -478,7 +481,7 @@ def _course_challenges(course_id, user_id):
             func.count(Submission.c.user_id.distinct()).label("n_submitters"),
         )
         .join(Challenge, Challenge.c.id == Submission.c.challenge_id)
-        .where(Challenge.c.course_id == course_id)
+        .where(Challenge.c.course_id == course_id, _is_student_submission())
         .group_by(Submission.c.challenge_id)
         .cte("submitted")
     )

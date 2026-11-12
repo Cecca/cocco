@@ -184,7 +184,8 @@ async def query_users(conn: AsyncConnection, q: str = ""):
         SELECT user_id,
                count(*) AS n_submissions,
                max(enqueued) AS last_submitted
-        FROM submission GROUP BY user_id
+        -- `_is_student_submission`, spelled again: this is a text() query.
+        FROM submission WHERE reference_label IS NULL GROUP BY user_id
     ),
     accounts AS (
         SELECT
@@ -265,13 +266,16 @@ async def query_user_profile(conn: AsyncConnection, user_id: int):
     -- theirs, and would go missing from a total added up over `enrollment`.
     totals AS (
         SELECT count(*) AS n_submissions, max(enqueued) AS last_submitted
-        FROM submission WHERE user_id = :user_id
+        -- `_is_student_submission`, spelled again: this is a text() query.
+        FROM submission
+        WHERE user_id = :user_id AND reference_label IS NULL
     ),
     per_course AS (
         SELECT challenge.course_id, count(*) AS n_submissions
         FROM submission
         JOIN challenge ON challenge.id = submission.challenge_id
         WHERE submission.user_id = :user_id
+          AND submission.reference_label IS NULL
         GROUP BY challenge.course_id
     ),
     memberships AS (

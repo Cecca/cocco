@@ -16,6 +16,7 @@ from cocco.model import (
     Course,
     ExerciseJobKind,
     OutcomeEnum,
+    ReferenceVisibility,
     Submission,
     SubmissionStatus,
     TestCase,
@@ -499,6 +500,7 @@ async def _populate_dummy_data(conn: AsyncConnection):
         outcome: OutcomeEnum,
         score: float,
         elapsed_s: float | None,
+        reference_label: str | None = None,
     ) -> None:
         submission_id = (
             await conn.execute(
@@ -510,6 +512,10 @@ async def _populate_dummy_data(conn: AsyncConnection):
                     language="python",
                     filename=filename,
                     source=seeded_source,
+                    reference_label=reference_label,
+                    reference_visibility=(
+                        ReferenceVisibility.results if reference_label else None
+                    ),
                 )
                 .returning(Submission.c.id)
             )
@@ -571,3 +577,14 @@ async def _populate_dummy_data(conn: AsyncConnection):
         await _seed_submission(
             classmate_id, filename, OutcomeEnum.success, 1.0, elapsed_s
         )
+
+    # A teacher's reference solution, visible on the leaderboard, so the marked
+    # row's styling shows in a fresh database.
+    await _seed_submission(
+        user_ids[DUMMY_ADMIN],
+        "reference.py",
+        OutcomeEnum.success,
+        1.0,
+        0.150,
+        reference_label="Teacher's Dijkstra",
+    )

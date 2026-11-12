@@ -51,7 +51,10 @@ async def notify_queue(conn: AsyncConnection) -> None:
 
 async def pull_queued_submission(conn: Connection) -> SubmissionRunData | None:
     """Get a queued submission, along with all the data required to run it.
-    Atomically set it to 'running'."""
+    Atomically set it to 'running'.
+
+    Teachers' reference solutions are submissions and are graded like any other:
+    no `reference_label` filter, on purpose, as for archived, hidden and blocked."""
     # Get the submission to run, if any, and atomically sets it to running.
     #
     # `FOR UPDATE SKIP LOCKED` is what makes that "atomically" true with more
@@ -116,6 +119,7 @@ def requeue_submission(conn: Connection, submission_id: int) -> None:
 
     For a judge stopped mid-run. Only while it is still `running`, so a
     submission that was meanwhile regraded, finished or deleted is left alone.
+    References are included on purpose: the judge grades them like any other.
     """
     conn.execute(
         update(Submission)
@@ -130,6 +134,7 @@ def requeue_submission(conn: Connection, submission_id: int) -> None:
 
 
 def mark_submission_done(conn: Connection, submission_id: int) -> None:
+    """References are included on purpose: the judge grades them like any other."""
     conn.execute(
         update(Submission)
         .where(Submission.c.id == submission_id)

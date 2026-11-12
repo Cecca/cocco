@@ -77,6 +77,10 @@ The heading tells you how it ranks:
 shows your display name and picture, which you can change on your profile
 (see [Your profile](/docs/account#profile)).
 
+Your teacher may also add reference solutions, shown in a marked row with a
+"Reference" badge and no rank. They are not classmates and don't take anyone's
+place; see [Reference solutions](/docs/challenges#references).
+
 ## Exercises in class {#exercises-in-class}
 
 Your teacher may run short programming exercises during the lesson. Open the

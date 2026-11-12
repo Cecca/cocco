@@ -518,9 +518,23 @@ async def authorize_submission(
     Not a dependency like `require_challenge_editor`, because it needs the
     submission row first and because a student *is* allowed here: the rule is
     that you may read your own work, and course staff may read anyone's.
+
+    A reference solution is nobody's work: its `user_id` is the staff member who
+    added it, and being that person is not a claim on it (a demoted teacher
+    must not keep reading a hidden one). It is staff only, except that one
+    whose visibility is `source` is readable by anyone on the course, as long
+    as the challenge is visible to them (`require_challenge_visible`, so a
+    hidden challenge's reference can't be read by id). The row needs
+    `reference_label` and `reference_visibility`.
     """
     role = await effective_challenge_role(db, user, submission["challenge_id"])
     is_staff = role in EDITOR_ROLES
+    if submission["reference_label"] is not None:
+        if not is_staff:
+            if role is None or submission["reference_visibility"] != "source":
+                raise Forbidden("That submission is not yours.")
+            await require_challenge_visible(db, submission["challenge_id"], role)
+        return is_staff
     if not is_staff and submission["user_id"] != user.id:
         raise Forbidden("That submission is not yours.")
     return is_staff

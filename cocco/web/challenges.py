@@ -127,6 +127,35 @@ async def get_challenge(
     )
 
 
+async def read_solution_upload(solution: UploadFile) -> tuple[str, str, str] | str:
+    """`(filename, language, source)` for an uploaded solution, or the sentence
+    that says why it was refused.
+
+    One rule with two callers - a student's submission and a teacher's reference
+    solution - so the two cannot drift on what is accepted. The caller turns the
+    sentence into its own alert.
+    """
+    filename = os.path.basename(solution.filename or "")
+    if not filename:
+        return "No file was uploaded."
+
+    contents = await solution.read()
+    if len(contents) > MAX_UPLOAD_BYTES:
+        return f"That file is {len(contents) / 1024:.0f} KB — the limit is 1 MB."
+
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    language = EXTENSION_TO_LANGUAGE.get(extension)
+    if language is None:
+        known = ", ".join(sorted("." + e for e in EXTENSION_TO_LANGUAGE))
+        return f"Cannot tell the language of {filename!r}. Accepted: {known}."
+
+    try:
+        source = contents.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"{filename} is not valid UTF-8 text."
+    return filename, language, source
+
+
 @router.post("/courses/{course_id}/{challenge_id}/submissions")
 async def post_submission(
     course_id: int,
@@ -166,26 +195,10 @@ async def post_submission(
             "over your attempts, but it is not taking new submissions."
         )
 
-    filename = os.path.basename(solution.filename or "")
-    if not filename:
-        return alert("No file was uploaded.")
-
-    contents = await solution.read()
-    if len(contents) > MAX_UPLOAD_BYTES:
-        return alert(
-            f"That file is {len(contents) / 1024:.0f} KB — the limit is 1 MB."
-        )
-
-    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    language = EXTENSION_TO_LANGUAGE.get(extension)
-    if language is None:
-        known = ", ".join(sorted("." + e for e in EXTENSION_TO_LANGUAGE))
-        return alert(f"Cannot tell the language of {filename!r}. Accepted: {known}.")
-
-    try:
-        source = contents.decode("utf-8")
-    except UnicodeDecodeError:
-        return alert(f"{filename} is not valid UTF-8 text.")
+    parsed = await read_solution_upload(solution)
+    if isinstance(parsed, str):
+        return alert(parsed)
+    filename, language, source = parsed
 
     await insert_submission(
         db,
@@ -229,8 +242,12 @@ async def get_fragment_leaderboard(
     if ranking is None:
         raise HTTPException(status_code=404)
     score_threshold = await query_challenge_score_threshold(db, challenge_id)
+    is_staff = role in EDITOR_ROLES
     entries = await query_challenge_leaderboard(
-        db, challenge_id=challenge_id, ranking=ranking
+        db,
+        challenge_id=challenge_id,
+        ranking=ranking,
+        include_hidden_references=is_staff,
     )
     return templates.TemplateResponse(
         request=request,
@@ -240,6 +257,7 @@ async def get_fragment_leaderboard(
             "ranking": ranking.value,
             "score_threshold": score_threshold,
             "user": user,
+            "is_staff": is_staff,
         },
     )
 
@@ -290,11 +308,14 @@ async def get_submission(
     if submission is None:
         raise HTTPException(status_code=404)
     is_staff = await authorize_submission(db, user, submission)
-    viewer_is_author = submission["user_id"] == user.id
+    is_reference = submission["reference_label"] is not None
+    # A reference has no author to speak of: its `user_id` is the staff member
+    # who added it, so nobody is "the author" and no per-student page exists.
+    viewer_is_author = not is_reference and submission["user_id"] == user.id
 
     course_id = submission["course_id"]
     challenge_id = submission["challenge_id"]
-    if viewer_is_author:
+    if viewer_is_author or is_reference:
         back_url = request.url_for(
             "get_challenge", course_id=course_id, challenge_id=challenge_id
         )
@@ -317,9 +338,14 @@ async def get_submission(
             "outcomes": visible_outcomes(submission["outcomes"], is_staff),
             "is_staff": is_staff,
             "viewer_is_author": viewer_is_author,
+            "is_reference": is_reference,
             "back_url": back_url,
             "back_label": back_label,
-            "title": f"#{submission['attempt']} · {submission['challenge_title']}",
+            "title": (
+                f"{submission['reference_label']} · {submission['challenge_title']}"
+                if is_reference
+                else f"#{submission['attempt']} · {submission['challenge_title']}"
+            ),
         },
     )
 

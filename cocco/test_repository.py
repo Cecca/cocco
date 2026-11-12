@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg
 import pytest
-from sqlalchemy import Float, cast, func, insert, literal, or_, select, text, update
+from sqlalchemy import Float, cast, delete, func, insert, literal, or_, select, text, update
 
 import cocco.model as cm
 from cocco.avatar import generate_identicon
@@ -62,10 +62,13 @@ from cocco.repository.challenges import (
     count_running_submissions,
     count_testcase_outcomes,
     insert_challenge,
+    insert_reference,
     insert_submission,
     query_challenge,
     query_challenge_leaderboard,
     query_challenge_ranking,
+    query_challenge_references,
+    query_reference,
     query_challenge_score_threshold,
     query_challenge_standings,
     query_challenge_testcases,
@@ -74,10 +77,13 @@ from cocco.repository.challenges import (
     query_submission_outcomes,
     query_user_submissions,
     regrade_challenge,
+    requeue_reference,
+    update_reference,
 )
 from cocco.repository.lifecycle import (
     delete_challenge,
     delete_course,
+    delete_reference,
     lock_challenge_submissions,
     lock_course_submissions,
     query_challenge_file_paths,
@@ -2182,3 +2188,572 @@ async def test_standings_rank_cleared_students_before_failed_ones(
         )
         standings = await query_challenge_standings(conn, challenge_id)
         assert all(s["cleared"] and not s["has_threshold"] for s in standings)
+
+
+# ── teachers' reference solutions are not students ────────────────────────────
+# A reference is a `submission` row with `reference_label` set. Every
+# student-facing reader of `submission` filters it out; one test per reader,
+# named after it, so a new reader that forgets the filter has a template.
+@pytest.fixture
+def with_reference(example_database):
+    """A fresh challenge on Algorithms 101 with a graded student submission by
+    carol and a graded hidden reference by alice, its teacher. Hands back the
+    engine and the ids."""
+    engine = example_database
+    challenge_id = _new_challenge(engine, None)
+    student_id = _graded_attempt(engine, "carol", challenge_id, [3], minutes_ago=10)
+    reference_id = _graded_attempt(engine, "alice", challenge_id, [9], minutes_ago=5)
+    with engine.begin() as conn:
+        conn.execute(
+            update(Submission)
+            .where(Submission.c.id == reference_id)
+            .values(
+                reference_label="Teacher's",
+                reference_visibility=cm.ReferenceVisibility.hidden,
+            )
+        )
+    return engine, challenge_id, student_id, reference_id
+
+
+def _n_students_submissions(engine, nickname: str) -> int:
+    """How many non-reference submissions `nickname` has, over everything."""
+    with engine.connect() as conn:
+        return conn.execute(
+            select(func.count())
+            .select_from(Submission.join(User, User.c.id == Submission.c.user_id))
+            .where(User.c.nickname == nickname, Submission.c.reference_label.is_(None))
+        ).scalar_one()
+
+
+async def test_query_user_submissions_skips_references(with_reference, app_engine):
+    engine, challenge_id, student_id, reference_id = with_reference
+    async with app_engine.connect() as conn:
+        carol = (await query_user_by_email(conn, "carol@unipd.it")).id
+        alice = (await query_user_by_email(conn, "alice@unipd.it")).id
+        assert [a["id"] for a in await query_user_submissions(conn, carol, challenge_id)] == [
+            student_id
+        ]
+        # The teacher's own history is empty: the reference is not an attempt.
+        assert await query_user_submissions(conn, alice, challenge_id) is None
+
+
+async def test_query_challenge_standings_skips_references(with_reference, app_engine):
+    engine, challenge_id, student_id, reference_id = with_reference
+    async with app_engine.connect() as conn:
+        standings = await query_challenge_standings(conn, challenge_id)
+        students = [s for s in standings if not s["is_reference"]]
+        # Carol is the only submitter; alice, who teaches the course, is not
+        # enrolled as a student and would only appear through the reference.
+        assert [(s["nickname"], s["best_submission_id"]) for s in students
+                if s["best_submission_id"] is not None] == [("carol", student_id)]
+        assert "alice" not in [s["nickname"] for s in standings]
+        assert all(s["n_attempts"] <= 1 for s in students)
+        assert all(s["user_id"] is not None and s["label"] is None for s in students)
+
+
+def _make_reference(engine, submission_id: int, label: str, visibility) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            update(Submission)
+            .where(Submission.c.id == submission_id)
+            .values(reference_label=label, reference_visibility=visibility)
+        )
+
+
+async def test_standings_interleave_references_by_score(example_database, app_engine):
+    engine = example_database
+    challenge_id = _new_challenge(engine, None)
+    _graded_attempt(engine, "carol", challenge_id, [9])
+    _graded_attempt(engine, "dave", challenge_id, [3])
+    ref = _graded_attempt(engine, "alice", challenge_id, [6])
+    _make_reference(engine, ref, "Middling", cm.ReferenceVisibility.hidden)
+    async with app_engine.connect() as conn:
+        rows = await query_challenge_standings(conn, challenge_id)
+    carol, middle, dave = [r for r in rows if r["score"] is not None]
+    assert [r["nickname"] for r in (carol, dave)] == ["carol", "dave"]
+    assert rows.index(middle) == 1
+    # Hidden ones are included, unranked, and do not shift the students' ranks.
+    assert middle["is_reference"] and middle["label"] == "Middling"
+    assert middle["visibility"] == "hidden" and middle["language"] == "python"
+    assert middle["rank"] is None and middle["user_id"] is None
+    assert middle["n_attempts"] is None and middle["best_submission_id"] == ref
+    assert (carol["rank"], dave["rank"]) == (1, 2)
+    assert not carol["is_reference"]
+
+
+async def test_standings_list_an_ungraded_reference_with_the_pending(
+    example_database, app_engine
+):
+    engine = example_database
+    challenge_id = _new_challenge(engine, None)
+    _graded_attempt(engine, "carol", challenge_id, [1])
+    pending = _graded_attempt(engine, "dave", challenge_id, [1])
+    _set_status(engine, pending, cm.SubmissionStatus.queued)
+    with engine.begin() as conn:
+        conn.execute(delete(TestOutcome).where(TestOutcome.c.submission_id == pending))
+    ref = _graded_attempt(engine, "alice", challenge_id, [1])
+    with engine.begin() as conn:
+        conn.execute(delete(TestOutcome).where(TestOutcome.c.submission_id == ref))
+    _set_status(engine, ref, cm.SubmissionStatus.queued)
+    _make_reference(engine, ref, "Fresh", cm.ReferenceVisibility.source)
+    async with app_engine.connect() as conn:
+        rows = await query_challenge_standings(conn, challenge_id)
+    assert rows[0]["nickname"] == "carol"
+    fresh = next(r for r in rows if r["is_reference"])
+    assert fresh["score"] is None and fresh["cleared"] is False
+    assert rows.index(fresh) >= 1
+    # No student ranks below it with a score.
+    assert all(r["score"] is None for r in rows[rows.index(fresh):])
+    assert sum(1 for r in rows if r["is_reference"]) == 1
+
+
+async def test_query_challenge_leaderboard_skips_references(with_reference, app_engine):
+    engine, challenge_id, student_id, reference_id = with_reference
+    async with app_engine.connect() as conn:
+        for ranking in LeaderboardRanking:
+            board = await query_challenge_leaderboard(conn, challenge_id, ranking)
+            assert [(e["nickname"], e["submission_id"]) for e in board] == [
+                ("carol", student_id)
+            ]
+
+
+async def test_query_course_people_skips_references(with_reference, app_engine):
+    engine, challenge_id, student_id, reference_id = with_reference
+    async with app_engine.connect() as conn:
+        people = (await query_course_people(conn, 1))["people"]
+        by_name = {p["nickname"]: p for p in people}
+        assert by_name["alice"]["n_submissions"] == _n_students_submissions(engine, "alice")
+        # Carol's three seeded attempts here plus the new one; no reference.
+        assert by_name["carol"]["n_submissions"] == 4
+
+
+async def test_course_challenges_skip_references(with_reference, app_engine):
+    engine, challenge_id, student_id, reference_id = with_reference
+    async with app_engine.connect() as conn:
+        alice = (await query_user_by_email(conn, "alice@unipd.it")).id
+        card = {
+            c["id"]: c for c in await query_course_challenges(conn, 1, user_id=alice)
+        }[challenge_id]
+        # Alice's reference is not "hers" and is not a submitter.
+        assert (card["n_mine"], card["n_submitters"]) == (0, 1)
+
+
+async def test_query_users_skips_references(with_reference, app_engine):
+    engine, challenge_id, student_id, reference_id = with_reference
+    async with app_engine.connect() as conn:
+        accounts = {u["nickname"]: u for u in (await query_users(conn))["accounts"]}
+        for nickname in ("alice", "carol"):
+            assert accounts[nickname]["n_submissions"] == _n_students_submissions(
+                engine, nickname
+            )
+
+
+async def test_query_user_profile_skips_references(with_reference, app_engine):
+    engine, challenge_id, student_id, reference_id = with_reference
+    async with app_engine.connect() as conn:
+        alice = (await query_user_by_email(conn, "alice@unipd.it")).id
+        profile = await query_user_profile(conn, alice)
+        assert profile["n_submissions"] == _n_students_submissions(engine, "alice")
+        per_course = {c["id"]: c["n_submissions"] for c in profile["courses"]}
+        assert per_course[1] == _n_students_submissions(engine, "alice")
+
+
+# ── a reference's own reads and writes ────────────────────────────────────────
+def _lone_reference(engine, scores=(9,)) -> tuple[int, int]:
+    """A challenge whose only graded submission is a reference by alice, so its
+    outcomes cover exactly the active test cases (the `with_reference` student
+    brings a test case of their own)."""
+    challenge_id = _new_challenge(engine, None)
+    ref_id = _graded_attempt(engine, "alice", challenge_id, list(scores))
+    with engine.begin() as conn:
+        conn.execute(
+            update(Submission)
+            .where(Submission.c.id == ref_id)
+            .values(
+                reference_label="Teacher's",
+                reference_visibility=cm.ReferenceVisibility.hidden,
+            )
+        )
+    return challenge_id, ref_id
+
+
+def _set_status(engine, submission_id: int, status) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            update(Submission).where(Submission.c.id == submission_id).values(status=status)
+        )
+
+
+def _n_outcomes(engine, submission_id: int) -> int:
+    with engine.connect() as conn:
+        return conn.execute(
+            select(func.count()).where(TestOutcome.c.submission_id == submission_id)
+        ).scalar_one()
+
+
+async def test_insert_reference_writes_label_and_hidden(example_database, app_engine):
+    challenge_id = _new_challenge(example_database, None)
+    async with app_engine.connect() as conn:
+        alice = (await query_user_by_email(conn, "alice@unipd.it")).id
+        ref_id = await insert_reference(
+            conn, alice, challenge_id, "python", "sol.py", "print(1)", "Naive"
+        )
+        plain_id = await insert_submission(
+            conn, alice, challenge_id, "python", "a.py", "print(2)"
+        )
+        await conn.commit()
+    with example_database.connect() as conn:
+        rows = {
+            r.id: r
+            for r in conn.execute(
+                select(
+                    Submission.c.id,
+                    Submission.c.reference_label,
+                    Submission.c.reference_visibility,
+                    Submission.c.status,
+                    Submission.c.source,
+                )
+            )
+        }
+    assert rows[ref_id].reference_label == "Naive"
+    assert rows[ref_id].reference_visibility == cm.ReferenceVisibility.hidden
+    assert rows[ref_id].status == cm.SubmissionStatus.queued
+    assert rows[ref_id].source == "print(1)"
+    assert rows[plain_id].reference_label is None
+    assert rows[plain_id].reference_visibility is None
+
+
+async def test_query_challenge_references_fields(example_database, app_engine):
+    challenge_id, reference_id = _lone_reference(example_database)
+    async with app_engine.connect() as conn:
+        refs = await query_challenge_references(conn, challenge_id)
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref["id"] == reference_id
+    assert ref["label"] == "Teacher's"
+    assert ref["language"] == "python" and ref["filename"] == "a.py"
+    assert ref["visibility"] == "hidden" and ref["status"] == "done"
+    assert (ref["score"], ref["elapsed_s"], ref["n_tests"]) == (9, 1.0, 1)
+    assert ref["cleared"] is True and ref["stale"] is False
+
+
+async def test_query_challenge_references_is_empty_without_references(
+    example_database, app_engine
+):
+    challenge_id = _new_challenge(example_database, None)
+    _graded_attempt(example_database, "carol", challenge_id, [3])
+    async with app_engine.connect() as conn:
+        assert await query_challenge_references(conn, challenge_id) == []
+
+
+async def test_query_challenge_references_cleared_and_order(example_database, app_engine):
+    challenge_id = _new_challenge(example_database, 5)
+    low = _graded_attempt(example_database, "alice", challenge_id, [1, 1])
+    queued = _graded_attempt(example_database, "alice", challenge_id, [])
+    _set_status(example_database, queued, cm.SubmissionStatus.queued)
+    for sub_id, label in ((queued, "B"), (low, "A")):
+        with example_database.begin() as conn:
+            conn.execute(
+                update(Submission)
+                .where(Submission.c.id == sub_id)
+                .values(
+                    reference_label=label,
+                    reference_visibility=cm.ReferenceVisibility.results,
+                )
+            )
+    async with app_engine.connect() as conn:
+        refs = await query_challenge_references(conn, challenge_id)
+    assert [r["id"] for r in refs] == sorted([low, queued])
+    by_id = {r["id"]: r for r in refs}
+    assert by_id[low]["cleared"] is False and by_id[low]["score"] == 2
+    assert by_id[low]["visibility"] == "results"
+    # Nothing graded: no score, not cleared, and not stale until done.
+    assert by_id[queued]["score"] is None and by_id[queued]["cleared"] is False
+    assert by_id[queued]["stale"] is False
+
+
+async def test_a_reference_goes_stale_when_the_test_cases_change(
+    example_database, app_engine
+):
+    engine = example_database
+    challenge_id, reference_id = _lone_reference(engine)
+
+    async def stale():
+        async with app_engine.connect() as conn:
+            return (await query_challenge_references(conn, challenge_id))[0]["stale"]
+
+    assert await stale() is False
+    with engine.begin() as conn:
+        new_case = conn.execute(
+            insert(TestCase)
+            .values(
+                challenge_id=challenge_id,
+                execution_order=99,
+                input_path="in",
+                expected_output_path="out",
+            )
+            .returning(TestCase.c.id)
+        ).scalar_one()
+    assert await stale() is True
+    # Retiring the new case makes the sets agree again.
+    with engine.begin() as conn:
+        conn.execute(update(TestCase).where(TestCase.c.id == new_case).values(is_active=False))
+    assert await stale() is False
+    # Retiring one it was graded on makes it stale the other way.
+    with engine.begin() as conn:
+        conn.execute(
+            update(TestCase)
+            .where(
+                TestCase.c.id.in_(
+                    select(TestOutcome.c.testcase_id).where(
+                        TestOutcome.c.submission_id == reference_id
+                    )
+                )
+            )
+            .values(is_active=False)
+        )
+    assert await stale() is True
+
+
+async def test_count_testcase_outcomes_counts_a_references_outcomes(
+    example_database, app_engine
+):
+    """A reference's outcomes count, so a test case it was graded on is retired
+    rather than deleted, until the reference itself is deleted."""
+    engine = example_database
+    _, ref_id = _lone_reference(engine)
+    with engine.connect() as conn:
+        testcase_id = conn.execute(
+            select(TestOutcome.c.testcase_id).where(TestOutcome.c.submission_id == ref_id)
+        ).scalar_one()
+    async with app_engine.connect() as conn:
+        assert await count_testcase_outcomes(conn, testcase_id) == 1
+        assert await delete_reference(conn, ref_id) is True
+        await conn.commit()
+    async with app_engine.connect() as conn:
+        assert await count_testcase_outcomes(conn, testcase_id) == 0
+
+
+async def test_query_reference_only_finds_a_reference_of_this_challenge(
+    with_reference, app_engine
+):
+    engine, challenge_id, student_id, reference_id = with_reference
+    other = _new_challenge(engine, None)
+    async with app_engine.connect() as conn:
+        ref = await query_reference(conn, challenge_id, reference_id)
+        assert ref.id == reference_id and ref.label == "Teacher's"
+        assert ref.visibility == cm.ReferenceVisibility.hidden
+        assert ref.status == cm.SubmissionStatus.done
+        assert await query_reference(conn, challenge_id, student_id) is None
+        assert await query_reference(conn, other, reference_id) is None
+        assert await query_reference(conn, challenge_id, 99999) is None
+
+
+async def test_update_reference_writes_only_what_is_given(with_reference, app_engine):
+    engine, challenge_id, student_id, reference_id = with_reference
+    async with app_engine.connect() as conn:
+        await update_reference(conn, reference_id)
+        ref = await query_reference(conn, challenge_id, reference_id)
+        assert (ref.label, ref.visibility) == ("Teacher's", cm.ReferenceVisibility.hidden)
+        await update_reference(conn, reference_id, label="Renamed")
+        ref = await query_reference(conn, challenge_id, reference_id)
+        assert (ref.label, ref.visibility) == ("Renamed", cm.ReferenceVisibility.hidden)
+        await update_reference(conn, reference_id, visibility=cm.ReferenceVisibility.source)
+        ref = await query_reference(conn, challenge_id, reference_id)
+        assert (ref.label, ref.visibility) == ("Renamed", cm.ReferenceVisibility.source)
+        # A student's submission is not touched.
+        await update_reference(conn, student_id, label="x")
+        await conn.commit()
+    with engine.connect() as conn:
+        assert conn.execute(
+            select(Submission.c.reference_label).where(Submission.c.id == student_id)
+        ).scalar_one() is None
+
+
+async def test_requeue_reference(with_reference, app_engine):
+    engine, challenge_id, student_id, reference_id = with_reference
+    _set_status(engine, reference_id, cm.SubmissionStatus.running)
+    async with app_engine.connect() as conn:
+        assert await requeue_reference(conn, reference_id) is False
+        await conn.commit()
+    assert _n_outcomes(engine, reference_id) == 1
+
+    _set_status(engine, reference_id, cm.SubmissionStatus.done)
+    async with app_engine.connect() as conn:
+        assert await requeue_reference(conn, reference_id) is True
+        # Never a student's submission.
+        assert await requeue_reference(conn, student_id) is False
+        await conn.commit()
+    assert _n_outcomes(engine, reference_id) == 0
+    assert _n_outcomes(engine, student_id) == 1
+    with engine.connect() as conn:
+        row = conn.execute(
+            select(Submission.c.status, Submission.c.started_at, Submission.c.finished_at)
+            .where(Submission.c.id == reference_id)
+        ).one()
+    assert row.status == cm.SubmissionStatus.queued
+    assert row.started_at is None and row.finished_at is None
+
+
+async def test_delete_reference(with_reference, app_engine):
+    engine, challenge_id, student_id, reference_id = with_reference
+    _set_status(engine, reference_id, cm.SubmissionStatus.running)
+    async with app_engine.connect() as conn:
+        assert await delete_reference(conn, reference_id) is False
+        await conn.commit()
+    assert _n_outcomes(engine, reference_id) == 1
+
+    _set_status(engine, reference_id, cm.SubmissionStatus.done)
+    async with app_engine.connect() as conn:
+        assert await delete_reference(conn, student_id) is False
+        assert await delete_reference(conn, reference_id) is True
+        await conn.commit()
+    assert _n_outcomes(engine, reference_id) == 0
+    with engine.connect() as conn:
+        ids = conn.execute(select(Submission.c.id)).scalars().all()
+    assert reference_id not in ids and student_id in ids
+
+
+# ── references on the leaderboard: unranked, interleaved ─────────────────────
+def _make_reference(engine, submission_id, label, visibility=cm.ReferenceVisibility.results):
+    with engine.begin() as conn:
+        conn.execute(
+            update(Submission)
+            .where(Submission.c.id == submission_id)
+            .values(reference_label=label, reference_visibility=visibility)
+        )
+
+
+def _marks(board):
+    """(nickname or label, rank) per row, in order."""
+    return [(e["label"] if e["is_reference"] else e["nickname"], e["rank"]) for e in board]
+
+
+@pytest.mark.parametrize("ranking", list(LeaderboardRanking))
+async def test_a_reference_between_two_students_has_no_rank(
+    example_database, app_engine, ranking
+):
+    engine = example_database
+    challenge_id = _new_challenge(engine, None)
+    # Time: lower is better; score: higher is better. Alice sits in the middle.
+    fast, mid, slow = (1.0, 2.0, 3.0) if ranking == LeaderboardRanking.running_time else (3.0, 2.0, 1.0)
+    _graded_attempt(engine, "carol", challenge_id, [fast], elapsed_s=fast)
+    ref = _graded_attempt(engine, "alice", challenge_id, [mid], elapsed_s=mid)
+    _graded_attempt(engine, "dave", challenge_id, [slow], elapsed_s=slow)
+    _make_reference(engine, ref, "Naive")
+    async with app_engine.connect() as conn:
+        board = await query_challenge_leaderboard(conn, challenge_id, ranking)
+    assert _marks(board) == [("carol", 1), ("Naive", None), ("dave", 2)]
+    student, reference, _ = board
+    assert not student["is_reference"] and student["label"] is None
+    assert reference["visibility"] == "results"
+    assert reference["nickname"] is None and reference["user_id"] is None
+
+
+async def test_a_slow_reference_is_listed_after_the_board(example_database, app_engine):
+    engine = example_database
+    challenge_id = _new_challenge(engine, None)
+    for i, name in enumerate(["carol", "dave", "erin"]):
+        _graded_attempt(engine, name, challenge_id, [1], elapsed_s=1.0 + i)
+    ref = _graded_attempt(engine, "alice", challenge_id, [1], elapsed_s=99.0)
+    _make_reference(engine, ref, "Slow")
+    async with app_engine.connect() as conn:
+        board = await query_challenge_leaderboard(conn, challenge_id, limit=2)
+    # The limit counts students only; the reference rides after them.
+    assert _marks(board) == [("carol", 1), ("dave", 2), ("Slow", None)]
+
+
+async def test_hidden_references_only_for_staff(example_database, app_engine):
+    engine = example_database
+    challenge_id = _new_challenge(engine, None)
+    ref = _graded_attempt(engine, "alice", challenge_id, [1])
+    _make_reference(engine, ref, "Secret", cm.ReferenceVisibility.hidden)
+    async with app_engine.connect() as conn:
+        assert await query_challenge_leaderboard(conn, challenge_id) is None
+        board = await query_challenge_leaderboard(
+            conn, challenge_id, include_hidden_references=True
+        )
+    assert _marks(board) == [("Secret", None)]
+    assert board[0]["visibility"] == "hidden"
+
+
+@pytest.mark.parametrize("ranking", list(LeaderboardRanking))
+async def test_an_uncleared_reference_is_never_listed(
+    example_database, app_engine, ranking
+):
+    engine = example_database
+    challenge_id = _new_challenge(engine, 5)
+    ref = _graded_attempt(engine, "alice", challenge_id, [1])
+    _make_reference(engine, ref, "Weak")
+    async with app_engine.connect() as conn:
+        board = await query_challenge_leaderboard(
+            conn, challenge_id, ranking, include_hidden_references=True
+        )
+    assert board is None
+
+
+async def test_a_teacher_with_two_references_gets_two_rows(example_database, app_engine):
+    engine = example_database
+    challenge_id = _new_challenge(engine, None)
+    for label, t in (("A", 2.0), ("B", 1.0)):
+        _make_reference(engine, _graded_attempt(engine, "alice", challenge_id, [1], elapsed_s=t), label)
+    async with app_engine.connect() as conn:
+        board = await query_challenge_leaderboard(conn, challenge_id)
+    assert _marks(board) == [("B", None), ("A", None)]
+
+
+@pytest.mark.parametrize("ranking", list(LeaderboardRanking))
+async def test_a_reference_ties_after_the_student(example_database, app_engine, ranking):
+    engine = example_database
+    challenge_id = _new_challenge(engine, None)
+    # The reference is submitted first, so only the tie rule can put it second.
+    ref = _graded_attempt(engine, "alice", challenge_id, [2], elapsed_s=1.0)
+    _graded_attempt(engine, "carol", challenge_id, [2], elapsed_s=1.0)
+    _make_reference(engine, ref, "Tied")
+    async with app_engine.connect() as conn:
+        board = await query_challenge_leaderboard(conn, challenge_id, ranking)
+    assert _marks(board) == [("carol", 1), ("Tied", None)]
+
+
+async def test_a_submissions_attempt_number_ignores_references(
+    example_database, app_engine
+):
+    """`query_submission`'s "#N" counts a person's own attempts only, as
+    `query_user_submissions` does; a teacher's reference gets none."""
+    challenge_id = _new_challenge(example_database, None)
+    first = _graded_attempt(example_database, "carol", challenge_id, [1])
+    async with app_engine.connect() as conn:
+        user_id = (
+            await conn.execute(
+                select(Submission.c.user_id).where(Submission.c.id == first)
+            )
+        ).scalar_one()
+        ref = (
+            await conn.execute(
+                insert(Submission)
+                .values(user_id=user_id, challenge_id=challenge_id,
+                        language="python", filename="r.py", source="1",
+                        status=cm.SubmissionStatus.done, reference_label="Ref",
+                        reference_visibility=cm.ReferenceVisibility.hidden)
+                .returning(Submission.c.id)
+            )
+        ).scalar_one()
+        second = (
+            await conn.execute(
+                insert(Submission)
+                .values(user_id=user_id, challenge_id=challenge_id,
+                        language="python", filename="b.py", source="2",
+                        status=cm.SubmissionStatus.done)
+                .returning(Submission.c.id)
+            )
+        ).scalar_one()
+        await conn.commit()
+        history = await query_user_submissions(conn, user_id, challenge_id)
+        assert sorted(s["attempt"] for s in history) == [1, 2]
+        assert (await query_submission(conn, first))["attempt"] == 1
+        assert (await query_submission(conn, second))["attempt"] == 2
+        page = await query_submission(conn, ref)
+        assert page["attempt"] is None and page["reference_label"] == "Ref"
+        polled = await query_submission_outcomes(conn, ref)
+        assert polled["reference_label"] == "Ref"
+        assert polled["reference_visibility"] == "hidden"

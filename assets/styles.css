@@ -74,6 +74,14 @@ body {
   background: color-mix(in oklch, var(--color-primary) 6%, transparent);
 }
 
+/* A teacher's reference solution among the leaderboard's students (and the
+   staff standings): dashed and muted, so it reads as a marker, not a person. */
+.cocco-reference-row {
+  outline: 1.5px dashed oklch(75% 0.02 80);
+  outline-offset: -1.5px;
+  background: color-mix(in oklch, var(--color-base-content) 4%, transparent);
+}
+
 /* The navbar's breadcrumb trail. daisyUI's `breadcrumbs` draws its separator as
    a rotated border the size of the text; this one is a bracket spanning the
    whole bar, so it is written out here. */

@@ -196,6 +196,37 @@ what students will see.
 A file you submit here is a real submission. It is graded like a student's and
 shows up in the class standings and on the leaderboard under your name.
 
+## Reference solutions {#references}
+
+A reference solution is your own answer to the challenge, added from the
+**Reference solutions** card in the editor with a file and a label such as
+"Naive O(n²)". Use it to show what a good answer scores and how fast it runs.
+Leave the label empty to use the file name.
+
+**Students see** says how much of it the class gets:
+
+- **Staff only**: nothing. This is where a new reference starts.
+- **Leaderboard**: its label, language and results, in a marked row.
+- **Leaderboard and source**: the same, plus a link to the code.
+
+A reference never takes a student's place. It has no rank, doesn't use one of
+the top 10 slots, and on a tie the student comes first. It is listed only if it
+would make the board, so a reference below the challenge's score target stays
+off it, and the card warns you when that happens: either the reference or the
+target is wrong. You always see every reference in the standings, marked as a
+reference.
+
+A reference is graded like a submission, but it is not re-run on its own. After
+you change the test cases, a **stale** badge means the active test cases are no
+longer the ones it was graded on; press **Re-run**. Regrading the challenge
+re-runs references too.
+
+You can change the label and who sees it at any time. To change the code, add a
+new reference and delete the old one, so the results always belong to the code
+shown. Delete is refused while the judge is running the reference; try again
+when it finishes. A test case a reference has been graded on can't be deleted
+until the reference is, just as for a student's submission.
+
 ## Archiving a challenge {#archive}
 
 Archiving closes a challenge without taking it away. The class keeps reading

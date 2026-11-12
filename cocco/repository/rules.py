@@ -8,6 +8,7 @@ from sqlalchemy import (
 from cocco.model import (
     Challenge,
     Course,
+    Submission,
 )
 
 
@@ -69,6 +70,17 @@ def _clears_threshold(score, threshold):
     """`threshold IS NULL OR score >= threshold`, for a score expression and a
     threshold expression (column, scalar subquery or bound value)."""
     return or_(threshold.is_(None), score >= threshold)
+
+
+# Whether a submission is a student's rather than a teacher's reference
+# solution: `submission.reference_label` is NULL for every student row. Every
+# student-facing read of `submission` carries it, so a reference never counts as
+# a student. The `text()` queries that cannot call it spell the same thing,
+# `submission.reference_label IS NULL`, and say so.
+def _is_student_submission():
+    """`submission.reference_label IS NULL`. Only valid in a statement that has
+    `submission` in its FROM."""
+    return Submission.c.reference_label.is_(None)
 
 
 # A challenge's `number`, the "Challenge 03" a page prints: its rank within its

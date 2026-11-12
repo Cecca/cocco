@@ -81,6 +81,20 @@
     </div>
   </div>
 
+  <!-- ══ REFERENCE SOLUTIONS ═══════════════════════════════════════════ -->
+  <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
+    <div class="card-body p-7">
+      <h2 class="font-bold text-lg">Reference solutions {{ help("challenges", "references", "Help: Reference solutions") }}</h2>
+      <p class="text-[13px] text-base-content/55 -mt-1 mb-3">
+        Your own solutions, graded like a submission but never counted as a student.
+        Choose what the class sees of each one.
+      </p>
+
+      <!-- Every route returns this whole card, so it always matches the database -->
+      {% include "f-challenge-references.jinja" %}
+    </div>
+  </div>
+
   <!-- ══ DANGER ZONE ═══════════════════════════════════════════════════ -->
   {# No `is_admin` guard, unlike the course editor's: the whole page is behind
      `ChallengeEditor`, which is already "administrators and course staff". #}
@@ -218,5 +232,17 @@
       if (dirty()) { e.preventDefault(); e.returnValue = ""; }
     });
   })();
+
+  /* The reference solutions card polls itself while something is being
+     graded; skip a tick while a label is half typed or a file is chosen, so the
+     swap can't wipe it. Only the poll is cancelled: the card's own forms are
+     the request's element, never #references itself. */
+  document.addEventListener("htmx:before:request", (e) => {
+    const card = e.target;
+    if (!card || card.id !== "references") return;
+    const typing = [...card.querySelectorAll(".ref-text")].some((i) => i.value !== i.defaultValue);
+    const chosen = [...card.querySelectorAll(".ref-file")].some((i) => i.files.length);
+    if (typing || chosen) e.preventDefault();
+  });
 </script>
 {% endblock %}

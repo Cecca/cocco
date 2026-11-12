@@ -50,6 +50,7 @@ from cocco.web.courses import _confirmation_matches, _danger_alert, _judge_busy_
 from cocco.web.templating import (
     templates,
 )
+from cocco.web.references import _references_context
 from cocco.web.testcases import _evaluator_context, _evaluator_dir, _testcase_dir
 
 router = APIRouter()
@@ -296,6 +297,7 @@ async def get_challenge_edit(
             # The evaluator card is an included fragment, so the page has to
             # carry the same context the fragment's own route builds.
             **await _evaluator_context(db, course_id, challenge_id),
+            **await _references_context(db, course_id, challenge_id),
             "user": user,
             "challenge": challenge,
             "testcases": testcases,

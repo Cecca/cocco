@@ -1,6 +1,36 @@
 {# Rows for #leaderboard: the best submission per student, where "best" is what
-   the challenge's `ranking` says - fastest correct one, or highest scoring. #}
+   the challenge's `ranking` says - fastest correct one, or highest scoring.
+   A teacher's reference solution is interleaved, unranked, as a marked row; the
+   `is_reference` branch comes first because its author may be the viewer. #}
+{% set ns = namespace(students=0) %}
+{% for entry in entries if not entry.is_reference %}{% set ns.students = ns.students + 1 %}{% endfor %}
 {% for entry in entries %}
+{% if entry.is_reference %}
+<div class="cocco-reference-row flex items-center gap-3 rounded-lg px-2.5 py-2">
+  <span class="w-5 font-mono text-sm text-base-content/45" title="Not ranked">—</span>
+  <span class="w-7 h-7 rounded-full bg-base-200 flex items-center justify-center font-mono text-xs text-base-content/55"
+        aria-hidden="true">&lt;/&gt;</span>
+  <span class="flex-1 text-sm">
+    {% if entry.visibility == 'source' or is_staff %}
+    <a class="link link-hover italic" href="{{ url_for('get_submission', submission_id=entry.submission_id) }}">{{ entry.label }}</a>
+    {% else %}
+    <span class="italic">{{ entry.label }}</span>
+    {% endif %}
+    <span class="badge badge-sm badge-neutral badge-outline ml-1">Reference</span>
+    <span class="badge badge-sm badge-ghost font-mono ml-1">{{ entry.language }}</span>
+    {% if is_staff and entry.visibility == 'hidden' %}
+    <span class="badge badge-sm badge-warning badge-outline ml-1">staff only</span>
+    {% endif %}
+  </span>
+  <span class="font-mono text-sm text-base-content/70">
+    {% if ranking == 'total_score' %}
+    {{ entry.total_score | score }}
+    {% else %}
+    {{ entry.elapsed_s | duration }}
+    {% endif %}
+  </span>
+</div>
+{% else %}
 {% set is_me = entry.user_id == user.id %}
 <div class="flex items-center gap-3 rounded-lg px-2.5 py-2"
      {% if is_me %}style="background:color-mix(in oklch, var(--color-primary) 14%, transparent);"{% endif %}>
@@ -23,7 +53,9 @@
     {% endif %}
   </span>
 </div>
-{% else %}
+{% endif %}
+{% endfor %}
+{% if ns.students == 0 %}
 <p class="text-sm text-base-content/45 py-2">
   {% if score_threshold is not none %}
   Nobody has reached {{ score_threshold | score }} points yet — be the first.
@@ -33,4 +65,4 @@
   Nothing has been graded yet — be the first.
   {% endif %}
 </p>
-{% endfor %}
+{% endif %}

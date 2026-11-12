@@ -9,7 +9,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from cocco.exercises.compare import Rules
-from cocco.model import ExerciseJobKind, OutcomeEnum, SubmissionStatus
+from cocco.model import ExerciseJobKind, OutcomeEnum, ReferenceVisibility, SubmissionStatus
 
 
 class Base(BaseModel):
@@ -86,6 +86,9 @@ class Submission(Base):
     language: str
     filename: str
     source: str
+    # Both NULL for a student's submission; see `Submission` in `model.py`.
+    reference_label: str | None = None
+    reference_visibility: ReferenceVisibility | None = None
 
 
 class TestOutcome(Base):

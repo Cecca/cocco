@@ -22,6 +22,7 @@ Moved from `CLAUDE.md`'s *Authorization* section. The summary stays there.
 - `require_challenge_viewer` adds the `challenge_in_course` cross-check (as `require_challenge_editor` does), so nobody can name their own course in front of another's challenge.
 - `require_challenge_member` is the challenge-only-URL variant (`/f/submissions/{id}`, `/f/leaderboard/{id}`, sample download); with one id there's nothing to disagree with.
 - Staff of one course are strangers on every other.
+- **`authorize_submission` has a reference branch**: a reference is nobody's work, so the author clause never grants it to a non-staff user. Staff read any; anyone with a role on the course reads one whose visibility is `source`, if `require_challenge_visible` passes (a hidden challenge's reference can't be read by id). Redaction by `visible_outcomes` still applies to non-staff.
 
 **Outside the gate**, deliberately: the home page and `/f/courses` (or nobody could find a course), `post_course_enroll` (the way in), and `get_course`, which for a non-member renders a **preview** (title, description, `Enroll!`) and branches *before* `query_course_info` runs.
 

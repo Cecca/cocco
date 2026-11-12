@@ -17,5 +17,6 @@ Moved from `CLAUDE.md`'s *Data model* section.
 - **`user.first_login_at` ≠ `created_at`**: `get_or_create_user` also runs from the people page (rosters before term), so NULL means "never signed in". `record_sign_in` sets it once via `coalesce`, alongside `last_login_at`, from `_complete_sign_in` *after* the blacklist check.
 - **`submission.started_at` / `finished_at`** bracket a judge run (`pull_queued_submission`, `mark_submission_done`) and `regrade_challenge` resets them to NULL. `submission.enqueued` is that table's `created_at`.
 - Neither goes through `_USER_COLUMNS`, which stays the list `schema.User` is built from.
+- **`submission.reference_label` / `reference_visibility`** (nullable `String` / `ReferenceVisibility`) mark a teacher's reference solution (`user_id` is only who added it). The named check constraint `submission_reference_columns_together` keeps them both NULL or both set. See `domain-rules.md`.
 
 `cocco/schema.py` holds the Pydantic mirrors (including the judge's `SubmissionRunData`). `schema.User`'s block fields have **no defaults**, so a query with a trimmed column list fails validation instead of reporting everyone as unblocked.

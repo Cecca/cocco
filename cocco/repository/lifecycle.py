@@ -204,7 +204,8 @@ async def lock_challenge_submissions(
     conn: AsyncConnection, challenge_id: int
 ) -> int:
     """Take every submission row of a challenge FOR UPDATE, and answer how many
-    of them a judge is running.
+    of them a judge is running. References are included on purpose: the cascade
+    takes them with the challenge.
 
     `count_running_submissions` asked before a *delete* would only be usually
     true, the way "a course never loses its last teacher" was before
@@ -238,7 +239,8 @@ async def lock_course_submissions(conn: AsyncConnection, course_id: int) -> int:
 
     A subquery on `challenge` rather than a join, so the `FOR UPDATE` needs no
     `OF`: it locks `submission` and only `submission`, which is what keeps the
-    lock order the same as the per-challenge version's.
+    lock order the same as the per-challenge version's. References are included,
+    as there.
     """
     stmt = (
         select(Submission.c.status)
@@ -289,7 +291,8 @@ async def lock_course_exercises(conn: AsyncConnection, course_id: int) -> None:
 
 
 async def delete_challenge(conn: AsyncConnection, challenge_id: int) -> None:
-    """Delete a challenge and everything that hangs off it.
+    """Delete a challenge and everything that hangs off it, its teachers'
+    reference solutions included (they are submissions, and go the same way).
 
     Hand-ordered, because no foreign key in `cocco/model.py` declares an
     `ON DELETE` - and that is deliberate rather than an omission:
@@ -328,6 +331,34 @@ async def delete_challenge(conn: AsyncConnection, challenge_id: int) -> None:
     )
     await conn.execute(delete(TestCase).where(TestCase.c.challenge_id == challenge_id))
     await conn.execute(delete(Challenge).where(Challenge.c.id == challenge_id))
+
+
+async def delete_reference(conn: AsyncConnection, submission_id: int) -> bool:
+    """Delete one reference solution and its outcomes. False, changing nothing,
+    while a judge is running it, or when it is not a reference.
+
+    The row is locked first and testoutcome touched after, the judge's order, so
+    the two cannot deadlock; and for `lock_challenge_submissions`'s reason, a
+    row deleted mid-run would take the judge process down on a foreign key.
+    Does not commit.
+    """
+    status = (
+        await conn.execute(
+            select(Submission.c.status)
+            .where(
+                Submission.c.id == submission_id,
+                Submission.c.reference_label.is_not(None),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if status is None or status == SubmissionStatus.running:
+        return False
+    await conn.execute(
+        delete(TestOutcome).where(TestOutcome.c.submission_id == submission_id)
+    )
+    await conn.execute(delete(Submission).where(Submission.c.id == submission_id))
+    return True
 
 
 async def delete_course(conn: AsyncConnection, course_id: int) -> None:

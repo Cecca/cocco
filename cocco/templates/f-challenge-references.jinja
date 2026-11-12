@@ -1,0 +1,127 @@
+{# The reference solutions card's body. Served by every route in
+   cocco/web/references.py and inlined by challenge-edit.jinja; the whole of
+   `#references` is swapped (outerHTML), alert included.
+
+   Context: course_id, challenge_id, references, score_threshold, and
+   optionally message / ok.
+
+   While something is queued or running the card polls itself. The poll is
+   skipped while a `.ref-text` box differs from its stored value or a
+   `.ref-file` has a file chosen, so it never wipes a half-typed label or
+   upload: a listener in challenge-edit.jinja cancels `htmx:before:request` on
+   #references. (Not a trigger filter: htmx 4 doesn't take `every 3s [expr]`.) #}
+{% set base = "/courses/%d/%d/references" | format(course_id, challenge_id) %}
+{% set pending = references | selectattr("status", "in", ["queued", "running"]) | list %}
+<div id="references"
+     {% if pending %}
+     hx-get="{{ url_for('get_fragment_references', course_id=course_id, challenge_id=challenge_id) }}"
+     hx-trigger="every 3s"
+     hx-target="this"
+     hx-swap="outerHTML"
+     {% endif %}>
+
+  {% if message %}
+  <div role="alert" class="alert {{ 'alert-success' if ok else 'alert-error' }} text-sm mb-4">
+    <span>{{ message }}</span>
+  </div>
+  {% endif %}
+
+  <div class="overflow-x-auto">
+    <table class="table">
+      <thead>
+        <tr class="text-xs uppercase tracking-wider text-base-content/45 font-mono">
+          <th>Label</th>
+          <th>File</th>
+          <th>Students see</th>
+          <th>Result</th>
+          <th class="text-right">Time</th>
+          <th class="w-44"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for ref in references %}
+        <tr>
+          <td>
+            <form hx-post="{{ base }}/{{ ref.id }}" hx-target="#references" hx-swap="outerHTML"
+                  class="flex items-center gap-1.5">
+              <input type="text" name="label" value="{{ ref.label }}"
+                     class="ref-text input input-sm input-ghost text-sm w-full max-w-[14rem] px-2"
+                     aria-label="Label" />
+              <button type="submit" class="btn btn-xs btn-ghost text-primary" title="Rename">✎</button>
+            </form>
+          </td>
+          <td class="whitespace-nowrap">
+            <span class="font-mono text-sm">{{ ref.filename }}</span>
+            <span class="badge badge-sm badge-ghost font-mono">{{ ref.language }}</span>
+          </td>
+          <td>
+            <select name="visibility" class="select select-sm" aria-label="What students see"
+                    hx-post="{{ base }}/{{ ref.id }}" hx-trigger="change"
+                    hx-target="#references" hx-swap="outerHTML">
+              <option value="hidden" {% if ref.visibility == "hidden" %}selected{% endif %}>Staff only</option>
+              <option value="results" {% if ref.visibility == "results" %}selected{% endif %}>Leaderboard</option>
+              <option value="source" {% if ref.visibility == "source" %}selected{% endif %}>Leaderboard and source</option>
+            </select>
+          </td>
+          <td>
+            <div class="flex flex-wrap items-center gap-1.5">
+              {% if ref.status == "queued" %}
+              <span class="badge badge-ghost gap-1.5 font-mono font-semibold">queued</span>
+              {% elif ref.status == "running" %}
+              <span class="badge badge-ghost gap-1.5 font-mono font-semibold">
+                <span class="loading loading-spinner loading-xs"></span>running
+              </span>
+              {% elif ref.score is none %}
+              <span class="badge badge-ghost gap-1.5 font-mono font-semibold">no tests</span>
+              {% else %}
+              {% with score = ref.score, cleared = ref.cleared, has_threshold = score_threshold is not none,
+                      n_tests = none, n_passed = none %}
+              {% include "_score-badge.jinja" %}
+              {% endwith %}
+              {% endif %}
+              {% if ref.stale %}
+              <span class="badge badge-sm badge-warning"
+                    title="The active test cases have changed since this was graded. Re-run it.">stale</span>
+              {% endif %}
+            </div>
+            {% if ref.status == "done" and score_threshold is not none and not ref.cleared %}
+            <p class="text-xs text-warning mt-1">Doesn't clear the score threshold, so it won't appear on the leaderboard.</p>
+            {% endif %}
+          </td>
+          <td class="text-right font-mono text-sm text-base-content/60">{{ ref.elapsed_s | duration }}</td>
+          <td class="text-right whitespace-nowrap">
+            <a href="{{ url_for('get_submission', submission_id=ref.id) }}" class="btn btn-xs btn-ghost">Open</a>
+            <form class="inline" hx-post="{{ base }}/{{ ref.id }}/rerun" hx-target="#references" hx-swap="outerHTML">
+              <button type="submit" class="btn btn-xs btn-ghost">Re-run</button>
+            </form>
+            <form class="inline" hx-post="{{ base }}/{{ ref.id }}/delete" hx-target="#references" hx-swap="outerHTML"
+                  hx-confirm="Delete this reference solution and its results?">
+              <button type="submit" class="btn btn-xs btn-ghost text-error">Delete</button>
+            </form>
+          </td>
+        </tr>
+        {% else %}
+        <tr>
+          <td colspan="6" class="text-center text-sm text-base-content/45 py-6">No reference solutions yet.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <form hx-post="{{ base }}" hx-encoding="multipart/form-data" hx-target="#references" hx-swap="outerHTML"
+        class="mt-5 rounded-xl border border-base-300 bg-base-200/40 p-4">
+    <h3 class="text-xs font-bold uppercase tracking-wider text-base-content/50 mb-3">Add a reference solution</h3>
+    <div class="flex flex-wrap items-end gap-4">
+      <div>
+        <label class="text-xs text-base-content/55">Source file</label>
+        <input type="file" name="solution" required class="ref-file file-input file-input-sm w-56 mt-1" />
+      </div>
+      <div>
+        <label class="text-xs text-base-content/55">Label (defaults to the file name)</label>
+        <input type="text" name="label" class="ref-text input input-sm w-56 mt-1" />
+      </div>
+      <button type="submit" class="btn btn-sm btn-primary">Add</button>
+    </div>
+  </form>
+</div>

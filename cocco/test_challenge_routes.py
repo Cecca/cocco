@@ -943,3 +943,79 @@ async def test_the_staff_view_warns_about_a_missing_threshold(
 
     sign_in_as(client, STUDENT)
     assert "Reach 4 points to make the leaderboard." in client.get(url).text
+
+
+async def _reference(app_engine, challenge_id, user_id, label, visibility):
+    """A graded reference solution by `user_id`."""
+    from cocco.model import ReferenceVisibility, Submission
+
+    submission_id = await _graded(app_engine, challenge_id, user_id, [1])
+    async with app_engine.connect() as conn:
+        await conn.execute(
+            update(Submission)
+            .where(Submission.c.id == submission_id)
+            .values(
+                reference_label=label,
+                reference_visibility=ReferenceVisibility(visibility),
+            )
+        )
+        await conn.commit()
+    return submission_id
+
+
+async def test_students_see_visible_references_on_the_leaderboard(
+    client, world, app_engine
+):
+    challenge_id = await _add_challenge(app_engine, world["course"], PUBLISHED)
+    await _graded(app_engine, challenge_id, world["bob"], [1])
+    results = await _reference(app_engine, challenge_id, world["alice"], "Results-only", "results")
+    source = await _reference(app_engine, challenge_id, world["alice"], "With-source", "source")
+    await _reference(app_engine, challenge_id, world["alice"], "Hidden-one", "hidden")
+
+    sign_in_as(client, STUDENT)
+    page = client.get(f"/f/leaderboard/{challenge_id}").text
+    assert "Results-only" in page and "With-source" in page
+    assert "Hidden-one" not in page and "staff only" not in page
+    assert "Reference" in page and "cocco-reference-row" in page
+    assert f"/submissions/{source}" in page
+    assert f"/submissions/{results}" not in page
+
+
+async def test_staff_see_hidden_references_marked(client, world, app_engine):
+    challenge_id = await _add_challenge(app_engine, world["course"], PUBLISHED)
+    hidden = await _reference(app_engine, challenge_id, world["alice"], "Hidden-one", "hidden")
+    sign_in_as(client, TEACHER)
+    page = client.get(f"/f/leaderboard/{challenge_id}").text
+    assert "Hidden-one" in page and "staff only" in page
+    assert f"/submissions/{hidden}" in page
+    assert "You ·" not in page
+
+
+async def test_the_staff_standings_show_references_with_their_visibility(
+    client, world, app_engine
+):
+    challenge_id = await _add_challenge(app_engine, world["course"], PUBLISHED)
+    await _graded(app_engine, challenge_id, world["bob"], [1])
+    hidden = await _reference(app_engine, challenge_id, world["alice"], "Hidden-one", "hidden")
+    shown = await _reference(app_engine, challenge_id, world["alice"], "Shown-one", "source")
+    sign_in_as(client, TEACHER)
+    page = client.get(
+        f"/f/standings/{challenge_id}?course_id={world['course']}"
+    ).text
+    assert "Hidden-one" in page and "Staff only" in page
+    assert "Shown-one" in page and "Leaderboard and source" in page
+    assert "cocco-reference-row" in page
+    assert f"/submissions/{hidden}" in page and f"/submissions/{shown}" in page
+    # Only the student has a page of their own; the references link to none.
+    assert page.count(f"/students/{world['bob']}") == 2 and page.count("/students/") == 2
+    assert f"/students/{world['alice']}" not in page
+
+
+async def test_the_empty_state_shows_with_only_references(client, world, app_engine):
+    challenge_id = await _add_challenge(app_engine, world["course"], PUBLISHED)
+    await _set_threshold(app_engine, challenge_id, 0.5)
+    await _reference(app_engine, challenge_id, world["alice"], "Only-ref", "results")
+    sign_in_as(client, STUDENT)
+    page = client.get(f"/f/leaderboard/{challenge_id}").text
+    assert "Only-ref" in page
+    assert "Nobody has reached 0.5 points yet — be the first." in page

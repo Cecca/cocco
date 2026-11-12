@@ -61,7 +61,7 @@ Each area has a guide in `.claude/rules/`, loaded when you touch its files. Read
 
 ### Data model (`cocco/model.py`)
 
-Core `Table`s on one `MetaData`: `User` (roles via `Enrollment`; `Administrator` beside it, keyed on email so it can name someone who never signed in), `Course` → `Challenge` → `TestCase` (files referenced by path, not stored in the DB; `is_sample` = downloadable by students, `is_active` = graded), `Submission` → `TestOutcome`. No queue table: queued means `status == SubmissionStatus.queued`. `Challenge.ranking` (`LeaderboardRanking`) and `Challenge.score_threshold` are presentation-only; the judge never reads either. The `exercise_*` tables share nothing with this above the execution layer.
+Core `Table`s on one `MetaData`: `User` (roles via `Enrollment`; `Administrator` beside it, keyed on email so it can name someone who never signed in), `Course` → `Challenge` → `TestCase` (files referenced by path, not stored in the DB; `is_sample` = downloadable by students, `is_active` = graded), `Submission` → `TestOutcome` (a submission with `reference_label` is a teacher's reference solution). No queue table: queued means `status == SubmissionStatus.queued`. `Challenge.ranking` (`LeaderboardRanking`) and `Challenge.score_threshold` are presentation-only; the judge never reads either. The `exercise_*` tables share nothing with this above the execution layer.
 
 **Every timestamp is `timestamptz` written by Postgres** (`server_default=func.now()`), never `datetime.now()`.
 
@@ -75,7 +75,7 @@ Insert helpers (`insert_enrollment`, `insert_submission`) don't commit; the call
 
 ### HTTP layer (`cocco/main.py`, `cocco/web/`)
 
-FastAPI app `cocco.main:app`. `main.py` is the composition root: it builds the app, adds the middlewares, mounts `/static`, registers the exception handlers and the startup hook, and calls `include_router` once per module of `cocco/web/`. The routes live there as `APIRouter` modules: `core` (config, engine, `Storage`, `get_db`, shared constants) and `templating` at the bottom; `access` (identity, refusals, gates) above every area; then `signin`, `home`, `admin`, `courses`, `people`, `exercise_sets`, `exercise_sessions`, `exercise_student`, `challenges`, `challenge_editor`, `testcases`, `profile`, `api`, plus `seed` (schema check and dev data). Imports run one way (e.g. `courses` → `home`, `testcases`); nothing under `web/` imports `cocco.main`. Loggers are `cocco.web.<module>`.
+FastAPI app `cocco.main:app`. `main.py` is the composition root: it builds the app, adds the middlewares, mounts `/static`, registers the exception handlers and the startup hook, and calls `include_router` once per module of `cocco/web/`. The routes live there as `APIRouter` modules: `core` (config, engine, `Storage`, `get_db`, shared constants) and `templating` at the bottom; `access` (identity, refusals, gates) above every area; then `signin`, `home`, `admin`, `courses`, `people`, `exercise_sets`, `exercise_sessions`, `exercise_student`, `challenges`, `challenge_editor`, `references`, `testcases`, `profile`, `api`, plus `seed` (schema check and dev data). Imports run one way (e.g. `courses` → `home`, `testcases`); nothing under `web/` imports `cocco.main`. Loggers are `cocco.web.<module>`.
 
 **Seams.** `CONFIG`, `DUMMY_AUTH` and `storage` are read through `core` (`core.CONFIG`), `oauth_client` through `signin`; a test patches the module whose code looks the name up, and `main.py` re-exports nothing, so patching `main.X` reaches nothing.
 

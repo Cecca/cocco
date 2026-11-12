@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### 🚀 Features
+
+- *(editor)* Reference solutions: graded like a submission, shown on the leaderboard unranked
+
 ## [0.1.0] - 2026-08-14
 
 ### 🚀 Features

@@ -1148,6 +1148,65 @@ async def test_a_judge_stopped_mid_run_puts_the_submission_back(db, app_engine, 
 
 
 @pytest.mark.integration
+async def test_a_reference_is_graded_like_any_submission(db, app_engine, tmp_path):
+    """The judge never learns about references: one added through
+    `insert_reference` is pulled, run in the sandbox and graded through
+    `run_from_queue`, and ends `done` with its outcome, label untouched."""
+    from cocco.repository.challenges import insert_reference
+
+    storage = Storage(tmp_path)
+    storage.write(Path("ref/in.txt"), "moon")
+    storage.write(Path("ref/out.txt"), "hello moon")
+    user_id, challenge_id = _user_and_challenge(db)
+    with db.begin() as conn:
+        # `_user_and_challenge`'s 1 MB is below what an interpreter needs.
+        conn.execute(
+            cm.Challenge.update()
+            .where(cm.Challenge.c.id == challenge_id)
+            .values(max_memory_bytes=64 << 20)
+        )
+        conn.execute(
+            insert(cm.TestCase).values(
+                challenge_id=challenge_id,
+                execution_order=0,
+                input_path="ref/in.txt",
+                expected_output_path="ref/out.txt",
+            )
+        )
+    async with app_engine.connect() as conn:
+        reference_id = await insert_reference(
+            conn,
+            user_id,
+            challenge_id,
+            "python",
+            "ref.py",
+            'print("hello", input())',
+            "Teacher's",
+        )
+        await conn.commit()
+
+    assert await cj.run_from_queue(db, storage)
+
+    with db.connect() as conn:
+        row = conn.execute(
+            select(
+                cm.Submission.c.status,
+                cm.Submission.c.reference_label,
+                cm.Submission.c.reference_visibility,
+            ).where(cm.Submission.c.id == reference_id)
+        ).one()
+        outcomes = conn.execute(
+            select(cm.TestOutcome.c.outcome, cm.TestOutcome.c.score).where(
+                cm.TestOutcome.c.submission_id == reference_id
+            )
+        ).all()
+    assert row.status == cm.SubmissionStatus.done
+    assert row.reference_label == "Teacher's"
+    assert row.reference_visibility == cm.ReferenceVisibility.hidden
+    assert [(o.outcome, o.score) for o in outcomes] == [(cm.OutcomeEnum.success, 1.0)]
+
+
+@pytest.mark.integration
 async def test_a_cancelled_run_cleans_its_box_up():
     """A box whose run is cancelled is cleaned up and its id handed back, so
     the next `--init` on it finds nothing left behind."""

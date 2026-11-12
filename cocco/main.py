@@ -26,6 +26,7 @@ from cocco.web import (
     home,
     people,
     profile,
+    references,
     signin,
     testcases,
 )
@@ -93,6 +94,7 @@ app.include_router(exercise_student.router)
 app.include_router(challenges.router)
 app.include_router(challenge_editor.router)
 app.include_router(testcases.router)
+app.include_router(references.router)
 app.include_router(profile.router)
 app.include_router(api.router)
 
