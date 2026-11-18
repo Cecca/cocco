@@ -256,6 +256,13 @@ body {
   background: var(--color-base-100);
   color: var(--color-base-content);
 }
+/* iOS Safari zooms the page in on focusing any field set below 16px, and
+   doesn't zoom back out: on a phone the editor is 1rem. */
+@media (max-width: 639px) {
+  .cocco-editor .CodeMirror {
+    font-size: 1rem;
+  }
+}
 .cocco-editor .CodeMirror-scroll {
   min-height: 18rem;
 }

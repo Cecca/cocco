@@ -19,11 +19,11 @@
 {# Escaped explicitly: `Jinja2Templates` autoescapes only .html/.xml, so a
    `.jinja` file is not, and what this prints is code and program output. #}
 {% autoescape true %}
-<main class="mx-auto max-w-3xl px-6 py-8">
+<main class="mx-auto max-w-3xl px-3 py-4 sm:px-6 sm:py-8">
   {% include "f-exercise-strip.jinja" %}
 
   <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
-    <div class="card-body p-7 items-center text-center">
+    <div class="card-body p-4 sm:p-7 items-center text-center">
       {% if waiting %}
       <span class="loading loading-dots loading-lg text-primary"></span>
       <h1 class="font-serif text-2xl font-semibold tracking-tight mt-2">Wait for the teacher {{ help("students", "exercises-in-class", "Help: Exercises in class") }}</h1>

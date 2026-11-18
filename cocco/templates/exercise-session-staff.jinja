@@ -10,11 +10,11 @@
 ] %}
 
 {% block body %}
-<main class="mx-auto max-w-6xl px-6 py-8">
+<main class="mx-auto max-w-6xl px-3 py-4 sm:px-6 sm:py-8">
   <div class="flex items-start justify-between gap-4 mb-6">
     <div>
       <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">Exercise session</p>
-      <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ session.label }}</h1>
+      <h1 class="font-serif text-2xl sm:text-3xl font-semibold tracking-tight mt-1">{{ session.label }}</h1>
     </div>
     <div class="flex flex-wrap gap-2">
       <a href="{{ url_for('get_exercise_dashboard', course_id=course_id, session_id=session.id) }}"
@@ -35,7 +35,7 @@
 
   <!-- ══ DANGER ZONE ════════════════════════════════════════════════ -->
   <div class="card bg-base-100 border border-error/40 shadow-sm mt-10">
-    <div class="card-body p-7">
+    <div class="card-body p-4 sm:p-7">
       <h2 class="font-bold text-lg text-error">Danger zone</h2>
       <div id="exercise-session-danger-result" class="empty:hidden mt-3"></div>
 

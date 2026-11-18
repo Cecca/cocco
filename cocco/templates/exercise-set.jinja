@@ -9,12 +9,12 @@
 ] %}
 
 {% block body %}
-<main class="mx-auto max-w-6xl px-6 py-8">
+<main class="mx-auto max-w-6xl px-3 py-4 sm:px-6 sm:py-8">
 
   <div class="flex items-start justify-between gap-4 mb-6">
     <div>
       <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">Exercise set</p>
-      <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ exercise_set.title }}</h1>
+      <h1 class="font-serif text-2xl sm:text-3xl font-semibold tracking-tight mt-1">{{ exercise_set.title }}</h1>
     </div>
     <a href="{{ url_for('get_course', course_id=course_id) }}"
        class="btn btn-sm btn-ghost border border-base-300 font-semibold">
@@ -32,7 +32,7 @@
      opened on the current version and keeps it; the session's own page is
      where it is moved to a newer one. #}
   <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
-    <div class="card-body p-7">
+    <div class="card-body p-4 sm:p-7">
       <h2 class="font-bold text-lg">Sessions {{ help("exercises", "sessions", "Help: Sessions") }}</h2>
       <p class="text-[13px] text-base-content/55">
         One run of this set with one group of students.
@@ -110,7 +110,7 @@
 
   <!-- ══ DANGER ZONE ════════════════════════════════════════════════ -->
   <div class="card bg-base-100 border border-error/40 shadow-sm mt-10">
-    <div class="card-body p-7">
+    <div class="card-body p-4 sm:p-7">
       <h2 class="font-bold text-lg text-error">Danger zone</h2>
       <div id="exercise-set-danger-result" class="empty:hidden mt-3"></div>
 

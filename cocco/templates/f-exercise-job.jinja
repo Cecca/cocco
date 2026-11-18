@@ -180,7 +180,7 @@
       <pre class="mt-1 max-h-32 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono whitespace-pre-wrap">{{ row.test.input or "(empty)" }}</pre>
     </div>
     {% endif %}
-    <div class="grid gap-2 sm:grid-cols-2">
+    <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
       <div>
         <div class="text-[11px] uppercase tracking-wider text-base-content/45">Expected</div>
         {{ marked(row.expected) }}

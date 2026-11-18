@@ -30,7 +30,7 @@
    `.jinja` file is not, and what this prints is code and program output. #}
 {% autoescape true %}
 {% set can_attempt = not closed and not staff %}
-<main class="mx-auto max-w-6xl px-6 py-8">
+<main class="mx-auto max-w-6xl px-3 py-4 sm:px-6 sm:py-8">
 
   <div class="mb-6">{% include "f-exercise-strip.jinja" %}</div>
 
@@ -51,14 +51,14 @@
   </div>
   {% endif %}
 
-  <div class="grid gap-6 lg:grid-cols-2">
+  <div class="grid grid-cols-1 gap-6 lg:grid-cols-2">
     <!-- ══ THE EXERCISE ═════════════════════════════════════════════ -->
     <div class="card bg-base-100 border border-base-300 shadow-sm self-start">
-      <div class="card-body p-7">
+      <div class="card-body p-4 sm:p-7">
         <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">
           Exercise {{ "%02d" | format(n) }} of {{ n_exercises }}
         </p>
-        <h1 class="font-serif text-3xl font-semibold tracking-tight">{{ exercise.title }}</h1>
+        <h1 class="font-serif text-2xl sm:text-3xl font-semibold tracking-tight">{{ exercise.title }}</h1>
 
         <article class="prose prose-sm max-w-none mt-2">
           {{ exercise.statement | markdown }}
@@ -90,7 +90,7 @@
           {% for test in exercise.tests %}
           <div class="rounded-xl border border-base-300 p-3">
             <div class="text-xs font-mono font-semibold text-base-content/55">Example {{ loop.index }}</div>
-            <div class="grid gap-2 sm:grid-cols-2 mt-2">
+            <div class="grid grid-cols-1 gap-2 sm:grid-cols-2 mt-2">
               <div>
                 <div class="text-[11px] uppercase tracking-wider text-base-content/45">Input</div>
                 <pre class="mt-1 max-h-40 overflow-auto rounded-md bg-base-200 p-2 text-xs font-mono whitespace-pre-wrap">{{ test.input or "(empty)" }}</pre>
@@ -130,7 +130,7 @@
        would; the stdin box is a Run's only. The tabs are radios, and their
        value is posted along and ignored. #}
     <div class="card bg-base-100 border border-base-300 shadow-sm self-start">
-      <div class="card-body p-7">
+      <div class="card-body p-4 sm:p-7">
         <form class="flex flex-col gap-3" onsubmit="return false">
           <div class="flex items-center gap-2">
             <label class="text-xs text-base-content/55" for="exercise-source">Your code</label>
@@ -182,7 +182,7 @@
               <textarea id="exercise-stdin" name="stdin" rows="3" spellcheck="false"
                         {% if not closed %}data-draft-key="{{ draft_key }}:stdin"{% endif %}
                         {% if closed %}readonly{% endif %}
-                        class="textarea w-full font-mono text-sm mt-1">{{ stdin }}</textarea>
+                        class="textarea w-full font-mono text-base sm:text-sm mt-1">{{ stdin }}</textarea>
               {% if can_attempt %}
               <button type="button" id="run-button" data-swap-guard class="btn btn-sm mt-2"
                       hx-post="{{ url_for('post_session_run', course_id=course_id, session_id=session_id, n=n) }}"

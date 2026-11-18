@@ -22,13 +22,13 @@
    (`session_progress_view`), `course`, `course_id`. #}
 {% block body %}
 {% autoescape true %}
-<main class="mx-auto max-w-7xl px-6 py-8">
+<main class="mx-auto max-w-7xl px-3 py-4 sm:px-6 sm:py-8">
   <div class="flex flex-wrap items-start justify-between gap-4 mb-6">
     <div>
       <p class="font-mono text-xs uppercase tracking-[0.14em] text-base-content/45">Dashboard</p>
       {# The ? leads to the projector's section too, since that screen has
          none of its own: the class sees it. #}
-      <h1 class="font-serif text-3xl font-semibold tracking-tight mt-1">{{ session.label }} {{ help("exercises", "dashboard", "Help: The dashboard") }}</h1>
+      <h1 class="font-serif text-2xl sm:text-3xl font-semibold tracking-tight mt-1">{{ session.label }} {{ help("exercises", "dashboard", "Help: The dashboard") }}</h1>
     </div>
     <div class="flex gap-2">
       <a href="{{ url_for('get_exercise_projector', course_id=course_id, session_id=session.id) }}"

@@ -22,7 +22,7 @@
 
   <!-- ── THE LATEST VERSION ─────────────────────────────────────────── -->
   <div class="card bg-base-100 border border-base-300 shadow-sm">
-    <div class="card-body p-7">
+    <div class="card-body p-4 sm:p-7">
       <div class="flex flex-wrap items-center gap-3">
         <h2 class="font-bold text-lg">Latest import {{ help("exercises", "import", "Help: Importing a set") }}</h2>
         {% if latest.status == "ready" %}
@@ -64,7 +64,7 @@
 
   <!-- ── EVERY VERSION ──────────────────────────────────────────────── -->
   <div class="card bg-base-100 border border-base-300 shadow-sm mt-6">
-    <div class="card-body p-7">
+    <div class="card-body p-4 sm:p-7">
       <h2 class="font-bold text-lg">Versions {{ help("exercises", "versions", "Help: Versions") }}</h2>
       <p class="text-[13px] text-base-content/55">
         Every import, newest first. The current one is the newest that built.

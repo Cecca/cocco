@@ -29,7 +29,7 @@ hx-swap="outerHTML"
 
   <!-- ── STATE AND PACING ───────────────────────────────────────────── -->
   <div class="card bg-base-100 border border-base-300 shadow-sm">
-    <div class="card-body p-7">
+    <div class="card-body p-4 sm:p-7">
       <div class="flex flex-wrap items-center gap-3">
         <h2 class="font-bold text-lg">
           {% if closed %}Closed {{ help("exercises", "close", "Help: Closing a session") }}
@@ -89,7 +89,7 @@ hx-swap="outerHTML"
 
   <!-- ── EXERCISES ──────────────────────────────────────────────────── -->
   <div class="card bg-base-100 border border-base-300 shadow-sm">
-    <div class="card-body p-7">
+    <div class="card-body p-4 sm:p-7">
       <h2 class="font-bold text-lg">Exercises {{ help("exercises", "reveal", "Help: Revealing a solution") }}</h2>
       <p class="text-[13px] text-base-content/55">
         Revealing a solution shows it to the class. It cannot be hidden again.
@@ -123,7 +123,7 @@ hx-swap="outerHTML"
 
   <!-- ── VERSION ────────────────────────────────────────────────────── -->
   <div class="card bg-base-100 border border-base-300 shadow-sm">
-    <div class="card-body p-7">
+    <div class="card-body p-4 sm:p-7">
       <h2 class="font-bold text-lg">Version {{ help("exercises", "switch-version", "Help: Switching version") }}</h2>
       {% if not switch %}
       <p class="text-[13px] text-base-content/55">
@@ -157,7 +157,7 @@ hx-swap="outerHTML"
   <!-- ── CLOSE ──────────────────────────────────────────────────────── -->
   {% if not closed %}
   <div class="card bg-base-100 border border-error/40 shadow-sm">
-    <div class="card-body p-7">
+    <div class="card-body p-4 sm:p-7">
       <div class="flex flex-wrap items-center justify-between gap-4">
         <div class="min-w-0 flex-1">
           <h2 class="font-bold text-lg text-error">Close the session {{ help("exercises", "close", "Help: Closing a session") }}</h2>
